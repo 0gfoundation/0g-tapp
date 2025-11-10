@@ -1,0 +1,94 @@
+[package]
+name = "tapp-service"
+version = "0.1.0"
+edition = "2021"
+authors = ["TDX TAPP Developers"]
+description = "TDX Trusted Application Platform Service - Rust Implementation"
+license = "Apache-2.0"
+
+[dependencies]
+# gRPC and async runtime
+tonic = "0.12"
+prost = "0.13"
+tokio = { version = "1.0", features = [
+    "macros",
+    "rt-multi-thread",
+    "fs",
+    "process",
+    "signal",
+] }
+tokio-stream = "0.1"
+async-recursion = "1.0"
+
+# Attestation
+# attester = { git = "https://github.com/inclavare-containers/guest-components" }
+attestation-agent = { git = "https://github.com/inclavare-containers/guest-components", features = [
+    "tdx-attester",
+    "sgx-attester",
+    "snp-attester",
+    "cca-attester",
+    "csv-attester",
+] }
+# resource_uri = { git = "https://github.com/inclavare-containers/guest-components" }
+# kbs-types = { git = "https://github.com/inclavare-containers/kbs-types.git", rev = "5c029c9" }
+
+# Serialization and data handling
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+toml = "0.8"
+base64 = "0.22"
+
+# Cryptography
+sha2 = "0.10"
+sha3 = "0.10"
+hex = "0.4"
+ring = "0.17"
+k256 = { version = "0.13", features = ["ecdsa", "std"] }
+
+# Error handling and logging
+anyhow = "1.0"
+thiserror = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = [
+    "json",
+    "env-filter",
+    "fmt",
+    "ansi",
+] }
+
+# Configuration
+config = "0.14"
+clap = { version = "4.0", features = ["derive"] }
+
+# System monitoring
+sysinfo = "0.30"
+psutil = "3.2"
+
+# Docker integration
+bollard = "0.17"
+futures-util = "0.3"
+
+# JSON canonicalization (removed for simplicity)
+
+# Utilities
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.0", features = ["v4"] }
+dirs = "5.0"
+regex = "1.10"
+tempfile = "3.23.0"
+rand = "0.8.5"
+
+[build-dependencies]
+tonic-build = "0.12"
+
+[dev-dependencies]
+tokio-test = "0.4"
+
+[[bin]]
+name = "tapp-server"
+path = "src/main.rs"
+
+[[bin]]
+name = "tapp-cli"
+path = "src/cli.rs"
