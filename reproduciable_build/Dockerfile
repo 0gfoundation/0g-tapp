@@ -62,15 +62,20 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --de
     rustc --version && \
     cargo --version
 
+ENV RUSTUP_UPDATE_ROOT=https://mirrors.aliyun.com/rustup/rustup
+ENV RUSTUP_DIST_SERVER=https://mirrors.aliyun.com/rustup
+
 # Set working directory
 WORKDIR /build
+
+# Copy project files
+COPY . .
 
 # Build both binaries in release mode
 # This produces:
 # - /build/target/release/tapp-server
 # - /build/target/release/tapp-cli
-RUN COPY ../ . && \
-    cargo build --release
+RUN cargo build --release
 
 # Copy build artifacts to output directory
 RUN mkdir -p /output && \
