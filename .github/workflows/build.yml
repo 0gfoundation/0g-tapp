@@ -1,0 +1,179 @@
+name: Build and Sign Binaries
+
+on:
+  push:
+    tags: [ 'v*' ]
+  workflow_dispatch:
+
+env:
+  BINARY_NAME_SERVER: tapp-server
+  BINARY_NAME_CLI: tapp-cli
+
+permissions:
+  contents: write        # For creating releases
+  packages: write        # For pushing container images
+  id-token: write        # For Sigstore signing
+  attestations: write    # For SLSA attestations
+
+jobs:
+  build-and-sign:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Install cosign
+      uses: sigstore/cosign-installer@v3
+
+    - name: Build binaries with Docker
+      run: |
+        # Build the builder image
+        docker build -f reproducible/Dockerfile -t 0g-tapp-builder .
+        
+        # Create output directory
+        mkdir -p artifacts
+        
+        # Extract binaries from container
+        docker run --rm -v $(pwd)/artifacts:/artifacts 0g-tapp-builder
+        
+        # Verify binaries exist
+        ls -lh artifacts/
+        file artifacts/*
+
+    - name: Generate checksums
+      run: |
+        cd artifacts
+        sha256sum * > SHA256SUMS
+        cat SHA256SUMS
+
+    - name: Sign binaries with cosign
+      run: |
+        cd artifacts
+        
+        # Sign each binary
+        for binary in ${{ env.BINARY_NAME_SERVER }} ${{ env.BINARY_NAME_CLI }}; do
+          echo "Signing $binary..."
+          cosign sign-blob --yes \
+            --bundle ${binary}.cosign.bundle \
+            $binary
+        done
+        
+        # Sign the checksum file
+        cosign sign-blob --yes \
+          --bundle SHA256SUMS.cosign.bundle \
+          SHA256SUMS
+        
+        ls -lh
+
+    - name: Generate SLSA provenance for binaries
+      uses: actions/attest-build-provenance@v1
+      with:
+        subject-path: |
+          artifacts/${{ env.BINARY_NAME_SERVER }}
+          artifacts/${{ env.BINARY_NAME_CLI }}
+
+    - name: Verify signatures
+      run: |
+        cd artifacts
+        
+        # Verify each binary signature
+        for binary in ${{ env.BINARY_NAME_SERVER }} ${{ env.BINARY_NAME_CLI }}; do
+          echo "Verifying $binary..."
+          cosign verify-blob \
+            --bundle ${binary}.cosign.bundle \
+            --certificate-identity-regexp="https://github.com/${{ github.repository }}/.*" \
+            --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \
+            $binary
+        done
+
+    - name: Create GitHub Release
+      uses: softprops/action-gh-release@v1
+      if: startsWith(github.ref, 'refs/tags/')
+      with:
+        files: |
+          artifacts/${{ env.BINARY_NAME_SERVER }}
+          artifacts/${{ env.BINARY_NAME_CLI }}
+          artifacts/*.cosign.bundle
+          artifacts/SHA256SUMS
+        body: |
+          ## 🔐 Verified Binaries - ${{ github.ref_name }}
+          
+          These binaries are signed with [Sigstore](https://www.sigstore.dev/) for supply chain security.
+          
+          ### 📦 Downloads
+          - `${{ env.BINARY_NAME_SERVER }}` - Server binary
+          - `${{ env.BINARY_NAME_CLI }}` - CLI binary
+          - `SHA256SUMS` - Checksums for verification
+          - `*.cosign.bundle` - Sigstore signature bundles
+          
+          ### ✅ Verification Instructions
+          
+          **1. Install cosign:**
+          ```bash
+          # macOS
+          brew install cosign
+          
+          # Linux
+          wget https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64
+          chmod +x cosign-linux-amd64
+          sudo mv cosign-linux-amd64 /usr/local/bin/cosign
+          ```
+          
+          **2. Verify binary signature:**
+          ```bash
+          # Download binary and signature bundle
+          wget https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/${{ env.BINARY_NAME_SERVER }}
+          wget https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/${{ env.BINARY_NAME_SERVER }}.cosign.bundle
+          
+          # Verify signature
+          cosign verify-blob \
+            --bundle ${{ env.BINARY_NAME_SERVER }}.cosign.bundle \
+            --certificate-identity-regexp="https://github.com/${{ github.repository }}/.*" \
+            --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \
+            ${{ env.BINARY_NAME_SERVER }}
+          ```
+          
+          **3. Verify checksums:**
+          ```bash
+          # Download checksums
+          wget https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/SHA256SUMS
+          
+          # Verify
+          sha256sum -c SHA256SUMS
+          ```
+          
+          ### 🔍 Build Provenance
+          View SLSA build provenance attestations on [Sigstore](https://search.sigstore.dev/)
+          
+          ### 🏗️ Build Environment
+          - OS: Alibaba Cloud Linux 3
+          - Rust: 1.91.0
+          - Reproducible build with pinned dependencies
+          - Built from commit: ${{ github.sha }}
+
+    - name: Output build summary
+      run: |
+        echo "## Build Summary" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "✅ **Binaries built and signed successfully**" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### 📦 Artifacts" >> $GITHUB_STEP_SUMMARY
+        echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+        ls -lh artifacts/ >> $GITHUB_STEP_SUMMARY
+        echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### 🔐 Checksums" >> $GITHUB_STEP_SUMMARY
+        echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+        cat artifacts/SHA256SUMS >> $GITHUB_STEP_SUMMARY
+        echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### 📝 Release" >> $GITHUB_STEP_SUMMARY
+        if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+          echo "🚀 Released at: https://github.com/${{ github.repository }}/releases/tag/${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "ℹ️ Manual run - no release created" >> $GITHUB_STEP_SUMMARY
+        fi
