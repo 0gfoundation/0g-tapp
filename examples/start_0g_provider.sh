@@ -15,7 +15,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEFAULT_HOST="39.97.63.199"
 DEFAULT_PORT="50051"
 DEFAULT_APP_ID="test-broker-app"
-DEFAULT_DEPLOYER_HEX="0x0000000000000000000000000000000000000000000000000000000000000000"
+DEFAULT_DEPLOYER_HEX="0xbae5046287f1b3fe2540d13160778c459d0f4038f1dcda0651679f5cb8a21f0ef1550b51ab5e6ae5a8e531512b1a06a97dfbb992c5e6f3aa36b04e1dd928d269"
 DEFAULT_COMPOSE_FILE="$SCRIPT_DIR/docker-compose.yml"
 DEFAULT_CONFIG_FILE="$SCRIPT_DIR/config.yml"
 
@@ -55,6 +55,7 @@ echo "0G Serving Provider Deployment"
 echo "========================================"
 echo "Target:        $TARGET_ADDRESS"
 echo "App ID:        $APP_ID"
+echo "Deployer:      $DEPLOYER_HEX"
 echo "Compose File:  $COMPOSE_FILE"
 echo "Config File:   $CONFIG_FILE"
 echo "========================================"
@@ -84,30 +85,63 @@ request_json=$(jq -n \
   '{
     compose_content: $compose,
     app_id: $app_id,
+    deployer: $deployer,
     mount_files: [
       {
         source_path: "./config.yml",
         content: $config,
         mode: "0644"
       }
-    ],
-    deployer: $deployer
+    ]
   }')
 
 echo "Request JSON:"
 echo "--------------------------------------"
 echo "$request_json"
 echo "--------------------------------------"
+echo ""
 
-echo "Calling gRPC service..."
-response=$(grpcurl -plaintext \
+echo "Sending StartApp request..."
+echo ""
+
+# Add pipe to pass request_json to grpcurl
+response=$(printf "%s" "$request_json" | tr -d '\n' | grpcurl -plaintext \
   -import-path ./proto \
   -proto tapp_service.proto \
   -d @ \
   "$TARGET_ADDRESS" \
-  tapp_service.TappService/StartApp)
+  tapp_service.TappService/StartApp 2>&1)
 
 echo "Response:"
 echo "--------------------------------------"
 echo "$response"
 echo "--------------------------------------"
+echo ""
+
+# Extract task_id from response
+task_id=$(echo "$response" | jq -r '.taskId // .task_id // empty' 2>/dev/null)
+
+echo "========================================"
+echo "Next Steps:"
+echo "========================================"
+echo "✓ App is starting asynchronously"
+echo ""
+
+if [ -n "$task_id" ]; then
+    echo "📋 Task ID: $task_id"
+    echo ""
+    echo "To check task status, run:"
+    echo "  sh examples/get_task_status.sh $task_id $TARGET_HOST $TARGET_PORT"
+    echo ""
+    echo "Or use this one-liner to monitor until completion:"
+    echo "  while true; do sh examples/get_task_status.sh $task_id $TARGET_HOST $TARGET_PORT && break || sleep 2; done"
+else
+    echo "⚠️  Could not extract task_id from response."
+    echo "Please copy the task_id from the response above and run:"
+    echo "  sh examples/get_task_status.sh <TASK_ID> $TARGET_HOST $TARGET_PORT"
+fi
+
+echo ""
+echo "Once completed, you can get evidence:"
+echo "  sh examples/get_evidence.sh $TARGET_HOST $TARGET_PORT"
+echo "========================================"
