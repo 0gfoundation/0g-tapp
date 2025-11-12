@@ -32,7 +32,7 @@ jobs:
     - name: Build binaries with Docker
       run: |
         # Build the builder image
-        docker build -f reproducible/Dockerfile -t 0g-tapp-builder .
+        docker build -f reproducible_build/Dockerfile -t 0g-tapp-builder .
         
         # Create output directory
         mkdir -p artifacts
