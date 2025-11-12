@@ -26,7 +26,7 @@ ARG REGION=cn-beijing
 
 # Install all required build dependencies with pinned versions for reproducible builds
 RUN yum install -y yum-utils-4.0.21-25.1.al8.noarch && \
-    yum-config-manager --add-repo https://enclave-${REGION}.oss-${REGION}-internal.aliyuncs.com/repo/alinux/enclave-expr.repo && \
+    yum-config-manager --add-repo https://enclave-${REGION}.oss-${REGION}.aliyuncs.com/repo/alinux/enclave-expr.repo && \
     yum install -y \
     git-2.43.7-1.0.1.al8.x86_64 \
     tar-1.30-11.0.1.al8.x86_64 \
