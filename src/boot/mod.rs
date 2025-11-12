@@ -7,7 +7,7 @@ pub use measurement::{AppMeasurement, ComposeMeasurement, HashAlgorithm};
 pub use task_manager::{Task, TaskManager, TaskStatus as TaskState, TaskSuccessResult};
 
 use crate::config::BootServiceConfig;
-use crate::error::{DockerError, TappResult};
+use crate::error::{DockerError, TappError, TappResult};
 use crate::proto::{GetEvidenceRequest, GetEvidenceResponse, StartAppRequest, StartAppResponse};
 use attestation_agent::{AttestationAPIs, AttestationAgent};
 use std::collections::HashMap;
@@ -92,11 +92,15 @@ enable_eventlog = true
     /// Internal method to handle the actual app start logic
     async fn _start_app(&self, request: StartAppRequest, task_id: String) {
         let result = async {
-            let task_suffix = task_id
-                .strip_prefix("task-")
-                .unwrap_or(&task_id)
-                .to_string();
-            let app_id = format!("{}-{}", request.app_id, task_suffix);
+            let app_id = request.app_id.clone();
+            if self.app_measurements.lock().await.contains_key(&app_id) {
+                return Err(TappError::InvalidParameter {
+                    field: "app_id".to_string(),
+                    reason: format!("Application {} already exists", app_id),
+                }
+                .into());
+            }
+
             info!(
                 task_id = %task_id,
                 app_id = %app_id,
