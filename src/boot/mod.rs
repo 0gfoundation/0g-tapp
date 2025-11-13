@@ -123,17 +123,13 @@ enable_eventlog = true
                 })
                 .collect();
 
-            // Start the Docker Compose application with mount files
-            self.manager
-                .lock()
-                .await
-                .deploy_compose(&app_id, &request.compose_content, &mount_files)
-                .await?;
-
             // Calculate application measurement
             let (measurement, compose_content, volumes_content) = self
                 .calculate_app_measurement(&request, &mount_files, &app_id)
                 .await?;
+
+            let measurement_json = serde_json::to_string(&measurement)?;
+            info!("measurement_json: {}", measurement_json);
 
             self.app_compose_content
                 .lock()
@@ -145,14 +141,18 @@ enable_eventlog = true
                 .await
                 .insert(app_id.clone(), volumes_content);
 
+            // Start the Docker Compose application with mount files
+            self.manager
+                .lock()
+                .await
+                .deploy_compose(&app_id, &request.compose_content, &mount_files)
+                .await?;
+
             // Store measurement in memory
             self.app_measurements
                 .lock()
                 .await
                 .insert(app_id.clone(), measurement.clone());
-
-            let measurement_json = serde_json::to_string(&measurement)?;
-            info!("measurement_json: {}", measurement_json);
 
             self.aa
                 .lock()
