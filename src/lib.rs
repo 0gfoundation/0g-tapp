@@ -419,7 +419,7 @@ pub fn init_tracing(config: &config::LoggingConfig) -> TappResult<()> {
         fmt::{self, format::FmtSpan},
         layer::SubscriberExt,
         util::SubscriberInitExt,
-        EnvFilter,
+        EnvFilter, Layer,
     };
 
     let filter = EnvFilter::try_from_default_env()
@@ -429,69 +429,18 @@ pub fn init_tracing(config: &config::LoggingConfig) -> TappResult<()> {
             reason: format!("Invalid log level: {}", e),
         })?;
 
-    let registry = tracing_subscriber::registry().with(filter);
-
-    match config.format.as_str() {
-        "json" => {
-            if let Some(file_path) = &config.file_path {
-                let file = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(file_path)
-                    .map_err(|e| error::ConfigError::InvalidValue {
-                        field: "logging.file_path".to_string(),
-                        reason: format!("Cannot open log file: {}", e),
-                    })?;
-
-                registry
-                    .with(
-                        fmt::layer()
-                            .json()
-                            .with_writer(file)
-                            .with_span_events(FmtSpan::CLOSE),
-                    )
-                    .init();
-            } else {
-                registry
-                    .with(
-                        fmt::layer()
-                            .json()
-                            .with_writer(std::io::stdout)
-                            .with_span_events(FmtSpan::CLOSE),
-                    )
-                    .init();
-            }
-        }
-        "pretty" => {
-            if let Some(file_path) = &config.file_path {
-                let file = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(file_path)
-                    .map_err(|e| error::ConfigError::InvalidValue {
-                        field: "logging.file_path".to_string(),
-                        reason: format!("Cannot open log file: {}", e),
-                    })?;
-
-                registry
-                    .with(
-                        fmt::layer()
-                            .pretty()
-                            .with_writer(file)
-                            .with_span_events(FmtSpan::CLOSE),
-                    )
-                    .init();
-            } else {
-                registry
-                    .with(
-                        fmt::layer()
-                            .pretty()
-                            .with_writer(std::io::stdout)
-                            .with_span_events(FmtSpan::CLOSE),
-                    )
-                    .init();
-            }
-        }
+    let stdout_layer = match config.format.as_str() {
+        "json" => fmt::layer()
+            .json()
+            .with_writer(std::io::stdout)
+            .with_span_events(FmtSpan::CLOSE)
+            .boxed(),
+        "pretty" => fmt::layer()
+            .pretty()
+            .with_writer(std::io::stdout)
+            .with_ansi(true)
+            .with_span_events(FmtSpan::CLOSE)
+            .boxed(),
         _ => {
             return Err(error::ConfigError::InvalidValue {
                 field: "logging.format".to_string(),
@@ -499,11 +448,64 @@ pub fn init_tracing(config: &config::LoggingConfig) -> TappResult<()> {
             }
             .into());
         }
+    };
+
+    if let Some(file_path) = &config.file_path {
+        use tracing_appender::rolling::{RollingFileAppender, Rotation};
+
+        let path = std::path::Path::new(file_path);
+
+        let (directory, file_name_prefix) = if file_path.to_string_lossy().ends_with('/') {
+            (path, "app")
+        } else if path.extension().is_some() {
+            let directory = path.parent().unwrap_or(std::path::Path::new("."));
+            let file_name_prefix = path.file_stem().and_then(|n| n.to_str()).unwrap_or("app");
+            (directory, file_name_prefix)
+        } else {
+            let directory = path.parent().unwrap_or(std::path::Path::new("."));
+            let file_name_prefix = path.file_name().and_then(|n| n.to_str()).unwrap_or("app");
+            (directory, file_name_prefix)
+        };
+
+        std::fs::create_dir_all(directory).map_err(|e| error::ConfigError::InvalidValue {
+            field: "logging.file_path".to_string(),
+            reason: format!("Cannot create log directory: {}", e),
+        })?;
+
+        let file_appender = RollingFileAppender::new(Rotation::DAILY, directory, file_name_prefix);
+
+        let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+        std::mem::forget(_guard);
+
+        let file_layer = match config.format.as_str() {
+            "json" => fmt::layer()
+                .json()
+                .with_writer(non_blocking)
+                .with_ansi(false)
+                .with_span_events(FmtSpan::CLOSE)
+                .boxed(),
+            "pretty" => fmt::layer()
+                .with_writer(non_blocking)
+                .with_ansi(false)
+                .with_span_events(FmtSpan::CLOSE)
+                .boxed(),
+            _ => unreachable!(),
+        };
+
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(stdout_layer)
+            .with(file_layer)
+            .init();
+    } else {
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(stdout_layer)
+            .init();
     }
 
     Ok(())
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;

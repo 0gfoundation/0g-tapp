@@ -169,6 +169,10 @@ impl DockerComposeManager {
         compose_content: &str,
         mount_files: &[MountFile],
     ) -> TappResult<()> {
+        use std::sync::Arc;
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        use tokio::sync::Mutex;
+
         // 1. store compose file
         let base_path = PathBuf::from(format!("/var/lib/tapp/apps/{}", app_id));
         if !base_path.exists() {
@@ -184,47 +188,94 @@ impl DockerComposeManager {
         // 2. store mount files to corresponding location
         self.store_mount_files(&base_path, mount_files).await?;
 
-        // 3. start compose
-        let output = Command::new("docker")
+        // 3. start compose with real-time output
+        info!(app_id = %app_id, "🚀 Starting docker compose up");
+
+        let mut child = Command::new("docker")
             .current_dir(&base_path)
             .args(["compose", "-f", "docker-compose.yml", "up", "-d"])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .output()
-            .await
+            .spawn()
             .map_err(|e| DockerError::ContainerOperationFailed {
                 operation: "docker_compose_up".to_string(),
                 reason: format!("Failed to execute docker compose command: {}", e),
             })?;
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let stdout = String::from_utf8_lossy(&output.stdout);
+        let stdout = child.stdout.take().unwrap();
+        let stderr = child.stderr.take().unwrap();
 
+        // Collect output
+        let stdout_lines = Arc::new(Mutex::new(Vec::new()));
+        let stderr_lines = Arc::new(Mutex::new(Vec::new()));
+
+        let app_id_clone = app_id.to_string();
+        let stdout_lines_clone = stdout_lines.clone();
+        let stdout_task = tokio::spawn(async move {
+            let reader = BufReader::new(stdout);
+            let mut lines = reader.lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                info!(
+                    app_id = %app_id_clone,
+                    output_type = "stdout",
+                    "🐳 {}", line
+                );
+                stdout_lines_clone.lock().await.push(line);
+            }
+        });
+
+        let app_id_clone = app_id.to_string();
+        let stderr_lines_clone = stderr_lines.clone();
+        let stderr_task = tokio::spawn(async move {
+            let reader = BufReader::new(stderr);
+            let mut lines = reader.lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                info!(
+                    app_id = %app_id_clone,
+                    "🐳 {}", line
+                );
+                stderr_lines_clone.lock().await.push(line);
+            }
+        });
+
+        let status = child
+            .wait()
+            .await
+            .map_err(|e| DockerError::ContainerOperationFailed {
+                operation: "docker_compose_up".to_string(),
+                reason: format!("Failed to wait for docker compose: {}", e),
+            })?;
+
+        let _ = tokio::join!(stdout_task, stderr_task);
+
+        let all_stdout = stdout_lines.lock().await.join("\n");
+        let all_stderr = stderr_lines.lock().await.join("\n");
+
+        if !status.success() {
             error!(
-                exit_code = ?output.status.code(),
-                stderr = %stderr,
-                stdout = %stdout,
-                "Docker compose command failed"
+                app_id = %app_id,
+                exit_code = ?status.code(),
+                stderr = %all_stderr,
+                stdout = %all_stdout,
+                "❌ Docker compose command failed"
             );
 
             return Err(DockerError::ContainerOperationFailed {
                 operation: "docker_compose_up".to_string(),
                 reason: format!(
                     "Docker compose failed with exit code {:?}\nStderr: {}\nStdout: {}",
-                    output.status.code(),
-                    stderr,
-                    stdout
+                    status.code(),
+                    all_stderr,
+                    all_stdout
                 ),
             }
             .into());
         }
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
         info!(
             app_id = %app_id,
-            output = %stdout,
-            "Docker compose up completed successfully"
+            output = %all_stdout,
+            "✅ Docker compose up completed successfully"
         );
 
         Ok(())

@@ -1,26 +1,23 @@
 use clap::Parser;
 use std::net::SocketAddr;
-use tapp_service::config::TappConfig;
-use tapp_service::proto::tapp_service_server::TappServiceServer;
-use tapp_service::TappServiceImpl;
+use tapp_service::{config::TappConfig, init_tracing, TappServiceImpl, TappServiceServer, VERSION};
 use tonic::transport::Server;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
-/// TDX TAPP Service - Rust Implementation
-#[derive(Parser)]
+#[derive(Parser, Debug)]
 #[command(name = "tapp-server")]
-#[command(about = "TDX Trusted Application Platform Service")]
+#[command(about = "TAPP gRPC Server", version = VERSION)]
 struct Args {
-    /// Configuration file path
-    #[arg(short, long, default_value = "config.toml")]
+    /// Path to configuration file
+    #[arg(short, long, default_value = "/etc/tapp/config.toml")]
     config: String,
 
-    /// Server bind address
-    #[arg(short, long, default_value = "0.0.0.0:50051")]
-    bind: String,
+    /// Bind address (overrides config)
+    #[arg(short, long)]
+    bind: Option<String>,
 
-    /// Enable verbose logging
-    #[arg(short, long, default_value = "false")]
+    /// Enable verbose logging (overrides config)
+    #[arg(short, long)]
     verbose: bool,
 }
 
@@ -28,54 +25,69 @@ struct Args {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
-    // Initialize tracing
-    let log_level = if args.verbose { "debug" } else { "info" };
-    tracing_subscriber::fmt().with_env_filter(log_level).init();
-
-    info!("Starting TDX TAPP Service Server");
-    info!("Version: {}", tapp_service::VERSION);
-
-    // Load configuration
-    let config = match TappConfig::load(args.config.clone()) {
+    // Step 1: Load configuration first (before initializing logging)
+    let mut config = match TappConfig::load(args.config.clone()) {
         Ok(config) => {
-            info!("Configuration loaded from: {}", args.config);
+            // Use println because tracing is not initialized yet
+            println!("✓ Configuration loaded from: {}", args.config);
             config
         }
         Err(e) => {
-            warn!("Failed to load config from {}: {}", args.config, e);
-            info!("Using default configuration");
+            println!("⚠ Failed to load config from {}: {}", args.config, e);
+            println!("Using default configuration");
             TappConfig::default()
         }
     };
 
-    // Parse bind address
-    let addr: SocketAddr = args
+    // Step 2: Override config with command-line args if provided
+    if args.verbose {
+        config.logging.level = "debug".to_string();
+    }
+
+    // Step 3: Initialize tracing with config
+    init_tracing(&config.logging)?;
+
+    info!("🚀 Starting TDX TAPP Service Server");
+    info!("Version: {}", VERSION);
+    info!("Configuration loaded from: {}", args.config);
+    info!(
+        logging_level = %config.logging.level,
+        logging_format = %config.logging.format,
+        logging_file = ?config.logging.file_path,
+        "Logging initialized"
+    );
+
+    // Step 4: Determine bind address
+    let bind_address = args
         .bind
+        .unwrap_or_else(|| config.server.bind_address.clone());
+
+    let addr: SocketAddr = bind_address
         .parse()
-        .map_err(|e| format!("Invalid bind address '{}': {}", args.bind, e))?;
+        .map_err(|e| format!("Invalid bind address '{}': {}", bind_address, e))?;
 
     info!("Binding to address: {}", addr);
 
-    // Initialize service
-    let service = match TappServiceImpl::new(config).await {
+    // Step 5: Initialize service
+    let service = match TappServiceImpl::new(config.clone()).await {
         Ok(service) => {
-            info!("TAPP service initialized successfully");
+            info!("✓ TAPP service initialized successfully");
             service
         }
         Err(e) => {
-            error!("Failed to initialize TAPP service: {}", e);
+            error!("✗ Failed to initialize TAPP service: {}", e);
             std::process::exit(1);
         }
     };
 
-    // Create gRPC server
+    // Step 6: Create gRPC server
     let server = Server::builder()
         .add_service(TappServiceServer::new(service))
         .serve(addr);
 
-    info!("TAPP gRPC server starting on {}", addr);
+    info!("🌐 TAPP gRPC server starting on {}", addr);
 
-    // Handle shutdown gracefully
+    // Step 7: Handle shutdown gracefully
     tokio::select! {
         result = server => {
             if let Err(e) = result {
