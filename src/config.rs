@@ -51,9 +51,13 @@ pub struct LoggingConfig {
 /// Main configuration structure for TAPP service
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct TappConfig {
+    #[serde(default)]
     pub logging: LoggingConfig,
+    #[serde(default)]
     pub boot: BootServiceConfig,
+    #[serde(default)]
     pub server: ServerConfig,
+    #[serde(default)]
     pub kbs: Option<KbsConfig>,
 }
 
