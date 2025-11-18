@@ -83,12 +83,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    // Step 6: Create API key interceptor
+    // Step 6: Create API key interceptor and gRPC server
     let api_key_config = config.server.api_key.clone();
-    let interceptor = ApiKeyInterceptor::new(api_key_config.clone());
 
     // Log API key configuration status
-    if let Some(ref api_config) = api_key_config {
+    let use_interceptor = if let Some(ref api_config) = api_key_config {
         if api_config.enabled {
             info!(
                 "🔐 API key authentication enabled with {} key(s)",
@@ -96,25 +95,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
             if api_config.protected_methods.is_empty() {
                 info!("   All methods require API key authentication");
+                true  // Use interceptor for all methods
             } else {
                 info!(
                     "   Protected methods: {}",
                     api_config.protected_methods.join(", ")
                 );
+                info!("   Method-level validation will be used");
+                false  // Use per-method validation
             }
         } else {
             info!("🔓 API key authentication disabled");
+            false
         }
     } else {
         info!("🔓 API key authentication not configured");
-    }
+        false
+    };
 
-    // Step 7: Create gRPC server with interceptor
-    let server = Server::builder()
-        .add_service(TappServiceServer::with_interceptor(service, move |req| {
-            interceptor.clone().intercept(req)
-        }))
-        .serve(addr);
+    // Step 7: Create gRPC server (with or without interceptor)
+    let server = if use_interceptor {
+        let interceptor = ApiKeyInterceptor::new(api_key_config);
+        Server::builder()
+            .add_service(TappServiceServer::with_interceptor(service, move |req| {
+                interceptor.clone().intercept(req)
+            }))
+            .serve(addr)
+    } else {
+        Server::builder()
+            .add_service(TappServiceServer::new(service))
+            .serve(addr)
+    };
 
     info!("🌐 TAPP gRPC server starting on {}", addr);
 

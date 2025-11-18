@@ -18,6 +18,8 @@ impl ApiKeyInterceptor {
     }
 
     /// Validate API key from request metadata
+    /// Note: Method-level filtering should be done at the service implementation level
+    /// This interceptor validates all requests if enabled
     fn validate_api_key(&self, req: &Request<()>) -> Result<(), Status> {
         // If API key auth is not configured or disabled, allow all requests
         let Some(config) = self.config.as_ref() else {
@@ -28,37 +30,7 @@ impl ApiKeyInterceptor {
             return Ok(());
         }
 
-        // Extract method name from request URI
-        let uri = req.uri();
-        let method_name = uri
-            .path()
-            .split('/')
-            .last()
-            .unwrap_or("")
-            .to_string();
-
-        debug!(
-            method = %method_name,
-            uri = %uri,
-            "Processing API key authentication"
-        );
-
-        // Check if this method requires authentication
-        // If protected_methods is empty, all methods require auth
-        // If protected_methods is specified, only those methods require auth
-        let requires_auth = if config.protected_methods.is_empty() {
-            true
-        } else {
-            config.protected_methods.contains(&method_name)
-        };
-
-        if !requires_auth {
-            debug!(
-                method = %method_name,
-                "Method does not require API key authentication"
-            );
-            return Ok(());
-        }
+        debug!("Processing API key authentication");
 
         // Extract API key from metadata
         // The client should send: metadata.insert("x-api-key", api_key)
@@ -68,7 +40,6 @@ impl ApiKeyInterceptor {
             .and_then(|v| v.to_str().ok())
             .ok_or_else(|| {
                 warn!(
-                    method = %method_name,
                     remote_addr = ?req.remote_addr(),
                     event = "AUTH_MISSING_API_KEY",
                     "API key missing in request metadata"
@@ -79,7 +50,6 @@ impl ApiKeyInterceptor {
         // Validate API key
         if !config.keys.contains(&api_key.to_string()) {
             warn!(
-                method = %method_name,
                 remote_addr = ?req.remote_addr(),
                 event = "AUTH_INVALID_API_KEY",
                 "Invalid API key attempted"
@@ -88,7 +58,6 @@ impl ApiKeyInterceptor {
         }
 
         debug!(
-            method = %method_name,
             event = "AUTH_SUCCESS",
             "API key validation successful"
         );
@@ -102,10 +71,52 @@ impl ApiKeyInterceptor {
         let (metadata, extensions, msg) = req.into_parts();
         let temp_req = Request::from_parts(metadata.clone(), extensions.clone(), ());
 
-        // Validate API key
+        // Validate API key (applies to all methods when enabled)
         self.validate_api_key(&temp_req)?;
 
         // Reconstruct the original request
         Ok(Request::from_parts(metadata, extensions, msg))
     }
+}
+
+/// Helper function for validating API key at method level
+/// Use this in individual RPC handlers for fine-grained control
+pub fn validate_method_api_key(
+    config: &Option<ApiKeyConfig>,
+    metadata: &tonic::metadata::MetadataMap,
+    method_name: &str,
+) -> Result<(), Status> {
+    let Some(api_config) = config else {
+        return Ok(());
+    };
+
+    if !api_config.enabled {
+        return Ok(());
+    }
+
+    // Check if this method requires authentication
+    let requires_auth = if api_config.protected_methods.is_empty() {
+        // If no methods specified, all methods require auth (handled by interceptor)
+        return Ok(());
+    } else {
+        api_config.protected_methods.iter().any(|m| m == method_name)
+    };
+
+    if !requires_auth {
+        return Ok(());
+    }
+
+    // Extract and validate API key
+    let api_key = metadata
+        .get("x-api-key")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| {
+            Status::unauthenticated("Missing API key. Please provide 'x-api-key' in metadata")
+        })?;
+
+    if !api_config.keys.contains(&api_key.to_string()) {
+        return Err(Status::permission_denied("Invalid API key"));
+    }
+
+    Ok(())
 }
