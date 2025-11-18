@@ -101,6 +101,26 @@ pub struct ServerConfig {
 
     /// TLS private key path (if TLS enabled)
     pub tls_key_path: Option<PathBuf>,
+
+    /// API Key configuration for authentication
+    #[serde(default)]
+    pub api_key: Option<ApiKeyConfig>,
+}
+
+/// API Key authentication configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiKeyConfig {
+    /// Enable API key authentication
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// List of valid API keys (in production, use env vars or secrets management)
+    pub keys: Vec<String>,
+
+    /// Methods that require authentication (if empty, all methods require auth)
+    /// Examples: "StartApp", "GetAppSecretKey"
+    #[serde(default)]
+    pub protected_methods: Vec<String>,
 }
 
 /// KBS configuration

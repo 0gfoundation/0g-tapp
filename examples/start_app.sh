@@ -1,13 +1,18 @@
 #!/bin/bash
 
 # Usage:
-#   ./start_app.sh [HOST] [PORT] [APP_ID] [DEPLOYER_HEX]
+#   ./start_app.sh [HOST] [PORT] [APP_ID] [DEPLOYER_HEX] [API_KEY]
 #
 # Examples:
 #   ./start_app.sh
 #   ./start_app.sh 39.97.63.199 50051
 #   ./start_app.sh 39.97.63.199 50051 test-nginx-app
 #   ./start_app.sh 39.97.63.199 50051 test-nginx-app 0xbae5046287f1b3fe2540d13160778c459d0f4038f1dcda0651679f5cb8a21f0ef1550b51ab5e6ae5a8e531512b1a06a97dfbb992c5e6f3aa36b04e1dd928d269
+#   ./start_app.sh 39.97.63.199 50051 test-nginx-app 0xbae... my-secret-api-key-12345
+#
+# Or use environment variable:
+#   export TAPP_API_KEY="my-secret-api-key-12345"
+#   ./start_app.sh
 
 # Default configuration
 DEFAULT_HOST="39.97.63.199"
@@ -20,6 +25,7 @@ TARGET_HOST=${1:-$DEFAULT_HOST}
 TARGET_PORT=${2:-$DEFAULT_PORT}
 APP_ID=${3:-$DEFAULT_APP_ID}
 DEPLOYER_HEX=${4:-$DEFAULT_DEPLOYER_HEX}
+API_KEY=${5:-$TAPP_API_KEY}  # From argument or environment variable
 TARGET_ADDRESS="$TARGET_HOST:$TARGET_PORT"
 
 # Remove 0x prefix if present
@@ -32,6 +38,11 @@ echo "======================================"
 echo "Target:        $TARGET_ADDRESS"
 echo "App ID:        $APP_ID"
 echo "Deployer:      $DEPLOYER_HEX"
+if [ -n "$API_KEY" ]; then
+    echo "API Key:       ${API_KEY:0:8}... (configured)"
+else
+    echo "API Key:       (not set)"
+fi
 echo "======================================"
 echo ""
 
@@ -119,12 +130,17 @@ echo "$request_json"
 echo "--------------------------------------"
 echo ""
 
-response=$(printf "%s" "$request_json" | tr -d '\n' | grpcurl -plaintext \
-  -import-path ./proto \
-  -proto tapp_service.proto \
-  -d @ \
-  "$TARGET_ADDRESS" \
-  tapp_service.TappService/StartApp 2>&1)
+# Build grpcurl command with optional API key
+GRPCURL_CMD="grpcurl -plaintext"
+
+# Add API key header if provided
+if [ -n "$API_KEY" ]; then
+    GRPCURL_CMD="$GRPCURL_CMD -H \"x-api-key: $API_KEY\""
+fi
+
+GRPCURL_CMD="$GRPCURL_CMD -import-path ./proto -proto tapp_service.proto -d @ \"$TARGET_ADDRESS\" tapp_service.TappService/StartApp"
+
+response=$(printf "%s" "$request_json" | tr -d '\n' | eval $GRPCURL_CMD 2>&1)
 
 
 echo "Response:"

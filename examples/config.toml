@@ -1,0 +1,53 @@
+# TAPP Service Configuration Example
+
+[logging]
+level = "info"              # Log level: "trace", "debug", "info", "warn", "error"
+format = "json"             # Log format: "json" or "pretty"
+# file_path = "/var/log/tapp/app.log"  # Optional: log to file
+max_file_size_mb = 100
+max_files = 10
+
+[server]
+bind_address = "0.0.0.0:50051"
+max_connections = 1000
+request_timeout_seconds = 30
+tls_enabled = false
+# tls_cert_path = "/path/to/cert.pem"
+# tls_key_path = "/path/to/key.pem"
+
+# API Key Authentication Configuration
+[server.api_key]
+enabled = true
+# List of valid API keys
+# IMPORTANT: In production, use environment variables or secrets management
+# instead of hardcoding keys in config files
+keys = [
+    "your-api-key-here",
+    "another-api-key-for-different-client"
+]
+# Specify which methods require authentication
+# If empty, ALL methods will require API key
+# Example: only protect sensitive operations
+protected_methods = [
+    "StartApp",
+    "GetAppSecretKey"
+]
+
+[boot]
+# aa_config_path = "/etc/tapp/attestation-agent.toml"
+socket_path = "/var/run/docker.sock"
+container_timeout_seconds = 300
+
+# KBS (Key Broker Service) Configuration
+# If not configured, the service will use in-memory key generation
+[kbs]
+endpoint = "http://localhost:8080"
+timeout_seconds = 30
+# cert_path = "/path/to/kbs-ca.pem"
+
+[kbs.retry]
+max_retries = 3
+initial_delay_ms = 1000
+max_delay_ms = 30000
+
+supported_key_types = ["ethereum", "rsa", "ec"]

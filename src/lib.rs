@@ -1,4 +1,5 @@
 pub mod app_key;
+pub mod auth;
 pub mod boot;
 pub mod config;
 pub mod error;

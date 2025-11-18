@@ -1,6 +1,9 @@
 use clap::Parser;
 use std::net::SocketAddr;
-use tapp_service::{config::TappConfig, init_tracing, TappServiceImpl, TappServiceServer, VERSION};
+use tapp_service::{
+    auth::ApiKeyInterceptor, config::TappConfig, init_tracing, TappServiceImpl, TappServiceServer,
+    VERSION,
+};
 use tonic::transport::Server;
 use tracing::{error, info};
 
@@ -80,14 +83,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    // Step 6: Create gRPC server
+    // Step 6: Create API key interceptor
+    let api_key_config = config.server.api_key.clone();
+    let interceptor = ApiKeyInterceptor::new(api_key_config.clone());
+
+    // Log API key configuration status
+    if let Some(ref api_config) = api_key_config {
+        if api_config.enabled {
+            info!(
+                "🔐 API key authentication enabled with {} key(s)",
+                api_config.keys.len()
+            );
+            if api_config.protected_methods.is_empty() {
+                info!("   All methods require API key authentication");
+            } else {
+                info!(
+                    "   Protected methods: {}",
+                    api_config.protected_methods.join(", ")
+                );
+            }
+        } else {
+            info!("🔓 API key authentication disabled");
+        }
+    } else {
+        info!("🔓 API key authentication not configured");
+    }
+
+    // Step 7: Create gRPC server with interceptor
     let server = Server::builder()
-        .add_service(TappServiceServer::new(service))
+        .add_service(TappServiceServer::with_interceptor(service, move |req| {
+            interceptor.clone().intercept(req)
+        }))
         .serve(addr);
 
     info!("🌐 TAPP gRPC server starting on {}", addr);
 
-    // Step 7: Handle shutdown gracefully
+    // Step 8: Handle shutdown gracefully
     tokio::select! {
         result = server => {
             if let Err(e) = result {
