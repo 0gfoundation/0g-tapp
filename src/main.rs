@@ -1,10 +1,11 @@
 use clap::Parser;
 use std::net::SocketAddr;
 use tapp_service::{
-    auth::ApiKeyInterceptor, config::TappConfig, init_tracing, TappServiceImpl, TappServiceServer,
+    auth_layer::ApiKeyLayer, config::TappConfig, init_tracing, TappServiceImpl, TappServiceServer,
     VERSION,
 };
 use tonic::transport::Server;
+use tower::ServiceBuilder;
 use tracing::{error, info};
 
 #[derive(Parser, Debug)]
@@ -83,11 +84,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    // Step 6: Create API key interceptor and gRPC server
+    // Step 6: Create API key layer and log configuration
     let api_key_config = config.server.api_key.clone();
 
     // Log API key configuration status
-    let use_interceptor = if let Some(ref api_config) = api_key_config {
+    if let Some(ref api_config) = api_key_config {
         if api_config.enabled {
             info!(
                 "🔐 API key authentication enabled with {} key(s)",
@@ -95,37 +96,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
             if api_config.protected_methods.is_empty() {
                 info!("   All methods require API key authentication");
-                true  // Use interceptor for all methods
             } else {
                 info!(
                     "   Protected methods: {}",
                     api_config.protected_methods.join(", ")
                 );
-                info!("   Method-level validation will be used");
-                false  // Use per-method validation
             }
         } else {
             info!("🔓 API key authentication disabled");
-            false
         }
     } else {
         info!("🔓 API key authentication not configured");
-        false
-    };
+    }
 
-    // Step 7: Create gRPC server (with or without interceptor)
-    let server = if use_interceptor {
-        let interceptor = ApiKeyInterceptor::new(api_key_config);
-        Server::builder()
-            .add_service(TappServiceServer::with_interceptor(service, move |req| {
-                interceptor.clone().intercept(req)
-            }))
-            .serve(addr)
-    } else {
-        Server::builder()
-            .add_service(TappServiceServer::new(service))
-            .serve(addr)
-    };
+    // Step 7: Create gRPC server with API key layer
+    // The layer automatically validates API keys based on configuration
+    // No need to modify individual RPC methods!
+    let layer = ServiceBuilder::new()
+        .layer(ApiKeyLayer::new(api_key_config))
+        .into_inner();
+
+    let server = Server::builder()
+        .layer(layer)
+        .add_service(TappServiceServer::new(service))
+        .serve(addr);
 
     info!("🌐 TAPP gRPC server starting on {}", addr);
 

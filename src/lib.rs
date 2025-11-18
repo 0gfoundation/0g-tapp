@@ -1,5 +1,5 @@
 pub mod app_key;
-pub mod auth;
+pub mod auth_layer;
 pub mod boot;
 pub mod config;
 pub mod error;
@@ -123,13 +123,7 @@ impl TappService for TappServiceImpl {
         &self,
         request: Request<StartAppRequest>,
     ) -> Result<Response<StartAppResponse>, Status> {
-        // Validate API key for method-level protection
-        crate::auth::validate_method_api_key(
-            &self.config.server.api_key,
-            request.metadata(),
-            "StartApp",
-        )?;
-
+        // API key validation is handled by ApiKeyLayer - no code needed here!
         let req = request.into_inner();
         let response = self.boot_service.clone().start_app(req).await?;
         Ok(Response::new(response))
