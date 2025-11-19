@@ -7,6 +7,9 @@ service TappService {
   // Start an application using Docker Compose content (async - returns task ID)
   rpc StartApp(StartAppRequest) returns (StartAppResponse);
 
+  // Stop a running application (synchronous)
+  rpc StopApp(StopAppRequest) returns (StopAppResponse);
+
   // Get task status for async operations
   rpc GetTaskStatus(GetTaskStatusRequest) returns (GetTaskStatusResponse);
 
@@ -84,6 +87,17 @@ message StartAppResponse {
   string message = 2;
   string task_id = 3;   // Async task identifier for tracking progress
   int64 timestamp = 4;  // Timestamp of the start request
+}
+
+// Stop App Messages
+message StopAppRequest {
+  string app_id = 1;  // Application identifier to stop
+}
+
+message StopAppResponse {
+  bool success = 1;
+  string message = 2;
+  int64 timestamp = 3;  // Timestamp of the stop request
 }
 
 // Task Status Messages
@@ -267,3 +281,4 @@ message GetAppLogsResponse {
   string content = 3;         // Log content from docker compose logs
   int32 total_lines = 4;      // Total lines returned
 }
+

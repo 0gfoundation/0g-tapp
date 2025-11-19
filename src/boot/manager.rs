@@ -1,4 +1,4 @@
-use crate::error::{DockerError, TappResult, TappError};
+use crate::error::{DockerError, TappError, TappResult};
 use bollard::container::{ListContainersOptions, StopContainerOptions};
 use bollard::models::ContainerInspectResponse;
 use bollard::Docker;
@@ -288,193 +288,51 @@ impl DockerComposeManager {
 
     /// Stop Docker Compose application
     pub async fn stop_compose(&mut self, app_id: &str) -> TappResult<()> {
-        info!(app_id = %app_id, "Stopping Docker Compose application");
+        let app_dir = self.get_app_dir(app_id);
 
-        let container_names = self
-            .app_containers
-            .get(app_id)
-            .ok_or_else(|| DockerError::ServiceNotFound {
-                service_name: app_id.to_string(),
-            })?
-            .clone();
-
-        for container_name in &container_names {
-            match self.stop_container(container_name).await {
-                Ok(_) => {
-                    info!(container_name = %container_name, "Container stopped");
-                }
-                Err(e) => {
-                    error!(
-                        container_name = %container_name,
-                        error = %e,
-                        "Failed to stop container"
-                    );
-                }
-            }
+        if !app_dir.exists() {
+            return Err(TappError::InvalidParameter {
+                field: "app_id".to_string(),
+                reason: format!("App {} not found", app_id),
+            });
         }
 
-        // Remove from tracking
-        self.app_containers.remove(app_id);
+        info!(app_id = %app_id, "🛑 Stopping Docker Compose application");
 
-        info!(app_id = %app_id, "Docker Compose application stopped");
-        Ok(())
-    }
-
-    /// Stop and remove a single container
-    async fn stop_container(&self, container_name: &str) -> TappResult<()> {
-        // Stop container
-        self.docker
-            .stop_container(
-                container_name,
-                Some(StopContainerOptions {
-                    t: 10, // 10 second timeout
-                }),
-            )
+        // Execute docker compose down in app directory
+        let output = tokio::process::Command::new("docker")
+            .args(&["compose", "down"])
+            .current_dir(&app_dir)
+            .output()
             .await
-            .map_err(|e| DockerError::ContainerOperationFailed {
+            .map_err(|e| {
+                TappError::Docker(DockerError::ContainerOperationFailed {
+                    operation: "stop".to_string(),
+                    reason: format!("Failed to execute docker compose down: {}", e),
+                })
+            })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            error!(
+                app_id = %app_id,
+                stderr = %stderr,
+                "❌ Docker compose down failed"
+            );
+            return Err(TappError::Docker(DockerError::ContainerOperationFailed {
                 operation: "stop".to_string(),
-                reason: format!("Failed to stop container {}: {}", container_name, e),
-            })?;
+                reason: format!("docker compose down failed: {}", stderr),
+            }));
+        }
 
-        // Remove container
-        self.docker
-            .remove_container(container_name, None)
-            .await
-            .map_err(|e| DockerError::ContainerOperationFailed {
-                operation: "remove".to_string(),
-                reason: format!("Failed to remove container {}: {}", container_name, e),
-            })?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        info!(
+            app_id = %app_id,
+            output = %stdout,
+            "✅ Docker compose down completed successfully"
+        );
 
         Ok(())
-    }
-
-    /// Get status of Docker Compose application
-    pub async fn get_compose_status(&self, app_id: &str) -> TappResult<AppStatus> {
-        let container_names =
-            self.app_containers
-                .get(app_id)
-                .ok_or_else(|| DockerError::ServiceNotFound {
-                    service_name: app_id.to_string(),
-                })?;
-
-        let mut containers = Vec::new();
-        let mut running_count = 0;
-        let mut started_at = None;
-
-        for container_name in container_names {
-            match self.get_container_status(container_name).await {
-                Ok(status) => {
-                    if status.state == "running" {
-                        running_count += 1;
-                    }
-                    containers.push(status);
-                }
-                Err(e) => {
-                    warn!(
-                        container_name = %container_name,
-                        error = %e,
-                        "Failed to get container status"
-                    );
-
-                    containers.push(ContainerStatus {
-                        name: container_name.clone(),
-                        state: "unknown".to_string(),
-                        health: None,
-                        ports: Vec::new(),
-                    });
-                }
-            }
-        }
-
-        // Get the earliest start time
-        if let Some(first_container) = container_names.first() {
-            if let Ok(inspect) = self.docker.inspect_container(first_container, None).await {
-                if let Some(state) = inspect.state {
-                    if let Some(started_time) = state.started_at {
-                        if let Ok(parsed_time) = chrono::DateTime::parse_from_rfc3339(&started_time)
-                        {
-                            started_at = Some(parsed_time.timestamp());
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(AppStatus {
-            app_id: app_id.to_string(),
-            running: running_count > 0,
-            container_count: containers.len(),
-            containers,
-            started_at,
-        })
-    }
-
-    /// Get status of a single container
-    async fn get_container_status(&self, container_name: &str) -> TappResult<ContainerStatus> {
-        let inspect: ContainerInspectResponse = self
-            .docker
-            .inspect_container(container_name, None)
-            .await
-            .map_err(|e| DockerError::ContainerOperationFailed {
-                operation: "inspect".to_string(),
-                reason: format!("Failed to inspect container {}: {}", container_name, e),
-            })?;
-
-        let state = inspect
-            .state
-            .as_ref()
-            .and_then(|s| s.status.as_ref())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| "unknown".to_string());
-
-        let health = inspect
-            .state
-            .as_ref()
-            .and_then(|s| s.health.as_ref())
-            .and_then(|h| h.status.as_ref())
-            .map(|s| s.to_string());
-
-        // Extract port information (simplified)
-        let ports = Vec::new(); // TODO: Implement proper port extraction
-
-        Ok(ContainerStatus {
-            name: container_name.to_string(),
-            state,
-            health,
-            ports,
-        })
-    }
-
-    /// List running Docker Compose applications
-    pub async fn list_running_composes(&self) -> TappResult<Vec<String>> {
-        let containers = self
-            .docker
-            .list_containers(Some(ListContainersOptions::<String> {
-                all: false,
-                filters: {
-                    let mut filters = HashMap::new();
-                    filters.insert("label".to_string(), vec!["tapp.managed=true".to_string()]);
-                    filters
-                },
-                ..Default::default()
-            }))
-            .await
-            .map_err(|e| DockerError::ContainerOperationFailed {
-                operation: "list".to_string(),
-                reason: format!("Failed to list containers: {}", e),
-            })?;
-
-        let mut app_ids = std::collections::HashSet::new();
-
-        for container in containers {
-            if let Some(labels) = container.labels {
-                if let Some(app_id) = labels.get("tapp.app_id") {
-                    app_ids.insert(app_id.clone());
-                }
-            }
-        }
-
-        Ok(app_ids.into_iter().collect())
     }
 
     /// Get application logs from docker compose

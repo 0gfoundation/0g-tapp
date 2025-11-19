@@ -390,20 +390,42 @@ enable_eventlog = true
     pub async fn stop_app(&self, app_id: &str) -> TappResult<()> {
         info!(app_id = %app_id, "Stopping application");
 
+        // 1. Stop compose
         self.manager.lock().await.stop_compose(app_id).await?;
+
+        // 2. Delete app directory
+        let app_dir = self.manager.lock().await.get_app_dir(app_id);
+        if app_dir.exists() {
+            tokio::fs::remove_dir_all(&app_dir).await.map_err(|e| {
+                TappError::Docker(DockerError::ContainerOperationFailed {
+                    operation: "delete_app_dir".to_string(),
+                    reason: format!("Failed to delete app directory: {}", e),
+                })
+            })?;
+            info!(app_id = %app_id, "App directory deleted successfully");
+        }
+
+        // 3. If has measurement, extend runtime measurement for stop operation
+        if let Some(measurement) = self.app_measurements.lock().await.get(app_id).cloned() {
+            info!(app_id = %app_id, "Extending runtime measurement for stop operation");
+            let measurement_json = serde_json::to_string(&measurement)?;
+
+            self.aa
+                .lock()
+                .await
+                .extend_runtime_measurement(
+                    ZGEL_DOMAIN,
+                    OPERATION_NAME_STOP_APP,
+                    &measurement_json,
+                    None,
+                )
+                .await?;
+
+            info!(app_id = %app_id, "Runtime measurement extended for stop operation");
+        }
 
         info!(app_id = %app_id, "Application stopped successfully");
         Ok(())
-    }
-
-    /// Get application status
-    pub async fn get_app_status(&self, app_id: &str) -> TappResult<AppStatus> {
-        self.manager.lock().await.get_compose_status(app_id).await
-    }
-
-    /// List running applications
-    pub async fn list_apps(&self) -> TappResult<Vec<String>> {
-        self.manager.lock().await.list_running_composes().await
     }
 
     pub async fn get_app_compose_content(&self, app_id: &str) -> TappResult<Option<String>> {
@@ -571,5 +593,4 @@ services:
         assert!(response.success);
     }
 }
-
 

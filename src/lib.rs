@@ -135,6 +135,19 @@ impl TappService for TappServiceImpl {
         Ok(Response::new(response))
     }
 
+    async fn stop_app(
+        &self,
+        request: Request<StopAppRequest>,
+    ) -> Result<Response<StopAppResponse>, Status> {
+        let req = request.into_inner();
+        self.boot_service.stop_app(&req.app_id).await?;
+        Ok(Response::new(StopAppResponse {
+            success: true,
+            message: format!("Application {} stopped successfully", req.app_id),
+            timestamp: utils::current_timestamp(),
+        }))
+    }
+
     async fn get_task_status(
         &self,
         request: Request<GetTaskStatusRequest>,
