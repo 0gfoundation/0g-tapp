@@ -251,49 +251,8 @@ enable_eventlog = true
         lines: i32,
         service_name: Option<&str>,
     ) -> TappResult<String> {
-        // Construct app directory path
-        use std::path::PathBuf;
-        let app_dir = PathBuf::from(format!("/var/lib/tapp/apps/{}", app_id));
-        if !app_dir.exists() {
-            return Err(TappError::InvalidParameter {
-                field: "app_id".to_string(),
-                reason: format!("App {} not found", app_id),
-            });
-        }
-
-        // Build docker compose logs command
-        let lines_arg = if lines > 0 { lines.to_string() } else { "100".to_string() };
-
-        let mut args = vec!["compose", "logs", "--tail", &lines_arg];
-
-        // Add service name if specified
-        if let Some(svc) = service_name {
-            if !svc.is_empty() {
-                args.push(svc);
-            }
-        }
-
-        // Execute command in app directory
-        let output = tokio::process::Command::new("docker")
-            .args(&args)
-            .current_dir(&app_dir)
-            .output()
-            .await
-            .map_err(|e| TappError::Docker(DockerError::ContainerOperationFailed {
-                operation: "get logs".to_string(),
-                reason: format!("Failed to execute docker compose logs: {}", e),
-            }))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(TappError::Docker(DockerError::ContainerOperationFailed {
-                operation: "get logs".to_string(),
-                reason: format!("docker compose logs failed: {}", stderr),
-            }));
-        }
-
-        let logs = String::from_utf8_lossy(&output.stdout).to_string();
-        Ok(logs)
+        let manager = self.manager.lock().await;
+        manager.get_app_logs(app_id, lines, service_name).await
     }
 
     /// List all app measurements
@@ -612,4 +571,5 @@ services:
         assert!(response.success);
     }
 }
+
 
