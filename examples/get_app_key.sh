@@ -5,12 +5,12 @@
 #
 # Examples:
 #   ./get_app_key.sh
-#   ./get_app_key.sh 39.97.63.199 50051
-#   ./get_app_key.sh 39.97.63.199 50051 test-nginx-app
-#   ./get_app_key.sh 39.97.63.199 50051 test-nginx-app ethereum
+#   ./get_app_key.sh your-cvm-instance-host 50051
+#   ./get_app_key.sh your-cvm-instance-host 50051 test-nginx-app
+#   ./get_app_key.sh your-cvm-instance-host 50051 test-nginx-app ethereum
 
 # Default configuration
-DEFAULT_HOST="39.97.63.199"
+DEFAULT_HOST="your-cvm-instance-host"
 DEFAULT_PORT="50051"
 DEFAULT_APP_ID="test-nginx-app"
 DEFAULT_KEY_TYPE="ethereum"

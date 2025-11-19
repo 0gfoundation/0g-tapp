@@ -4,13 +4,12 @@
 #   ./get_app_info.sh [HOST] [PORT] [APP_ID]
 #
 # Examples:
-#   ./get_app_info.sh test-nginx-app
-#   ./get_app_info.sh 39.97.63.199 50051 test-nginx-app
+#   ./get_app_info.sh your-cvm-instance-host 50051 test-nginx-app
 
 # Default configuration
-DEFAULT_HOST="39.97.63.199"
+DEFAULT_HOST="your-cvm-instance-host"
 DEFAULT_PORT="50051"
-DEFAULT_APP_ID="test-nginx-app-"
+DEFAULT_APP_ID="test-nginx-app"
 
 # Parse command line arguments
 APP_ID=${1:-$DEFAULT_APP_ID}

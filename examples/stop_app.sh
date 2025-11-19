@@ -6,8 +6,8 @@
 # Examples:
 #   ./stop_app.sh
 #   ./stop_app.sh test-nginx-app
-#   ./stop_app.sh test-nginx-app 39.97.63.199 50051
-#   ./stop_app.sh test-nginx-app 39.97.63.199 50051 my-secret-api-key-12345
+#   ./stop_app.sh test-nginx-app your-cvm-instance-host 50051
+#   ./stop_app.sh test-nginx-app your-cvm-instance-host 50051 my-secret-api-key-12345
 #
 # Or use environment variable:
 #   export TAPP_API_KEY="my-secret-api-key-12345"
@@ -15,7 +15,7 @@
 
 # Default configuration
 DEFAULT_APP_ID="test-nginx-app"
-DEFAULT_HOST="39.97.63.199"
+DEFAULT_HOST="your-cvm-instance-host"
 DEFAULT_PORT="50051"
 
 # Parse command line arguments

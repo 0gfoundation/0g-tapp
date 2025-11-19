@@ -5,21 +5,21 @@
 #
 # Examples:
 #   # Get last 100 lines from all services
-#   ./get_app_logs.sh localhost 50051 test-broker-app
+#   ./get_app_logs.sh your-cvm-instance-host 50051 test-nginx-app
 #
 #   # Get last 50 lines from all services
-#   ./get_app_logs.sh localhost 50051 test-broker-app 50
+#   ./get_app_logs.sh your-cvm-instance-host 50051 test-nginx-app 50
 #
-#   # Get logs from specific service (e.g., "broker")
-#   ./get_app_logs.sh localhost 50051 test-broker-app 100 broker
+#   # Get logs from specific service (e.g., "xxx")
+#   ./get_app_logs.sh your-cvm-instance-host 50051 test-nginx-app 100 xxx
 #
 #   # With API key
-#   ./get_app_logs.sh localhost 50051 test-broker-app 100 broker my-api-key
+#   ./get_app_logs.sh your-cvm-instance-host 50051 test-nginx-app 100 xxx my-api-key
 
 # Default configuration
-DEFAULT_HOST="localhost"
+DEFAULT_HOST="your-cvm-instance-host"
 DEFAULT_PORT="50051"
-DEFAULT_APP_ID="test-broker-app"
+DEFAULT_APP_ID="test-nginx-app"
 DEFAULT_LINES="100"
 DEFAULT_SERVICE_NAME=""  # Empty means all services
 

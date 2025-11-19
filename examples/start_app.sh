@@ -5,17 +5,17 @@
 #
 # Examples:
 #   ./start_app.sh
-#   ./start_app.sh 39.97.63.199 50051
-#   ./start_app.sh 39.97.63.199 50051 test-nginx-app
-#   ./start_app.sh 39.97.63.199 50051 test-nginx-app 0xbae5046287f1b3fe2540d13160778c459d0f4038f1dcda0651679f5cb8a21f0ef1550b51ab5e6ae5a8e531512b1a06a97dfbb992c5e6f3aa36b04e1dd928d269
-#   ./start_app.sh 39.97.63.199 50051 test-nginx-app 0xbae... my-secret-api-key-12345
+#   ./start_app.sh your-cvm-instance-host 50051
+#   ./start_app.sh your-cvm-instance-host 50051 test-nginx-app
+#   ./start_app.sh your-cvm-instance-host 50051 test-nginx-app 0xbae5046287f1b3fe2540d13160778c459d0f4038f1dcda0651679f5cb8a21f0ef1550b51ab5e6ae5a8e531512b1a06a97dfbb992c5e6f3aa36b04e1dd928d269
+#   ./start_app.sh your-cvm-instance-host 50051 test-nginx-app 0xbae... my-secret-api-key-12345
 #
 # Or use environment variable:
 #   export TAPP_API_KEY="my-secret-api-key-12345"
 #   ./start_app.sh
 
 # Default configuration
-DEFAULT_HOST="39.97.63.199"
+DEFAULT_HOST="your-cvm-instance-host"
 DEFAULT_PORT="50051"
 DEFAULT_APP_ID="test-nginx-app"
 DEFAULT_DEPLOYER_HEX="0xbae5046287f1b3fe2540d13160778c459d0f4038f1dcda0651679f5cb8a21f0ef1550b51ab5e6ae5a8e531512b1a06a97dfbb992c5e6f3aa36b04e1dd928d269"

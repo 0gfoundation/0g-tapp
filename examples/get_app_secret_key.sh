@@ -4,7 +4,7 @@
 #   ./get_app_secret_key.sh [OPTIONS]
 #
 # Options:
-#   -h, --host HOST              Target host (default: 127.0.0.1)
+#   -h, --host HOST              Target host (default: your-cvm-instance-host)
 #   -p, --port PORT              Target port (default: 50051)
 #   -a, --app-id APP_ID          Application ID (required)
 #   -d, --deployer-key KEY       Deployer private key (required)
@@ -21,10 +21,10 @@
 #   ./get_app_secret_key.sh -a my-app -d "$(cat deployer_key.pem)"
 #
 #   # Remote server
-#   ./get_app_secret_key.sh -a test-nginx-app-xxx -h 127.0.0.1 -p 50051 -d 0x00...00
+#   ./get_app_secret_key.sh -a test-nginx-app-xxx -h your-cvm-instance-host -p 50051 -d 0x00...00
 
 # Default configuration
-DEFAULT_HOST="127.0.0.1"
+DEFAULT_HOST="your-cvm-instance-host"
 DEFAULT_PORT="50051"
 
 # Initialize variables
@@ -72,7 +72,7 @@ if [[ "$1" =~ ^- ]]; then
                 echo "  $0 -a my-app -d \"\$(cat deployer_key.pem)\""
                 echo ""
                 echo "Security Note:"
-                echo "  This command can ONLY be run from localhost or same-host containers."
+                echo "  This command can ONLY be run from your-cvm-instance-host or same-host containers."
                 echo "  Private keys will NEVER be sent over the network."
                 exit 0
                 ;;

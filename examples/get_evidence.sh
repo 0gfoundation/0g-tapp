@@ -8,12 +8,12 @@
 #
 # Examples:
 #   ./get_evidence.sh
-#   ./get_evidence.sh 39.97.63.199 50051
-#   ./get_evidence.sh 39.97.63.199 50051 abcd1234...
+#   ./get_evidence.sh your-cvm-instance-host 50051
+#   ./get_evidence.sh your-cvm-instance-host 50051 abcd1234...
 #   REPORT_DATA_HEX=abcd1234... ./get_evidence.sh
 
 # Default configuration
-DEFAULT_HOST="39.97.63.199"
+DEFAULT_HOST="your-cvm-instance-host"
 DEFAULT_PORT="50051"
 DEFAULT_REPORT_DATA_HEX="bae5046287f1b3fe2540d13160778c459d0f4038f1dcda0651679f5cb8a21f0ef1550b51ab5e6ae5a8e531512b1a06a97dfbb992c5e6f3aa36b04e1dd928d269"
 
@@ -44,7 +44,7 @@ if [ ${#REPORT_DATA_HEX} -gt 128 ]; then
     echo "Usage: $0 [HOST] [PORT] [REPORT_DATA_HEX]"
     echo ""
     echo "Example:"
-    echo "  $0 39.97.63.199 50051 bae5046287f1b3fe2540d13160778c459d0f4038f1dcda0651679f5cb8a21f0ef1550b51ab5e6ae5a8e531512b1a06a97dfbb992c5e6f3aa36b04e1dd928d269"
+    echo "  $0 your-cvm-instance-host 50051 bae5046287f1b3fe2540d13160778c459d0f4038f1dcda0651679f5cb8a21f0ef1550b51ab5e6ae5a8e531512b1a06a97dfbb992c5e6f3aa36b04e1dd928d269"
     echo ""
     echo "Or set REPORT_DATA_HEX environment variable:"
     echo "  REPORT_DATA_HEX=bae5046287f1b3fe2540d13160778c459d0f4038f1dcda0651679f5cb8a21f0ef1550b51ab5e6ae5a8e531512b1a06a97dfbb992c5e6f3aa36b04e1dd928d269 $0"

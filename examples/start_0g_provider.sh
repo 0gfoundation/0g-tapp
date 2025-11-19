@@ -5,14 +5,14 @@
 #
 # Examples:
 #   ./start_0g_provider.sh
-#   ./start_0g_provider.sh 39.97.63.199 50051 my-app
-#   ./start_0g_provider.sh 39.97.63.199 50051 my-app 0x123...abc ./custom-compose.yml ./custom-config.yml
+#   ./start_0g_provider.sh your-cvm-instance-host 50051 my-app
+#   ./start_0g_provider.sh your-cvm-instance-host 50051 my-app 0x123...abc ./custom-compose.yml ./custom-config.yml
 
 # Get script directory
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Default configuration
-DEFAULT_HOST="39.97.63.199"
+DEFAULT_HOST="your-cvm-instance-host"
 DEFAULT_PORT="50051"
 DEFAULT_APP_ID="test-broker-app"
 DEFAULT_DEPLOYER_HEX="0xbae5046287f1b3fe2540d13160778c459d0f4038f1dcda0651679f5cb8a21f0ef1550b51ab5e6ae5a8e531512b1a06a97dfbb992c5e6f3aa36b04e1dd928d269"

@@ -5,11 +5,11 @@
 #
 # Examples:
 #   ./list_app_measurements.sh
-#   ./list_app_measurements.sh 39.97.63.199 50051
-#   ./list_app_measurements.sh 39.97.63.199 50051 0x1234...
+#   ./list_app_measurements.sh your-cvm-instance-host 50051
+#   ./list_app_measurements.sh your-cvm-instance-host 50051 0x1234...
 
 # Default configuration
-DEFAULT_HOST="39.97.63.199"
+DEFAULT_HOST="your-cvm-instance-host"
 DEFAULT_PORT="50051"
 
 # Parse command line arguments
