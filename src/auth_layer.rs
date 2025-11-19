@@ -1,7 +1,7 @@
 use crate::config::ApiKeyConfig;
 use std::task::{Context, Poll};
 use tonic::body::BoxBody;
-use tonic::{Code, Status};
+use tonic::Status;
 use tower::{Layer, Service};
 use tracing::{debug, warn};
 
@@ -38,10 +38,11 @@ pub struct ApiKeyMiddleware<S> {
 
 impl<S> Service<http::Request<BoxBody>> for ApiKeyMiddleware<S>
 where
-    S: Service<http::Request<BoxBody>, Response = http::Response<BoxBody>, Error = std::convert::Infallible>
+    S: Service<http::Request<BoxBody>, Response = http::Response<BoxBody>>
         + Clone
         + Send
         + 'static,
+    S::Error: Into<Box<dyn std::error::Error + Send + Sync>> + Send,
     S::Future: Send + 'static,
 {
     type Response = S::Response;
@@ -68,8 +69,7 @@ where
             // Validate API key if configured
             if let Err(status) = validate_request(&config, &req, method_name) {
                 // Convert Status to HTTP response
-                let (mut parts, _body) = req.into_parts();
-                let response = status.to_http();
+                let response = status.into_http();
                 return Ok(response);
             }
 
