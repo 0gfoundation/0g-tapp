@@ -4,6 +4,7 @@ pub mod boot;
 pub mod config;
 pub mod error;
 pub mod nonce_manager;
+pub mod service_monitor;
 pub mod utils;
 pub use boot::BootService;
 pub use config::TappConfig;
@@ -33,6 +34,7 @@ pub struct TappServiceImpl {
     pub boot_service: Arc<BootService>,
     pub app_key_service: app_key::AppKeyService,
     pub nonce_manager: nonce_manager::NonceManager,
+    pub logs_service: service_monitor::logs::LogsService,
 }
 
 impl TappServiceImpl {
@@ -96,12 +98,16 @@ impl TappServiceImpl {
         // Initialize NonceManager for replay attack prevention
         let nonce_manager = nonce_manager::NonceManager::new();
 
+        // Initialize LogsService
+        let logs_service = service_monitor::logs::LogsService::new(config.logging.file_path.clone());
+
         info!("All TAPP service components initialized successfully");
 
         Ok(Self {
             boot_service,
             app_key_service,
             nonce_manager,
+            logs_service,
             config,
         })
     }
@@ -409,9 +415,38 @@ impl TappService for TappServiceImpl {
 
     async fn get_service_logs(
         &self,
-        _request: Request<GetServiceLogsRequest>,
+        request: Request<GetServiceLogsRequest>,
     ) -> Result<Response<GetServiceLogsResponse>, Status> {
-        todo!()
+        let req = request.into_inner();
+        let response = self.logs_service.get_logs(req).await?;
+        Ok(Response::new(response))
+    }
+
+    async fn get_app_logs(
+        &self,
+        request: Request<GetAppLogsRequest>,
+    ) -> Result<Response<GetAppLogsResponse>, Status> {
+        let req = request.into_inner();
+
+        let service_name = if req.service_name.is_empty() {
+            None
+        } else {
+            Some(req.service_name.as_str())
+        };
+
+        let content = self
+            .boot_service
+            .get_app_logs(&req.app_id, req.lines, service_name)
+            .await?;
+
+        let total_lines = content.lines().count() as i32;
+
+        Ok(Response::new(GetAppLogsResponse {
+            success: true,
+            message: format!("Retrieved {} lines from app {}", total_lines, req.app_id),
+            content,
+            total_lines,
+        }))
     }
 }
 
@@ -551,3 +586,4 @@ mod tests {
         assert_eq!(&padded[5..], &[0u8; 5]);
     }
 }
+

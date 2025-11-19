@@ -32,6 +32,9 @@ service TappService {
 
   // Get service logs with filtering options
   rpc GetServiceLogs(GetServiceLogsRequest) returns (GetServiceLogsResponse);
+
+  // Get application logs (docker compose logs)
+  rpc GetAppLogs(GetAppLogsRequest) returns (GetAppLogsResponse);
 }
 
 enum LogLevel {
@@ -229,28 +232,38 @@ message GetServiceStatusResponse {
 
 // Service Logs Messages
 message GetServiceLogsRequest {
-  string service_name =
-      1;             // Service name to get logs from (default: tapp-server)
-  int32 lines = 2;   // Number of lines to retrieve (default: 100)
-  string since = 3;  // Time filter: "1h", "30m", "2024-01-01 10:00:00"
-  string until = 4;  // Time filter: "1h", "30m", "2024-01-01 10:00:00"
-  LogLevel min_level = 5;   // Minimum log level to include
-  string grep_pattern = 6;  // Pattern to filter log messages
-  bool json_format = 7;     // Return logs in JSON format
+  string file_name = 1;  // Log file name (if empty, list all available files)
+  int32 lines = 2;       // Number of lines to retrieve (default: 100, tail -n behavior)
 }
 
-message LogEntry {
-  string timestamp = 1;              // Human-readable timestamp
-  LogLevel level = 2;                // Log level
-  string message = 3;                // Log message content
-  string service_name = 4;           // Service that generated the log
-  map<string, string> metadata = 5;  // Additional metadata
+message LogFileInfo {
+  string file_name = 1;   // File name
+  int64 size_bytes = 2;   // File size
+  int64 modified_time = 3;  // Last modified timestamp
 }
 
 message GetServiceLogsResponse {
   bool success = 1;
   string message = 2;
-  repeated LogEntry logs = 3;
-  int32 total_lines = 4;
-  bool truncated = 5;  // Whether results were truncated
+
+  // If file_name is empty in request, return list of available files
+  repeated LogFileInfo available_files = 3;
+
+  // If file_name is specified, return file content
+  string content = 4;       // File content (last N lines)
+  int32 total_lines = 5;    // Total lines returned
+}
+
+// Application Logs Messages
+message GetAppLogsRequest {
+  string app_id = 1;          // Application identifier
+  int32 lines = 2;            // Number of lines to retrieve (default: 100)
+  string service_name = 3;    // Optional: specific service in compose (e.g., "web", "broker")
+}
+
+message GetAppLogsResponse {
+  bool success = 1;
+  string message = 2;
+  string content = 3;         // Log content from docker compose logs
+  int32 total_lines = 4;      // Total lines returned
 }
