@@ -62,16 +62,18 @@ Use the provided example script to deploy an application:
 ./examples/start_app.sh
 
 # Custom host and port
-./examples/start_app.sh <HOST> <PORT> <APP_ID> <DEPLOYER_HEX> <API_KEY>
+./examples/start_app.sh <HOST> <PORT> <APP_ID> <DEPLOYER_HEX> <COMPOSE_FILE> <CONFIG_FILE> <API_KEY> 
 
 # Example
-./examples/start_app.sh your-cvm-instance-host port my-nginx-app 0xbae50462... my-api-key
+./examples/start_app.sh your-cvm-instance-host port your-app-id 0xbae50462... ./docker_compose.yml ./config.yml your-api-key
 ```
 
 The script will:
 1. Submit a StartApp request with Docker Compose configuration
 2. Return a task ID for tracking deployment progress
 3. The application will be measured and extended to TEE runtime measurements
+4. For actual deployment, please modify Docker Compose and its configuration
+5. RootFS space is limited, please store data in the /data directory
 
 #### Checking Task Status
 
@@ -93,7 +95,7 @@ Stop and remove a deployed application:
 ./examples/stop_app.sh <APP_ID> <HOST> <PORT> <API_KEY>
 
 # Example
-./examples/stop_app.sh my-nginx-app your-cvm-instance-host port my-api-key
+./examples/stop_app.sh my-nginx-app your-cvm-instance-host port your-api-key
 ```
 
 #### Getting Application Logs
@@ -176,9 +178,6 @@ Protected methods require API key authentication via the `x-api-key` header:
 ```bash
 # Set API key in environment
 export TAPP_API_KEY="your-secret-api-key"
-
-# Or pass directly in scripts
-./examples/start_app.sh your-cvm-instance-host port my-app 0xdeployer... my-api-key
 ```
 
 Configure API keys in the service configuration file under `[server.api_key]` section.

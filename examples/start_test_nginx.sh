@@ -1,87 +1,106 @@
 #!/bin/bash
 
 # Usage:
-#   ./start_app.sh [HOST] [PORT] [APP_ID] [DEPLOYER_HEX] [COMPOSE_FILE] [CONFIG_FILE]
+#   ./start_test_nginx.sh [HOST] [PORT] [APP_ID] [DEPLOYER_HEX] [API_KEY]
 #
 # Examples:
-#   ./start_app.sh
-#   ./start_app.sh your-cvm-instance-host 50051 my-app
-#   ./start_app.sh your-cvm-instance-host 50051 my-app 0x123...abc ./custom-compose.yml ./custom-config.yml
-
-# Get script directory
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+#   ./start_test_nginx.sh
+#   ./start_test_nginx.sh your-cvm-instance-host 50051
+#   ./start_test_nginx.sh your-cvm-instance-host 50051 test-nginx-app
+#   ./start_test_nginx.sh your-cvm-instance-host 50051 test-nginx-app 0xbae5046287f1b3fe2540d13160778c459d0f4038f1dcda0651679f5cb8a21f0ef1550b51ab5e6ae5a8e531512b1a06a97dfbb992c5e6f3aa36b04e1dd928d269
+#   ./start_test_nginx.sh your-cvm-instance-host 50051 test-nginx-app 0xbae... my-secret-api-key-12345
+#
+# Or use environment variable:
+#   export TAPP_API_KEY="my-secret-api-key-12345"
+#   ./start_test_nginx.sh
 
 # Default configuration
 DEFAULT_HOST="your-cvm-instance-host"
 DEFAULT_PORT="50051"
-DEFAULT_APP_ID="test-broker-app"
+DEFAULT_APP_ID="test-nginx-app"
 DEFAULT_DEPLOYER_HEX="0xbae5046287f1b3fe2540d13160778c459d0f4038f1dcda0651679f5cb8a21f0ef1550b51ab5e6ae5a8e531512b1a06a97dfbb992c5e6f3aa36b04e1dd928d269"
-DEFAULT_COMPOSE_FILE="$SCRIPT_DIR/docker-compose.yml"
-DEFAULT_CONFIG_FILE="$SCRIPT_DIR/config.yml"
 
-# Parse arguments
+# Parse command line arguments
 TARGET_HOST=${1:-$DEFAULT_HOST}
 TARGET_PORT=${2:-$DEFAULT_PORT}
 APP_ID=${3:-$DEFAULT_APP_ID}
 DEPLOYER_HEX=${4:-$DEFAULT_DEPLOYER_HEX}
-COMPOSE_FILE=${5:-$DEFAULT_COMPOSE_FILE}
-CONFIG_FILE=${6:-$DEFAULT_CONFIG_FILE}
-API_KEY=${5:-$TAPP_API_KEY} 
-
+API_KEY=${5:-$TAPP_API_KEY}  # From argument or environment variable
 TARGET_ADDRESS="$TARGET_HOST:$TARGET_PORT"
 
 # Remove 0x prefix if present
 DEPLOYER_HEX=${DEPLOYER_HEX#0x}
 DEPLOYER_HEX=${DEPLOYER_HEX#0X}
 
-# Check if config files exist
-if [ ! -f "$COMPOSE_FILE" ]; then
-    echo "Error: Docker Compose file not found: $COMPOSE_FILE"
-    echo ""
-    echo "Please create the file or specify a custom path:"
-    echo "  $0 $TARGET_HOST $TARGET_PORT $APP_ID $DEPLOYER_HEX <COMPOSE_FILE> <CONFIG_FILE>"
-    exit 1
-fi
-
-if [ ! -f "$CONFIG_FILE" ]; then
-    echo "Error: Config file not found: $CONFIG_FILE"
-    echo ""
-    echo "Please create the file or specify a custom path:"
-    echo "  $0 $TARGET_HOST $TARGET_PORT $APP_ID $DEPLOYER_HEX <COMPOSE_FILE> <CONFIG_FILE>"
-    exit 1
-fi
-
-echo "========================================"
-echo "0G Serving Provider Deployment"
-echo "========================================"
+echo "======================================"
+echo "StartApp Request Configuration"
+echo "======================================"
 echo "Target:        $TARGET_ADDRESS"
 echo "App ID:        $APP_ID"
 echo "Deployer:      $DEPLOYER_HEX"
-echo "Compose File:  $COMPOSE_FILE"
-echo "Config File:   $CONFIG_FILE"
-echo "========================================"
+if [ -n "$API_KEY" ]; then
+    echo "API Key:       ${API_KEY:0:8}... (configured)"
+else
+    echo "API Key:       (not set)"
+fi
+echo "======================================"
 echo ""
 
-# Convert deployer hex to base64
 if [ -n "$DEPLOYER_HEX" ]; then
     DEPLOYER_BASE64=$(echo -n "$DEPLOYER_HEX" | xxd -r -p | base64)
 else
     DEPLOYER_BASE64=""
 fi
 
-echo "Reading configuration files..."
-# Read compose file content
-COMPOSE_CONTENT=$(cat "$COMPOSE_FILE")
+# --- Content Preparation ---
 
-# Read and base64 encode config file
-CONFIG_BASE64=$(base64 < "$CONFIG_FILE" | tr -d '\n')
+nginx_content='user nginx;
+worker_processes 1;
 
-echo "Generating JSON request..."
-# Use jq to properly encode the compose content and output compact JSON
+events {
+    worker_connections 1024;
+}
+
+http {
+    include /etc/nginx/mime.types;
+    default_type application/octet-stream;
+
+    server {
+        listen 80;
+        server_name localhost;
+
+        location / {
+            root /usr/share/nginx/html;
+            index index.html;
+        }
+    }
+}'
+
+config_content='{
+  "key": "value",
+  "enabled": true
+}'
+
+nginx_conf=$(printf '%s' "$nginx_content" | base64 -w 0)
+config_json=$(printf '%s' "$config_content" | base64 -w 0)
+
+compose_content='version: "3.8"
+services:
+  web:
+    image: nginx:alpine
+    command: ["nginx", "-g", "daemon off;"]
+    ports:
+      - "8080:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf
+      - ./config.json:/app/config.json
+'
+
 request_json=$(jq -n \
-  --arg compose "$COMPOSE_CONTENT" \
+  --arg compose "$compose_content" \
+  --arg nginx "$nginx_conf" \
+  --arg config "$config_json" \
   --arg app_id "$APP_ID" \
-  --arg config "$CONFIG_BASE64" \
   --arg deployer "$DEPLOYER_BASE64" \
   '{
     compose_content: $compose,
@@ -89,22 +108,29 @@ request_json=$(jq -n \
     deployer: $deployer,
     mount_files: [
       {
-        source_path: "./config.yml",
+        source_path: "./nginx.conf",
+        content: $nginx,
+        mode: "0644"
+      },
+      {
+        source_path: "./config.json",
         content: $config,
         mode: "0644"
       }
     ]
   }')
 
-echo "Request JSON:"
+
+echo "Sending StartApp request..."
+echo ""
+
+echo "Request:"
 echo "--------------------------------------"
 echo "$request_json"
 echo "--------------------------------------"
 echo ""
 
-echo "Sending StartApp request..."
-echo ""
-
+# Build grpcurl command with optional API key
 GRPCURL_CMD="grpcurl -plaintext"
 
 # Add API key header if provided
@@ -116,18 +142,18 @@ GRPCURL_CMD="$GRPCURL_CMD -import-path ./proto -proto tapp_service.proto -d @ \"
 
 response=$(printf "%s" "$request_json" | tr -d '\n' | eval $GRPCURL_CMD 2>&1)
 
+
 echo "Response:"
 echo "--------------------------------------"
 echo "$response"
 echo "--------------------------------------"
 echo ""
 
-# Extract task_id from response
 task_id=$(echo "$response" | jq -r '.taskId // .task_id // empty' 2>/dev/null)
 
-echo "========================================"
+echo "======================================"
 echo "Next Steps:"
-echo "========================================"
+echo "======================================"
 echo "✓ App is starting asynchronously"
 echo ""
 
@@ -148,4 +174,4 @@ fi
 echo ""
 echo "Once completed, you can get evidence:"
 echo "  sh examples/get_evidence.sh $TARGET_HOST $TARGET_PORT"
-echo "========================================"
+echo "======================================"

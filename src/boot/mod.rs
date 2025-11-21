@@ -142,10 +142,7 @@ enable_eventlog = true
                 .insert(app_id.clone(), volumes_content);
 
             // Start the Docker Compose application with mount files
-            self.manager
-                .lock()
-                .await
-                .deploy_compose(&app_id, &request.compose_content, &mount_files)
+            DockerComposeManager::deploy_compose(&app_id, &request.compose_content, &mount_files)
                 .await?;
 
             // Store measurement in memory
@@ -251,8 +248,7 @@ enable_eventlog = true
         lines: i32,
         service_name: Option<&str>,
     ) -> TappResult<String> {
-        let manager = self.manager.lock().await;
-        manager.get_app_logs(app_id, lines, service_name).await
+        DockerComposeManager::get_app_logs(app_id, lines, service_name).await
     }
 
     /// List all app measurements
@@ -391,10 +387,10 @@ enable_eventlog = true
         info!(app_id = %app_id, "Stopping application");
 
         // 1. Stop compose
-        self.manager.lock().await.stop_compose(app_id).await?;
+        DockerComposeManager::stop_compose(app_id).await?;
 
         // 2. Delete app directory
-        let app_dir = self.manager.lock().await.get_app_dir(app_id);
+        let app_dir = DockerComposeManager::get_app_dir(app_id);
         if app_dir.exists() {
             tokio::fs::remove_dir_all(&app_dir).await.map_err(|e| {
                 TappError::Docker(DockerError::ContainerOperationFailed {
@@ -593,4 +589,3 @@ services:
         assert!(response.success);
     }
 }
-

@@ -54,7 +54,7 @@ pub struct DeploymentResult {
 
 impl DockerComposeManager {
     /// Get the directory path for an app
-    pub fn get_app_dir(&self, app_id: &str) -> PathBuf {
+    pub fn get_app_dir(app_id: &str) -> PathBuf {
         PathBuf::from(format!("/var/lib/tapp/apps/{}", app_id))
     }
 
@@ -95,7 +95,6 @@ impl DockerComposeManager {
     /// Store mount files to host filesystem and create mapping
     /// Returns a HashMap of source_path -> actual_host_path
     async fn store_mount_files(
-        &self,
         base_path: &PathBuf,
         mount_files: &[MountFile],
     ) -> TappResult<HashMap<String, String>> {
@@ -169,7 +168,6 @@ impl DockerComposeManager {
 
     /// Deploy Docker Compose application
     pub async fn deploy_compose(
-        &mut self,
         app_id: &str,
         compose_content: &str,
         mount_files: &[MountFile],
@@ -179,7 +177,7 @@ impl DockerComposeManager {
         use tokio::sync::Mutex;
 
         // 1. store compose file
-        let base_path = self.get_app_dir(app_id);
+        let base_path = Self::get_app_dir(app_id);
         if !base_path.exists() {
             fs::create_dir_all(&base_path).await.map_err(|e| {
                 DockerError::VolumeMeasurementFailed {
@@ -191,7 +189,7 @@ impl DockerComposeManager {
         fs::write(&compose_path, compose_content).await?;
 
         // 2. store mount files to corresponding location
-        self.store_mount_files(&base_path, mount_files).await?;
+        Self::store_mount_files(&base_path, mount_files).await?;
 
         // 3. start compose with real-time output
         info!(app_id = %app_id, "🚀 Starting docker compose up");
@@ -287,8 +285,8 @@ impl DockerComposeManager {
     }
 
     /// Stop Docker Compose application
-    pub async fn stop_compose(&mut self, app_id: &str) -> TappResult<()> {
-        let app_dir = self.get_app_dir(app_id);
+    pub async fn stop_compose(app_id: &str) -> TappResult<()> {
+        let app_dir = Self::get_app_dir(app_id);
 
         if !app_dir.exists() {
             return Err(TappError::InvalidParameter {
@@ -337,14 +335,21 @@ impl DockerComposeManager {
 
     /// Get application logs from docker compose
     pub async fn get_app_logs(
-        &self,
         app_id: &str,
         lines: i32,
         service_name: Option<&str>,
     ) -> TappResult<String> {
-        let app_dir = self.get_app_dir(app_id);
+        info!(
+            app_id = %app_id,
+            lines = lines,
+            service_name = ?service_name,
+            "Getting application logs"
+        );
+
+        let app_dir = Self::get_app_dir(app_id);
 
         if !app_dir.exists() {
+            warn!(app_id = %app_id, "App directory not found");
             return Err(TappError::InvalidParameter {
                 field: "app_id".to_string(),
                 reason: format!("App {} not found", app_id),
@@ -395,4 +400,3 @@ impl DockerComposeManager {
 
 #[cfg(test)]
 mod tests {}
-
