@@ -64,6 +64,10 @@ enum Commands {
         /// Deployer's private key (32 bytes hex) for signing the request
         #[arg(short = 'd', long)]
         deployer_private_key: String,
+
+        /// Output in JSON format (for programmatic use)
+        #[arg(long)]
+        json: bool,
     },
 
     /// Sign a message using a private key
@@ -111,8 +115,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::GetAppKey { app_id, key_type } => {
             get_app_key(&cli.server, app_id, key_type).await?;
         }
-        Commands::GetAppSecretKey { app_id, deployer_private_key } => {
-            get_app_secret_key(&cli.server, app_id, deployer_private_key).await?;
+        Commands::GetAppSecretKey {
+            app_id,
+            deployer_private_key,
+            json,
+        } => {
+            get_app_secret_key(&cli.server, app_id, deployer_private_key, json).await?;
         }
         Commands::SignMessage {
             private_key,
@@ -275,6 +283,7 @@ async fn get_app_secret_key(
     server: &str,
     app_id: String,
     deployer_private_key_hex: String,
+    json_output: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut client = TappServiceClient::connect(server.to_string()).await?;
 
@@ -369,8 +378,15 @@ async fn get_app_secret_key(
             eprintln!("╔════════════════════════════════════════════════════════════╗");
             eprintln!("║              APPLICATION NOT FOUND                         ║");
             eprintln!("╠════════════════════════════════════════════════════════════╣");
-            eprintln!("║ The application '{}' was not found.{:<16} ║",
-                     if app_id.len() <= 30 { &app_id } else { &app_id[..30] }, "");
+            eprintln!(
+                "║ The application '{}' was not found.{:<16} ║",
+                if app_id.len() <= 30 {
+                    &app_id
+                } else {
+                    &app_id[..30]
+                },
+                ""
+            );
             eprintln!("║                                                            ║");
             eprintln!("║ Make sure the application has been deployed using          ║");
             eprintln!("║ the StartApp interface.                                    ║");
@@ -387,30 +403,43 @@ async fn get_app_secret_key(
         std::process::exit(1);
     }
 
-    println!("╔════════════════════════════════════════════════════════════╗");
-    println!("║           APPLICATION SECRET KEY (SENSITIVE!)              ║");
-    println!("╠════════════════════════════════════════════════════════════╣");
-    println!("║ WARNING: This is highly sensitive information!            ║");
-    println!("║ Keep this private key secure and never share it.          ║");
-    println!("╚════════════════════════════════════════════════════════════╝");
-    println!();
-    println!("  App ID: {}", app_id);
-    println!(
-        "  Private Key (hex): 0x{}",
-        hex::encode(&result.private_key)
-    );
-    println!("  Public Key (hex):  0x{}", hex::encode(&result.public_key));
-
-    if !result.eth_address.is_empty() {
+    if json_output {
+        let output = serde_json::json!({
+            "private_key": format!("0x{}", hex::encode(&result.private_key)),
+            "public_key": format!("0x{}", hex::encode(&result.public_key)),
+            "evm_address": if !result.eth_address.is_empty() {
+                format!("0x{}", hex::encode(&result.eth_address))
+            } else {
+                String::new()
+            },
+        });
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else {
+        println!("╔════════════════════════════════════════════════════════════╗");
+        println!("║           APPLICATION SECRET KEY (SENSITIVE!)              ║");
+        println!("╠════════════════════════════════════════════════════════════╣");
+        println!("║ WARNING: This is highly sensitive information!            ║");
+        println!("║ Keep this private key secure and never share it.          ║");
+        println!("╚════════════════════════════════════════════════════════════╝");
+        println!();
+        println!("  App ID: {}", app_id);
         println!(
-            "  Ethereum Address:  0x{}",
-            hex::encode(&result.eth_address)
+            "  Private Key (hex): 0x{}",
+            hex::encode(&result.private_key)
         );
-    }
+        println!("  Public Key (hex):  0x{}", hex::encode(&result.public_key));
 
-    println!();
-    println!("💡 You can use this private key with:");
-    println!("   tapp-cli sign-message --private-key <KEY> --message <MSG>");
+        if !result.eth_address.is_empty() {
+            println!(
+                "  Ethereum Address:  0x{}",
+                hex::encode(&result.eth_address)
+            );
+        }
+
+        println!();
+        println!("💡 You can use this private key with:");
+        println!("   tapp-cli sign-message --private-key <KEY> --message <MSG>");
+    }
 
     Ok(())
 }

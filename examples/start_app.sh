@@ -26,7 +26,7 @@ APP_ID=${3:-$DEFAULT_APP_ID}
 DEPLOYER_HEX=${4:-$DEFAULT_DEPLOYER_HEX}
 COMPOSE_FILE=${5:-$DEFAULT_COMPOSE_FILE}
 CONFIG_FILE=${6:-$DEFAULT_CONFIG_FILE}
-API_KEY=${5:-$TAPP_API_KEY} 
+API_KEY=${7:-$TAPP_API_KEY} 
 
 TARGET_ADDRESS="$TARGET_HOST:$TARGET_PORT"
 
@@ -83,13 +83,14 @@ request_json=$(jq -n \
   --arg app_id "$APP_ID" \
   --arg config "$CONFIG_BASE64" \
   --arg deployer "$DEPLOYER_BASE64" \
+  --arg config_file "$CONFIG_FILE" \
   '{
     compose_content: $compose,
     app_id: $app_id,
     deployer: $deployer,
     mount_files: [
       {
-        source_path: "./config.yml",
+        source_path: $config_file,
         content: $config,
         mode: "0644"
       }

@@ -99,7 +99,8 @@ impl TappServiceImpl {
         let nonce_manager = nonce_manager::NonceManager::new();
 
         // Initialize LogsService
-        let logs_service = service_monitor::logs::LogsService::new(config.logging.file_path.clone());
+        let logs_service =
+            service_monitor::logs::LogsService::new(config.logging.file_path.clone());
 
         info!("All TAPP service components initialized successfully");
 
@@ -363,14 +364,14 @@ impl TappService for TappServiceImpl {
             "Private key access attempt from allowed source with valid signature"
         );
 
-        // Get private key
-        let private_key = self.app_key_service.get_private_key(&req.app_id).await?;
-
         // Also get public key and address for response
         let key_response = self
             .app_key_service
             .get_app_key(&req.app_id, "ethereum")
             .await?;
+
+        // Get private key
+        let private_key = self.app_key_service.get_private_key(&req.app_id).await?;
 
         // SECURITY: Log successful retrieval
         tracing::warn!(
@@ -599,4 +600,3 @@ mod tests {
         assert_eq!(&padded[5..], &[0u8; 5]);
     }
 }
-
