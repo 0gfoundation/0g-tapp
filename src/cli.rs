@@ -322,12 +322,6 @@ async fn get_app_secret_key(
     // Sign the message with deployer's private key
     let signature = tapp_service::app_key::sign_message(&deployer_private_key, &message)?;
 
-    println!("Requesting private key for app: {}", app_id);
-    println!("  Nonce: {}", nonce);
-    println!("  Timestamp: {}", timestamp);
-    println!("  Signature: 0x{}", hex::encode(&signature));
-    println!();
-
     let request = Request::new(GetAppSecretKeyRequest {
         app_id: app_id.clone(),
         nonce: nonce.clone(),
