@@ -14,9 +14,9 @@ use tracing::{debug, info, warn};
 /// Ethereum key pair
 #[derive(Clone)]
 struct EthKeyPair {
-    private_key: Vec<u8>,      // 32-byte private key (can be used to reconstruct SigningKey)
-    public_key: Vec<u8>,       // 64-byte uncompressed public key (without 0x04 prefix)
-    eth_address: Vec<u8>,      // 20-byte Ethereum address
+    private_key: Vec<u8>, // 32-byte private key (can be used to reconstruct SigningKey)
+    public_key: Vec<u8>,  // 64-byte uncompressed public key (without 0x04 prefix)
+    eth_address: Vec<u8>, // 20-byte Ethereum address
 }
 
 /// Application key service implementation
@@ -64,7 +64,7 @@ impl AppKeyService {
         let public_key_bytes = public_key_point.as_bytes();
 
         // Remove the 0x04 prefix to get 64 bytes
-        let public_key = public_key_bytes[1..].to_vec();
+        let public_key = public_key_bytes.to_vec();
 
         // Calculate Ethereum address from public key
         // Address = last 20 bytes of keccak256(public_key)
@@ -198,12 +198,11 @@ pub fn sign_message(private_key: &[u8], message: &[u8]) -> TappResult<Vec<u8>> {
         .into());
     }
 
-    let signing_key = SigningKey::from_slice(private_key).map_err(|e| {
-        DockerError::ContainerOperationFailed {
+    let signing_key =
+        SigningKey::from_slice(private_key).map_err(|e| DockerError::ContainerOperationFailed {
             operation: "sign_message".to_string(),
             reason: format!("Invalid private key: {}", e),
-        }
-    })?;
+        })?;
 
     let signature: Signature = signing_key.sign(message);
     Ok(signature.to_bytes().to_vec())
@@ -229,12 +228,11 @@ pub fn verify_signature(public_key: &[u8], message: &[u8], signature: &[u8]) -> 
         }
     })?;
 
-    let sig = Signature::from_slice(signature).map_err(|e| {
-        DockerError::ContainerOperationFailed {
+    let sig =
+        Signature::from_slice(signature).map_err(|e| DockerError::ContainerOperationFailed {
             operation: "verify_signature".to_string(),
             reason: format!("Invalid signature: {}", e),
-        }
-    })?;
+        })?;
 
     match verifying_key.verify(message, &sig) {
         Ok(_) => Ok(true),
