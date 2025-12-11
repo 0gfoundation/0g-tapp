@@ -50,26 +50,23 @@ impl AppKeyService {
     fn generate_eth_keypair(app_id: &str) -> TappResult<EthKeyPair> {
         use k256::elliptic_curve::rand_core::OsRng;
 
-        // Generate a new signing key
         let signing_key = SigningKey::random(&mut OsRng);
-
-        // Extract private key bytes (32 bytes)
         let private_key = signing_key.to_bytes().to_vec();
-
-        // Get verifying key (public key)
         let verifying_key = signing_key.verifying_key();
 
-        // Get uncompressed public key (65 bytes: 0x04 + 64 bytes)
+        // Get uncompressed public key
         let public_key_point = verifying_key.to_encoded_point(false);
         let public_key_bytes = public_key_point.as_bytes();
 
-        // Remove the 0x04 prefix to get 64 bytes
+        // Remove the 0x04 prefix to get 64 bytes for address calculation
+        let public_key_without_prefix = &public_key_bytes[1..];
+
+        // Store complete public key (with prefix) if needed
         let public_key = public_key_bytes.to_vec();
 
-        // Calculate Ethereum address from public key
-        // Address = last 20 bytes of keccak256(public_key)
+        // Calculate Ethereum address from 64-byte public key (without prefix)
         let mut hasher = Keccak256::new();
-        hasher.update(&public_key);
+        hasher.update(public_key_without_prefix);
         let hash = hasher.finalize();
         let eth_address = hash[12..].to_vec(); // Last 20 bytes
 
