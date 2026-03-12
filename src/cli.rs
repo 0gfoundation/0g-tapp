@@ -506,12 +506,24 @@ fn extract_volume_mounts(
 
                     let source_path = parts[0].trim();
 
-                    // Only process relative local paths (starting with ./ or ../)
-                    if !source_path.starts_with("./") && !source_path.starts_with("../") {
+                    // Only process relative local paths starting with ./
+                    // ../ paths are not supported: on the server each app is isolated under its
+                    // own directory (/var/lib/tapp/apps/<app_id>/). A ../ source path would
+                    // resolve outside that boundary, which the server rejects for security
+                    // reasons. Copy the file into the compose directory and use a ./ path instead.
+                    if source_path.starts_with("../") {
+                        println!(
+                            "  ✗ Unsupported: {} — ../ paths are not allowed. \
+                            Copy the file into the compose directory and use a ./ path.",
+                            source_path
+                        );
+                        continue;
+                    }
+                    if !source_path.starts_with("./") {
                         continue;
                     }
 
-                    // Build absolute path (PathBuf::join handles ../ correctly)
+                    // Build absolute path
                     let local_file = compose_dir.join(source_path);
 
                     // Check if path exists as file or directory
