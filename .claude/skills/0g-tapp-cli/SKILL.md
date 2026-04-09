@@ -47,6 +47,32 @@ tapp-cli -s <server> get-app-logs --app-id <id> --service <name> -n 50
 tapp-cli -s <server> get-app-key --app-id <id>
 ```
 
+## On-chain Registration Commands
+
+These commands require `-k <deployer-private-key>`. The `--server` (`-s`) flag serves as both the gRPC endpoint and the on-chain `teeUrl`.
+
+```bash
+# Register a new app on TappRegistry
+tapp-cli -s <server> -k 0x<key> register-onchain \
+  --app-id <id> --rpc-url <rpc> --contract 0x<TappRegistry> --stake-wei <wei>
+
+# Update app hashes after redeployment
+tapp-cli -s <server> -k 0x<key> update-onchain \
+  --app-id <id> --rpc-url <rpc> --contract 0x<TappRegistry>
+
+# Add a new TEE node (--server points to the new node)
+tapp-cli -s <new-node> -k 0x<key> add-node-onchain \
+  --app-id <id> --rpc-url <rpc> --contract 0x<TappRegistry> --stake-wei <wei>
+
+# Remove a node from an app (starts lock period; --server points to the node being removed)
+tapp-cli -s <node> -k 0x<key> remove-node-onchain \
+  --app-id <id> --rpc-url <rpc> --contract 0x<TappRegistry>
+
+# Withdraw stake after lock period (node may be stopped; provide --signer-address explicitly)
+tapp-cli -s <any-server> -k 0x<key> withdraw-node-stake \
+  --app-id <id> --rpc-url <rpc> --contract 0x<TappRegistry> --signer-address 0x<addr>
+```
+
 ## Deploying docker-compose Apps — Key Rules
 
 ### What tapp-cli uploads automatically

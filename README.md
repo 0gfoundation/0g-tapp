@@ -10,6 +10,8 @@
 - **Docker Compose Integration**: Deploy containerized applications easily
 - **gRPC API**: Comprehensive API for application lifecycle management
 - **Signature-based Authentication**: EVM-compatible signature verification for access control
+- **On-chain Registration**: Register apps and TEE nodes on TappRegistry smart contract
+- **KMS Integration**: Fetch hardware-independent app secrets from a KMS cluster (decrypted locally within the TEE)
 
 ## Getting Started
 
@@ -224,4 +226,66 @@ socket_path = "/var/run/docker.sock"
 [logging]
 level = "info"
 path = "/var/log/tapp/"
+
+# Optional: KMS cluster for hardware-independent app secrets
+[kms]
+cluster_urls = [
+    "http://kms-node-1:8080",
+    "http://kms-node-2:8080",
+]
+
+# Optional: on-chain TappRegistry integration
+[chain]
+rpc_url = "https://evmrpc-testnet.0g.ai"
+contract_address = "0x..."
 ```
+
+## On-chain Registration
+
+Register your app and TEE nodes on the TappRegistry contract using `tapp-cli`. These commands require `--private-key` (the deployer's Ethereum private key) and `--server` (the tapp gRPC endpoint, used both as the gRPC target and as the on-chain `teeUrl`).
+
+```bash
+# Register a new app (fetches hashes and signerAddress from --server automatically)
+tapp-cli -s http://<tapp>:50051 -k 0x<deployer-key> register-onchain \
+  --app-id my-app \
+  --rpc-url https://evmrpc-testnet.0g.ai \
+  --contract 0x<TappRegistry> \
+  --stake-wei 1000000000000000000
+
+# Update app hashes after redeployment
+tapp-cli -s http://<tapp>:50051 -k 0x<deployer-key> update-onchain \
+  --app-id my-app \
+  --rpc-url https://evmrpc-testnet.0g.ai \
+  --contract 0x<TappRegistry>
+
+# Add a new TEE node to an existing app
+tapp-cli -s http://<new-node>:50051 -k 0x<deployer-key> add-node-onchain \
+  --app-id my-app \
+  --rpc-url https://evmrpc-testnet.0g.ai \
+  --contract 0x<TappRegistry> \
+  --stake-wei 1000000000000000000
+
+# Remove a node (starts lock period)
+tapp-cli -s http://<node>:50051 -k 0x<deployer-key> remove-node-onchain \
+  --app-id my-app \
+  --rpc-url https://evmrpc-testnet.0g.ai \
+  --contract 0x<TappRegistry>
+
+# Withdraw stake after lock period (--signer-address required, node may be stopped)
+tapp-cli -s http://<any-tapp>:50051 -k 0x<deployer-key> withdraw-node-stake \
+  --app-id my-app \
+  --rpc-url https://evmrpc-testnet.0g.ai \
+  --contract 0x<TappRegistry> \
+  --signer-address 0x<node-signer>
+```
+
+## KMS Integration
+
+When `[kms]` is configured, apps running inside the TEE can retrieve a hardware-independent, KMS-derived secret via the `GetSecretResource` gRPC call. This call is **local access only** (localhost / same-host Docker network).
+
+```bash
+# From inside the TEE or a local container:
+grpcurl -plaintext -d '{"app_id": "my-app"}' localhost:50051 tapp.TappService/GetSecretResource
+```
+
+The returned `secret` bytes are the HKDF-derived app key from the KMS cluster, decrypted inside the TEE. The KMS authenticates the request by verifying the TEE node's on-chain registered `signerAddress`.

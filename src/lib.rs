@@ -1,6 +1,8 @@
 pub mod app_key;
 pub mod auth_layer;
 pub mod balance_withdrawal;
+pub mod kms_client;
+pub mod onchain;
 pub mod boot;
 pub mod config;
 pub mod error;
@@ -40,6 +42,7 @@ pub struct TappServiceImpl {
     pub config: TappConfig,
     pub boot_service: Arc<BootService>,
     pub app_key_service: app_key::AppKeyService,
+    pub kms_client: Option<kms_client::KmsClient>,
     pub nonce_manager: nonce_manager::NonceManager,
     pub logs_service: service_monitor::logs::LogsService,
     pub permission_manager: Option<Arc<permission::PermissionManager>>,
@@ -148,11 +151,18 @@ impl TappServiceImpl {
         let logs_service =
             service_monitor::logs::LogsService::new(config.logging.file_path.clone());
 
+        // Initialize KMS client if configured
+        let kms_client = config.kms.as_ref().map(|kms| {
+            info!(nodes = kms.node_urls.len(), "Initializing KMS client");
+            kms_client::KmsClient::new(kms.node_urls.clone())
+        });
+
         info!("All TAPP service components initialized successfully");
 
         Ok(Self {
             boot_service,
             app_key_service,
+            kms_client,
             nonce_manager,
             logs_service,
             permission_manager,
@@ -1386,6 +1396,73 @@ impl TappService for TappServiceImpl {
         );
 
         Ok(Response::new(response))
+    }
+
+    async fn get_secret_resource(
+        &self,
+        request: Request<GetSecretResourceRequest>,
+    ) -> Result<Response<GetSecretResourceResponse>, Status> {
+        info!("Calling GetSecretResource");
+
+        // SECURITY: local access only
+        let remote_addr = request.remote_addr();
+        let allowed = remote_addr
+            .map(|a| Self::is_allowed_local_access(a.ip()))
+            .unwrap_or(true); // Unix socket
+        if !allowed {
+            return Err(Status::permission_denied(
+                "GetSecretResource can only be called from localhost or same-host Docker containers",
+            ));
+        }
+
+        let req = request.into_inner();
+        let app_id = &req.app_id;
+
+        let kms = self.kms_client.as_ref().ok_or_else(|| {
+            Status::failed_precondition("KMS not configured (set [kms] cluster_urls in config)")
+        })?;
+
+        // Get in-memory key pair: private key for signing + decryption, pubkey for KMS encryption target
+        let private_key = self
+            .app_key_service
+            .get_private_key(app_id)
+            .await
+            .map_err(|e| Status::internal(format!("Failed to get app key: {}", e)))?;
+
+        let (_, secp256k1_pubkey_64, _) = self
+            .app_key_service
+            .get_public_key(app_id)
+            .await
+            .map_err(|e| Status::internal(format!("Failed to get app public key: {}", e)))?;
+
+        // ecies expects uncompressed secp256k1 pubkey: 0x04 || 64 bytes
+        let pubkey_uncompressed = [&[0x04u8], secp256k1_pubkey_64.as_slice()].concat();
+        let pubkey_hex = hex::encode(&pubkey_uncompressed);
+
+        // Sign KMS request: "GetSecretResource:{timestamp}"
+        let timestamp = chrono::Utc::now().timestamp();
+        let message = signature_auth::build_sign_message("GetSecretResource", timestamp);
+        let signature = app_key::sign_message(&private_key, message.as_bytes())
+            .map_err(|e| Status::internal(format!("Failed to sign KMS request: {}", e)))?;
+        let signature_hex = hex::encode(&signature);
+
+        // Call KMS cluster → get ECIES-encrypted app key
+        let encrypted = kms
+            .get_encrypted_secret(app_id, timestamp, &pubkey_hex, &signature_hex)
+            .await
+            .map_err(|e| Status::unavailable(format!("KMS request failed: {}", e)))?;
+
+        // Decrypt with our private key
+        let secret = ecies::decrypt(&private_key, &encrypted)
+            .map_err(|e| Status::internal(format!("Failed to decrypt KMS secret: {}", e)))?;
+
+        info!(app_id = %app_id, "GetSecretResource succeeded");
+
+        Ok(Response::new(GetSecretResourceResponse {
+            success: true,
+            message: format!("Secret resource retrieved for app {}", app_id),
+            secret,
+        }))
     }
 }
 

@@ -43,6 +43,10 @@ pub struct TappConfig {
     pub server: ServerConfig,
     #[serde(default)]
     pub kbs: Option<KbsConfig>,
+    #[serde(default)]
+    pub kms: Option<KmsConfig>,
+    #[serde(default)]
+    pub chain: Option<ChainConfig>,
 }
 
 impl TappConfig {
@@ -106,6 +110,22 @@ pub struct PermissionConfig {
     /// Example: ["0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"]
     #[serde(default)]
     pub initial_whitelist: Vec<String>,
+}
+
+/// KMS cluster configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KmsConfig {
+    /// KMS cluster node URLs
+    pub node_urls: Vec<String>,
+}
+
+/// On-chain configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChainConfig {
+    /// Ethereum-compatible RPC URL
+    pub rpc_url: String,
+    /// TappRegistry contract address
+    pub contract_address: String,
 }
 
 /// KBS configuration
