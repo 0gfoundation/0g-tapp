@@ -291,25 +291,16 @@ impl DockerComposeManager {
             container_name: String,
         }
 
-        // docker compose images --format json outputs one JSON object per line (NDJSON)
+        // docker compose images --format json outputs a JSON array
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let mut images = Vec::new();
-        for line in stdout.lines() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            match serde_json::from_str::<ImageInfo>(line) {
-                Ok(img) => images.push(img),
-                Err(e) => {
-                    warn!(
-                        line = %line,
-                        error = %e,
-                        "Failed to parse docker compose images JSON line, skipping"
-                    );
-                }
-            }
-        }
+        let images: Vec<ImageInfo> = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+            warn!(
+                error = %e,
+                output = %stdout,
+                "Failed to parse docker compose images JSON output"
+            );
+            Vec::new()
+        });
 
         // Build map: service_name -> ContainerImageInfo
         let mut image_map = std::collections::BTreeMap::new();

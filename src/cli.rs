@@ -123,6 +123,13 @@ enum Commands {
         x25519: bool,
     },
 
+    /// Get secret resource from KMS (local access only)
+    GetSecretResource {
+        /// Application ID
+        #[arg(short, long)]
+        app_id: String,
+    },
+
     /// Start a specific service within an app
     StartService {
         /// Application ID
@@ -321,6 +328,14 @@ enum Commands {
         /// Stake amount in wei (must be >= minStakeAmount)
         #[arg(short, long)]
         stake_wei: u128,
+
+        /// Signer address of the new node (optional; fetched from --server if not set)
+        #[arg(long)]
+        signer_address: Option<String>,
+
+        /// TEE URL of the new node (optional; defaults to --server URL)
+        #[arg(long)]
+        tee_url: Option<String>,
     },
 
     /// Remove a node from an on-chain app (starts the stake lock period).
@@ -337,11 +352,15 @@ enum Commands {
         /// TappRegistry contract address (0x...)
         #[arg(short, long)]
         contract: String,
+
+        /// Signer address to remove (skips fetching from --server; useful when node is unreachable)
+        #[arg(long)]
+        signer_address: Option<String>,
     },
 
-    /// Withdraw a removed node's stake after the lock period elapses.
-    /// Requires --signer-address because the node may already be stopped.
-    WithdrawNodeStake {
+    /// Update a node: replace old signer with new signer atomically (transfers stake).
+    /// New signer is fetched from --server unless --new-signer is specified.
+    UpdateNodeOnchain {
         /// Application ID
         #[arg(short, long)]
         app_id: String,
@@ -354,9 +373,30 @@ enum Commands {
         #[arg(short, long)]
         contract: String,
 
-        /// Signer address of the removed node (0x...)
+        /// Old signer address to replace (optional; fetched from --server if not set)
+        #[arg(long)]
+        old_signer: Option<String>,
+
+        /// New signer address (optional; fetched from --server if not set)
+        #[arg(long)]
+        new_signer: Option<String>,
+
+        /// TEE URL for the new node (optional; defaults to --server URL)
+        #[arg(long)]
+        tee_url: Option<String>,
+    },
+
+    /// Withdraw a removed node's stake after the lock period elapses.
+    /// Requires --signer-address because the node may already be stopped.
+    /// Withdraw all matured locked stake entries for the caller.
+    Withdraw {
+        /// Ethereum RPC URL
         #[arg(short, long)]
-        signer_address: String,
+        rpc_url: String,
+
+        /// TappRegistry contract address (0x...)
+        #[arg(short, long)]
+        contract: String,
     },
 }
 
@@ -417,6 +457,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             x25519,
         } => {
             get_app_secret_key(&cli.server, app_id, json, x25519).await?;
+        }
+        Commands::GetSecretResource { app_id } => {
+            get_secret_resource(&cli.server, app_id).await?;
         }
         Commands::StartService {
             app_id,
@@ -533,26 +576,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             rpc_url,
             contract,
             stake_wei,
+            signer_address,
+            tee_url,
         } => {
             let private_key = require_private_key(&cli.private_key)?;
-            add_node_onchain(&cli.server, app_id, rpc_url, contract, stake_wei, private_key).await?;
+            add_node_onchain(&cli.server, app_id, rpc_url, contract, stake_wei, private_key, signer_address, tee_url).await?;
         }
         Commands::RemoveNodeOnchain {
-            app_id,
-            rpc_url,
-            contract,
-        } => {
-            let private_key = require_private_key(&cli.private_key)?;
-            remove_node_onchain(&cli.server, app_id, rpc_url, contract, private_key).await?;
-        }
-        Commands::WithdrawNodeStake {
             app_id,
             rpc_url,
             contract,
             signer_address,
         } => {
             let private_key = require_private_key(&cli.private_key)?;
-            withdraw_node_stake_onchain(app_id, rpc_url, contract, signer_address, private_key).await?;
+            remove_node_onchain(&cli.server, app_id, rpc_url, contract, private_key, signer_address).await?;
+        }
+        Commands::UpdateNodeOnchain {
+            app_id,
+            rpc_url,
+            contract,
+            old_signer,
+            new_signer,
+            tee_url,
+        } => {
+            let private_key = require_private_key(&cli.private_key)?;
+            update_node_onchain(&cli.server, app_id, rpc_url, contract, private_key, old_signer, new_signer, tee_url).await?;
+        }
+
+        Commands::Withdraw {
+            rpc_url,
+            contract,
+        } => {
+            let private_key = require_private_key(&cli.private_key)?;
+            withdraw_onchain(rpc_url, contract, private_key).await?;
         }
     }
 
@@ -1044,6 +1100,40 @@ async fn get_app_secret_key(
             println!("  Ethereum Address: 0x{}", hex::encode(&result.eth_address));
         }
     }
+
+    Ok(())
+}
+
+async fn get_secret_resource(
+    server: &str,
+    app_id: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut client = TappServiceClient::connect(server.to_string()).await?;
+
+    let request = Request::new(GetSecretResourceRequest {
+        app_id: app_id.clone(),
+    });
+
+    let response = match client.get_secret_resource(request).await {
+        Ok(resp) => resp,
+        Err(e) if e.code() == tonic::Code::PermissionDenied => {
+            eprintln!("✗ Permission denied: {}", e.message());
+            eprintln!("\nGetSecretResource can ONLY be called from localhost!");
+            std::process::exit(1);
+        }
+        Err(e) => return Err(e.into()),
+    };
+
+    let result = response.into_inner();
+
+    if !result.success {
+        eprintln!("✗ {}", result.message);
+        std::process::exit(1);
+    }
+
+    println!("✓ Secret resource retrieved");
+    println!("  App ID: {}", app_id);
+    println!("  Secret (hex): 0x{}", hex::encode(&result.secret));
 
     Ok(())
 }
@@ -1628,18 +1718,29 @@ async fn add_node_onchain(
     contract: String,
     stake_wei: u128,
     private_key: String,
+    signer_arg: Option<String>,
+    tee_url_arg: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use ethers::types::U256;
+    use ethers::types::{Address, U256};
+    use std::str::FromStr;
     use tapp_service::onchain::OnchainParams;
 
-    let signer = fetch_signer_address(server, &app_id).await?;
+    let (signer, tee_url) = if let Some(addr) = signer_arg {
+        let parsed = Address::from_str(addr.trim_start_matches("0x"))
+            .map_err(|_| format!("Invalid signer address: {}", addr))?;
+        (parsed, tee_url_arg.unwrap_or_else(|| server.to_string()))
+    } else {
+        let fetched = fetch_signer_address(server, &app_id).await?;
+        (fetched, tee_url_arg.unwrap_or_else(|| server.to_string()))
+    };
 
     let params = OnchainParams { rpc_url, contract, private_key };
-    let tx = tapp_service::onchain::add_node(&params, &app_id, signer, server, U256::from(stake_wei)).await?;
+    let tx = tapp_service::onchain::add_node(&params, &app_id, signer, &tee_url, U256::from(stake_wei)).await?;
 
     println!("✓ Node added on-chain");
     println!("  App ID: {}", app_id);
-    println!("  Signer Address: 0x{}", hex::encode(signer));
+    println!("  Signer Address: 0x{:x}", signer);
+    println!("  TEE URL: {}", tee_url);
     println!("  Tx Hash: 0x{:x}", tx);
 
     Ok(())
@@ -1651,10 +1752,15 @@ async fn remove_node_onchain(
     rpc_url: String,
     contract: String,
     private_key: String,
+    signer_address: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use tapp_service::onchain::OnchainParams;
 
-    let signer = fetch_signer_address(server, &app_id).await?;
+    let signer = if let Some(addr) = signer_address {
+        addr.trim_start_matches("0x").parse::<ethers::types::Address>()?
+    } else {
+        fetch_signer_address(server, &app_id).await?
+    };
 
     let params = OnchainParams { rpc_url, contract, private_key };
     let tx = tapp_service::onchain::remove_node(&params, &app_id, signer).await?;
@@ -1668,26 +1774,59 @@ async fn remove_node_onchain(
     Ok(())
 }
 
-async fn withdraw_node_stake_onchain(
+async fn update_node_onchain(
+    server: &str,
     app_id: String,
     rpc_url: String,
     contract: String,
-    signer_address: String,
     private_key: String,
+    old_signer_arg: Option<String>,
+    new_signer_arg: Option<String>,
+    tee_url_arg: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use ethers::types::Address;
     use std::str::FromStr;
-    use tapp_service::onchain::{self, OnchainParams};
+    use tapp_service::onchain::OnchainParams;
 
-    let signer = Address::from_str(&signer_address)
-        .map_err(|_| format!("Invalid signer address: {}", signer_address))?;
+    let old_signer_addr = if let Some(addr) = old_signer_arg {
+        Address::from_str(addr.trim_start_matches("0x"))
+            .map_err(|_| format!("Invalid old signer address: {}", addr))?
+    } else {
+        fetch_signer_address(server, &app_id).await?
+    };
+    let (new_signer, tee_url) = if let Some(addr) = new_signer_arg {
+        let parsed = Address::from_str(addr.trim_start_matches("0x"))
+            .map_err(|_| format!("Invalid new signer address: {}", addr))?;
+        (parsed, tee_url_arg.unwrap_or_else(|| server.to_string()))
+    } else {
+        let fetched = fetch_signer_address(server, &app_id).await?;
+        (fetched, tee_url_arg.unwrap_or_else(|| server.to_string()))
+    };
 
     let params = OnchainParams { rpc_url, contract, private_key };
-    let tx = onchain::withdraw_node_stake(&params, &app_id, signer).await?;
+    let tx = tapp_service::onchain::update_node(&params, &app_id, old_signer_addr, new_signer, tee_url.clone()).await?;
 
-    println!("✓ Node stake withdrawn");
+    println!("✓ Node updated on-chain");
     println!("  App ID: {}", app_id);
-    println!("  Signer Address: {}", signer_address);
+    println!("  Old Signer: 0x{:x}", old_signer_addr);
+    println!("  New Signer: 0x{:x}", new_signer);
+    println!("  TEE URL: {}", tee_url);
+    println!("  Tx Hash: 0x{:x}", tx);
+
+    Ok(())
+}
+
+async fn withdraw_onchain(
+    rpc_url: String,
+    contract: String,
+    private_key: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use tapp_service::onchain::{self, OnchainParams};
+
+    let params = OnchainParams { rpc_url, contract, private_key };
+    let tx = onchain::withdraw(&params).await?;
+
+    println!("✓ Stake withdrawn");
     println!("  Tx Hash: 0x{:x}", tx);
 
     Ok(())

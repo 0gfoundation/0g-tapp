@@ -14,4 +14,7 @@ contract/out/
 contract/cache/
 contract/broadcast/
 contract/lib/
+contract/src/*.flat.sol
+contract/verify
+contract/internal/
 

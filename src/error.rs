@@ -10,10 +10,6 @@ pub enum TappError {
     #[error("Attestation error: {0}")]
     Attestation(#[from] AttestationError),
 
-    /// KBS related errors
-    #[error("KBS error: {0}")]
-    Kbs(#[from] KbsError),
-
     /// Docker related errors
     #[error("Docker error: {0}")]
     Docker(#[from] DockerError),
@@ -68,28 +64,6 @@ pub enum AttestationError {
 
     #[error("RTMR extension failed: {reason}")]
     RtmrExtensionFailed { reason: String },
-}
-
-/// KBS specific errors
-#[derive(Error, Debug)]
-pub enum KbsError {
-    #[error("KBS connection failed: {endpoint}")]
-    ConnectionFailed { endpoint: String },
-
-    #[error("Authentication failed")]
-    AuthenticationFailed,
-
-    #[error("Resource not found: {resource_uri}")]
-    ResourceNotFound { resource_uri: String },
-
-    #[error("Invalid resource URI: {uri}")]
-    InvalidResourceUri { uri: String },
-
-    #[error("Key derivation failed: {reason}")]
-    KeyDerivationFailed { reason: String },
-
-    #[error("Unsupported key type: {key_type}")]
-    UnsupportedKeyType { key_type: String },
 }
 
 /// Docker specific errors
@@ -151,12 +125,6 @@ impl From<TappError> for tonic::Status {
             }
             TappError::Attestation(AttestationError::TeeNotSupported) => {
                 Status::failed_precondition("TEE not supported on this platform")
-            }
-            TappError::Kbs(KbsError::AuthenticationFailed) => {
-                Status::unauthenticated("KBS authentication failed")
-            }
-            TappError::Kbs(KbsError::ResourceNotFound { resource_uri }) => {
-                Status::not_found(format!("Resource not found: {}", resource_uri))
             }
             TappError::Docker(DockerError::ServiceNotFound { service_name }) => {
                 Status::not_found(format!("Service not found: {}", service_name))

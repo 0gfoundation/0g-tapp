@@ -1,7 +1,3 @@
-pub mod kbs_client;
-pub use kbs_client::KbsClient;
-
-use crate::config::KbsConfig;
 use crate::error::{DockerError, TappResult};
 use k256::ecdsa::{signature::Signer, signature::Verifier, Signature, SigningKey, VerifyingKey};
 use sha3::{Digest, Keccak256};
@@ -18,40 +14,20 @@ pub struct EthKeyPair {
     pub x25519_public_key: Option<Vec<u8>>, // 32-byte X25519 public key
 }
 
-/// Application key service implementation
+/// Application key service — always uses in-memory key generation.
+/// Keys are derived per app_id and persist for the lifetime of the process.
+/// KBS/KMS secret retrieval is handled separately via kms_client.
 pub struct AppKeyService {
-    kbs_client: Option<KbsClient>,
     /// In-memory key storage: app_id -> EthKeyPair
     app_keys: Mutex<HashMap<String, EthKeyPair>>,
-    /// Whether to use in-memory keys (if false, use KBS)
-    use_in_memory: bool,
 }
 
 impl AppKeyService {
-    /// Create new app key service
-    pub async fn new(
-        kbs_config: Option<&KbsConfig>, // ← 改为 Option
-        use_in_memory: bool,
-    ) -> TappResult<Self> {
-        let kbs_client = if let Some(config) = kbs_config {
-            info!(endpoint = %config.endpoint, "Initializing KBS client");
-            Some(KbsClient::new(&config.endpoint).await?)
-        } else {
-            info!("KBS client not initialized (in-memory mode)");
-            None
-        };
-
-        info!(
-            use_in_memory = use_in_memory,
-            has_kbs_client = kbs_client.is_some(),
-            "Initialized app key service"
-        );
-
-        Ok(Self {
-            kbs_client,
+    pub fn new() -> Self {
+        info!("Initialized app key service (in-memory)");
+        Self {
             app_keys: Mutex::new(HashMap::new()),
-            use_in_memory,
-        })
+        }
     }
 
     /// Generate a new Ethereum key pair for an app
@@ -132,17 +108,9 @@ impl AppKeyService {
         Ok(key_pair)
     }
 
-    /// Get private key for an app (internal use only)
-    /// WARNING: This returns sensitive private key material
+    /// Get private key for an app (local access only)
+    /// WARNING: Returns sensitive private key material
     pub async fn get_private_key(&self, app_id: &str) -> TappResult<Vec<u8>> {
-        if !self.use_in_memory {
-            return Err(DockerError::ContainerOperationFailed {
-                operation: "get_private_key".to_string(),
-                reason: "Private key retrieval only supported in in-memory mode".to_string(),
-            }
-            .into());
-        }
-
         let keys = self.app_keys.lock().await;
         if let Some(key_pair) = keys.get(app_id) {
             warn!(
@@ -158,19 +126,11 @@ impl AppKeyService {
         }
     }
 
-    /// Get public key for an app (internal use only)
+    /// Get public key for an app
     pub async fn get_public_key(
         &self,
         app_id: &str,
     ) -> TappResult<(Vec<u8>, Vec<u8>, Option<Vec<u8>>)> {
-        if !self.use_in_memory {
-            return Err(DockerError::ContainerOperationFailed {
-                operation: "get_public_key".to_string(),
-                reason: "Public key retrieval only supported in in-memory mode".to_string(),
-            }
-            .into());
-        }
-
         let keys = self.app_keys.lock().await;
         if let Some(key_pair) = keys.get(app_id) {
             Ok((
@@ -186,69 +146,32 @@ impl AppKeyService {
         }
     }
 
-    /// Handle get app key request (public key only - for gRPC)
+    /// Get app key pair (always in-memory)
     pub async fn get_app_key(
         &self,
         app_id: &str,
         key_type: &str,
         x25519: bool,
     ) -> TappResult<EthKeyPair> {
-        info!(
-            app_id = %app_id,
-            key_type = %key_type,
-            use_in_memory = self.use_in_memory,
-            "Processing app key request"
-        );
+        info!(app_id = %app_id, key_type = %key_type, "Processing app key request");
 
-        if self.use_in_memory {
-            // Use in-memory key generation
-            match key_type {
-                "ethereum" => {
-                    let key_pair = self.get_or_create_in_memory_key(app_id, x25519).await?;
-                    info!(
-                        app_id = %app_id,
-                        public_key_hex = format!("0x{}", hex::encode(&key_pair.public_key)),
-                        eth_address_hex = format!("0x{}", hex::encode(&key_pair.eth_address)),
-                        x25519_public_key_hex = format!("0x{:?}", key_pair.x25519_public_key),
-                        "Generated new Ethereum key pair"
-                    );
-                    Ok(key_pair)
-                }
-                _ => {
-                    warn!(key_type = %key_type, "Unsupported key type for in-memory mode");
-                    Err(DockerError::ContainerOperationFailed {
-                        operation: "get_app_key".to_string(),
-                        reason: format!("Unsupported key type: {}", key_type),
-                    }
-                    .into())
-                }
+        match key_type {
+            "ethereum" => {
+                let key_pair = self.get_or_create_in_memory_key(app_id, x25519).await?;
+                info!(
+                    app_id = %app_id,
+                    eth_address = format!("0x{}", hex::encode(&key_pair.eth_address)),
+                    "Returning in-memory key"
+                );
+                Ok(key_pair)
             }
-        } else {
-            // Use KBS
-            let kbs_client =
-                self.kbs_client
-                    .as_ref()
-                    .ok_or_else(|| DockerError::ContainerOperationFailed {
-                        operation: "get_app_key".to_string(),
-                        reason: "KBS client not configured".to_string(),
-                    })?;
-
-            let resource_uri = format!("kbs:///default/key/{}", app_id);
-            match kbs_client.get_resource(&resource_uri).await {
-                Ok(_key_data) => Ok(EthKeyPair {
-                    private_key: vec![],
-                    public_key: _key_data,
-                    eth_address: vec![],
-                    x25519_public_key: None,
-                }),
-                Err(e) => {
-                    tracing::error!(
-                        app_id = %app_id,
-                        error = %e,
-                        "Failed to retrieve app key from KBS"
-                    );
-                    Err(e)
+            _ => {
+                warn!(key_type = %key_type, "Unsupported key type");
+                Err(DockerError::ContainerOperationFailed {
+                    operation: "get_app_key".to_string(),
+                    reason: format!("Unsupported key type: {}", key_type),
                 }
+                .into())
             }
         }
     }

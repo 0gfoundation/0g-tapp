@@ -11,19 +11,19 @@ RPC: https://evmrpc-testnet.0g.ai
 
 > For local development and integration testing. Data may be reset at any time.
 
-**Deployed:** 2026-04-09
-**Deployer:** `0xa3b0779461beDF9Ddacb0D113766494Facc7E306`
+**Deployed:** 2026-04-10
+**Deployer:** `0xB831371eb2703305f1d9F8542163633D0675CEd7`
 **Min stake:** 1 0G (`1000000000000000000` wei)
 **Lock period:** 86400 s (1 day)
 
 | Contract | Address | Tx Hash |
 |----------|---------|---------|
-| TappRegistry Implementation | `0x15Ce553cb6ff5AD10FA83c1cd6337B45C444E0c4` | `0x98aa240c124d6344bf253458bac9e339838af0fe56c5656cb3ac07f51c1fb4ff` |
-| UpgradeableBeacon | `0x603F626990D07686cfa7c9B3c000D1B5D7E4301e` | `0xcbe6ea340769d8d499ef2f57c1bdda88f5b9399f9142a6e094e3211e8268f800` |
-| **BeaconProxy (stable)** | `0x650212889341E8Aa253E5319be2460C0642D8eb4` | `0x6c158fb02f3d03c7f63dc1e65930827c4469a2f1ebde66615b9f4fe5137d6f44` |
+| TappRegistry Implementation | `0xE03de87Dc82ABeacD48deEDCAA6D607Fa6EA05b6` | `0x465379c54d379b9a7b5be0e2442eaf32e363419aabf40e8817b8d65704687f32` |
+| UpgradeableBeacon | `0x8fD880b7FCc9f0170a6F2aA58Ee90B4A012a509E` | `0x92a77f5c52cce763b8e9d26d30efbe0ce305a63019a4f0fd842744dd9c2b1fc0` |
+| **BeaconProxy (stable)** | `0x95a0BF4148b30F6F8D86870534c51df46Da5511c` | `0x1e360fa0236bf3b2857ee7c69ce4680415ea5bfa34ac9b6826f2d643249f33ee` |
 
 ```env
-TAPP_REGISTRY_CONTRACT=0x650212889341E8Aa253E5319be2460C0642D8eb4
+TAPP_REGISTRY_CONTRACT=0x95a0BF4148b30F6F8D86870534c51df46Da5511c
 ```
 
 ### Testnet
@@ -54,111 +54,63 @@ tapp-cli / user  ──►  BeaconProxy  (stable address, all state lives here)
 
 ---
 
-## Deployment (First Time)
+## Go Tools
 
-> **TODO:** Replace the Docker/forge approach below with a native Rust deploy binary
-> (`cargo run --bin deploy-contract`), similar to how 0g-sandbox uses `go run ./cmd/deploy/`.
-> Read bytecode from `contract/out/` artifacts and deploy via ethers-rs — no Docker dependency.
+All contract operations are handled by Go tools under `contract/cmd/`. Docker is required only for compilation (forge runs inside a container to work around host GLIBC constraints).
 
-### Prerequisites
+### Compile
 
-- Docker (to run Foundry, works around GLIBC version constraint on the host)
-- Deployer private key with sufficient 0G balance for gas
-
-### 1. Build
+Compiles Solidity via Docker and extracts ABIs to `internal/chain/abi/`.
 
 ```bash
-docker run --rm \
-  --entrypoint forge \
-  -v /path/to/0g-tapp/contract:/contract \
-  -w /contract \
-  ghcr.io/foundry-rs/foundry:latest \
-  build
+cd contract
+go run ./cmd/compile/
 ```
 
-### 2. Deploy
+After an ABI change, regenerate Go bindings:
 
 ```bash
-docker run --rm \
-  --entrypoint forge \
-  -v /path/to/0g-tapp/contract:/contract \
-  -w /contract \
-  -e MIN_STAKE_AMOUNT=1000000000000000000 \
-  -e LOCK_PERIOD=86400 \
-  -e FOUNDRY_DISABLE_NIGHTLY_WARNING=1 \
-  ghcr.io/foundry-rs/foundry:latest \
-  script script/Deploy.s.sol \
-    --rpc-url <RPC_URL> \
-    --broadcast \
-    --private-key 0x<DEPLOYER_PRIVATE_KEY> \
-    --legacy \
-    --gas-price 3000000000 \
-    -vvv
+$(go env GOPATH)/bin/abigen \
+  --abi internal/chain/abi/TappRegistry.json \
+  --pkg chain --type TappRegistry \
+  --out internal/chain/tapp_registry.go
 ```
 
-Output:
-```
-Implementation: 0x...
-Beacon:         0x...
-Proxy (stable): 0x...   ← set this as TAPP_REGISTRY_CONTRACT
-```
-
-| Env var | Description |
-|---------|-------------|
-| `MIN_STAKE_AMOUNT` | Minimum stake per node in wei. `1000000000000000000` = 1 0G |
-| `LOCK_PERIOD` | Stake lock period after `removeNode` in seconds. `86400` = 1 day |
-
-> **Note:** 0G testnet requires `--legacy` transaction type. EIP-1559 gas estimation fails on this network.
-
----
-
-## Upgrade
-
-Deploy a new implementation and point the beacon at it. **The proxy address does not change.**
-
-### 1. Edit and rebuild
+### Deploy (first time)
 
 ```bash
-# Edit src/TappRegistry.sol, then rebuild
-docker run --rm \
-  --entrypoint forge \
-  -v /path/to/0g-tapp/contract:/contract \
-  -w /contract \
-  ghcr.io/foundry-rs/foundry:latest \
-  build
+cd contract
+go run ./cmd/deploy/ \
+  --rpc   https://evmrpc-testnet.0g.ai \
+  --key   0x<DEPLOYER_PRIVATE_KEY>     \
+  --stake 1000000000000000000          \
+  --lock  86400
 ```
 
-### 2. Run upgrade script
+Output lists Implementation, Beacon, and Proxy addresses. Set the Proxy as `TAPP_REGISTRY_CONTRACT`.
 
-```bash
-docker run --rm \
-  --entrypoint forge \
-  -v /path/to/0g-tapp/contract:/contract \
-  -w /contract \
-  -e BEACON_ADDRESS=<BEACON_ADDRESS> \
-  -e FOUNDRY_DISABLE_NIGHTLY_WARNING=1 \
-  ghcr.io/foundry-rs/foundry:latest \
-  script script/Upgrade.s.sol \
-    --rpc-url <RPC_URL> \
-    --broadcast \
-    --private-key 0x<DEPLOYER_PRIVATE_KEY> \
-    --legacy \
-    --gas-price 3000000000 \
-    -vvv
-```
+### Upgrade
 
-Output:
-```
-New Implementation: 0x...
-Beacon upgraded:    0x...
-```
-
-### 3. Verify
+Edit `src/TappRegistry.sol`, recompile, then:
 
 ```bash
-# Confirm beacon points to new impl
-cast call <BEACON> "implementation()(address)" --rpc-url <RPC_URL>
+cd contract
+go run ./cmd/upgrade/ \
+  --rpc    https://evmrpc-testnet.0g.ai     \
+  --key    0x<DEPLOYER_PRIVATE_KEY>         \
+  --beacon 0x<UPGRADEABLE_BEACON_ADDRESS>
 ```
+
+Deploys a new implementation and calls `beacon.upgradeTo`. The proxy address is unchanged.
+
+### Verify
+
+```bash
+cd contract
+go run ./cmd/verify/ --proxy 0x<BEACON_PROXY_ADDRESS>
+```
+
+Auto-discovers impl, beacon, and proxy from the given BeaconProxy address. Checks which are unverified, extracts constructor args from on-chain data, submits source, and polls for results. All three contracts are verified in one command.
 
 ---
 
@@ -206,15 +158,16 @@ tapp-cli \
 
 ## On-chain Queries
 
-> Use Docker if `cast` is not available on the host (`docker run --rm --entrypoint cast ghcr.io/foundry-rs/foundry:latest ...`).
-
 ```bash
 # Current implementation address
-cast call <BEACON> "implementation()(address)" --rpc-url <RPC_URL>
+docker run --rm --entrypoint cast ghcr.io/foundry-rs/foundry:latest \
+  call <BEACON> "implementation()(address)" --rpc-url <RPC_URL>
 
 # minStakeAmount
-cast call <PROXY> "minStakeAmount()(uint256)" --rpc-url <RPC_URL>
+docker run --rm --entrypoint cast ghcr.io/foundry-rs/foundry:latest \
+  call <PROXY> "minStakeAmount()(uint256)" --rpc-url <RPC_URL>
 
 # App info
-cast call <PROXY> "getAppInfo(string)((bytes,bytes,bytes[],address,uint256))" "<APP_ID>" --rpc-url <RPC_URL>
+docker run --rm --entrypoint cast ghcr.io/foundry-rs/foundry:latest \
+  call <PROXY> "getAppInfo(string)((bytes,bytes,bytes[],address,uint256))" "<APP_ID>" --rpc-url <RPC_URL>
 ```

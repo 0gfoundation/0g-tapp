@@ -135,14 +135,8 @@ impl TappServiceImpl {
         let boot_service =
             Arc::new(BootService::new(measurement_service.clone(), task_manager).await?);
 
-        // Initialize AppKeyService
-        let app_key_service = if let Some(ref kbs) = config.kbs {
-            info!("Using KBS for app key management");
-            app_key::AppKeyService::new(Some(kbs), false).await?
-        } else {
-            info!("KBS config not provided, using in-memory key generation");
-            app_key::AppKeyService::new(None, true).await?
-        };
+        // Initialize AppKeyService (always in-memory, independent of KBS)
+        let app_key_service = app_key::AppKeyService::new();
 
         // Initialize NonceManager for replay attack prevention
         let nonce_manager = nonce_manager::NonceManager::new();
@@ -151,10 +145,10 @@ impl TappServiceImpl {
         let logs_service =
             service_monitor::logs::LogsService::new(config.logging.file_path.clone());
 
-        // Initialize KMS client if configured
-        let kms_client = config.kms.as_ref().map(|kms| {
-            info!(nodes = kms.node_urls.len(), "Initializing KMS client");
-            kms_client::KmsClient::new(kms.node_urls.clone())
+        // Initialize KMS client from KBS config (used for GetSecretResource)
+        let kms_client = config.kbs.as_ref().map(|kbs| {
+            info!(nodes = kbs.node_urls.len(), "Initializing KMS client from KBS config");
+            kms_client::KmsClient::new(kbs.node_urls.clone(), &kbs.retry)
         });
 
         info!("All TAPP service components initialized successfully");
@@ -632,11 +626,10 @@ impl TappService for TappServiceImpl {
             };
 
             KbsConfigInfo {
-                endpoint: kbs.endpoint.clone(),
+                node_urls: kbs.node_urls.clone(),
                 timeout_seconds: kbs.timeout_seconds as i32,
                 cert_configured: kbs.cert_path.is_some(),
                 retry: Some(retry_config),
-                supported_key_types: kbs.supported_key_types.clone(),
             }
         });
 

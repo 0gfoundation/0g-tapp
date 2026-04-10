@@ -106,13 +106,19 @@ struct KmsResponse {
 pub struct KmsClient {
     node_urls: Vec<String>,
     http: reqwest::Client,
+    max_retries: usize,
+    initial_delay_ms: u64,
+    max_delay_ms: u64,
 }
 
 impl KmsClient {
-    pub fn new(node_urls: Vec<String>) -> Self {
+    pub fn new(node_urls: Vec<String>, retry: &crate::config::RetryConfig) -> Self {
         Self {
             node_urls,
             http: reqwest::Client::new(),
+            max_retries: retry.max_retries,
+            initial_delay_ms: retry.initial_delay_ms,
+            max_delay_ms: retry.max_delay_ms,
         }
     }
 
@@ -135,24 +141,38 @@ impl KmsClient {
         let mut last_err = anyhow!("no KMS nodes configured");
         for url in &self.node_urls {
             let endpoint = format!("{}/app-key", url.trim_end_matches('/'));
-            match self.http.post(&endpoint).json(&req).send().await {
-                Ok(resp) if resp.status().is_success() => {
-                    let body: KmsResponse = resp.json().await
-                        .map_err(|e| anyhow!("KMS {} invalid response: {}", url, e))?;
-                    let bytes = hex::decode(body.encrypted_secret.trim_start_matches("0x"))
-                        .map_err(|e| anyhow!("KMS {} invalid hex: {}", url, e))?;
-                    return Ok(bytes);
+            let mut attempt = 0usize;
+            loop {
+                match self.http.post(&endpoint).json(&req).send().await {
+                    Ok(resp) if resp.status().is_success() => {
+                        let body: KmsResponse = resp.json().await
+                            .map_err(|e| anyhow!("KMS {} invalid response: {}", url, e))?;
+                        let bytes = hex::decode(body.encrypted_secret.trim_start_matches("0x"))
+                            .map_err(|e| anyhow!("KMS {} invalid hex: {}", url, e))?;
+                        return Ok(bytes);
+                    }
+                    Ok(resp) => {
+                        let status = resp.status();
+                        let body = resp.text().await.unwrap_or_default();
+                        last_err = anyhow!("KMS {} returned {}: {}", url, status, body);
+                        // Don't retry on client errors (4xx) — request won't change
+                        if status.is_client_error() {
+                            tracing::warn!(url = %url, %status, "KMS client error, skipping node");
+                            break;
+                        }
+                        tracing::warn!(url = %url, %status, attempt, "KMS server error, retrying");
+                    }
+                    Err(e) => {
+                        last_err = anyhow!("KMS {} unreachable: {}", url, e);
+                        tracing::warn!(url = %url, error = %e, attempt, "KMS unreachable, retrying");
+                    }
                 }
-                Ok(resp) => {
-                    let status = resp.status();
-                    let body = resp.text().await.unwrap_or_default();
-                    last_err = anyhow!("KMS {} returned {}: {}", url, status, body);
-                    tracing::warn!(url = %url, status = %status, "KMS node error");
+                attempt += 1;
+                if attempt > self.max_retries {
+                    break;
                 }
-                Err(e) => {
-                    last_err = anyhow!("KMS {} unreachable: {}", url, e);
-                    tracing::warn!(url = %url, error = %e, "KMS node unreachable");
-                }
+                let delay = (self.initial_delay_ms * (1u64 << (attempt - 1))).min(self.max_delay_ms);
+                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
             }
         }
         Err(last_err)

@@ -12,20 +12,21 @@ pragma solidity ^0.8.24;
 ///         one node. Shared code identity (composeHash, etc.) is at the app level;
 ///         per-node differentiation (signerAddress, teeUrl) lives in NodeInfo.
 ///         registerApp always adds the first node atomically.
-///         App liveness is determined off-chain (app is live while it has staked nodes).
+///         When the last node is removed the app is automatically unregistered.
 ///
 ///         Staking
 ///         -------
 ///         Stake is per node. Each addNode / registerApp call requires
-///         msg.value >= minStakeAmount. After removeNode, stake is locked for
-///         lockPeriod seconds before the owner may withdraw.
+///         msg.value >= minStakeAmount. After removeNode, the stake is locked for
+///         lockPeriod seconds in the owner's locked balance. The owner may call
+///         withdraw() at any time to collect all matured entries.
 ///
 ///         Acknowledge
 ///         -----------
 ///         Each app has an ackVersion counter. Users acknowledge a specific version;
 ///         their acknowledgement becomes stale whenever the counter increments.
-///         updateApp and updateNode both increment the counter (code or node changed).
-///         addNode and removeNode do not (cluster trust is maintained by inter-node RA).
+///         updateApp, updateNode, addNode, and replaceNode all increment the counter.
+///         removeNode does not (shrinking the cluster does not increase trust risk).
 ///
 ///         Off-chain workflow:
 ///           1. Read app info + node list via getAppInfo / getNodeList.
@@ -33,9 +34,6 @@ pragma solidity ^0.8.24;
 ///           3. Submit evidence to an RA service; confirm the returned signerAddress
 ///              and codeHash match on-chain values.
 ///           4. Call acknowledgeApp(appId) to record acknowledgement on-chain.
-///
-///         Future: extend acknowledgeApp to accept evidence + RA-service signature
-///         for fully on-chain automated remote attestation.
 contract TappRegistry {
 
     // ─── Structs ──────────────────────────────────────────────────────────────
@@ -58,9 +56,9 @@ contract TappRegistry {
         uint256 stakeAmount;
     }
 
-    struct UnstakeRequest {
+    struct LockedEntry {
         uint256 amount;
-        /// @dev Timestamp after which the owner may withdraw
+        /// @dev Timestamp after which the owner may withdraw this entry
         uint256 unlockAt;
     }
 
@@ -74,15 +72,15 @@ contract TappRegistry {
     mapping(string => AppInfo) private _apps;
     // slot 2 — appId => signerAddress => NodeInfo (addedAt==0 means node does not exist)
     mapping(string => mapping(address => NodeInfo)) private _nodes;
-    // slot 3 — append-only; includes removed nodes
+    // slot 3 — active node list; entries are removed when a node is removed
     mapping(string => address[]) private _nodeList;
-    // slot 4 — appId => signerAddress => pending UnstakeRequest
-    mapping(string => mapping(address => UnstakeRequest)) private _nodeUnstakeReqs;
+    // slot 4 — owner => locked stake entries pending withdrawal
+    mapping(address => LockedEntry[]) private _lockedBalance;
     // slot 5 — user => appId => ackVersion at time of acknowledgement (0 = never acked)
     mapping(address => mapping(string => uint256)) private _acks;
     // slot 6
     mapping(string => uint256) private _ackCounts;
-    // slot 7 — incremented by updateApp / updateNode; invalidates all prior acks
+    // slot 7 — incremented by updateApp / updateNode / addNode / replaceNode
     mapping(string => uint256) private _appAckVersions;
 
     // slot 8
@@ -97,12 +95,14 @@ contract TappRegistry {
 
     // ─── Events ───────────────────────────────────────────────────────────────
 
-    event AppRegistered(string indexed appId, address indexed owner);
-    event AppUpdated(string indexed appId, uint256 newAckVersion);
-    event NodeAdded(string indexed appId, address indexed signerAddress, uint256 stakeAmount);
-    event NodeUpdated(string indexed appId, address indexed signerAddress, uint256 newAckVersion);
-    event NodeRemoved(string indexed appId, address indexed signerAddress, uint256 unlockAt);
-    event NodeStakeWithdrawn(string indexed appId, address indexed signerAddress, uint256 amount);
+    event AppRegistered(string indexed appId, address indexed owner, bytes composeHash, bytes volumesHash, bytes[] imageHashes);
+    event AppUpdated(string indexed appId, uint256 newAckVersion, bytes composeHash, bytes volumesHash, bytes[] imageHashes);
+    event AppUnregistered(string indexed appId, address indexed owner);
+    /// @dev oldSigner==0 means add, newSigner==0 means remove, both non-zero means replace.
+    ///      stakeAmount and unlockAt are only set on add/remove; zero for replace.
+    ///      newAckVersion is non-zero for add/replace (ack invalidated); zero for remove.
+    event NodeUpdated(string indexed appId, address indexed oldSigner, address indexed newSigner, uint256 stakeAmount, uint256 unlockAt, uint256 newAckVersion);
+    event StakeWithdrawn(address indexed owner, uint256 amount);
     event AppAcknowledged(string indexed appId, address indexed user, uint256 ackVersion);
     event MinStakeUpdated(uint256 oldAmount, uint256 newAmount);
     event LockPeriodUpdated(uint256 oldPeriod, uint256 newPeriod);
@@ -196,9 +196,9 @@ contract TappRegistry {
             registeredAt: block.timestamp
         });
 
-        _addNode(appId, firstSignerAddress, firstTeeUrl, msg.value);
+        _addNode(appId, firstSignerAddress, firstTeeUrl, msg.value, 0);
 
-        emit AppRegistered(appId, msg.sender);
+        emit AppRegistered(appId, msg.sender, composeHash, volumesHash, imageHashes);
     }
 
     /// @notice Update the shared code metadata for an app (e.g. after re-deployment).
@@ -209,87 +209,120 @@ contract TappRegistry {
         bytes   calldata volumesHash,
         bytes[] calldata imageHashes
     ) external onlyAppOwner(appId) {
-        require(_apps[appId].owner != address(0), "app not found");
-
         AppInfo storage app = _apps[appId];
         app.composeHash = composeHash;
         app.volumesHash = volumesHash;
         app.imageHashes = imageHashes;
 
         uint256 newVersion = ++_appAckVersions[appId];
-        emit AppUpdated(appId, newVersion);
+        emit AppUpdated(appId, newVersion, composeHash, volumesHash, imageHashes);
     }
 
     // ─── Nodes ────────────────────────────────────────────────────────────────
 
     /// @notice Add a node to an existing app. Only the app owner may add nodes.
     ///         msg.value is the stake for this node (>= minStakeAmount).
-    ///         Does NOT invalidate existing acknowledgements (new node is trusted
-    ///         via inter-node mutual RA).
+    ///         Increments ackVersion because a new cluster member changes trust assumptions.
     function addNode(
         string  calldata appId,
         address          signerAddress,
         string  calldata teeUrl
     ) external payable onlyAppOwner(appId) {
-        require(_apps[appId].owner != address(0), "app not found");
         require(msg.value >= minStakeAmount, "insufficient stake");
         require(_nodes[appId][signerAddress].addedAt == 0, "node already exists");
 
-        _addNode(appId, signerAddress, teeUrl, msg.value);
+        uint256 newVersion = ++_appAckVersions[appId];
+        _addNode(appId, signerAddress, teeUrl, msg.value, newVersion);
     }
 
-    /// @notice Update a node's evidence URL (e.g. after an endpoint change).
-    ///         Increments ackVersion, invalidating all prior acknowledgements.
+    /// @notice Update a node: replace signer address and teeUrl atomically.
+    ///         Stake transfers from oldSigner to newSigner — no lock period.
+    ///         Increments ackVersion because cluster membership changed.
+    ///         Only the app owner may call this.
     function updateNode(
         string  calldata appId,
-        address          signerAddress,
+        address          oldSigner,
+        address          newSigner,
         string  calldata teeUrl
     ) external onlyAppOwner(appId) {
-        NodeInfo storage node = _nodes[appId][signerAddress];
-        require(node.addedAt != 0, "node not found");
-        require(_nodeUnstakeReqs[appId][signerAddress].unlockAt == 0, "node being removed");
+        NodeInfo storage oldNode = _nodes[appId][oldSigner];
+        require(oldNode.addedAt != 0, "old node not found");
+        require(_nodes[appId][newSigner].addedAt == 0, "new signer already exists");
 
-        node.teeUrl = teeUrl;
+        uint256 stake = oldNode.stakeAmount;
 
+        // Remove old node
+        delete _nodes[appId][oldSigner];
+        address[] storage list = _nodeList[appId];
+        for (uint256 i = 0; i < list.length; i++) {
+            if (list[i] == oldSigner) {
+                list[i] = list[list.length - 1];
+                list.pop();
+                break;
+            }
+        }
+
+        // Add new node with transferred stake
         uint256 newVersion = ++_appAckVersions[appId];
-        emit NodeUpdated(appId, signerAddress, newVersion);
+        _addNode(appId, newSigner, teeUrl, stake, newVersion);
     }
 
-    /// @notice Remove a node and start the stake lock period.
+    /// @notice Remove a node. Stake is locked for lockPeriod seconds in the owner's
+    ///         locked balance. If this was the last node, the app is unregistered.
     ///         Only the app owner may remove nodes.
-    ///         Does NOT invalidate existing acknowledgements.
     function removeNode(
         string  calldata appId,
         address          signerAddress
     ) external onlyAppOwner(appId) {
         NodeInfo storage node = _nodes[appId][signerAddress];
         require(node.addedAt != 0, "node not found");
-        require(_nodeUnstakeReqs[appId][signerAddress].unlockAt == 0, "removal already pending");
 
+        address owner    = _apps[appId].owner;
+        uint256 stake    = node.stakeAmount;
         uint256 unlockAt = block.timestamp + lockPeriod;
-        _nodeUnstakeReqs[appId][signerAddress] = UnstakeRequest({
-            amount:   node.stakeAmount,
-            unlockAt: unlockAt
-        });
-        node.stakeAmount = 0; // prevent double-removal
 
-        emit NodeRemoved(appId, signerAddress, unlockAt);
+        // Lock stake in owner's balance
+        _lockedBalance[owner].push(LockedEntry({amount: stake, unlockAt: unlockAt}));
+
+        // Remove node from active set
+        delete _nodes[appId][signerAddress];
+        address[] storage list = _nodeList[appId];
+        for (uint256 i = 0; i < list.length; i++) {
+            if (list[i] == signerAddress) {
+                list[i] = list[list.length - 1];
+                list.pop();
+                break;
+            }
+        }
+
+        emit NodeUpdated(appId, signerAddress, address(0), stake, unlockAt, 0);
+
+        // If last node, unregister the app
+        if (list.length == 0) {
+            delete _apps[appId];
+            delete _appAckVersions[appId];
+            emit AppUnregistered(appId, owner);
+        }
     }
 
-    /// @notice Withdraw a removed node's stake after the lock period elapses.
-    function withdrawNodeStake(
-        string  calldata appId,
-        address          signerAddress
-    ) external nonReentrant onlyAppOwner(appId) {
-        UnstakeRequest memory req = _nodeUnstakeReqs[appId][signerAddress];
-        require(req.unlockAt != 0, "no unstake request");
-        require(block.timestamp >= req.unlockAt, "stake still locked");
-
-        delete _nodeUnstakeReqs[appId][signerAddress];
-        (bool ok,) = msg.sender.call{value: req.amount}("");
+    /// @notice Withdraw all matured locked stake entries for the caller.
+    function withdraw() external nonReentrant {
+        LockedEntry[] storage entries = _lockedBalance[msg.sender];
+        uint256 total = 0;
+        uint256 i = 0;
+        while (i < entries.length) {
+            if (block.timestamp >= entries[i].unlockAt) {
+                total += entries[i].amount;
+                entries[i] = entries[entries.length - 1];
+                entries.pop();
+            } else {
+                i++;
+            }
+        }
+        require(total > 0, "nothing to withdraw");
+        (bool ok,) = msg.sender.call{value: total}("");
         require(ok, "transfer failed");
-
-        emit NodeStakeWithdrawn(appId, signerAddress, req.amount);
+        emit StakeWithdrawn(msg.sender, total);
     }
 
     // ─── Acknowledge ──────────────────────────────────────────────────────────
@@ -329,17 +362,14 @@ contract TappRegistry {
         return _nodes[appId][signerAddress];
     }
 
-    /// @notice All signer addresses ever added to the app (including removed ones).
-    ///         A removed node has stakeAmount==0 and a pending UnstakeRequest.
+    /// @notice Active node list. Entries are removed immediately when a node is removed.
     function getNodeList(string calldata appId) external view returns (address[] memory) {
         return _nodeList[appId];
     }
 
-    function getNodeUnstakeRequest(
-        string  calldata appId,
-        address          signerAddress
-    ) external view returns (UnstakeRequest memory) {
-        return _nodeUnstakeReqs[appId][signerAddress];
+    /// @notice All locked stake entries for an owner.
+    function getLockedBalance(address owner) external view returns (LockedEntry[] memory) {
+        return _lockedBalance[owner];
     }
 
     /// @notice Returns true if the user has acknowledged the current app version.
@@ -359,7 +389,8 @@ contract TappRegistry {
         string  memory appId,
         address        signerAddress,
         string  memory teeUrl,
-        uint256        stakeAmount
+        uint256        stakeAmount,
+        uint256        newAckVersion
     ) internal {
         _nodes[appId][signerAddress] = NodeInfo({
             teeUrl:      teeUrl,
@@ -368,6 +399,6 @@ contract TappRegistry {
         });
         _nodeList[appId].push(signerAddress);
 
-        emit NodeAdded(appId, signerAddress, stakeAmount);
+        emit NodeUpdated(appId, address(0), signerAddress, stakeAmount, 0, newAckVersion);
     }
 }

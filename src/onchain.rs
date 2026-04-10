@@ -239,6 +239,32 @@ pub async fn add_node(
     send_tx(&params.rpc_url, &params.private_key, params.contract_address()?, data, stake_wei).await
 }
 
+/// updateNode(string,address,address,string)
+pub async fn update_node(
+    params: &OnchainParams,
+    app_id: &str,
+    old_signer: Address,
+    new_signer: Address,
+    tee_url: String,
+) -> Result<TxHash> {
+    let data = calldata(
+        "updateNode(string,address,address,string)",
+        vec![
+            Token::String(app_id.to_owned()),
+            Token::Address(old_signer),
+            Token::Address(new_signer),
+            Token::String(tee_url),
+        ],
+    );
+    send_tx(&params.rpc_url, &params.private_key, params.contract_address()?, data, U256::zero()).await
+}
+
+/// withdraw()
+pub async fn withdraw(params: &OnchainParams) -> Result<TxHash> {
+    let data = selector("withdraw()").to_vec();
+    send_tx(&params.rpc_url, &params.private_key, params.contract_address()?, data, U256::zero()).await
+}
+
 /// removeNode(string,address)
 pub async fn remove_node(
     params: &OnchainParams,
@@ -255,18 +281,3 @@ pub async fn remove_node(
     send_tx(&params.rpc_url, &params.private_key, params.contract_address()?, data, U256::zero()).await
 }
 
-/// withdrawNodeStake(string,address)
-pub async fn withdraw_node_stake(
-    params: &OnchainParams,
-    app_id: &str,
-    signer_address: Address,
-) -> Result<TxHash> {
-    let data = calldata(
-        "withdrawNodeStake(string,address)",
-        vec![
-            Token::String(app_id.to_owned()),
-            Token::Address(signer_address),
-        ],
-    );
-    send_tx(&params.rpc_url, &params.private_key, params.contract_address()?, data, U256::zero()).await
-}

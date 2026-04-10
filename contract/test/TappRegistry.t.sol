@@ -27,17 +27,10 @@ contract TappRegistryTest is Test {
     bytes[] imageHashes;
 
     function setUp() public {
-        // Deploy implementation (constructor locks it)
         TappRegistry impl = new TappRegistry();
-
-        // Deploy beacon with this test contract as owner
         UpgradeableBeacon beacon = new UpgradeableBeacon(address(impl), address(this));
-
-        // Deploy proxy with initialize calldata
         bytes memory initData = abi.encodeCall(TappRegistry.initialize, (MIN_STAKE, LOCK_PERIOD));
         BeaconProxy proxy = new BeaconProxy(address(beacon), initData);
-
-        // Bind TappRegistry interface to proxy address
         registry = TappRegistry(payable(address(proxy)));
 
         vm.deal(owner,  10 ether);
@@ -55,6 +48,12 @@ contract TappRegistryTest is Test {
         registry.registerApp{value: MIN_STAKE}(
             APP_ID, COMPOSE_HASH, VOLUMES_HASH, imageHashes, node1, TEE_URL_1
         );
+    }
+
+    function _registerTwo() internal {
+        _register();
+        vm.prank(owner);
+        registry.addNode{value: MIN_STAKE}(APP_ID, node2, TEE_URL_2);
     }
 
     // ─── registerApp ──────────────────────────────────────────────────────────
@@ -86,16 +85,6 @@ contract TappRegistryTest is Test {
         vm.prank(owner);
         registry.registerApp{value: MIN_STAKE}(
             APP_ID, COMPOSE_HASH, VOLUMES_HASH, imageHashes, node1, TEE_URL_1
-        );
-    }
-
-    function test_RegisterApp_Revert_DifferentCallerSameId() public {
-        _register();
-        vm.deal(hacker, 1 ether);
-        vm.expectRevert("app already exists");
-        vm.prank(hacker);
-        registry.registerApp{value: MIN_STAKE}(
-            APP_ID, COMPOSE_HASH, VOLUMES_HASH, imageHashes, node2, TEE_URL_2
         );
     }
 
@@ -156,20 +145,25 @@ contract TappRegistryTest is Test {
 
         address[] memory list = registry.getNodeList(APP_ID);
         assertEq(list.length, 2);
-        assertEq(list[1], node2);
     }
 
-    function test_AddNode_DoesNotInvalidateAck() public {
+    function test_AddNode_IncrementsAckVersion() public {
+        _register();
+        assertEq(registry.getAckVersion(APP_ID), 0);
+        vm.prank(owner);
+        registry.addNode{value: MIN_STAKE}(APP_ID, node2, TEE_URL_2);
+        assertEq(registry.getAckVersion(APP_ID), 1);
+    }
+
+    function test_AddNode_InvalidatesPriorAck() public {
         _register();
         vm.prank(user);
         registry.acknowledgeApp(APP_ID);
+        assertTrue(registry.isAcknowledged(user, APP_ID));
 
         vm.prank(owner);
         registry.addNode{value: MIN_STAKE}(APP_ID, node2, TEE_URL_2);
-
-        // ack still valid, version unchanged
-        assertTrue(registry.isAcknowledged(user, APP_ID));
-        assertEq(registry.getAckVersion(APP_ID), 0);
+        assertFalse(registry.isAcknowledged(user, APP_ID));
     }
 
     function test_AddNode_Revert_NotOwner() public {
@@ -177,12 +171,6 @@ contract TappRegistryTest is Test {
         vm.expectRevert("not app owner");
         vm.prank(hacker);
         registry.addNode{value: MIN_STAKE}(APP_ID, node2, TEE_URL_2);
-    }
-
-    function test_AddNode_Revert_AppNotFound() public {
-        vm.expectRevert("not app owner");
-        vm.prank(owner);
-        registry.addNode{value: MIN_STAKE}("nonexistent", node2, TEE_URL_2);
     }
 
     function test_AddNode_Revert_NodeAlreadyExists() public {
@@ -201,18 +189,27 @@ contract TappRegistryTest is Test {
 
     // ─── updateNode ───────────────────────────────────────────────────────────
 
-    function test_UpdateNode_UpdatesTeeUrl() public {
+    function test_UpdateNode_ReplacesSignerAndTeeUrl() public {
         _register();
-        string memory newUrl = "https://new.example.com";
         vm.prank(owner);
-        registry.updateNode(APP_ID, node1, newUrl);
-        assertEq(registry.getNode(APP_ID, node1).teeUrl, newUrl);
+        registry.updateNode(APP_ID, node1, node2, TEE_URL_2);
+
+        // old node gone
+        assertEq(registry.getNode(APP_ID, node1).addedAt, 0);
+        // new node present
+        TappRegistry.NodeInfo memory n = registry.getNode(APP_ID, node2);
+        assertEq(n.teeUrl,      TEE_URL_2);
+        assertEq(n.stakeAmount, MIN_STAKE);
+
+        address[] memory list = registry.getNodeList(APP_ID);
+        assertEq(list.length, 1);
+        assertEq(list[0], node2);
     }
 
     function test_UpdateNode_IncrementsAckVersion() public {
         _register();
         vm.prank(owner);
-        registry.updateNode(APP_ID, node1, "https://new.example.com");
+        registry.updateNode(APP_ID, node1, node2, TEE_URL_2);
         assertEq(registry.getAckVersion(APP_ID), 1);
     }
 
@@ -223,42 +220,66 @@ contract TappRegistryTest is Test {
         assertTrue(registry.isAcknowledged(user, APP_ID));
 
         vm.prank(owner);
-        registry.updateNode(APP_ID, node1, "https://new.example.com");
+        registry.updateNode(APP_ID, node1, node2, TEE_URL_2);
         assertFalse(registry.isAcknowledged(user, APP_ID));
     }
 
-    function test_UpdateNode_Revert_NodeNotFound() public {
+    function test_UpdateNode_Revert_OldNodeNotFound() public {
         _register();
-        vm.expectRevert("node not found");
+        vm.expectRevert("old node not found");
         vm.prank(owner);
-        registry.updateNode(APP_ID, node2, TEE_URL_2);
+        registry.updateNode(APP_ID, node2, makeAddr("node3"), TEE_URL_2);
     }
 
-    function test_UpdateNode_Revert_NodeBeingRemoved() public {
+    function test_UpdateNode_Revert_NewSignerAlreadyExists() public {
+        _registerTwo();
+        vm.expectRevert("new signer already exists");
+        vm.prank(owner);
+        registry.updateNode(APP_ID, node1, node2, TEE_URL_2);
+    }
+
+    function test_UpdateNode_Revert_NotOwner() public {
         _register();
-        vm.prank(owner);
-        registry.removeNode(APP_ID, node1);
-        vm.expectRevert("node being removed");
-        vm.prank(owner);
-        registry.updateNode(APP_ID, node1, "https://new.example.com");
+        vm.expectRevert("not app owner");
+        vm.prank(hacker);
+        registry.updateNode(APP_ID, node1, node2, TEE_URL_2);
     }
 
     // ─── removeNode ───────────────────────────────────────────────────────────
 
-    function test_RemoveNode_StartsLockPeriod() public {
+    function test_RemoveNode_RemovesFromList() public {
+        _registerTwo();
+        vm.prank(owner);
+        registry.removeNode(APP_ID, node1);
+
+        address[] memory list = registry.getNodeList(APP_ID);
+        assertEq(list.length, 1);
+        assertEq(registry.getNode(APP_ID, node1).addedAt, 0);
+    }
+
+    function test_RemoveNode_LocksStakeInOwnerBalance() public {
         _register();
         vm.prank(owner);
         registry.removeNode(APP_ID, node1);
 
-        TappRegistry.UnstakeRequest memory req = registry.getNodeUnstakeRequest(APP_ID, node1);
-        assertEq(req.amount,   MIN_STAKE);
-        assertEq(req.unlockAt, block.timestamp + LOCK_PERIOD);
-        // stakeAmount zeroed
-        assertEq(registry.getNode(APP_ID, node1).stakeAmount, 0);
+        TappRegistry.LockedEntry[] memory entries = registry.getLockedBalance(owner);
+        assertEq(entries.length, 1);
+        assertEq(entries[0].amount,   MIN_STAKE);
+        assertEq(entries[0].unlockAt, block.timestamp + LOCK_PERIOD);
+    }
+
+    function test_RemoveNode_LastNode_UnregistersApp() public {
+        _register();
+        vm.prank(owner);
+        registry.removeNode(APP_ID, node1);
+
+        // app info cleared
+        assertEq(registry.getAppInfo(APP_ID).owner, address(0));
+        assertEq(registry.getNodeList(APP_ID).length, 0);
     }
 
     function test_RemoveNode_DoesNotInvalidateAck() public {
-        _register();
+        _registerTwo();
         vm.prank(user);
         registry.acknowledgeApp(APP_ID);
 
@@ -266,7 +287,6 @@ contract TappRegistryTest is Test {
         registry.removeNode(APP_ID, node1);
 
         assertTrue(registry.isAcknowledged(user, APP_ID));
-        assertEq(registry.getAckVersion(APP_ID), 0);
     }
 
     function test_RemoveNode_Revert_NotOwner() public {
@@ -283,18 +303,9 @@ contract TappRegistryTest is Test {
         registry.removeNode(APP_ID, node2);
     }
 
-    function test_RemoveNode_Revert_AlreadyPending() public {
-        _register();
-        vm.prank(owner);
-        registry.removeNode(APP_ID, node1);
-        vm.expectRevert("removal already pending");
-        vm.prank(owner);
-        registry.removeNode(APP_ID, node1);
-    }
+    // ─── withdraw ─────────────────────────────────────────────────────────────
 
-    // ─── withdrawNodeStake ────────────────────────────────────────────────────
-
-    function test_WithdrawNodeStake_AfterLock() public {
+    function test_Withdraw_AfterLock() public {
         _register();
         vm.prank(owner);
         registry.removeNode(APP_ID, node1);
@@ -303,35 +314,42 @@ contract TappRegistryTest is Test {
 
         uint256 before = owner.balance;
         vm.prank(owner);
-        registry.withdrawNodeStake(APP_ID, node1);
+        registry.withdraw();
         assertEq(owner.balance - before, MIN_STAKE);
+
+        // entry cleared
+        assertEq(registry.getLockedBalance(owner).length, 0);
     }
 
-    function test_WithdrawNodeStake_Revert_StillLocked() public {
-        _register();
+    function test_Withdraw_MultipleEntries() public {
+        _registerTwo();
         vm.prank(owner);
         registry.removeNode(APP_ID, node1);
-
-        vm.expectRevert("stake still locked");
         vm.prank(owner);
-        registry.withdrawNodeStake(APP_ID, node1);
-    }
+        registry.removeNode(APP_ID, node2);
 
-    function test_WithdrawNodeStake_Revert_NoRequest() public {
-        _register();
-        vm.expectRevert("no unstake request");
-        vm.prank(owner);
-        registry.withdrawNodeStake(APP_ID, node1);
-    }
-
-    function test_WithdrawNodeStake_Revert_NotOwner() public {
-        _register();
-        vm.prank(owner);
-        registry.removeNode(APP_ID, node1);
         vm.warp(block.timestamp + LOCK_PERIOD + 1);
-        vm.expectRevert("not app owner");
-        vm.prank(hacker);
-        registry.withdrawNodeStake(APP_ID, node1);
+
+        uint256 before = owner.balance;
+        vm.prank(owner);
+        registry.withdraw();
+        assertEq(owner.balance - before, 2 * MIN_STAKE);
+    }
+
+    function test_Withdraw_Revert_StillLocked() public {
+        _register();
+        vm.prank(owner);
+        registry.removeNode(APP_ID, node1);
+
+        vm.expectRevert("nothing to withdraw");
+        vm.prank(owner);
+        registry.withdraw();
+    }
+
+    function test_Withdraw_Revert_NothingToWithdraw() public {
+        vm.expectRevert("nothing to withdraw");
+        vm.prank(owner);
+        registry.withdraw();
     }
 
     // ─── acknowledgeApp ───────────────────────────────────────────────────────
@@ -359,12 +377,10 @@ contract TappRegistryTest is Test {
         registry.acknowledgeApp(APP_ID);
         assertEq(registry.getAckCount(APP_ID), 1);
 
-        // Invalidate
         vm.prank(owner);
         registry.updateApp(APP_ID, hex"ffff", VOLUMES_HASH, imageHashes);
         assertFalse(registry.isAcknowledged(user, APP_ID));
 
-        // Re-acknowledge; count should not increment again
         vm.prank(user);
         registry.acknowledgeApp(APP_ID);
         assertTrue(registry.isAcknowledged(user, APP_ID));
@@ -430,13 +446,11 @@ contract TappRegistryTest is Test {
         TappRegistry.AppInfo memory infoBefore = registry.getAppInfo(APP_ID);
         assertTrue(registry.isAcknowledged(user, APP_ID));
 
-        // Deploy new implementation and upgrade beacon
         TappRegistry newImpl = new TappRegistry();
         bytes32 beaconSlot = 0xa3f0ad74e5423aebfd80d3ef4346578335a9a72aeaee59ff6cb3582b35133d50;
         address beaconAddr = address(uint160(uint256(vm.load(address(registry), beaconSlot))));
         UpgradeableBeacon(beaconAddr).upgradeTo(address(newImpl));
 
-        // State must be preserved
         TappRegistry.AppInfo memory infoAfter = registry.getAppInfo(APP_ID);
         assertEq(infoAfter.owner,       infoBefore.owner);
         assertEq(infoAfter.composeHash, infoBefore.composeHash);

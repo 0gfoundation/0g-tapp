@@ -302,11 +302,10 @@ message RetryConfigInfo {
 }
 
 message KbsConfigInfo {
-  string endpoint = 1;
+  repeated string node_urls = 1;
   int32 timeout_seconds = 2;
   bool cert_configured = 3;  // Whether custom CA cert is configured
   RetryConfigInfo retry = 4;
-  repeated string supported_key_types = 5;
 }
 
 message TappConfigInfo {
