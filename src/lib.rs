@@ -1432,10 +1432,11 @@ impl TappService for TappServiceImpl {
         let pubkey_uncompressed = [&[0x04u8], secp256k1_pubkey_64.as_slice()].concat();
         let pubkey_hex = hex::encode(&pubkey_uncompressed);
 
-        // Sign KMS request: "GetSecretResource:{timestamp}"
+        // Sign KMS request: EIP-191 personal_sign over "GetSecretResource:{timestamp}"
+        // (KMS server verifies via ecrecover, so signature must be 65-byte r||s||v).
         let timestamp = chrono::Utc::now().timestamp();
         let message = signature_auth::build_sign_message("GetSecretResource", timestamp);
-        let signature = app_key::sign_message(&private_key, message.as_bytes())
+        let signature = app_key::sign_message_eip191(&private_key, message.as_bytes())
             .map_err(|e| Status::internal(format!("Failed to sign KMS request: {}", e)))?;
         let signature_hex = hex::encode(&signature);
 

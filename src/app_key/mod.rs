@@ -197,6 +197,42 @@ pub fn sign_message(private_key: &[u8], message: &[u8]) -> TappResult<Vec<u8>> {
     Ok(signature.to_bytes().to_vec())
 }
 
+/// Sign a message using EIP-191 `personal_sign` format.
+/// Wraps the message with `"\x19Ethereum Signed Message:\n{len}"`, hashes with
+/// Keccak-256, and returns a 65-byte signature `r || s || v` where v is 0 or 1.
+pub fn sign_message_eip191(private_key: &[u8], message: &[u8]) -> TappResult<Vec<u8>> {
+    if private_key.len() != 32 {
+        return Err(DockerError::ContainerOperationFailed {
+            operation: "sign_message_eip191".to_string(),
+            reason: format!("Private key must be 32 bytes, got {}", private_key.len()),
+        }
+        .into());
+    }
+
+    let prefix = format!("\x19Ethereum Signed Message:\n{}", message.len());
+    let mut prefixed = Vec::with_capacity(prefix.len() + message.len());
+    prefixed.extend_from_slice(prefix.as_bytes());
+    prefixed.extend_from_slice(message);
+    let hash = Keccak256::digest(&prefixed);
+
+    let signing_key =
+        SigningKey::from_slice(private_key).map_err(|e| DockerError::ContainerOperationFailed {
+            operation: "sign_message_eip191".to_string(),
+            reason: format!("Invalid private key: {}", e),
+        })?;
+
+    let (sig, rid) = signing_key.sign_prehash_recoverable(&hash).map_err(|e| {
+        DockerError::ContainerOperationFailed {
+            operation: "sign_message_eip191".to_string(),
+            reason: format!("Sign failed: {}", e),
+        }
+    })?;
+
+    let mut out = sig.to_bytes().to_vec();
+    out.push(rid.to_byte());
+    Ok(out)
+}
+
 /// Verify a signature using a public key
 pub fn verify_signature(public_key: &[u8], message: &[u8], signature: &[u8]) -> TappResult<bool> {
     if public_key.len() != 64 {
