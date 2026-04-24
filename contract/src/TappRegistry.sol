@@ -80,7 +80,7 @@ contract TappRegistry {
     mapping(address => mapping(string => uint256)) private _acks;
     // slot 6
     mapping(string => uint256) private _ackCounts;
-    // slot 7 — incremented by updateApp / updateNode / addNode / replaceNode
+    // slot 7 — incremented by registerApp / updateApp / addNode / updateNode / removeNode(last)
     mapping(string => uint256) private _appAckVersions;
 
     // slot 8
@@ -196,6 +196,7 @@ contract TappRegistry {
             registeredAt: block.timestamp
         });
 
+        ++_appAckVersions[appId];
         _addNode(appId, firstSignerAddress, firstTeeUrl, msg.value, 0);
 
         emit AppRegistered(appId, msg.sender, composeHash, volumesHash, imageHashes);
@@ -235,9 +236,9 @@ contract TappRegistry {
         _addNode(appId, signerAddress, teeUrl, msg.value, newVersion);
     }
 
-    /// @notice Update a node: replace signer address and teeUrl atomically.
-    ///         Stake transfers from oldSigner to newSigner — no lock period.
-    ///         Increments ackVersion because cluster membership changed.
+    /// @notice Update a node's signer address and/or teeUrl.
+    ///         Requires the old node to exist; applies new values unconditionally.
+    ///         Stake carries over. Always increments ackVersion.
     ///         Only the app owner may call this.
     function updateNode(
         string  calldata appId,
@@ -245,26 +246,23 @@ contract TappRegistry {
         address          newSigner,
         string  calldata teeUrl
     ) external onlyAppOwner(appId) {
-        NodeInfo storage oldNode = _nodes[appId][oldSigner];
-        require(oldNode.addedAt != 0, "old node not found");
+        require(_nodes[appId][oldSigner].addedAt != 0, "old node not found");
         require(_nodes[appId][newSigner].addedAt == 0, "new signer already exists");
 
-        uint256 stake = oldNode.stakeAmount;
+        uint256 stake = _nodes[appId][oldSigner].stakeAmount;
 
-        // Remove old node
-        delete _nodes[appId][oldSigner];
+        // Replace signer in nodeList (no-op if same)
         address[] storage list = _nodeList[appId];
         for (uint256 i = 0; i < list.length; i++) {
-            if (list[i] == oldSigner) {
-                list[i] = list[list.length - 1];
-                list.pop();
-                break;
-            }
+            if (list[i] == oldSigner) { list[i] = newSigner; break; }
         }
 
-        // Add new node with transferred stake
+        // Replace node entry
+        delete _nodes[appId][oldSigner];
+        _nodes[appId][newSigner] = NodeInfo({teeUrl: teeUrl, addedAt: block.timestamp, stakeAmount: stake});
+
         uint256 newVersion = ++_appAckVersions[appId];
-        _addNode(appId, newSigner, teeUrl, stake, newVersion);
+        emit NodeUpdated(appId, oldSigner, newSigner, 0, 0, newVersion);
     }
 
     /// @notice Remove a node. Stake is locked for lockPeriod seconds in the owner's
@@ -300,7 +298,7 @@ contract TappRegistry {
         // If last node, unregister the app
         if (list.length == 0) {
             delete _apps[appId];
-            delete _appAckVersions[appId];
+            ++_appAckVersions[appId];
             emit AppUnregistered(appId, owner);
         }
     }
