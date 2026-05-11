@@ -176,7 +176,16 @@ impl TappService for TappServiceImpl {
         info!("Calling GetEvidence");
         debug!("Request: {:?}", request);
         let req = request.into_inner();
-        let evidence = self.boot_service.get_evidence(req).await?;
+        // Use the app signer (TEE-derived ethereum address) as report_data so the
+        // attestation binds to the on-chain registered signer.
+        let key_pair = self
+            .app_key_service
+            .get_app_key(&req.app_id, "ethereum", false)
+            .await?;
+        let evidence = self
+            .boot_service
+            .get_evidence(req, &key_pair.eth_address)
+            .await?;
         Ok(Response::new(evidence))
     }
 

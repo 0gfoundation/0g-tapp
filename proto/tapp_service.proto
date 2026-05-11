@@ -200,8 +200,8 @@ message ListAppMeasurementsResponse {
 // Get Evidence Messages
 message GetEvidenceRequest {
   string app_id = 1;  // Application identifier
-                      // The EVM address (owner) of the app will be
-                      // automatically used as report_data
+                      // The TEE-derived signer EVM address of the app will
+                      // be automatically used as report_data
 }
 
 message GetEvidenceResponse {
