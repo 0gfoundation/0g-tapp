@@ -90,8 +90,11 @@ contract TappRegistry {
     // slot 10 — node stake lock period after removeNode, in seconds
     uint256 public lockPeriod;
 
-    // slots 11–59: reserved for future upgrades
-    uint256[49] private __gap;
+    // slot 11 — appId => contract => is authorized to call invalidateAcks
+    mapping(string => mapping(address => bool)) private _authorizedInvalidators;
+
+    // slots 12–59: reserved for future upgrades
+    uint256[48] private __gap;
 
     // ─── Events ───────────────────────────────────────────────────────────────
 
@@ -100,10 +103,15 @@ contract TappRegistry {
     event AppUnregistered(string indexed appId, address indexed owner);
     /// @dev oldSigner==0 means add, newSigner==0 means remove, both non-zero means replace.
     ///      stakeAmount and unlockAt are only set on add/remove; zero for replace.
-    ///      newAckVersion is non-zero for add/replace (ack invalidated); zero for remove.
+    ///      newAckVersion is non-zero whenever the ack version was bumped by this call
+    ///      (add, replace, or remove of the last node); zero for non-last-node removes.
     event NodeUpdated(string indexed appId, address indexed oldSigner, address indexed newSigner, uint256 stakeAmount, uint256 unlockAt, uint256 newAckVersion);
     event StakeWithdrawn(address indexed owner, uint256 amount);
     event AppAcknowledged(string indexed appId, address indexed user, uint256 ackVersion);
+    event AppAcknowledgementRevoked(string indexed appId, address indexed user);
+    event InvalidatorAuthorized(string indexed appId, address indexed invalidator);
+    event InvalidatorRevoked(string indexed appId, address indexed invalidator);
+    event AcksInvalidated(string indexed appId, address indexed invalidator, uint256 newAckVersion);
     event MinStakeUpdated(uint256 oldAmount, uint256 newAmount);
     event LockPeriodUpdated(uint256 oldPeriod, uint256 newPeriod);
     event AdminTransferred(address indexed previousAdmin, address indexed newAdmin);
@@ -239,6 +247,7 @@ contract TappRegistry {
     /// @notice Update a node's signer address and/or teeUrl.
     ///         Requires the old node to exist; applies new values unconditionally.
     ///         Stake carries over. Always increments ackVersion.
+    ///         Pass newSigner == oldSigner to update only the teeUrl.
     ///         Only the app owner may call this.
     function updateNode(
         string  calldata appId,
@@ -246,19 +255,22 @@ contract TappRegistry {
         address          newSigner,
         string  calldata teeUrl
     ) external onlyAppOwner(appId) {
+        require(newSigner != address(0), "zero signer address");
         require(_nodes[appId][oldSigner].addedAt != 0, "old node not found");
-        require(_nodes[appId][newSigner].addedAt == 0, "new signer already exists");
+        require(
+            newSigner == oldSigner || _nodes[appId][newSigner].addedAt == 0,
+            "new signer already exists"
+        );
 
         uint256 stake = _nodes[appId][oldSigner].stakeAmount;
 
-        // Replace signer in nodeList (no-op if same)
-        address[] storage list = _nodeList[appId];
-        for (uint256 i = 0; i < list.length; i++) {
-            if (list[i] == oldSigner) { list[i] = newSigner; break; }
+        if (newSigner != oldSigner) {
+            address[] storage list = _nodeList[appId];
+            for (uint256 i = 0; i < list.length; i++) {
+                if (list[i] == oldSigner) { list[i] = newSigner; break; }
+            }
+            delete _nodes[appId][oldSigner];
         }
-
-        // Replace node entry
-        delete _nodes[appId][oldSigner];
         _nodes[appId][newSigner] = NodeInfo({teeUrl: teeUrl, addedAt: block.timestamp, stakeAmount: stake});
 
         uint256 newVersion = ++_appAckVersions[appId];
@@ -293,12 +305,17 @@ contract TappRegistry {
             }
         }
 
-        emit NodeUpdated(appId, signerAddress, address(0), stake, unlockAt, 0);
-
-        // If last node, unregister the app
+        // If last node, unregister the app and bump ackVersion before emitting,
+        // so NodeUpdated reflects the real post-bump version.
+        uint256 newAckVersion = 0;
         if (list.length == 0) {
             delete _apps[appId];
-            ++_appAckVersions[appId];
+            newAckVersion = ++_appAckVersions[appId];
+        }
+
+        emit NodeUpdated(appId, signerAddress, address(0), stake, unlockAt, newAckVersion);
+
+        if (newAckVersion != 0) {
             emit AppUnregistered(appId, owner);
         }
     }
@@ -327,20 +344,86 @@ contract TappRegistry {
 
     /// @notice Record that the caller has manually verified this app's TEE evidence.
     ///         Records the current ackVersion; becomes stale if updateApp or
-    ///         updateNode is called afterwards.
+    ///         updateNode is called afterwards. Idempotent: re-acking the same
+    ///         version is a no-op (no revert, no event).
     function acknowledgeApp(string calldata appId) external {
         require(_apps[appId].owner != address(0), "app not found");
 
         uint256 version = _appAckVersions[appId];
-        require(_acks[msg.sender][appId] != version + 1, "already acknowledged");
+        uint256 prior   = _acks[msg.sender][appId];
+        if (prior == version + 1) return;
 
         // Store version+1 so that version==0 (initial) is distinguishable from "never acked"
-        if (_acks[msg.sender][appId] == 0) {
+        if (prior == 0) {
             _ackCounts[appId]++;
         }
         _acks[msg.sender][appId] = version + 1;
 
         emit AppAcknowledged(appId, msg.sender, version);
+    }
+
+    /// @notice Withdraw the caller's acknowledgement for an app. After this,
+    ///         isAcknowledged(caller, appId) returns false until they ack again.
+    ///         No-op if the caller has no current ack.
+    function revokeAcknowledgement(string calldata appId) external {
+        uint256 prior = _acks[msg.sender][appId];
+        if (prior == 0) return;
+
+        delete _acks[msg.sender][appId];
+        if (_ackCounts[appId] > 0) {
+            _ackCounts[appId]--;
+        }
+
+        emit AppAcknowledgementRevoked(appId, msg.sender);
+    }
+
+    // ─── Invalidators ─────────────────────────────────────────────────────────
+    //
+    // Sibling contracts whose on-chain state is part of the dapp's user-facing
+    // surface (e.g. SandboxServing's prices) can be authorized by the app owner
+    // to bump _appAckVersions[appId]. This lets price/policy changes invalidate
+    // existing user acks without abusing updateApp (which is for code identity).
+
+    /// @notice Authorize a sibling contract to call invalidateAcks for this app.
+    ///         Only the app owner may authorize.
+    function authorizeInvalidator(string calldata appId, address invalidator)
+        external
+        onlyAppOwner(appId)
+    {
+        require(invalidator != address(0), "zero invalidator");
+        if (_authorizedInvalidators[appId][invalidator]) return;
+        _authorizedInvalidators[appId][invalidator] = true;
+        emit InvalidatorAuthorized(appId, invalidator);
+    }
+
+    /// @notice Revoke a previously-authorized invalidator.
+    ///         Only the app owner may revoke.
+    function revokeInvalidator(string calldata appId, address invalidator)
+        external
+        onlyAppOwner(appId)
+    {
+        if (!_authorizedInvalidators[appId][invalidator]) return;
+        delete _authorizedInvalidators[appId][invalidator];
+        emit InvalidatorRevoked(appId, invalidator);
+    }
+
+    /// @notice Bump the app's ackVersion, invalidating every existing user ack
+    ///         for this app. Callable only by an authorized invalidator.
+    function invalidateAcks(string calldata appId) external {
+        require(_apps[appId].owner != address(0), "app not found");
+        require(_authorizedInvalidators[appId][msg.sender], "not authorized");
+        uint256 newVersion = ++_appAckVersions[appId];
+        emit AcksInvalidated(appId, msg.sender, newVersion);
+    }
+
+    /// @notice Returns true if `invalidator` is currently authorized to call
+    ///         invalidateAcks for `appId`.
+    function isAuthorizedInvalidator(string calldata appId, address invalidator)
+        external
+        view
+        returns (bool)
+    {
+        return _authorizedInvalidators[appId][invalidator];
     }
 
     // ─── Views ────────────────────────────────────────────────────────────────
@@ -390,6 +473,7 @@ contract TappRegistry {
         uint256        stakeAmount,
         uint256        newAckVersion
     ) internal {
+        require(signerAddress != address(0), "zero signer address");
         _nodes[appId][signerAddress] = NodeInfo({
             teeUrl:      teeUrl,
             addedAt:     block.timestamp,

@@ -2,6 +2,7 @@
 pragma solidity ^0.8.24;
 
 import {Test, console} from "forge-std/Test.sol";
+import {Vm} from "forge-std/Vm.sol";
 import {TappRegistry} from "../src/TappRegistry.sol";
 import {UpgradeableBeacon} from "../src/proxy/UpgradeableBeacon.sol";
 import {BeaconProxy} from "../src/proxy/BeaconProxy.sol";
@@ -108,10 +109,10 @@ contract TappRegistryTest is Test {
 
     function test_UpdateApp_IncrementsAckVersion() public {
         _register();
-        assertEq(registry.getAckVersion(APP_ID), 0);
+        assertEq(registry.getAckVersion(APP_ID), 1);
         vm.prank(owner);
         registry.updateApp(APP_ID, COMPOSE_HASH, VOLUMES_HASH, imageHashes);
-        assertEq(registry.getAckVersion(APP_ID), 1);
+        assertEq(registry.getAckVersion(APP_ID), 2);
     }
 
     function test_UpdateApp_InvalidatesPriorAck() public {
@@ -149,10 +150,10 @@ contract TappRegistryTest is Test {
 
     function test_AddNode_IncrementsAckVersion() public {
         _register();
-        assertEq(registry.getAckVersion(APP_ID), 0);
+        assertEq(registry.getAckVersion(APP_ID), 1);
         vm.prank(owner);
         registry.addNode{value: MIN_STAKE}(APP_ID, node2, TEE_URL_2);
-        assertEq(registry.getAckVersion(APP_ID), 1);
+        assertEq(registry.getAckVersion(APP_ID), 2);
     }
 
     function test_AddNode_InvalidatesPriorAck() public {
@@ -210,7 +211,7 @@ contract TappRegistryTest is Test {
         _register();
         vm.prank(owner);
         registry.updateNode(APP_ID, node1, node2, TEE_URL_2);
-        assertEq(registry.getAckVersion(APP_ID), 1);
+        assertEq(registry.getAckVersion(APP_ID), 2);
     }
 
     function test_UpdateNode_InvalidatesPriorAck() public {
@@ -387,13 +388,17 @@ contract TappRegistryTest is Test {
         assertEq(registry.getAckCount(APP_ID), 1);
     }
 
-    function test_AcknowledgeApp_Revert_Duplicate() public {
+    function test_AcknowledgeApp_DuplicateIsNoop() public {
         _register();
         vm.prank(user);
         registry.acknowledgeApp(APP_ID);
-        vm.expectRevert("already acknowledged");
+        assertEq(registry.getAckCount(APP_ID), 1);
+
+        // re-acking the same version must not revert and must not double-count
         vm.prank(user);
         registry.acknowledgeApp(APP_ID);
+        assertEq(registry.getAckCount(APP_ID), 1);
+        assertTrue(registry.isAcknowledged(user, APP_ID));
     }
 
     function test_AcknowledgeApp_Revert_AppNotFound() public {
@@ -455,6 +460,192 @@ contract TappRegistryTest is Test {
         assertEq(infoAfter.owner,       infoBefore.owner);
         assertEq(infoAfter.composeHash, infoBefore.composeHash);
         assertTrue(registry.isAcknowledged(user, APP_ID));
+    }
+
+    // ─── revokeAcknowledgement ────────────────────────────────────────────────
+
+    function test_RevokeAcknowledgement_ClearsAck() public {
+        _register();
+        vm.prank(user);
+        registry.acknowledgeApp(APP_ID);
+        assertTrue(registry.isAcknowledged(user, APP_ID));
+        assertEq(registry.getAckCount(APP_ID), 1);
+
+        vm.prank(user);
+        registry.revokeAcknowledgement(APP_ID);
+
+        assertFalse(registry.isAcknowledged(user, APP_ID));
+        assertEq(registry.getAckCount(APP_ID), 0);
+    }
+
+    function test_RevokeAcknowledgement_Noop_WhenNeverAcked() public {
+        _register();
+        vm.prank(user);
+        registry.revokeAcknowledgement(APP_ID);   // must not revert, must not underflow ackCount
+        assertEq(registry.getAckCount(APP_ID), 0);
+    }
+
+    function test_RevokeAcknowledgement_AllowsReAck() public {
+        _register();
+        vm.prank(user);
+        registry.acknowledgeApp(APP_ID);
+        vm.prank(user);
+        registry.revokeAcknowledgement(APP_ID);
+
+        vm.prank(user);
+        registry.acknowledgeApp(APP_ID);
+        assertTrue(registry.isAcknowledged(user, APP_ID));
+        assertEq(registry.getAckCount(APP_ID), 1);
+    }
+
+    // ─── Invalidators ─────────────────────────────────────────────────────────
+
+    function test_Invalidator_Authorize_Then_InvalidateAcks() public {
+        _register();
+        address sibling = makeAddr("sibling");
+
+        vm.prank(owner);
+        registry.authorizeInvalidator(APP_ID, sibling);
+        assertTrue(registry.isAuthorizedInvalidator(APP_ID, sibling));
+
+        vm.prank(user);
+        registry.acknowledgeApp(APP_ID);
+        assertTrue(registry.isAcknowledged(user, APP_ID));
+
+        uint256 v0 = registry.getAckVersion(APP_ID);
+        vm.prank(sibling);
+        registry.invalidateAcks(APP_ID);
+        assertEq(registry.getAckVersion(APP_ID), v0 + 1);
+        assertFalse(registry.isAcknowledged(user, APP_ID));
+    }
+
+    function test_Invalidator_AuthorizeIdempotent() public {
+        _register();
+        address sibling = makeAddr("sibling");
+        vm.prank(owner);
+        registry.authorizeInvalidator(APP_ID, sibling);
+        vm.prank(owner);
+        registry.authorizeInvalidator(APP_ID, sibling);   // must not revert
+        assertTrue(registry.isAuthorizedInvalidator(APP_ID, sibling));
+    }
+
+    function test_Invalidator_Revoke_ThenInvalidateAcks_Reverts() public {
+        _register();
+        address sibling = makeAddr("sibling");
+        vm.prank(owner);
+        registry.authorizeInvalidator(APP_ID, sibling);
+        vm.prank(owner);
+        registry.revokeInvalidator(APP_ID, sibling);
+
+        assertFalse(registry.isAuthorizedInvalidator(APP_ID, sibling));
+        vm.expectRevert("not authorized");
+        vm.prank(sibling);
+        registry.invalidateAcks(APP_ID);
+    }
+
+    function test_Invalidator_Authorize_Revert_NotOwner() public {
+        _register();
+        vm.expectRevert("not app owner");
+        vm.prank(hacker);
+        registry.authorizeInvalidator(APP_ID, makeAddr("sibling"));
+    }
+
+    function test_Invalidator_Authorize_Revert_ZeroAddress() public {
+        _register();
+        vm.expectRevert("zero invalidator");
+        vm.prank(owner);
+        registry.authorizeInvalidator(APP_ID, address(0));
+    }
+
+    function test_Invalidator_InvalidateAcks_Revert_NotAuthorized() public {
+        _register();
+        vm.expectRevert("not authorized");
+        vm.prank(hacker);
+        registry.invalidateAcks(APP_ID);
+    }
+
+    function test_Invalidator_InvalidateAcks_Revert_AppNotFound() public {
+        vm.expectRevert("app not found");
+        vm.prank(makeAddr("sibling"));
+        registry.invalidateAcks("nonexistent");
+    }
+
+    // ─── Zero-address signer protection ───────────────────────────────────────
+
+    function test_RegisterApp_Revert_ZeroSigner() public {
+        vm.expectRevert("zero signer address");
+        vm.prank(owner);
+        registry.registerApp{value: MIN_STAKE}(
+            APP_ID, COMPOSE_HASH, VOLUMES_HASH, imageHashes, address(0), TEE_URL_1
+        );
+    }
+
+    function test_AddNode_Revert_ZeroSigner() public {
+        _register();
+        vm.expectRevert("zero signer address");
+        vm.prank(owner);
+        registry.addNode{value: MIN_STAKE}(APP_ID, address(0), TEE_URL_2);
+    }
+
+    function test_UpdateNode_Revert_ZeroNewSigner() public {
+        _register();
+        vm.expectRevert("zero signer address");
+        vm.prank(owner);
+        registry.updateNode(APP_ID, node1, address(0), TEE_URL_2);
+    }
+
+    // ─── updateNode same-signer URL update ────────────────────────────────────
+
+    function test_UpdateNode_SameSigner_UpdatesUrlOnly() public {
+        _register();
+        string memory newUrl = "https://node1.new.example.com";
+        vm.prank(owner);
+        registry.updateNode(APP_ID, node1, node1, newUrl);
+
+        TappRegistry.NodeInfo memory n = registry.getNode(APP_ID, node1);
+        assertEq(n.teeUrl,      newUrl);
+        assertEq(n.stakeAmount, MIN_STAKE);
+
+        address[] memory list = registry.getNodeList(APP_ID);
+        assertEq(list.length, 1);
+        assertEq(list[0], node1);
+    }
+
+    function test_UpdateNode_SameSigner_BumpsAckVersion() public {
+        _register();
+        vm.prank(user);
+        registry.acknowledgeApp(APP_ID);
+        assertTrue(registry.isAcknowledged(user, APP_ID));
+
+        vm.prank(owner);
+        registry.updateNode(APP_ID, node1, node1, "https://changed");
+        assertFalse(registry.isAcknowledged(user, APP_ID));
+    }
+
+    // ─── removeNode last-node event reports real version ─────────────────────
+
+    function test_RemoveNode_LastNode_NodeUpdatedReportsBumpedVersion() public {
+        _register();
+        uint256 v0 = registry.getAckVersion(APP_ID);
+
+        vm.recordLogs();
+        vm.prank(owner);
+        registry.removeNode(APP_ID, node1);
+
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        bytes32 sig = keccak256("NodeUpdated(string,address,address,uint256,uint256,uint256)");
+        uint256 reported;
+        bool found;
+        for (uint256 i = 0; i < logs.length; i++) {
+            if (logs[i].topics[0] == sig) {
+                (, , reported) = abi.decode(logs[i].data, (uint256, uint256, uint256));
+                found = true;
+                break;
+            }
+        }
+        assertTrue(found, "NodeUpdated not emitted");
+        assertEq(reported, v0 + 1);
+        assertEq(registry.getAckVersion(APP_ID), v0 + 1);
     }
 
     // ─── Fuzz ─────────────────────────────────────────────────────────────────
