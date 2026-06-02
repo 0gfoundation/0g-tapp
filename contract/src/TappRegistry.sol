@@ -347,6 +347,39 @@ contract TappRegistry {
     ///         updateNode is called afterwards. Idempotent: re-acking the same
     ///         version is a no-op (no revert, no event).
     function acknowledgeApp(string calldata appId) external {
+        _acknowledgeApp(appId);
+    }
+
+    /// @notice Batch version of acknowledgeApp. All-or-nothing: if any appId
+    ///         does not exist, the entire batch reverts. Per-app idempotency is
+    ///         preserved (re-acking the same version emits no event). Duplicates
+    ///         within the array are allowed; the second occurrence is a no-op.
+    function acknowledgeApps(string[] calldata appIds) external {
+        uint256 n = appIds.length;
+        for (uint256 i = 0; i < n; i++) {
+            _acknowledgeApp(appIds[i]);
+        }
+    }
+
+    /// @notice Withdraw the caller's acknowledgement for an app. After this,
+    ///         isAcknowledged(caller, appId) returns false until they ack again.
+    ///         No-op if the caller has no current ack.
+    function revokeAcknowledgement(string calldata appId) external {
+        _revokeAcknowledgement(appId);
+    }
+
+    /// @notice Batch version of revokeAcknowledgement. No-op per appId for which
+    ///         the caller has no current ack. Does not check that the apps exist
+    ///         (revoking against a stale or missing app is harmless and clears
+    ///         stale entries).
+    function revokeAcknowledgements(string[] calldata appIds) external {
+        uint256 n = appIds.length;
+        for (uint256 i = 0; i < n; i++) {
+            _revokeAcknowledgement(appIds[i]);
+        }
+    }
+
+    function _acknowledgeApp(string calldata appId) internal {
         require(_apps[appId].owner != address(0), "app not found");
 
         uint256 version = _appAckVersions[appId];
@@ -362,10 +395,7 @@ contract TappRegistry {
         emit AppAcknowledged(appId, msg.sender, version);
     }
 
-    /// @notice Withdraw the caller's acknowledgement for an app. After this,
-    ///         isAcknowledged(caller, appId) returns false until they ack again.
-    ///         No-op if the caller has no current ack.
-    function revokeAcknowledgement(string calldata appId) external {
+    function _revokeAcknowledgement(string calldata appId) internal {
         uint256 prior = _acks[msg.sender][appId];
         if (prior == 0) return;
 

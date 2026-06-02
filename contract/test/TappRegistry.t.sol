@@ -407,6 +407,88 @@ contract TappRegistryTest is Test {
         registry.acknowledgeApp(APP_ID);
     }
 
+    function test_AcknowledgeApps_BatchAcksAllListed() public {
+        _register();
+        string memory APP_ID_2 = "my-app-2";
+        vm.prank(owner);
+        registry.registerApp{value: MIN_STAKE}(
+            APP_ID_2, COMPOSE_HASH, VOLUMES_HASH, imageHashes, node2, TEE_URL_2
+        );
+
+        string[] memory ids = new string[](2);
+        ids[0] = APP_ID;
+        ids[1] = APP_ID_2;
+        vm.prank(user);
+        registry.acknowledgeApps(ids);
+
+        assertTrue(registry.isAcknowledged(user, APP_ID));
+        assertTrue(registry.isAcknowledged(user, APP_ID_2));
+        assertEq(registry.getAckCount(APP_ID), 1);
+        assertEq(registry.getAckCount(APP_ID_2), 1);
+    }
+
+    function test_AcknowledgeApps_Revert_AnyMissingRevertsBatch() public {
+        _register();
+
+        string[] memory ids = new string[](2);
+        ids[0] = APP_ID;
+        ids[1] = "does-not-exist";
+        vm.expectRevert("app not found");
+        vm.prank(user);
+        registry.acknowledgeApps(ids);
+
+        // The whole batch must have reverted — even the valid entry stays un-acked.
+        assertFalse(registry.isAcknowledged(user, APP_ID));
+        assertEq(registry.getAckCount(APP_ID), 0);
+    }
+
+    function test_AcknowledgeApps_DuplicatesWithinBatchAreNoop() public {
+        _register();
+
+        string[] memory ids = new string[](3);
+        ids[0] = APP_ID;
+        ids[1] = APP_ID;
+        ids[2] = APP_ID;
+        vm.prank(user);
+        registry.acknowledgeApps(ids);
+
+        assertTrue(registry.isAcknowledged(user, APP_ID));
+        assertEq(registry.getAckCount(APP_ID), 1);
+    }
+
+    function test_RevokeAcknowledgements_BatchRevokesAllListed() public {
+        _register();
+        string memory APP_ID_2 = "my-app-2";
+        vm.prank(owner);
+        registry.registerApp{value: MIN_STAKE}(
+            APP_ID_2, COMPOSE_HASH, VOLUMES_HASH, imageHashes, node2, TEE_URL_2
+        );
+
+        string[] memory ids = new string[](2);
+        ids[0] = APP_ID;
+        ids[1] = APP_ID_2;
+        vm.startPrank(user);
+        registry.acknowledgeApps(ids);
+        registry.revokeAcknowledgements(ids);
+        vm.stopPrank();
+
+        assertFalse(registry.isAcknowledged(user, APP_ID));
+        assertFalse(registry.isAcknowledged(user, APP_ID_2));
+        assertEq(registry.getAckCount(APP_ID), 0);
+        assertEq(registry.getAckCount(APP_ID_2), 0);
+    }
+
+    function test_BatchAck_EmptyArrayIsNoop() public {
+        _register();
+        string[] memory empty = new string[](0);
+        vm.startPrank(user);
+        registry.acknowledgeApps(empty);
+        registry.revokeAcknowledgements(empty);
+        vm.stopPrank();
+        assertFalse(registry.isAcknowledged(user, APP_ID));
+        assertEq(registry.getAckCount(APP_ID), 0);
+    }
+
     // ─── Admin ────────────────────────────────────────────────────────────────
 
     function test_SetMinStakeAmount() public {
