@@ -398,6 +398,46 @@ enum Commands {
         #[arg(short, long)]
         contract: String,
     },
+
+    /// Authorize a sibling contract to call invalidateAcks for this app.
+    /// Only the app owner may authorize. Idempotent: re-authorizing has no effect.
+    AuthorizeInvalidatorOnchain {
+        /// Application ID
+        #[arg(short, long)]
+        app_id: String,
+
+        /// Ethereum RPC URL
+        #[arg(short, long)]
+        rpc_url: String,
+
+        /// TappRegistry contract address (0x...)
+        #[arg(short, long)]
+        contract: String,
+
+        /// Invalidator address to authorize (0x...; typically a sibling contract)
+        #[arg(short, long)]
+        invalidator: String,
+    },
+
+    /// Revoke a previously-authorized invalidator for this app.
+    /// Only the app owner may revoke. Idempotent: revoking a non-authorized address is a no-op.
+    RevokeInvalidatorOnchain {
+        /// Application ID
+        #[arg(short, long)]
+        app_id: String,
+
+        /// Ethereum RPC URL
+        #[arg(short, long)]
+        rpc_url: String,
+
+        /// TappRegistry contract address (0x...)
+        #[arg(short, long)]
+        contract: String,
+
+        /// Invalidator address to revoke (0x...)
+        #[arg(short, long)]
+        invalidator: String,
+    },
 }
 
 #[tokio::main]
@@ -609,6 +649,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             let private_key = require_private_key(&cli.private_key)?;
             withdraw_onchain(rpc_url, contract, private_key).await?;
+        }
+        Commands::AuthorizeInvalidatorOnchain {
+            app_id,
+            rpc_url,
+            contract,
+            invalidator,
+        } => {
+            let private_key = require_private_key(&cli.private_key)?;
+            authorize_invalidator_onchain(app_id, rpc_url, contract, invalidator, private_key).await?;
+        }
+        Commands::RevokeInvalidatorOnchain {
+            app_id,
+            rpc_url,
+            contract,
+            invalidator,
+        } => {
+            let private_key = require_private_key(&cli.private_key)?;
+            revoke_invalidator_onchain(app_id, rpc_url, contract, invalidator, private_key).await?;
         }
     }
 
@@ -1827,6 +1885,56 @@ async fn withdraw_onchain(
     let tx = onchain::withdraw(&params).await?;
 
     println!("✓ Stake withdrawn");
+    println!("  Tx Hash: 0x{:x}", tx);
+
+    Ok(())
+}
+
+async fn authorize_invalidator_onchain(
+    app_id: String,
+    rpc_url: String,
+    contract: String,
+    invalidator: String,
+    private_key: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use ethers::types::Address;
+    use std::str::FromStr;
+    use tapp_service::onchain::{self, OnchainParams};
+
+    let invalidator_addr = Address::from_str(invalidator.trim_start_matches("0x"))
+        .map_err(|_| format!("Invalid invalidator address: {}", invalidator))?;
+
+    let params = OnchainParams { rpc_url, contract, private_key };
+    let tx = onchain::authorize_invalidator(&params, &app_id, invalidator_addr).await?;
+
+    println!("✓ Invalidator authorized");
+    println!("  App ID: {}", app_id);
+    println!("  Invalidator: 0x{:x}", invalidator_addr);
+    println!("  Tx Hash: 0x{:x}", tx);
+
+    Ok(())
+}
+
+async fn revoke_invalidator_onchain(
+    app_id: String,
+    rpc_url: String,
+    contract: String,
+    invalidator: String,
+    private_key: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use ethers::types::Address;
+    use std::str::FromStr;
+    use tapp_service::onchain::{self, OnchainParams};
+
+    let invalidator_addr = Address::from_str(invalidator.trim_start_matches("0x"))
+        .map_err(|_| format!("Invalid invalidator address: {}", invalidator))?;
+
+    let params = OnchainParams { rpc_url, contract, private_key };
+    let tx = onchain::revoke_invalidator(&params, &app_id, invalidator_addr).await?;
+
+    println!("✓ Invalidator revoked");
+    println!("  App ID: {}", app_id);
+    println!("  Invalidator: 0x{:x}", invalidator_addr);
     println!("  Tx Hash: 0x{:x}", tx);
 
     Ok(())

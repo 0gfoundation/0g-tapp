@@ -281,3 +281,35 @@ pub async fn remove_node(
     send_tx(&params.rpc_url, &params.private_key, params.contract_address()?, data, U256::zero()).await
 }
 
+/// authorizeInvalidator(string,address)
+pub async fn authorize_invalidator(
+    params: &OnchainParams,
+    app_id: &str,
+    invalidator: Address,
+) -> Result<TxHash> {
+    let data = calldata(
+        "authorizeInvalidator(string,address)",
+        vec![
+            Token::String(app_id.to_owned()),
+            Token::Address(invalidator),
+        ],
+    );
+    send_tx(&params.rpc_url, &params.private_key, params.contract_address()?, data, U256::zero()).await
+}
+
+/// revokeInvalidator(string,address)
+pub async fn revoke_invalidator(
+    params: &OnchainParams,
+    app_id: &str,
+    invalidator: Address,
+) -> Result<TxHash> {
+    let data = calldata(
+        "revokeInvalidator(string,address)",
+        vec![
+            Token::String(app_id.to_owned()),
+            Token::Address(invalidator),
+        ],
+    );
+    send_tx(&params.rpc_url, &params.private_key, params.contract_address()?, data, U256::zero()).await
+}
+
