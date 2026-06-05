@@ -217,9 +217,9 @@ port = 50051
 
 [server.permission]
 enabled = true
-owner_address = "0xea695C312CE119dE347425B29AFf85371c9d1837"
+owner_address = "0xYourOwnerAddressHere"
 initial_whitelist = [
-    "0x0E552ac14124F6f336a4504Aa72c921b4D7F8032"
+    "0xYourWhitelistAddressHere"
 ]
 
 [boot]
