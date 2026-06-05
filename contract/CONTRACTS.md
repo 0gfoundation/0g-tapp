@@ -19,7 +19,7 @@ RPC: https://evmrpc-testnet.0g.ai
 | Contract | Address | Tx Hash |
 |----------|---------|---------|
 | TappRegistry Implementation (initial) | `0xE03de87Dc82ABeacD48deEDCAA6D607Fa6EA05b6` | `0x465379c54d379b9a7b5be0e2442eaf32e363419aabf40e8817b8d65704687f32` |
-| **TappRegistry Implementation (current)** | `0xcE835faCd6381aaFA3fA2DB921DbFb2209f4523c` | `0x54ff07dc9c364fd8f6f69f3b7b4bdb88d1b4ae56919802851ba421626a2a45c3` |
+| **TappRegistry Implementation (current)** | `0x259c066ef1030a42cDf1bea5Acc928e49aa46822` | `0x7e1b4d078544e5ba877a1f4eb816fa19be5adbae8d9e4aa36e9c9bfedcc0714a` |
 | UpgradeableBeacon | `0x8fD880b7FCc9f0170a6F2aA58Ee90B4A012a509E` | `0x92a77f5c52cce763b8e9d26d30efbe0ce305a63019a4f0fd842744dd9c2b1fc0` |
 | **BeaconProxy (stable)** | `0x95a0BF4148b30F6F8D86870534c51df46Da5511c` | `0x1e360fa0236bf3b2857ee7c69ce4680415ea5bfa34ac9b6826f2d643249f33ee` |
 
@@ -28,6 +28,7 @@ RPC: https://evmrpc-testnet.0g.ai
 | Date | New Implementation | Upgrade Tx | Notes |
 |------|--------------------|-----------|-------|
 | 2026-06-02 | `0xcE835faCd6381aaFA3fA2DB921DbFb2209f4523c` | `0x6390a0c5fcb9002c379a0f14378a2139e5499a09127427d73675051beba49ee0` | Add user revoke ack + authorize/revoke invalidator + invalidateAcks |
+| 2026-06-02 | `0x259c066ef1030a42cDf1bea5Acc928e49aa46822` | `0x21542dd5a4edb72925419bfc7d71380739e40fbbac063dea3aa022619ec73046` | Add batch acknowledgeApps / revokeAcknowledgements |
 
 ```env
 TAPP_REGISTRY_CONTRACT=0x95a0BF4148b30F6F8D86870534c51df46Da5511c
