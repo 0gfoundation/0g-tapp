@@ -273,7 +273,7 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 [[package]]
 name = "attestation-agent"
 version = "0.1.0"
-source = "git+https://github.com/inclavare-containers/guest-components#5683fa5a9d51dca5583c1d853900921af57174de"
+source = "git+https://github.com/inclavare-containers/guest-components#8d71a3b42794d657441295b5f16ba06772337a6b"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -301,7 +301,7 @@ dependencies = [
 [[package]]
 name = "attester"
 version = "0.1.0"
-source = "git+https://github.com/inclavare-containers/guest-components#5683fa5a9d51dca5583c1d853900921af57174de"
+source = "git+https://github.com/inclavare-containers/guest-components#8d71a3b42794d657441295b5f16ba06772337a6b"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -313,6 +313,7 @@ dependencies = [
  "hex",
  "hyper 0.14.32",
  "hyper-tls",
+ "iocuddle",
  "kbs-types",
  "log",
  "nvml-wrapper",
@@ -1119,7 +1120,7 @@ checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
 [[package]]
 name = "crypto"
 version = "0.1.0"
-source = "git+https://github.com/inclavare-containers/guest-components#5683fa5a9d51dca5583c1d853900921af57174de"
+source = "git+https://github.com/inclavare-containers/guest-components#8d71a3b42794d657441295b5f16ba06772337a6b"
 dependencies = [
  "aes-gcm",
  "aes-kw",
@@ -3058,7 +3059,7 @@ dependencies = [
 [[package]]
 name = "kbs-types"
 version = "0.12.0"
-source = "git+https://github.com/inclavare-containers/kbs-types.git?rev=5c029c9#5c029c904afb458ce7e331d27d734fab1d0faf06"
+source = "git+https://github.com/inclavare-containers/kbs-types.git?rev=8e36434#8e364347f4ceb362ae45f3a6b71953af1d060412"
 dependencies = [
  "base64 0.22.1",
  "serde",
@@ -3072,7 +3073,7 @@ dependencies = [
 [[package]]
 name = "kbs_protocol"
 version = "0.1.0"
-source = "git+https://github.com/inclavare-containers/guest-components#5683fa5a9d51dca5583c1d853900921af57174de"
+source = "git+https://github.com/inclavare-containers/guest-components#8d71a3b42794d657441295b5f16ba06772337a6b"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4511,7 +4512,7 @@ dependencies = [
 [[package]]
 name = "resource_uri"
 version = "0.1.0"
-source = "git+https://github.com/inclavare-containers/guest-components#5683fa5a9d51dca5583c1d853900921af57174de"
+source = "git+https://github.com/inclavare-containers/guest-components#8d71a3b42794d657441295b5f16ba06772337a6b"
 dependencies = [
  "anyhow",
  "serde",
