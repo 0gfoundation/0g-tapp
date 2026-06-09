@@ -10,6 +10,8 @@
 - **Docker Compose Integration**: Deploy containerized applications easily
 - **gRPC API**: Comprehensive API for application lifecycle management
 - **Signature-based Authentication**: EVM-compatible signature verification for access control
+- **On-chain Registration**: Register apps and TEE nodes on TappRegistry smart contract
+- **KMS Integration**: Fetch hardware-independent app secrets from a KMS cluster (decrypted locally within the TEE)
 
 ## Getting Started
 
@@ -79,7 +81,7 @@ export TAPP_OWNER_PRIVATE_KEY="0x..."
 
 **What happens:**
 1. The script submits a StartApp request with Docker Compose configuration
-2. Files referenced in volume mounts (e.g., `./config.yml:/app/config.yml`) are automatically uploaded
+2. Files referenced in volume mounts (e.g., `./config.yml:/app/config.yml`) are automatically uploaded. Paths that escape the compose directory (e.g., `../shared/config.yml`) are rejected with a clear error — copy such files into the compose directory and use a `./` path.
 3. Returns a task ID for tracking deployment progress
 4. The application deployment is cryptographically measured and extended to TEE runtime measurements
 
@@ -135,6 +137,8 @@ This security model is ideal for scenarios requiring maximum trust minimization,
 ### Trusted Execution Environment
 
 All applications run within TEE boundaries and are cryptographically measured. The runtime measurements are extended to the TEE event log for remote attestation.
+
+Attestation evidence returned by `GetEvidence` binds the application's TEE-derived signer (an Ethereum address derived inside the enclave) into the TDX `report_data` field — the first 20 bytes of `report_data` equal the signer address, with the remaining bytes zero-padded. Verifiers can match this against the signer address registered on `TappRegistry` to prove that a signed message and the on-chain identity both come from the same app running on this TEE.
 
 ### Measurement Design Philosophy
 
@@ -213,9 +217,9 @@ port = 50051
 
 [server.permission]
 enabled = true
-owner_address = "0xea695C312CE119dE347425B29AFf85371c9d1837"
+owner_address = "0xYourOwnerAddressHere"
 initial_whitelist = [
-    "0x0E552ac14124F6f336a4504Aa72c921b4D7F8032"
+    "0xYourWhitelistAddressHere"
 ]
 
 [boot]
@@ -224,4 +228,94 @@ socket_path = "/var/run/docker.sock"
 [logging]
 level = "info"
 path = "/var/log/tapp/"
+
+# Optional: KMS cluster for hardware-independent app secrets
+[kms]
+cluster_urls = [
+    "http://kms-node-1:8080",
+    "http://kms-node-2:8080",
+]
+
+# Optional: on-chain TappRegistry integration
+[chain]
+rpc_url = "https://evmrpc-testnet.0g.ai"
+contract_address = "0x..."
 ```
+
+## On-chain Registration
+
+Register your app and TEE nodes on the TappRegistry contract using `tapp-cli`. These commands require `--private-key` (the deployer's Ethereum private key) and `--server` (the tapp gRPC endpoint, used both as the gRPC target and as the on-chain `teeUrl`).
+
+```bash
+# Register a new app (fetches hashes and signerAddress from --server automatically)
+tapp-cli -s http://<tapp>:50051 -k 0x<deployer-key> register-onchain \
+  --app-id my-app \
+  --rpc-url https://evmrpc-testnet.0g.ai \
+  --contract 0x<TappRegistry> \
+  --stake-wei 1000000000000000000
+
+# Update app hashes after redeployment
+tapp-cli -s http://<tapp>:50051 -k 0x<deployer-key> update-onchain \
+  --app-id my-app \
+  --rpc-url https://evmrpc-testnet.0g.ai \
+  --contract 0x<TappRegistry>
+
+# Add a new TEE node to an existing app
+tapp-cli -s http://<new-node>:50051 -k 0x<deployer-key> add-node-onchain \
+  --app-id my-app \
+  --rpc-url https://evmrpc-testnet.0g.ai \
+  --contract 0x<TappRegistry> \
+  --stake-wei 1000000000000000000
+
+# Remove a node (starts lock period). Pass --signer-address explicitly when the
+# node is unreachable; otherwise it is fetched from --server automatically.
+tapp-cli -s http://<node>:50051 -k 0x<deployer-key> remove-node-onchain \
+  --app-id my-app \
+  --rpc-url https://evmrpc-testnet.0g.ai \
+  --contract 0x<TappRegistry>
+
+# Re-key a node: replace its old signer with a new one atomically (stake transfers
+# directly, no withdrawal needed). New signer is fetched from --server unless
+# --new-signer is provided.
+tapp-cli -s http://<node>:50051 -k 0x<deployer-key> update-node-onchain \
+  --app-id my-app \
+  --rpc-url https://evmrpc-testnet.0g.ai \
+  --contract 0x<TappRegistry>
+
+# Withdraw all matured stake entries belonging to the caller (across all apps).
+# Run this after the lock period elapses on any node you removed.
+tapp-cli -s http://<any-tapp>:50051 -k 0x<deployer-key> withdraw \
+  --rpc-url https://evmrpc-testnet.0g.ai \
+  --contract 0x<TappRegistry>
+```
+
+### Managing Ack Invalidators
+
+User acknowledgements (acks) on TappRegistry are tied to an app's `ackVersion`, which bumps automatically on `updateApp` and node changes. When a sibling contract (e.g. a pricing or policy contract) needs to invalidate existing user acks without changing the app's code identity, the app owner can authorize that contract as an **invalidator**. Authorized invalidators may call `invalidateAcks(appId)` to bump the version. Both commands are app-owner-only and idempotent (no-op if the state already matches).
+
+```bash
+# Authorize a sibling contract to invalidate user acks for this app
+tapp-cli -k 0x<owner-key> authorize-invalidator-onchain \
+  --app-id my-app \
+  --rpc-url https://evmrpc-testnet.0g.ai \
+  --contract 0x<TappRegistry> \
+  --invalidator 0x<SiblingContract>
+
+# Revoke a previously-authorized invalidator
+tapp-cli -k 0x<owner-key> revoke-invalidator-onchain \
+  --app-id my-app \
+  --rpc-url https://evmrpc-testnet.0g.ai \
+  --contract 0x<TappRegistry> \
+  --invalidator 0x<SiblingContract>
+```
+
+## KMS Integration
+
+When `[kms]` is configured, apps running inside the TEE can retrieve a hardware-independent, KMS-derived secret via the `GetSecretResource` gRPC call. This call is **local access only** (localhost / same-host Docker network).
+
+```bash
+# From inside the TEE or a local container:
+grpcurl -plaintext -d '{"app_id": "my-app"}' localhost:50051 tapp.TappService/GetSecretResource
+```
+
+The returned `secret` bytes are the HKDF-derived app key from the KMS cluster, decrypted inside the TEE. The KMS authenticates the request by verifying the TEE node's on-chain registered `signerAddress`.

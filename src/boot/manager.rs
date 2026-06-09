@@ -4,7 +4,6 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
 use tokio::fs;
-use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tracing::{error, info, warn};
 
@@ -62,14 +61,28 @@ impl DockerComposeManager {
         let mut source_to_host = HashMap::new();
 
         for mount_file in mount_files {
-            // Sanitize source path for storage (remove ./ prefix, convert / to _)
-            let sanitized = mount_file
+            // Normalize source path: remove leading ./ or / to get a relative path
+            // Preserve directory structure so docker compose can find files at their original paths
+            let relative = mount_file
                 .source_path
                 .trim_start_matches("./")
-                .trim_start_matches('/')
-                .replace('/', "_");
+                .trim_start_matches('/');
 
-            let host_path = base_path.join(&sanitized);
+            let host_path = base_path.join(relative);
+
+            // Ensure the resolved path stays within base_path (prevent directory traversal)
+            let canonical_base = base_path.canonicalize().unwrap_or_else(|_| base_path.clone());
+            let canonical_host = host_path
+                .parent()
+                .and_then(|p| p.canonicalize().ok())
+                .unwrap_or_else(|| host_path.parent().unwrap_or(base_path).to_path_buf());
+            if !canonical_host.starts_with(&canonical_base) {
+                warn!(
+                    source_path = %mount_file.source_path,
+                    "Skipping mount file: path escapes app directory"
+                );
+                continue;
+            }
 
             // Create parent directories if needed
             if let Some(parent) = host_path.parent() {
@@ -80,16 +93,12 @@ impl DockerComposeManager {
                 })?;
             }
 
-            // Write file content
-            let mut file = fs::File::create(&host_path).await.map_err(|e| {
+            // Write file content atomically in a single blocking task
+            let content = mount_file.content.clone();
+            let write_path = host_path.clone();
+            fs::write(&write_path, &content).await.map_err(|e| {
                 DockerError::VolumeMeasurementFailed {
-                    path: format!("Failed to create file {}: {}", host_path.display(), e),
-                }
-            })?;
-
-            file.write_all(&mount_file.content).await.map_err(|e| {
-                DockerError::VolumeMeasurementFailed {
-                    path: format!("Failed to write file {}: {}", host_path.display(), e),
+                    path: format!("Failed to write file {}: {}", write_path.display(), e),
                 }
             })?;
 
@@ -282,12 +291,16 @@ impl DockerComposeManager {
             container_name: String,
         }
 
+        // docker compose images --format json outputs a JSON array
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let images: Vec<ImageInfo> =
-            serde_json::from_str(&stdout).map_err(|e| DockerError::ContainerOperationFailed {
-                operation: "parse_images_json".to_string(),
-                reason: format!("Failed to parse JSON: {}", e),
-            })?;
+        let images: Vec<ImageInfo> = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+            warn!(
+                error = %e,
+                output = %stdout,
+                "Failed to parse docker compose images JSON output"
+            );
+            Vec::new()
+        });
 
         // Build map: service_name -> ContainerImageInfo
         let mut image_map = std::collections::BTreeMap::new();
@@ -1054,4 +1067,62 @@ fn parse_size_to_bytes(size_str: &str) -> i64 {
 }
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn make_mount_file(source_path: &str, content: &[u8]) -> MountFile {
+        MountFile {
+            source_path: source_path.to_string(),
+            content: content.to_vec(),
+            mode: "0644".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_store_mount_files_preserves_directory_structure() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().to_path_buf();
+
+        let files = vec![
+            make_mount_file("./subdir/file.txt", b"hello"),
+            make_mount_file("./flat.txt", b"world"),
+        ];
+
+        let mapping = DockerComposeManager::store_mount_files(&base, &files)
+            .await
+            .unwrap();
+
+        // Subdirectory structure must be preserved (not flattened to subdir_file.txt)
+        let subdir_host = base.join("subdir/file.txt");
+        assert!(
+            subdir_host.exists(),
+            "expected file at subdir/file.txt, not flattened"
+        );
+        assert_eq!(std::fs::read(&subdir_host).unwrap(), b"hello");
+
+        let flat_host = base.join("flat.txt");
+        assert!(flat_host.exists());
+        assert_eq!(std::fs::read(&flat_host).unwrap(), b"world");
+
+        // Mapping keys are the original source paths
+        assert!(mapping.contains_key("./subdir/file.txt"));
+        assert!(mapping.contains_key("./flat.txt"));
+    }
+
+    #[tokio::test]
+    async fn test_store_mount_files_blocks_path_traversal() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().to_path_buf();
+
+        let files = vec![make_mount_file("../escape.txt", b"evil")];
+
+        let mapping = DockerComposeManager::store_mount_files(&base, &files)
+            .await
+            .unwrap();
+
+        // Path traversal must be rejected — nothing written outside base
+        assert!(mapping.is_empty(), "traversal path should be skipped");
+        assert!(!tmp.path().parent().unwrap().join("escape.txt").exists());
+    }
+}

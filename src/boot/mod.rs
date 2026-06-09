@@ -456,6 +456,7 @@ enable_eventlog = true
     pub async fn get_evidence(
         &self,
         request: GetEvidenceRequest,
+        signer_eth_address: &[u8],
     ) -> TappResult<GetEvidenceResponse> {
         // Get app_id from request
         let app_id = request.app_id;
@@ -466,55 +467,36 @@ enable_eventlog = true
             });
         }
 
-        // Get AppInfo to retrieve owner (EVM address)
-        let app_info = {
+        // Ensure app exists
+        {
             let app_info_lock = self.app_info.lock().await;
-            app_info_lock.get(&app_id).cloned()
-        };
-
-        let owner = match app_info {
-            Some(info) => info.owner,
-            None => {
+            if !app_info_lock.contains_key(&app_id) {
                 return Err(TappError::InvalidParameter {
                     field: "app_id".to_string(),
                     reason: format!("App {} not found", app_id),
                 });
             }
-        };
+        }
 
-        // Convert EVM address to bytes for report_data
-        // EVM address format: "0x" + 40 hex characters = 20 bytes
-        let evm_address_bytes = {
-            // Remove 0x prefix if present
-            let address_hex = owner.trim_start_matches("0x").trim_start_matches("0X");
+        if signer_eth_address.len() != 20 {
+            return Err(TappError::InvalidParameter {
+                field: "signer_eth_address".to_string(),
+                reason: format!(
+                    "Invalid signer address length: expected 20 bytes, got {}",
+                    signer_eth_address.len()
+                ),
+            });
+        }
 
-            // Validate length (should be 40 hex characters = 20 bytes)
-            if address_hex.len() != 40 {
-                return Err(TappError::InvalidParameter {
-                    field: "owner".to_string(),
-                    reason: format!(
-                        "Invalid EVM address format: expected 40 hex characters, got {}",
-                        address_hex.len()
-                    ),
-                });
-            }
-
-            // Decode hex to bytes
-            hex::decode(address_hex).map_err(|e| TappError::InvalidParameter {
-                field: "owner".to_string(),
-                reason: format!("Failed to decode EVM address: {}", e),
-            })?
-        };
-
-        // Prepare report_data: pad EVM address (20 bytes) to 64 bytes
+        // Prepare report_data: pad signer EVM address (20 bytes) to 64 bytes
         let mut report_data = vec![0u8; 64];
-        report_data[..evm_address_bytes.len()].copy_from_slice(&evm_address_bytes);
+        report_data[..signer_eth_address.len()].copy_from_slice(signer_eth_address);
 
         info!(
             app_id = %app_id,
-            owner = %owner,
+            signer = %format!("0x{}", hex::encode(signer_eth_address)),
             report_data = %hex::encode(&report_data),
-            "Generating evidence with app owner as report_data"
+            "Generating evidence with app signer as report_data"
         );
 
         let evidence = self.measurement_service.get_evidence(&report_data).await?;

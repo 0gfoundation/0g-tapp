@@ -45,6 +45,16 @@ sha3 = "0.10"
 hex = "0.4"
 ring = "0.17"
 k256 = { version = "0.13", features = ["ecdsa", "std"] }
+# ECIES encryption compatible with eciesjs
+# Config 1: secp256k1 + AES-256-GCM (OpenSSL, best performance) ← CURRENT
+ecies = { version = "0.2", features = ["std"] }
+# Config 2: secp256k1 + XChaCha20-Poly1305 (Pure Rust)
+# ecies = { version = "0.2", default-features = false, features = ["xchacha20"] }
+# Config 3: curve25519 (x25519) + AES-256-GCM (OpenSSL)
+# ecies = { version = "0.2", features = ["std", "x25519"] }
+# Config 4: curve25519 (x25519) + XChaCha20-Poly1305 (Pure Rust)
+# ecies = { version = "0.2", default-features = false, features = ["x25519", "xchacha20"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 x25519-dalek = { version = "2.0", features = ["static_secrets"] }
 
 # Ethereum transaction support
@@ -95,6 +105,7 @@ tonic-build = "0.12"
 
 [dev-dependencies]
 tokio-test = "0.4"
+wiremock = "0.6"
 
 [[bin]]
 name = "tapp-server"

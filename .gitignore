@@ -4,7 +4,17 @@ examples/input
 examples/mainnet
 examples/oracle
 examples/testnet
+examples/dev
+examples/pre_mainnet
 examples/nginx
 verifier/output
 verifier/input
 config/*
+contract/out/
+contract/cache/
+contract/broadcast/
+contract/lib/
+contract/src/*.flat.sol
+contract/verify
+contract/internal/
+

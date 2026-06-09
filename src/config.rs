@@ -43,6 +43,8 @@ pub struct TappConfig {
     pub server: ServerConfig,
     #[serde(default)]
     pub kbs: Option<KbsConfig>,
+    #[serde(default)]
+    pub chain: Option<ChainConfig>,
 }
 
 impl TappConfig {
@@ -108,11 +110,21 @@ pub struct PermissionConfig {
     pub initial_whitelist: Vec<String>,
 }
 
-/// KBS configuration
+/// On-chain configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChainConfig {
+    /// Ethereum-compatible RPC URL
+    pub rpc_url: String,
+    /// TappRegistry contract address
+    pub contract_address: String,
+}
+
+/// KBS configuration — points to the KMS cluster for app secret retrieval.
+/// in-memory key generation is always active regardless of this config.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KbsConfig {
-    /// KBS endpoint URL
-    pub endpoint: String,
+    /// KMS cluster node URLs (tried in order, first success wins)
+    pub node_urls: Vec<String>,
 
     /// Connection timeout in seconds
     #[serde(default = "default_kbs_timeout")]
@@ -122,12 +134,8 @@ pub struct KbsConfig {
     pub cert_path: Option<PathBuf>,
 
     /// Retry configuration
-    #[serde(default)]
+    #[serde(default = "default_kbs_retry")]
     pub retry: RetryConfig,
-
-    /// Default app key types to support
-    #[serde(default = "default_supported_key_types")]
-    pub supported_key_types: Vec<String>,
 }
 
 /// Retry configuration for KBS operations
@@ -163,8 +171,12 @@ fn default_kbs_timeout() -> u64 {
     30
 }
 
-fn default_supported_key_types() -> Vec<String> {
-    vec!["ethereum".to_string(), "rsa".to_string(), "ec".to_string()]
+fn default_kbs_retry() -> RetryConfig {
+    RetryConfig {
+        max_retries: 2,
+        initial_delay_ms: 200,
+        max_delay_ms: 2000,
+    }
 }
 
 fn default_max_retries() -> usize {
@@ -195,18 +207,13 @@ fn default_log_format() -> String {
     "json".to_string()
 }
 
-fn default_kbs_endpoint() -> String {
-    "http://localhost:8080".to_string()
-}
-
 impl Default for KbsConfig {
     fn default() -> Self {
         Self {
-            endpoint: default_kbs_endpoint(),
+            node_urls: vec![],
             timeout_seconds: default_kbs_timeout(),
             cert_path: None,
             retry: RetryConfig::default(),
-            supported_key_types: default_supported_key_types(),
         }
     }
 }

@@ -5,7 +5,7 @@
 #   ./add_to_whitelist.sh --address ADDRESS [OPTIONS]
 #
 # Example:
-#   ./add_to_whitelist.sh --address 0x0E552ac14124F6f336a4504Aa72c921b4D7F8032 --use-owner
+#   ./add_to_whitelist.sh --address 0xYourWhitelistAddressHere --use-owner
 
 set -e
 
@@ -17,7 +17,7 @@ DEFAULT_HOST="localhost"
 DEFAULT_PORT="50051"
 
 # Pre-configured addresses (for reference only)
-OWNER_ADDRESS="0xea695C312CE119dE347425B29AFf85371c9d1837"
+OWNER_ADDRESS="0xYourOwnerAddressHere"
 
 # Private keys from environment variables (recommended for security)
 # Set these in your environment:

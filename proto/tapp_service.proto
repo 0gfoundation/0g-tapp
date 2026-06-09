@@ -85,6 +85,11 @@ service TappService {
   // Get application container status
   rpc GetAppContainerStatus(GetAppContainerStatusRequest)
       returns (GetAppContainerStatusResponse);
+
+  // Get KMS-managed secret resource for this app. LOCAL ACCESS ONLY.
+  // tapp signs the KMS request with its in-memory key, decrypts the response, and returns plaintext.
+  rpc GetSecretResource(GetSecretResourceRequest)
+      returns (GetSecretResourceResponse);
 }
 
 enum LogLevel {
@@ -195,8 +200,8 @@ message ListAppMeasurementsResponse {
 // Get Evidence Messages
 message GetEvidenceRequest {
   string app_id = 1;  // Application identifier
-                      // The EVM address (owner) of the app will be
-                      // automatically used as report_data
+                      // The TEE-derived signer EVM address of the app will
+                      // be automatically used as report_data
 }
 
 message GetEvidenceResponse {
@@ -297,11 +302,10 @@ message RetryConfigInfo {
 }
 
 message KbsConfigInfo {
-  string endpoint = 1;
+  repeated string node_urls = 1;
   int32 timeout_seconds = 2;
   bool cert_configured = 3;  // Whether custom CA cert is configured
   RetryConfigInfo retry = 4;
-  repeated string supported_key_types = 5;
 }
 
 message TappConfigInfo {
@@ -571,4 +575,15 @@ message ContainerStatus {
   string state = 2;           // Container state (running, stopped, etc.)
   string health = 3;          // Health status (if available)
   repeated string ports = 4;  // Port mappings (e.g., "0.0.0.0:8080->80/tcp")
+}
+
+// GetSecretResource Messages
+message GetSecretResourceRequest {
+  string app_id = 1;
+}
+
+message GetSecretResourceResponse {
+  bool success = 1;
+  string message = 2;
+  bytes secret = 3;  // plaintext KMS-derived app key
 }

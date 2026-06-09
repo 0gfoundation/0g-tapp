@@ -18,7 +18,7 @@ DEFAULT_HOST="localhost"
 DEFAULT_PORT="50051"
 
 # Pre-configured addresses (for reference only)
-OWNER_ADDRESS="0xea695C312CE119dE347425B29AFf85371c9d1837"
+OWNER_ADDRESS="0xYourOwnerAddressHere"
 
 # Private keys from environment variables (recommended for security)
 OWNER_PRIVATE_KEY="${TAPP_OWNER_PRIVATE_KEY:-}"

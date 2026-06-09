@@ -3,10 +3,10 @@ use std::path::PathBuf;
 use tapp_service::proto::{
     tapp_service_client::TappServiceClient, AddToWhitelistRequest, DockerLoginRequest,
     DockerLogoutRequest, GetAppContainerStatusRequest, GetAppInfoRequest, GetAppKeyRequest,
-    GetAppLogsRequest, GetAppSecretKeyRequest, GetEvidenceRequest, GetServiceLogsRequest,
-    GetServiceStatusRequest, GetTappInfoRequest, GetTaskStatusRequest, ListWhitelistRequest,
-    MountFile, PruneImagesRequest, RemoveFromWhitelistRequest, StartAppRequest,
-    StartServiceRequest, StopAppRequest, StopServiceRequest, WithdrawBalanceRequest,
+    GetAppLogsRequest, GetAppSecretKeyRequest, GetEvidenceRequest, GetSecretResourceRequest,
+    GetServiceLogsRequest, GetServiceStatusRequest, GetTappInfoRequest, GetTaskStatusRequest,
+    ListWhitelistRequest, MountFile, PruneImagesRequest, RemoveFromWhitelistRequest,
+    StartAppRequest, StartServiceRequest, StopAppRequest, StopServiceRequest, WithdrawBalanceRequest,
 };
 use tonic::{metadata::MetadataValue, Request};
 
@@ -121,6 +121,13 @@ enum Commands {
         /// Use X25519 key pair
         #[arg(long)]
         x25519: bool,
+    },
+
+    /// Get secret resource from KMS (local access only)
+    GetSecretResource {
+        /// Application ID
+        #[arg(short, long)]
+        app_id: String,
     },
 
     /// Start a specific service within an app
@@ -264,6 +271,173 @@ enum Commands {
         #[arg(short, long)]
         signature: String,
     },
+
+
+    /// Register app on-chain after starting it.
+    /// Fetches compose/volume/image hashes and signerAddress from --server, registers them.
+    /// The --server URL is also recorded on-chain as the node's evidence URL.
+    RegisterOnchain {
+        /// Application ID
+        #[arg(short, long)]
+        app_id: String,
+
+        /// Ethereum RPC URL
+        #[arg(short, long)]
+        rpc_url: String,
+
+        /// TappRegistry contract address (0x...)
+        #[arg(short, long)]
+        contract: String,
+
+        /// Stake amount in wei (must be >= minStakeAmount)
+        #[arg(short, long)]
+        stake_wei: u128,
+    },
+
+    /// Update app hashes on-chain after redeployment (fetches updated hashes from --server)
+    UpdateOnchain {
+        /// Application ID
+        #[arg(short, long)]
+        app_id: String,
+
+        /// Ethereum RPC URL
+        #[arg(short, long)]
+        rpc_url: String,
+
+        /// TappRegistry contract address (0x...)
+        #[arg(short, long)]
+        contract: String,
+    },
+
+    /// Add a node to an existing on-chain app.
+    /// Connect to the new node via --server to fetch its signerAddress automatically.
+    /// The --server URL is recorded on-chain as the node's evidence URL.
+    AddNodeOnchain {
+        /// Application ID
+        #[arg(short, long)]
+        app_id: String,
+
+        /// Ethereum RPC URL
+        #[arg(short, long)]
+        rpc_url: String,
+
+        /// TappRegistry contract address (0x...)
+        #[arg(short, long)]
+        contract: String,
+
+        /// Stake amount in wei (must be >= minStakeAmount)
+        #[arg(short, long)]
+        stake_wei: u128,
+
+        /// Signer address of the new node (optional; fetched from --server if not set)
+        #[arg(long)]
+        signer_address: Option<String>,
+
+        /// TEE URL of the new node (optional; defaults to --server URL)
+        #[arg(long)]
+        tee_url: Option<String>,
+    },
+
+    /// Remove a node from an on-chain app (starts the stake lock period).
+    /// Connect to the node via --server to fetch its signerAddress automatically.
+    RemoveNodeOnchain {
+        /// Application ID
+        #[arg(short, long)]
+        app_id: String,
+
+        /// Ethereum RPC URL
+        #[arg(short, long)]
+        rpc_url: String,
+
+        /// TappRegistry contract address (0x...)
+        #[arg(short, long)]
+        contract: String,
+
+        /// Signer address to remove (skips fetching from --server; useful when node is unreachable)
+        #[arg(long)]
+        signer_address: Option<String>,
+    },
+
+    /// Update a node: replace old signer with new signer atomically (transfers stake).
+    /// New signer is fetched from --server unless --new-signer is specified.
+    UpdateNodeOnchain {
+        /// Application ID
+        #[arg(short, long)]
+        app_id: String,
+
+        /// Ethereum RPC URL
+        #[arg(short, long)]
+        rpc_url: String,
+
+        /// TappRegistry contract address (0x...)
+        #[arg(short, long)]
+        contract: String,
+
+        /// Old signer address to replace (optional; fetched from --server if not set)
+        #[arg(long)]
+        old_signer: Option<String>,
+
+        /// New signer address (optional; fetched from --server if not set)
+        #[arg(long)]
+        new_signer: Option<String>,
+
+        /// TEE URL for the new node (optional; defaults to --server URL)
+        #[arg(long)]
+        tee_url: Option<String>,
+    },
+
+    /// Withdraw a removed node's stake after the lock period elapses.
+    /// Requires --signer-address because the node may already be stopped.
+    /// Withdraw all matured locked stake entries for the caller.
+    Withdraw {
+        /// Ethereum RPC URL
+        #[arg(short, long)]
+        rpc_url: String,
+
+        /// TappRegistry contract address (0x...)
+        #[arg(short, long)]
+        contract: String,
+    },
+
+    /// Authorize a sibling contract to call invalidateAcks for this app.
+    /// Only the app owner may authorize. Idempotent: re-authorizing has no effect.
+    AuthorizeInvalidatorOnchain {
+        /// Application ID
+        #[arg(short, long)]
+        app_id: String,
+
+        /// Ethereum RPC URL
+        #[arg(short, long)]
+        rpc_url: String,
+
+        /// TappRegistry contract address (0x...)
+        #[arg(short, long)]
+        contract: String,
+
+        /// Invalidator address to authorize (0x...; typically a sibling contract)
+        #[arg(short, long)]
+        invalidator: String,
+    },
+
+    /// Revoke a previously-authorized invalidator for this app.
+    /// Only the app owner may revoke. Idempotent: revoking a non-authorized address is a no-op.
+    RevokeInvalidatorOnchain {
+        /// Application ID
+        #[arg(short, long)]
+        app_id: String,
+
+        /// Ethereum RPC URL
+        #[arg(short, long)]
+        rpc_url: String,
+
+        /// TappRegistry contract address (0x...)
+        #[arg(short, long)]
+        contract: String,
+
+        /// Invalidator address to revoke (0x...)
+        #[arg(short, long)]
+        invalidator: String,
+    },
 }
 
 #[tokio::main]
@@ -323,6 +497,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             x25519,
         } => {
             get_app_secret_key(&cli.server, app_id, json, x25519).await?;
+        }
+        Commands::GetSecretResource { app_id } => {
+            get_secret_resource(&cli.server, app_id).await?;
         }
         Commands::StartService {
             app_id,
@@ -417,6 +594,80 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             verify_signature(public_key, message, signature)?;
         }
+        Commands::RegisterOnchain {
+            app_id,
+            rpc_url,
+            contract,
+            stake_wei,
+        } => {
+            let private_key = require_private_key(&cli.private_key)?;
+            register_onchain(&cli.server, app_id, rpc_url, contract, stake_wei, private_key).await?;
+        }
+        Commands::UpdateOnchain {
+            app_id,
+            rpc_url,
+            contract,
+        } => {
+            let private_key = require_private_key(&cli.private_key)?;
+            update_onchain(&cli.server, app_id, rpc_url, contract, private_key).await?;
+        }
+        Commands::AddNodeOnchain {
+            app_id,
+            rpc_url,
+            contract,
+            stake_wei,
+            signer_address,
+            tee_url,
+        } => {
+            let private_key = require_private_key(&cli.private_key)?;
+            add_node_onchain(&cli.server, app_id, rpc_url, contract, stake_wei, private_key, signer_address, tee_url).await?;
+        }
+        Commands::RemoveNodeOnchain {
+            app_id,
+            rpc_url,
+            contract,
+            signer_address,
+        } => {
+            let private_key = require_private_key(&cli.private_key)?;
+            remove_node_onchain(&cli.server, app_id, rpc_url, contract, private_key, signer_address).await?;
+        }
+        Commands::UpdateNodeOnchain {
+            app_id,
+            rpc_url,
+            contract,
+            old_signer,
+            new_signer,
+            tee_url,
+        } => {
+            let private_key = require_private_key(&cli.private_key)?;
+            update_node_onchain(&cli.server, app_id, rpc_url, contract, private_key, old_signer, new_signer, tee_url).await?;
+        }
+
+        Commands::Withdraw {
+            rpc_url,
+            contract,
+        } => {
+            let private_key = require_private_key(&cli.private_key)?;
+            withdraw_onchain(rpc_url, contract, private_key).await?;
+        }
+        Commands::AuthorizeInvalidatorOnchain {
+            app_id,
+            rpc_url,
+            contract,
+            invalidator,
+        } => {
+            let private_key = require_private_key(&cli.private_key)?;
+            authorize_invalidator_onchain(app_id, rpc_url, contract, invalidator, private_key).await?;
+        }
+        Commands::RevokeInvalidatorOnchain {
+            app_id,
+            rpc_url,
+            contract,
+            invalidator,
+        } => {
+            let private_key = require_private_key(&cli.private_key)?;
+            revoke_invalidator_onchain(app_id, rpc_url, contract, invalidator, private_key).await?;
+        }
     }
 
     Ok(())
@@ -427,6 +678,40 @@ fn require_private_key(key: &Option<String>) -> Result<String, Box<dyn std::erro
         "Private key required. Use --private-key or set TAPP_PRIVATE_KEY environment variable"
             .into()
     })
+}
+
+/// Recursively collect all files under a directory into MountFile entries.
+/// `dir` is the directory to walk, `base_dir` is the root of the mount source
+/// (so relative paths are computed from base_dir's parent), and `source_prefix`
+/// is the original source path string from the compose file (e.g. `./nginx/ssl`).
+fn collect_dir_files(
+    dir: &std::path::Path,
+    base_dir: &std::path::Path,
+    source_prefix: &str,
+    files: &mut Vec<MountFile>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_file() {
+            let rel = path
+                .strip_prefix(base_dir)
+                .map_err(|e| format!("strip_prefix error: {}", e))?;
+            let file_source_path =
+                format!("{}/{}", source_prefix.trim_end_matches('/'), rel.to_string_lossy());
+            let content = std::fs::read(&path)
+                .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
+            println!("    ✓ Found: {}", file_source_path);
+            files.push(MountFile {
+                source_path: file_source_path,
+                content,
+                mode: "0644".to_string(),
+            });
+        } else if path.is_dir() {
+            collect_dir_files(&path, base_dir, source_prefix, files)?;
+        }
+    }
+    Ok(())
 }
 
 /// Extract local volume mounts from docker-compose.yml content
@@ -472,15 +757,27 @@ fn extract_volume_mounts(
 
                     let source_path = parts[0].trim();
 
-                    // Only process local paths starting with ./
+                    // Only process relative local paths starting with ./
+                    // ../ paths are not supported: on the server each app is isolated under its
+                    // own directory (/var/lib/tapp/apps/<app_id>/). A ../ source path would
+                    // resolve outside that boundary, which the server rejects for security
+                    // reasons. Copy the file into the compose directory and use a ./ path instead.
+                    if source_path.starts_with("../") {
+                        println!(
+                            "  ✗ Unsupported: {} — ../ paths are not allowed. \
+                            Copy the file into the compose directory and use a ./ path.",
+                            source_path
+                        );
+                        continue;
+                    }
                     if !source_path.starts_with("./") {
                         continue;
                     }
 
                     // Build absolute path
-                    let local_file = compose_dir.join(&source_path[2..]); // Remove "./"
+                    let local_file = compose_dir.join(source_path);
 
-                    // Check if file exists
+                    // Check if path exists as file or directory
                     if local_file.exists() && local_file.is_file() {
                         println!("  ✓ Found: {} -> {}", source_path, local_file.display());
 
@@ -494,9 +791,12 @@ fn extract_volume_mounts(
                             content,
                             mode: "0644".to_string(),
                         });
+                    } else if local_file.exists() && local_file.is_dir() {
+                        println!("  ✓ Dir:   {} -> {}", source_path, local_file.display());
+                        collect_dir_files(&local_file, &local_file, source_path, &mut mount_files)?;
                     } else {
                         println!(
-                            "  ⊘ Skipped: {} (file not found at {})",
+                            "  ⊘ Skipped: {} (not found at {})",
                             source_path,
                             local_file.display()
                         );
@@ -858,6 +1158,40 @@ async fn get_app_secret_key(
             println!("  Ethereum Address: 0x{}", hex::encode(&result.eth_address));
         }
     }
+
+    Ok(())
+}
+
+async fn get_secret_resource(
+    server: &str,
+    app_id: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut client = TappServiceClient::connect(server.to_string()).await?;
+
+    let request = Request::new(GetSecretResourceRequest {
+        app_id: app_id.clone(),
+    });
+
+    let response = match client.get_secret_resource(request).await {
+        Ok(resp) => resp,
+        Err(e) if e.code() == tonic::Code::PermissionDenied => {
+            eprintln!("✗ Permission denied: {}", e.message());
+            eprintln!("\nGetSecretResource can ONLY be called from localhost!");
+            std::process::exit(1);
+        }
+        Err(e) => return Err(e.into()),
+    };
+
+    let result = response.into_inner();
+
+    if !result.success {
+        eprintln!("✗ {}", result.message);
+        std::process::exit(1);
+    }
+
+    println!("✓ Secret resource retrieved");
+    println!("  App ID: {}", app_id);
+    println!("  Secret (hex): 0x{}", hex::encode(&result.secret));
 
     Ok(())
 }
@@ -1329,6 +1663,283 @@ fn verify_signature(
     Ok(())
 }
 
+// ─── On-chain command handlers ────────────────────────────────────────────────
+
+async fn fetch_signer_address(
+    server: &str,
+    app_id: &str,
+) -> Result<ethers::types::Address, Box<dyn std::error::Error>> {
+    let mut client = TappServiceClient::connect(server.to_string()).await?;
+    let key_resp = client
+        .get_app_key(Request::new(GetAppKeyRequest {
+            app_id: app_id.to_owned(),
+            key_type: "ethereum".to_string(),
+            additional_data: vec![],
+            kbs_resource_uri: String::new(),
+            x25519: false,
+        }))
+        .await?
+        .into_inner();
+
+    if !key_resp.success {
+        return Err(format!("GetAppKey failed: {}", key_resp.message).into());
+    }
+    if key_resp.eth_address.len() != 20 {
+        return Err(format!("Unexpected eth_address length: {}", key_resp.eth_address.len()).into());
+    }
+    Ok(ethers::types::Address::from_slice(&key_resp.eth_address))
+}
+
+async fn fetch_app_hashes(
+    server: &str,
+    app_id: &str,
+) -> Result<(Vec<u8>, Vec<u8>, Vec<Vec<u8>>), Box<dyn std::error::Error>> {
+    use tapp_service::onchain;
+    let mut client = TappServiceClient::connect(server.to_string()).await?;
+    let info_resp = client
+        .get_app_info(Request::new(GetAppInfoRequest {
+            app_id: app_id.to_owned(),
+        }))
+        .await?
+        .into_inner();
+
+    if !info_resp.success {
+        return Err(format!("GetAppInfo failed: {}", info_resp.message).into());
+    }
+
+    let compose_hash = onchain::hex_to_bytes(&info_resp.compose_hash)?;
+    let volumes_hash = onchain::combine_map_hashes(&info_resp.volumes_hash);
+    let image_hashes = onchain::map_to_bytes_array(&info_resp.image_hash);
+    Ok((compose_hash, volumes_hash, image_hashes))
+}
+
+async fn register_onchain(
+    server: &str,
+    app_id: String,
+    rpc_url: String,
+    contract: String,
+    stake_wei: u128,
+    private_key: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use ethers::types::U256;
+    use tapp_service::onchain::OnchainParams;
+
+    let (compose_hash, volumes_hash, image_hashes) = fetch_app_hashes(server, &app_id).await?;
+    let signer_address = fetch_signer_address(server, &app_id).await?;
+
+    let params = OnchainParams { rpc_url, contract, private_key };
+    let tx = tapp_service::onchain::register_app(
+        &params,
+        &app_id,
+        compose_hash,
+        volumes_hash,
+        image_hashes,
+        signer_address,
+        server, // the server URL is recorded on-chain as the node's evidence URL
+        U256::from(stake_wei),
+    )
+    .await?;
+
+    println!("✓ App registered on-chain");
+    println!("  App ID: {}", app_id);
+    println!("  Signer Address: 0x{}", hex::encode(signer_address));
+    println!("  Tx Hash: 0x{:x}", tx);
+
+    Ok(())
+}
+
+async fn update_onchain(
+    server: &str,
+    app_id: String,
+    rpc_url: String,
+    contract: String,
+    private_key: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use tapp_service::onchain::OnchainParams;
+
+    let (compose_hash, volumes_hash, image_hashes) = fetch_app_hashes(server, &app_id).await?;
+
+    let params = OnchainParams { rpc_url, contract, private_key };
+    let tx = tapp_service::onchain::update_app(&params, &app_id, compose_hash, volumes_hash, image_hashes).await?;
+
+    println!("✓ App updated on-chain");
+    println!("  App ID: {}", app_id);
+    println!("  Tx Hash: 0x{:x}", tx);
+
+    Ok(())
+}
+
+async fn add_node_onchain(
+    server: &str,
+    app_id: String,
+    rpc_url: String,
+    contract: String,
+    stake_wei: u128,
+    private_key: String,
+    signer_arg: Option<String>,
+    tee_url_arg: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use ethers::types::{Address, U256};
+    use std::str::FromStr;
+    use tapp_service::onchain::OnchainParams;
+
+    let (signer, tee_url) = if let Some(addr) = signer_arg {
+        let parsed = Address::from_str(addr.trim_start_matches("0x"))
+            .map_err(|_| format!("Invalid signer address: {}", addr))?;
+        (parsed, tee_url_arg.unwrap_or_else(|| server.to_string()))
+    } else {
+        let fetched = fetch_signer_address(server, &app_id).await?;
+        (fetched, tee_url_arg.unwrap_or_else(|| server.to_string()))
+    };
+
+    let params = OnchainParams { rpc_url, contract, private_key };
+    let tx = tapp_service::onchain::add_node(&params, &app_id, signer, &tee_url, U256::from(stake_wei)).await?;
+
+    println!("✓ Node added on-chain");
+    println!("  App ID: {}", app_id);
+    println!("  Signer Address: 0x{:x}", signer);
+    println!("  TEE URL: {}", tee_url);
+    println!("  Tx Hash: 0x{:x}", tx);
+
+    Ok(())
+}
+
+async fn remove_node_onchain(
+    server: &str,
+    app_id: String,
+    rpc_url: String,
+    contract: String,
+    private_key: String,
+    signer_address: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use tapp_service::onchain::OnchainParams;
+
+    let signer = if let Some(addr) = signer_address {
+        addr.trim_start_matches("0x").parse::<ethers::types::Address>()?
+    } else {
+        fetch_signer_address(server, &app_id).await?
+    };
+
+    let params = OnchainParams { rpc_url, contract, private_key };
+    let tx = tapp_service::onchain::remove_node(&params, &app_id, signer).await?;
+
+    println!("✓ Node removal initiated on-chain");
+    println!("  App ID: {}", app_id);
+    println!("  Signer Address: 0x{}", hex::encode(signer));
+    println!("  Tx Hash: 0x{:x}", tx);
+    println!("  (stake locked; run withdraw-node-stake after lock period)");
+
+    Ok(())
+}
+
+async fn update_node_onchain(
+    server: &str,
+    app_id: String,
+    rpc_url: String,
+    contract: String,
+    private_key: String,
+    old_signer_arg: Option<String>,
+    new_signer_arg: Option<String>,
+    tee_url_arg: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use ethers::types::Address;
+    use std::str::FromStr;
+    use tapp_service::onchain::OnchainParams;
+
+    let old_signer_addr = if let Some(addr) = old_signer_arg {
+        Address::from_str(addr.trim_start_matches("0x"))
+            .map_err(|_| format!("Invalid old signer address: {}", addr))?
+    } else {
+        fetch_signer_address(server, &app_id).await?
+    };
+    let (new_signer, tee_url) = if let Some(addr) = new_signer_arg {
+        let parsed = Address::from_str(addr.trim_start_matches("0x"))
+            .map_err(|_| format!("Invalid new signer address: {}", addr))?;
+        (parsed, tee_url_arg.unwrap_or_else(|| server.to_string()))
+    } else {
+        let fetched = fetch_signer_address(server, &app_id).await?;
+        (fetched, tee_url_arg.unwrap_or_else(|| server.to_string()))
+    };
+
+    let params = OnchainParams { rpc_url, contract, private_key };
+    let tx = tapp_service::onchain::update_node(&params, &app_id, old_signer_addr, new_signer, tee_url.clone()).await?;
+
+    println!("✓ Node updated on-chain");
+    println!("  App ID: {}", app_id);
+    println!("  Old Signer: 0x{:x}", old_signer_addr);
+    println!("  New Signer: 0x{:x}", new_signer);
+    println!("  TEE URL: {}", tee_url);
+    println!("  Tx Hash: 0x{:x}", tx);
+
+    Ok(())
+}
+
+async fn withdraw_onchain(
+    rpc_url: String,
+    contract: String,
+    private_key: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use tapp_service::onchain::{self, OnchainParams};
+
+    let params = OnchainParams { rpc_url, contract, private_key };
+    let tx = onchain::withdraw(&params).await?;
+
+    println!("✓ Stake withdrawn");
+    println!("  Tx Hash: 0x{:x}", tx);
+
+    Ok(())
+}
+
+async fn authorize_invalidator_onchain(
+    app_id: String,
+    rpc_url: String,
+    contract: String,
+    invalidator: String,
+    private_key: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use ethers::types::Address;
+    use std::str::FromStr;
+    use tapp_service::onchain::{self, OnchainParams};
+
+    let invalidator_addr = Address::from_str(invalidator.trim_start_matches("0x"))
+        .map_err(|_| format!("Invalid invalidator address: {}", invalidator))?;
+
+    let params = OnchainParams { rpc_url, contract, private_key };
+    let tx = onchain::authorize_invalidator(&params, &app_id, invalidator_addr).await?;
+
+    println!("✓ Invalidator authorized");
+    println!("  App ID: {}", app_id);
+    println!("  Invalidator: 0x{:x}", invalidator_addr);
+    println!("  Tx Hash: 0x{:x}", tx);
+
+    Ok(())
+}
+
+async fn revoke_invalidator_onchain(
+    app_id: String,
+    rpc_url: String,
+    contract: String,
+    invalidator: String,
+    private_key: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use ethers::types::Address;
+    use std::str::FromStr;
+    use tapp_service::onchain::{self, OnchainParams};
+
+    let invalidator_addr = Address::from_str(invalidator.trim_start_matches("0x"))
+        .map_err(|_| format!("Invalid invalidator address: {}", invalidator))?;
+
+    let params = OnchainParams { rpc_url, contract, private_key };
+    let tx = onchain::revoke_invalidator(&params, &app_id, invalidator_addr).await?;
+
+    println!("✓ Invalidator revoked");
+    println!("  App ID: {}", app_id);
+    println!("  Invalidator: 0x{:x}", invalidator_addr);
+    println!("  Tx Hash: 0x{:x}", tx);
+
+    Ok(())
+}
+
 fn add_signature_metadata<T>(
     request: &mut Request<T>,
     private_key_hex: &str,
@@ -1393,4 +2004,69 @@ fn add_signature_metadata<T>(
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    fn write_file(dir: &std::path::Path, name: &str, content: &str) {
+        let path = dir.join(name);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(path, content).unwrap();
+    }
+
+    fn make_compose(volumes: &[&str]) -> String {
+        let volume_lines: String = volumes
+            .iter()
+            .map(|v| format!("      - {}\n", v))
+            .collect();
+        format!(
+            "services:\n  app:\n    image: test\n    volumes:\n{}",
+            volume_lines
+        )
+    }
+
+    #[test]
+    fn test_extract_dot_slash_paths() {
+        let tmp = TempDir::new().unwrap();
+        write_file(tmp.path(), "config.yaml", "key: value");
+
+        let compose_path = tmp.path().join("docker-compose.yaml");
+        let content = make_compose(&["./config.yaml:/etc/config.yaml"]);
+
+        let mounts = extract_volume_mounts(&compose_path, &content).unwrap();
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0].source_path, "./config.yaml");
+    }
+
+    #[test]
+    fn test_extract_dot_dot_paths() {
+        let tmp = TempDir::new().unwrap();
+        let compose_dir = tmp.path().join("deploy");
+        fs::create_dir_all(&compose_dir).unwrap();
+        let compose_path = compose_dir.join("docker-compose.yaml");
+        let content = make_compose(&["../sibling/config.yaml:/etc/config.yaml"]);
+
+        // ../ paths are not allowed and should be skipped
+        let mounts = extract_volume_mounts(&compose_path, &content).unwrap();
+        assert!(mounts.is_empty(), "../ paths should be rejected");
+    }
+
+    #[test]
+    fn test_skip_named_volumes_and_absolute_paths() {
+        let tmp = TempDir::new().unwrap();
+        let compose_path = tmp.path().join("docker-compose.yaml");
+        let content = make_compose(&[
+            "myvolume:/data",
+            "/absolute/path:/etc/file",
+        ]);
+
+        let mounts = extract_volume_mounts(&compose_path, &content).unwrap();
+        assert!(mounts.is_empty(), "named volumes and absolute paths must be skipped");
+    }
 }

@@ -34,8 +34,8 @@ pub fn pad_to_length(data: &[u8], length: usize) -> Vec<u8> {
 /// Validate application ID format
 pub fn validate_app_id(app_id: &str) -> bool {
     // App ID should be alphanumeric with hyphens and underscores
-    // Length between 0 and 64 characters
-    if app_id.is_empty() || app_id.len() > 64 {
+    // Length between 3 and 64 characters
+    if app_id.len() < 3 || app_id.len() > 64 {
         return false;
     }
 
