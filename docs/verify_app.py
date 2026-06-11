@@ -79,7 +79,7 @@ for signer in nodes:
         f"-d @ {AS} attestation.AttestationService/AttestationEvaluate < /tmp/_as_req.json",
         shell=True, capture_output=True, text=True, timeout=90)
     tm = re.search(r'"attestationToken":\s*"([^"]+)"', out.stdout)
-    as_status = tcb = None
+    as_status = tcb = as_report_data = None
     if tm:
         pl = tm.group(1).split('.')[1]; pl += '=' * (-len(pl) % 4)
         claims = json.loads(base64.urlsafe_b64decode(pl))
@@ -87,14 +87,16 @@ for signer in nodes:
         as_status = sm.get("ear.status")
         tdx = sm.get("ear.veraison.annotated-evidence", {}).get("tdx", {})
         tcb = tdx.get("tcb_status"); adv = tdx.get("advisory_ids", [])
+        qb = (tdx.get("quote", {}) or {}).get("body", {}) or {}
+        as_report_data = qb.get("report_data")               # AS 已按 quote 版本正确对齐
         print(f"  ③ AS: ear.status={as_status}  tcb_status={tcb}  advisories={len(adv)}")
     else:
         print(f"  ③ ❌ AS 无 token: {(out.stdout + out.stderr).strip()[:160]}")
 
     # ───────── ④ 对账 evidence ↔ 链上 ─────────
-    body = base64.b64decode(j["quote"])[48:48+584]
-    rd = body[520:584]
-    sig_ok = rd.hex().find(signer.lower()[2:]) >= 0            # report_data 内搜 signer(兼容双布局)
+    # signer 用 AS 解析出的 report_data（不手搓 quote 偏移——header 长度随 quote version 变, 易错）。
+    # report_data 里 signer 恒在偏移 0; 仍以"搜链上 signer 子串"锚定, 不写死偏移。
+    sig_ok = bool(as_report_data) and signer.lower()[2:] in as_report_data.lower()
     # cc_eventlog -> 最后一条 compose 匹配的成功 start_app
     log = base64.b64decode(j["cc_eventlog"]); o = 8 + 20
     ds, = struct.unpack_from('<I', log, o); o += 4 + ds

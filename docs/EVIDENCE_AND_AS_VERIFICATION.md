@@ -114,28 +114,29 @@ subprocess.run(
 
 evidence(hex) 解码后 = `{ cc_eventlog: <base64>, gpu_evidence: null, quote: <base64> }`。
 
-### Quote（TDX v4）
+### Quote 度量 / report_data —— 直接取自 §③ 的 AS 解析结果
+
+**不要手搓 quote 字节偏移取度量。** TD body 的字段内部偏移是固定的，但 **body 在 quote 里的起始偏移随 quote version 变**：
+v4 header = 48 字节、**v5 header = 54 字节**。硬编 `q[48:]` 在 v5 quote 上会整体错位 6 字节，把 RTMR3 末尾误当成 report_data 前缀——这是个真实踩过的坑（见 `VERIFIER_AGENT_GUIDANCE.md`）。
+
+AS（§③）已按版本正确对齐并解析好，直接读 token 的 `submods.cpu0.ear.veraison.annotated-evidence.tdx.quote.body`：
 
 ```python
-q = base64.b64decode(j['quote']); body = q[48:48+584]      # 头48B + TD body 584B + 签名段
-M = {'MRTD': body[136:184], 'rtmr0': body[328:376], 'rtmr1': body[376:424],
-     'rtmr2': body[424:472], 'rtmr3': body[472:520], 'report_data': body[520:584]}
+qb = claims["submods"]["cpu0"]["ear.veraison.annotated-evidence"]["tdx"]["quote"]["body"]
+report_data = qb["report_data"]   # signer 恒在偏移 0 (前 20 字节), 其余补零
+mrtd        = qb["mr_td"]
+rtmr3       = qb["rtmr_3"]
 ```
 
-| 寄存器 | 含义 |
+| 字段 | 含义 |
 |---|---|
-| MRTD | TD 初始内存度量（固件/虚机镜像）；同款镜像多台相同 |
+| MRTD (`mr_td`) | TD 初始内存度量（固件/虚机镜像）；同款镜像多台相同 |
 | RTMR0/1/2 | 固件配置 / 引导(shim·grub) / OS(grub 命令·内核·initrd) |
 | RTMR3 | 运行时：cryptpilot FDE（老镜像）+ tapp 操作 |
+| `report_data` | signer EVM 地址在**偏移 0**（前 20 字节），其余补零。**RTMR(非 report_data)绝不能当 signer** |
 
-### ⚠️ report_data 有两种布局（验证代码必须兼容）
-
-| 版本 | report_data 布局 | 取 signer 的方式 |
-|---|---|---|
-| 新版本 | `[20字节地址][44字节 0]` | `report_data[0:20]` |
-| 老版本 | `[6字节前缀][20字节地址][零填充]` | `report_data[6:26]` |
-
-稳妥做法：把链上 `signerAddress`（20字节）当作子串，在 64 字节 `report_data` 里**搜索**它是否出现，不要写死偏移。
+> 取 signer 的稳妥做法：从 AS 的 `report_data` 里取前 20 字节，并把链上 `signerAddress`（20字节）当作**子串去搜索/比对**——既不写死 quote 偏移，也以链上值为锚。
+> （非要离线手搓时，必须按 `quote[0:2]` 的 version 决定 header 长度：v4→48、v5→54，再 `body[520:584]` 取 report_data。）
 
 ### cc_eventlog（TCG2，全程 SHA-384）
 
@@ -224,7 +225,7 @@ tapp.0g.com <operation> {"app_id","operation","result","error",
 ③ AS 验签 @ 47.237.201.184:50004 (AttestationEvaluate): 返回 token, quote 签名✅, report_data 解出=0x6C30…335f
         但 tcb_status=OutOfDate (INTEL-SA-01036 等 8 条) → ear.status=contraindicated  ⚠️ 平台 TCB 过期
 ④ 对账:
-   node signer  0x6C30…335f      == report_data[6:26]                 ✅
+   node signer  0x6C30…335f      == AS report_data 前20字节            ✅
    composeHash  740e9c57…2751d8   == start_app(ts 1781099341).compose ✅
    volumesHash  .env:<digest>\n   == start_app.volumes_hash (重建)    ✅
    imageHashes  sha256:b7aaa6…/4b7183ac… == start_app.image_hash       ✅
@@ -241,5 +242,5 @@ tapp.0g.com <operation> {"app_id","operation","result","error",
 1. 链上 `getAppInfo` / `getNodeList` / `getNode` 读注册信息 + 各节点 teeUrl。
 2. 对每个节点：按 teeUrl `get-evidence --app-id <id>`。
 3. 验 quote 签名 + TCB：提交 **CoCo-AS gRPC `47.237.201.184:50004`** `AttestationEvaluate`（`runtime_data` 留空），看 `ear.status==affirming` 且 `tcb_status==UpToDate`（**别用 8080 KBS，那是 RCAR 密钥分发，会 401**）。
-4. 对账：report_data 内地址==signerAddress（兼容双布局）；compose/volumes/image hash==链上（按 §① 编码）；MRTD/启动链==AS 参考值（cmdline OR）。
+4. 对账：取 AS 解析的 report_data 前20字节==signerAddress（别手搓 quote 偏移）；compose/volumes/image hash==链上（按 §① 编码）；MRTD/启动链==AS 参考值（cmdline OR）。
 5. RTMR3 识别 cryptpilot（老镜像）+ 取最后一条成功 start_app 做 compose/image/volumes 对账。
