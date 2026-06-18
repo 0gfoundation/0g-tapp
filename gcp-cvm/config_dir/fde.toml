@@ -1,0 +1,9 @@
+[rootfs]
+rw_overlay = "ram"
+
+[data]
+integrity = false
+
+[data.encrypt.exec]
+command = "echo"
+args = ["-n", "test-passphrase"]

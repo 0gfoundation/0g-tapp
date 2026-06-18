@@ -26,6 +26,8 @@
 
 To run 0G Tapp, you need to create an Alibaba Cloud ECS instance with confidential computing support.
 
+> **GCP (Intel TDX) variant**: To build a hardened, measured, attestable confidential image for Google Cloud from a stock Ubuntu 24.04 cloud image, see [`gcp-cvm/`](gcp-cvm/) — one-command build (`build-gcp-tapp.sh`), full SOP and root-cause notes in [`gcp-cvm/cryptpilot-gcp-boot-fix.md`](gcp-cvm/cryptpilot-gcp-boot-fix.md), and a security-hardening audit (removes SSH / cloud-init / google-guest-agent / metadata startup-scripts and other backdoor vectors).
+
 #### Step 1: Import the Confidential Image
 
 1. Navigate to [Alibaba Cloud Custom Image Import](https://www.alibabacloud.com/help/en/ecs/user-guide/import-a-custom-image#a79650c1bdp04)
