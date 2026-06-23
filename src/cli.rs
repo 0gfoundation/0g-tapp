@@ -75,7 +75,7 @@ enum Commands {
         lines: i32,
 
         /// Specific service name
-        #[arg(short, long)]
+        #[arg(long)]
         service: Option<String>,
     },
 
@@ -137,7 +137,7 @@ enum Commands {
         app_id: String,
 
         /// Service name
-        #[arg(short, long)]
+        #[arg(long)]
         service_name: String,
 
         /// Pull latest image before starting
@@ -152,7 +152,7 @@ enum Commands {
         app_id: String,
 
         /// Service name
-        #[arg(short, long)]
+        #[arg(long)]
         service_name: String,
     },
 
@@ -238,11 +238,11 @@ enum Commands {
         rpc_url: String,
 
         /// Chain ID
-        #[arg(short, long)]
+        #[arg(long)]
         chain_id: u64,
 
         /// Custom recipient address (defaults to tapp owner)
-        #[arg(short = 'r', long)]
+        #[arg(long)]
         recipient: Option<String>,
     },
 
@@ -268,7 +268,7 @@ enum Commands {
         message: String,
 
         /// Signature (hex)
-        #[arg(short, long)]
+        #[arg(long)]
         signature: String,
     },
 
@@ -290,7 +290,7 @@ enum Commands {
         contract: String,
 
         /// Stake amount in wei (must be >= minStakeAmount)
-        #[arg(short, long)]
+        #[arg(long)]
         stake_wei: u128,
     },
 
@@ -326,7 +326,7 @@ enum Commands {
         contract: String,
 
         /// Stake amount in wei (must be >= minStakeAmount)
-        #[arg(short, long)]
+        #[arg(long)]
         stake_wei: u128,
 
         /// Signer address of the new node (optional; fetched from --server if not set)
