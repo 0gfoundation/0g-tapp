@@ -270,20 +270,20 @@ contract TappRegistryTest is Test {
         vm.prank(owner);
         registry.addNode{value: MIN_STAKE}(APP_ID, node2, TEE_URL_2, hex"", hex"");
 
-        // Empty per-node override means "inherit the app-level default":
-        // the node carries no own code; the app-level COMPOSE_HASH/VOLUMES_HASH
-        // (in getAppInfo) remains authoritative.
+        // Empty per-node override means "inherit the app-level default": getNode
+        // resolves the empty override to the app-level COMPOSE_HASH/VOLUMES_HASH.
         TappRegistry.NodeInfo memory n = registry.getNode(APP_ID, node2);
-        assertEq(n.composeHash, hex"");
-        assertEq(n.volumesHash, hex"");
+        assertEq(n.composeHash, COMPOSE_HASH);
+        assertEq(n.volumesHash, VOLUMES_HASH);
     }
 
-    function test_RegisterApp_FirstNode_HasEmptyOverride() public {
+    function test_RegisterApp_FirstNode_InheritsAppDefault() public {
         _register();
-        // registerApp's first node inherits the app-level default => empty override.
+        // registerApp's first node has an empty override (inherit); getNode resolves it
+        // to the app-level default. (Raw-empty is covered by the NodeCode event test.)
         TappRegistry.NodeInfo memory n = registry.getNode(APP_ID, node1);
-        assertEq(n.composeHash, hex"");
-        assertEq(n.volumesHash, hex"");
+        assertEq(n.composeHash, COMPOSE_HASH);
+        assertEq(n.volumesHash, VOLUMES_HASH);
     }
 
     function test_UpdateNode_SetsPerNodeOverride() public {
@@ -307,12 +307,12 @@ contract TappRegistryTest is Test {
         );
         assertEq(registry.getNode(APP_ID, node1).composeHash, NODE_COMPOSE_OVERRIDE);
 
-        // ...then clear it back to inherit (empty bytes).
+        // ...then clear it back to inherit (empty bytes): getNode resolves to app default.
         vm.prank(owner);
         registry.updateNode(APP_ID, node1, node1, TEE_URL_1, hex"", hex"");
         TappRegistry.NodeInfo memory n = registry.getNode(APP_ID, node1);
-        assertEq(n.composeHash, hex"");
-        assertEq(n.volumesHash, hex"");
+        assertEq(n.composeHash, COMPOSE_HASH);
+        assertEq(n.volumesHash, VOLUMES_HASH);
     }
 
     // ─── NodeCode event coverage ──────────────────────────────────────────────
@@ -714,17 +714,18 @@ contract TappRegistryTest is Test {
         address[] memory nodes = reg.getNodeList(APP_ID);
         assertEq(nodes.length, 2);
 
-        // 4c. Old node fields preserved; appended override fields default to empty (= inherit).
+        // 4c. Old node fields preserved; appended override is empty in storage (= inherit),
+        //     so getNode resolves it to the app-level default.
         TappRegistry.NodeInfo memory n1 = reg.getNode(APP_ID, node1);
         assertEq(n1.teeUrl,      TEE_URL_1);
         assertEq(n1.stakeAmount, MIN_STAKE);
         assertEq(n1.addedAt,     node1AddedAt);
-        assertEq(n1.composeHash, hex"");
-        assertEq(n1.volumesHash, hex"");
+        assertEq(n1.composeHash, COMPOSE_HASH);   // inherited (resolved by getNode)
+        assertEq(n1.volumesHash, VOLUMES_HASH);
         TappRegistry.NodeInfo memory n2 = reg.getNode(APP_ID, node2);
         assertEq(n2.teeUrl,      TEE_URL_2);
-        assertEq(n2.composeHash, hex"");
-        assertEq(n2.volumesHash, hex"");
+        assertEq(n2.composeHash, COMPOSE_HASH);
+        assertEq(n2.volumesHash, VOLUMES_HASH);
 
         // 5. New per-node override paths work on the upgraded proxy.
         vm.prank(owner);

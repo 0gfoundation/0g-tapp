@@ -45,7 +45,8 @@ TAPP_REGISTRY_CONTRACT=0x95a0BF4148b30F6F8D86870534c51df46Da5511c
 
 | Contract | Address |
 |----------|---------|
-| TappRegistry Implementation | `0xaeddc6b6A6b9d4a9513Cc2322bbb78DFF97DA459` |
+| TappRegistry Implementation (initial) | `0xaeddc6b6A6b9d4a9513Cc2322bbb78DFF97DA459` |
+| **TappRegistry Implementation (current, getNode resolves inherit)** | `0x6987fD9afe6e2430bF5AD85cfBC8c63487d4e4BD` |
 | UpgradeableBeacon | `0x1Cd7544068AdC525b9Cb21cC13aF25D95a53645E` |
 | **BeaconProxy (stable)** | `0x2Ce80374318B1d7Fb3345724457a182E0ad165c9` |
 
@@ -211,8 +212,9 @@ docker run --rm --entrypoint cast ghcr.io/foundry-rs/foundry:latest \
 docker run --rm --entrypoint cast ghcr.io/foundry-rs/foundry:latest \
   call <PROXY> "getAppInfo(string)((bytes,bytes,bytes[],address,uint256))" "<APP_ID>" --rpc-url <RPC_URL>
 
-# Node info — teeUrl, addedAt, stakeAmount, composeHash, volumesHash. The compose/volumes
-# here are this node's OVERRIDE; empty means it inherits the app-level default above.
+# Node info — teeUrl, addedAt, stakeAmount, composeHash, volumesHash. getNode returns the
+# node's EFFECTIVE compose/volumes: its own override if set, else the app-level default
+# resolved in. (Storage holds empty = inherit; the raw override is in the NodeCode event.)
 docker run --rm --entrypoint cast ghcr.io/foundry-rs/foundry:latest \
   call <PROXY> "getNode(string,address)((string,uint256,uint256,bytes,bytes))" "<APP_ID>" "<SIGNER>" --rpc-url <RPC_URL>
 ```

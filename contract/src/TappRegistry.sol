@@ -57,9 +57,10 @@ contract TappRegistry {
         string  teeUrl;
         uint256 addedAt;
         uint256 stakeAmount;
-        /// @dev OPTIONAL per-node override of the app-level composeHash. Empty means
-        ///      "inherit the app-level default". Appended after stakeAmount to keep the
-        ///      storage layout upgrade-compatible (existing nodes read empty = inherit).
+        /// @dev OPTIONAL per-node override of the app-level composeHash. Empty in storage
+        ///      means "inherit the app-level default"; getNode() resolves it to the
+        ///      default on read (raw override is still observable via the NodeCode event).
+        ///      Appended after stakeAmount to keep the storage layout upgrade-compatible.
         bytes   composeHash;
         /// @dev OPTIONAL per-node override of the app-level volumesHash (see composeHash).
         bytes   volumesHash;
@@ -495,11 +496,22 @@ contract TappRegistry {
         return _appAckVersions[appId];
     }
 
+    /// @notice Returns a node's info with its EFFECTIVE compose/volumes resolved: if the
+    ///         node's per-node override is empty (inherit), the app-level default is
+    ///         substituted in the returned struct. (Storage still holds empty = inherit;
+    ///         the raw override is observable via the NodeCode event.) A non-existent
+    ///         node (addedAt == 0) is returned as-is without substitution.
     function getNode(
         string  calldata appId,
         address          signerAddress
     ) external view returns (NodeInfo memory) {
-        return _nodes[appId][signerAddress];
+        NodeInfo memory node = _nodes[appId][signerAddress];
+        if (node.addedAt != 0) {
+            AppInfo storage app = _apps[appId];
+            if (node.composeHash.length == 0) node.composeHash = app.composeHash;
+            if (node.volumesHash.length == 0) node.volumesHash = app.volumesHash;
+        }
+        return node;
     }
 
     /// @notice Active node list. Entries are removed immediately when a node is removed.
