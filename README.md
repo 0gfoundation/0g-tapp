@@ -289,6 +289,32 @@ tapp-cli -s http://<any-tapp>:50051 -k 0x<deployer-key> withdraw \
   --contract 0x<TappRegistry>
 ```
 
+### Verifying an App
+
+`tapp-cli verify-app` checks that what a node actually runs matches what is registered on-chain.
+
+**Chain mode** (pass `--contract` + `--rpc-url`): reads the registry, fetches evidence from every node's on-chain `teeUrl`, verifies each TDX quote via the CoCo Attestation Service, and reconciles the evidence (signer, compose, volumes, image) against the chain.
+
+```bash
+tapp-cli verify-app \
+  --app-id my-app \
+  --rpc-url https://evmrpc-testnet.0g.ai \
+  --contract 0x<TappRegistry>
+  # --as-endpoint host:port   # CoCo-AS gRPC endpoint, default 47.237.201.184:50004
+```
+
+**Direct mode** (omit `--contract`, pass `-s <server>`): verifies a single node's evidence + quote and shows what it attests, without on-chain reconciliation — useful for apps not yet registered.
+
+```bash
+tapp-cli -s http://<tapp>:50051 verify-app --app-id my-app
+```
+
+List the apps a server is currently running (read-only, no key needed):
+
+```bash
+tapp-cli -s http://<tapp>:50051 list-apps
+```
+
 ### Managing Ack Invalidators
 
 User acknowledgements (acks) on TappRegistry are tied to an app's `ackVersion`, which bumps automatically on `updateApp` and node changes. When a sibling contract (e.g. a pricing or policy contract) needs to invalidate existing user acks without changing the app's code identity, the app owner can authorize that contract as an **invalidator**. Authorized invalidators may call `invalidateAcks(appId)` to bump the version. Both commands are app-owner-only and idempotent (no-op if the state already matches).
