@@ -660,6 +660,23 @@ enable_eventlog = true
         Ok(app_info.get(app_id).cloned())
     }
 
+    /// Summaries of all apps currently running on this server:
+    /// (app_id, owner, compose_hash, image_count).
+    pub async fn list_apps(&self) -> Vec<(String, String, String, usize)> {
+        let app_info = self.app_info.lock().await;
+        app_info
+            .values()
+            .map(|a| {
+                (
+                    a.app_id.clone(),
+                    a.owner.clone(),
+                    a.compose_content.hash.clone(),
+                    a.compose_content.image_hash.len(),
+                )
+            })
+            .collect()
+    }
+
     /// Docker login to registry for pulling private images
     pub async fn docker_login(
         &self,

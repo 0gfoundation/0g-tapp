@@ -5,7 +5,7 @@ use tapp_service::proto::{
     DockerLogoutRequest, GetAppContainerStatusRequest, GetAppInfoRequest, GetAppKeyRequest,
     GetAppLogsRequest, GetAppSecretKeyRequest, GetEvidenceRequest, GetSecretResourceRequest,
     GetServiceLogsRequest, GetServiceStatusRequest, GetTappInfoRequest, GetTaskStatusRequest,
-    ListWhitelistRequest, MountFile, PruneImagesRequest, RemoveFromWhitelistRequest,
+    ListAppsRequest, ListWhitelistRequest, MountFile, PruneImagesRequest, RemoveFromWhitelistRequest,
     StartAppRequest, StartServiceRequest, StopAppRequest, StopServiceRequest, WithdrawBalanceRequest,
 };
 use tonic::{metadata::MetadataValue, Request};
@@ -63,6 +63,9 @@ enum Commands {
         #[arg(short, long)]
         app_id: String,
     },
+
+    /// List all apps currently on the server
+    ListApps,
 
     /// Get application logs
     GetAppLogs {
@@ -468,6 +471,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::GetAppInfo { app_id } => {
             get_app_info(&cli.server, app_id).await?;
+        }
+        Commands::ListApps => {
+            list_apps(&cli.server).await?;
         }
         Commands::GetAppLogs {
             app_id,
@@ -973,6 +979,33 @@ async fn get_app_info(server: &str, app_id: String) -> Result<(), Box<dyn std::e
     println!("  Compose Hash: {}", result.compose_hash);
     println!("  Volumes Hash: {:?}", result.volumes_hash);
     println!("  Image Hash: {:?}", result.image_hash);
+
+    Ok(())
+}
+
+async fn list_apps(server: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let mut client = TappServiceClient::connect(server.to_string()).await?;
+
+    let response = client.list_apps(Request::new(ListAppsRequest {})).await?;
+    let result = response.into_inner();
+
+    if result.apps.is_empty() {
+        println!("No apps on this server.");
+        return Ok(());
+    }
+
+    println!("Apps ({}):", result.apps.len());
+    for a in &result.apps {
+        let compose = if a.compose_hash.len() > 16 {
+            format!("{}…", &a.compose_hash[..16])
+        } else {
+            a.compose_hash.clone()
+        };
+        println!(
+            "  {}\n    owner={}  compose={}  images={}",
+            a.app_id, a.owner, compose, a.image_count
+        );
+    }
 
     Ok(())
 }

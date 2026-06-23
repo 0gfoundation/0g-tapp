@@ -29,6 +29,9 @@ service TappService {
   // Get application information
   rpc GetAppInfo(GetAppInfoRequest) returns (GetAppInfoResponse);
 
+  // List all apps currently on the server
+  rpc ListApps(ListAppsRequest) returns (ListAppsResponse);
+
   // Get TAPP service configuration
   rpc GetTappInfo(GetTappInfoRequest) returns (GetTappInfoResponse);
 
@@ -267,6 +270,21 @@ message GetAppInfoResponse {
   map<string, string> volumes_hash = 6;  // Map: file_name -> hash
   string compose_content = 7;
   map<string, string> image_hash = 9;  // Map: service_name -> image_hash
+}
+
+// List Apps Messages
+message ListAppsRequest {}
+
+message AppSummary {
+  string app_id = 1;
+  string owner = 2;
+  string compose_hash = 3;
+  uint32 image_count = 4;  // number of service images in the compose
+}
+
+message ListAppsResponse {
+  bool success = 1;
+  repeated AppSummary apps = 2;
 }
 
 // Get TAPP Info Messages
