@@ -1,7 +1,7 @@
 ---
 name: 0g-tapp-cli
 description: Use this skill when the user wants to deploy, manage, or troubleshoot applications on a 0G Tapp (Trusted Application Platform) server using tapp-cli. Covers start/stop apps, on-chain registration, registry login, check task status, view logs, and manage docker compose deployments across multiple remote TEE servers.
-version: 1.2.0
+version: 1.3.0
 author: 0G Labs
 tags: [0g, tapp, tee, docker, deployment, cli, onchain]
 ---
@@ -14,8 +14,9 @@ Deploy and manage containerized applications on 0G Tapp TEE servers using `tapp-
 
 - **tapp-cli binary**: `/usr/local/bin/tapp-cli`
 - **Server**: `-s <url>` (e.g. `http://<host>:50051`). There are MANY tapp servers; always pass `-s` explicitly.
-- **Auth**: private key via `-k` flag or `TAPP_PRIVATE_KEY`.
+- **Auth**: private key via `-k` flag or `TAPP_PRIVATE_KEY` env var. Read-only commands (`get-tapp-info`, `get-service-status`, `get-app-info`, `get-app-key`, `get-evidence`) work without `-k`; owner-only commands require it.
 - **TappRegistry (testnet)**: proxy `0x95a0BF4148b30F6F8D86870534c51df46Da5511c`, RPC `https://evmrpc-testnet.0g.ai`, chainId `16602`. See `contract/CONTRACTS.md`.
+- **⚠️ Short flag `-s` conflict**: the global `-s` / `--server` flag is shadowed by local `-s` in `register-onchain` (`--stake-wei`), `get-app-logs` (`--service`), and `verify-signature` (`--signature`). Always use `--server` (full name) with these subcommands.
 
 ## Keys & servers — read this first
 
@@ -24,7 +25,7 @@ Each server has an **owner** address (set in its config). App/onchain operations
 - **Server ops** (start/stop/login/get-*): key must be the **server owner** (or whitelisted). Wrong key → `PermissionDenied`.
 - **On-chain** (`register-onchain` etc.): the SAME `--private-key` is used to BOTH auth the `--server` AND sign+pay the tx. So it must satisfy **three things at once**: server-authorized + the app's on-chain owner + funded (stake + gas). If they can't be the same address, do the on-chain part with raw `cast send` (see below) using the funded owner key, bypassing `--server`.
 - **Find a server's owner**: `tapp-cli -s <server> -k <anykey> get-tapp-info` (read-only; prints `Owner Address`). Then match the key whose address equals it.
-- Convert a key → address: `docker run --rm --entrypoint cast ghcr.io/foundry-rs/foundry:latest wallet address 0x<key>`.
+- Convert a key → address: `docker run --rm --entrypoint cast ghcr.io/foundry-rs/foundry:latest wallet address 0x<key>`, or if you have `cast` installed locally: `cast wallet address 0x<key>`.
 
 Record which key maps to which server/owner in memory — it changes per deployment.
 
@@ -39,12 +40,34 @@ tapp-cli -s <server> -k 0x<key> stop-service  --app-id <id> --service-name <svc>
 tapp-cli -s <server> -k 0x<key> start-service --app-id <id> --service-name <svc>
 tapp-cli -s <server> -k 0x<key> get-app-container-status --app-id <id>
 tapp-cli -s <server> -k 0x<key> get-app-info --app-id <id>        # compose/volume/image hashes the server holds
-tapp-cli -s <server> -k 0x<key> get-app-logs --app-id <id> --service <name> -n 100
-tapp-cli -s <server> -k 0x<key> get-app-key --app-id <id>         # TEE-derived app signing key (Ethereum addr)
-tapp-cli -s <server> -k 0x<key> get-tapp-info                     # server version + Owner Address
-tapp-cli -s <server> -k 0x<key> prune-images                     # delete UNUSED images (app must be stopped to free its images)
-tapp-cli -s <server> -k 0x<key> get-service-logs -f <file>       # tapp-server's own logs (no -f lists files)
+tapp-cli -s <server> -k 0x<key> get-app-logs --app-id <id> --service <name> -n 100  # note: use --server, not -s (see above)
+tapp-cli -s <server> -k 0x<key> get-app-key --app-id <id>         # TEE-derived app signing key (ethereum); --key-type / --x25519 for other types
+tapp-cli -s <server> -k 0x<key> get-tapp-info                     # server version + Owner Address (no key needed)
+tapp-cli -s <server> -k 0x<key> prune-images [--all]              # delete UNUSED images (--all removes all unused, not just dangling)
+tapp-cli -s <server> -k 0x<key> get-service-logs -f <file> [-n 100] # tapp-server's own logs (-n limits lines; no -f lists files)
+tapp-cli -s <server> -k 0x<key> docker-logout                    # logout from Docker registry on this server
 ```
+
+### Server health & whitelist
+```bash
+tapp-cli -s <server> get-service-status                           # server health + systemd journalctl (no key needed)
+tapp-cli -s <server> -k 0x<key> add-to-whitelist --address 0x<evm-addr>    # authorize another address to manage this server
+tapp-cli -s <server> -k 0x<key> remove-from-whitelist --address 0x<evm-addr>
+tapp-cli -s <server> -k 0x<key> list-whitelist                    # list all authorized addresses
+```
+
+### Signing & verification
+```bash
+tapp-cli -k 0x<key> sign-message -m "hello"                      # sign a message; returns hex + base64 signature
+tapp-cli verify-signature -m "hello" --signature 0x<hex> --pubkey 0x<addr>  # verify a signature
+```
+
+### Local-only commands (require localhost access)
+```bash
+tapp-cli -s http://localhost:50051 -k 0x<key> get-app-secret-key --app-id <id>   # TEE-derived secret key; BLOCKED remotely
+tapp-cli -s http://localhost:50051 -k 0x<key> get-secret-resource --app-id <id> --resource <name>  # KMS resource; BLOCKED remotely
+```
+These commands error with "Private keys will NEVER be sent over the network" when called from a remote host. They only work on the server itself.
 
 ### Waiting for async tasks
 `start-app`/`stop-app` return a task-id and run async. Poll until done — do NOT chain `sleep`s (blocked); use an until-loop:
@@ -64,14 +87,23 @@ update-onchain      --app-id <id> --rpc-url <rpc> --contract 0x<reg>            
 add-node-onchain    --app-id <id> --rpc-url <rpc> --contract 0x<reg> --stake-wei <wei>                 # -s = new node
 update-node-onchain --app-id <id> --rpc-url <rpc> --contract 0x<reg> [--old-signer 0x..] [--new-signer 0x..] [--tee-url ..]
 remove-node-onchain --app-id <id> --rpc-url <rpc> --contract 0x<reg>                                   # -s = node to remove; starts 1-day stake lock
-withdraw            --rpc-url <rpc> --contract 0x<reg> --signer-address 0x<removed-node-signer>         # after lock elapses
+withdraw            --rpc-url <rpc> --contract 0x<reg>                                   # after lock elapses; uses -k key to identify caller
+withdraw-balance    --app-id <id> --rpc-url <rpc> --contract 0x<reg>                        # withdraw app balance to owner
 ```
+- `remove-node-onchain` accepts `--signer-address 0x<addr>` to provide the signer directly when the node is unreachable (can't connect to `--server`).
 - `update-node-onchain`: new signer auto-fetched from `--server` unless `--new-signer` given; `--tee-url` defaults to the `--server` URL. Pass `--old-signer` explicitly when replacing a node on a different host.
 - No app-owner transfer exists: to change owner, old owner `remove-node-onchain` (→ stake locks ~1 day, then `withdraw`) then new owner `register-onchain`.
 - app-id is **global & unique** in the registry. `register-onchain` on an existing id → `app already exists`; use add-node/update-node instead.
 
-### Raw contract calls (no tapp-cli subcommand)
-For `authorizeInvalidator` / `updateNode` etc., or when the funded owner key isn't the server owner, call the contract directly. **Set gas explicitly** — testnet min tip is 2 gwei, cast's default (1 wei) is rejected (`gas tip cap below minimum`):
+### Native on-chain subcommands
+For `authorizeInvalidator` / `revokeInvalidator`, use the built-in subcommands instead of raw `cast send`:
+```bash
+tapp-cli --app-id <id> --rpc-url <rpc> --contract 0x<reg> authorize-invalidator-onchain --invalidator 0x<addr>
+tapp-cli --app-id <id> --rpc-url <rpc> --contract 0x<reg> revoke-invalidator-onchain --invalidator 0x<addr>
+```
+
+### Raw contract calls (fallback)
+For other contract interactions or when the funded owner key isn't the server owner, call the contract directly. **Set gas explicitly** — testnet min tip is 2 gwei, cast's default (1 wei) is rejected (`gas tip cap below minimum`):
 ```bash
 docker run --rm --entrypoint cast ghcr.io/foundry-rs/foundry:latest send 0x<reg> \
   "authorizeInvalidator(string,address)" "<appId>" 0x<SandboxServing> \
