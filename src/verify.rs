@@ -213,6 +213,63 @@ async fn fetch_evidence(tee_url: &str, app_id: &str) -> Result<Vec<u8>> {
     Ok(resp.evidence)
 }
 
+/// Direct (no-chain) verification of a single server: fetch evidence, verify the quote
+/// via CoCo-AS, and report what the node attests. No on-chain reconciliation — used when
+/// the app is not (yet) registered on-chain, or to check one node directly.
+pub struct DirectVerdict {
+    pub server: String,
+    pub signer: String, // from quote report_data (0x…), as attested (not reconciled)
+    pub ear_status: String,
+    pub tcb_status: String,
+    pub advisories: usize,
+    pub compose_hash: String, // from latest successful start_app, if any
+    pub images: Vec<String>,
+    pub note: String,
+}
+
+pub async fn verify_node_direct(
+    server: &str,
+    app_id: &str,
+    as_endpoint: &str,
+) -> Result<DirectVerdict> {
+    let mut v = DirectVerdict {
+        server: server.to_string(),
+        signer: String::new(),
+        ear_status: "-".to_string(),
+        tcb_status: "-".to_string(),
+        advisories: 0,
+        compose_hash: String::new(),
+        images: Vec::new(),
+        note: String::new(),
+    };
+
+    let raw = fetch_evidence(server, app_id).await?;
+    let j: serde_json::Value = serde_json::from_slice(&raw)?;
+    let quote_b64 = j["quote"].as_str().unwrap_or("");
+    let cc_b64 = j["cc_eventlog"].as_str().unwrap_or("");
+
+    if let Ok(rd) = quote_report_data(quote_b64) {
+        v.signer = format!("0x{}", hex::encode(&rd[..20]));
+    } else {
+        v.note = "quote parse failed; ".to_string();
+    }
+
+    match verify_with_as(as_endpoint, &raw).await {
+        Ok((s, t, a)) => {
+            v.ear_status = s;
+            v.tcb_status = t;
+            v.advisories = a;
+        }
+        Err(e) => v.note = format!("{}AS: {}", v.note, e),
+    }
+
+    if let Ok(Some(m)) = latest_successful_start(cc_b64, app_id) {
+        v.compose_hash = m.compose_hash;
+        v.images = m.image_hash.into_values().collect();
+    }
+    Ok(v)
+}
+
 /// Verify every node of `app_id`: read chain, fetch evidence from each node's teeUrl,
 /// verify the quote via CoCo-AS, and reconcile evidence against on-chain values.
 pub async fn verify_app(
