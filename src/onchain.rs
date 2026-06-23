@@ -65,6 +65,106 @@ pub async fn get_app_default_hashes(
     }
 }
 
+/// Low-level eth_call helper returning raw return bytes.
+async fn call_raw(rpc_url: &str, contract: &str, data: Vec<u8>) -> Result<Vec<u8>> {
+    let provider =
+        Provider::<Http>::try_from(rpc_url).map_err(|e| anyhow!("Invalid RPC URL: {}", e))?;
+    let to = Address::from_str(contract).map_err(|_| anyhow!("Invalid contract address"))?;
+    let tx = TransactionRequest::new().to(to).data(Bytes::from(data));
+    provider
+        .call(&tx.into(), None)
+        .await
+        .map(|b| b.to_vec())
+        .map_err(|e| anyhow!("eth_call failed: {}", e))
+}
+
+/// App-level shared image digests (each is the on-chain bytes, e.g. b"sha256:...").
+pub async fn get_app_image_hashes(
+    rpc_url: &str,
+    contract: &str,
+    app_id: &str,
+) -> Result<Vec<Vec<u8>>> {
+    let data = calldata("getAppInfo(string)", vec![Token::String(app_id.to_owned())]);
+    let out = call_raw(rpc_url, contract, data).await?;
+    let tuple = ParamType::Tuple(vec![
+        ParamType::Bytes,
+        ParamType::Bytes,
+        ParamType::Array(Box::new(ParamType::Bytes)),
+        ParamType::Address,
+        ParamType::Uint(256),
+    ]);
+    let tokens = decode(&[tuple], &out).map_err(|e| anyhow!("decode getAppInfo: {}", e))?;
+    if let Some(Token::Tuple(fields)) = tokens.into_iter().next() {
+        if let Token::Array(arr) = &fields[2] {
+            return Ok(arr
+                .iter()
+                .filter_map(|t| match t {
+                    Token::Bytes(b) => Some(b.clone()),
+                    _ => None,
+                })
+                .collect());
+        }
+    }
+    Err(anyhow!("unexpected getAppInfo return shape"))
+}
+
+/// Registered node signer addresses for an app (getNodeList).
+pub async fn get_node_list(rpc_url: &str, contract: &str, app_id: &str) -> Result<Vec<Address>> {
+    let data = calldata("getNodeList(string)", vec![Token::String(app_id.to_owned())]);
+    let out = call_raw(rpc_url, contract, data).await?;
+    let tokens = decode(&[ParamType::Array(Box::new(ParamType::Address))], &out)
+        .map_err(|e| anyhow!("decode getNodeList: {}", e))?;
+    if let Some(Token::Array(arr)) = tokens.into_iter().next() {
+        return Ok(arr
+            .into_iter()
+            .filter_map(|t| match t {
+                Token::Address(a) => Some(a),
+                _ => None,
+            })
+            .collect());
+    }
+    Err(anyhow!("unexpected getNodeList return shape"))
+}
+
+/// A node's teeUrl and EFFECTIVE compose/volumes (getNode resolves inherit→default).
+pub async fn get_node(
+    rpc_url: &str,
+    contract: &str,
+    app_id: &str,
+    signer: Address,
+) -> Result<(String, Vec<u8>, Vec<u8>)> {
+    let data = calldata(
+        "getNode(string,address)",
+        vec![Token::String(app_id.to_owned()), Token::Address(signer)],
+    );
+    let out = call_raw(rpc_url, contract, data).await?;
+    // NodeInfo = (string teeUrl, uint256 addedAt, uint256 stakeAmount, bytes composeHash, bytes volumesHash)
+    let tuple = ParamType::Tuple(vec![
+        ParamType::String,
+        ParamType::Uint(256),
+        ParamType::Uint(256),
+        ParamType::Bytes,
+        ParamType::Bytes,
+    ]);
+    let tokens = decode(&[tuple], &out).map_err(|e| anyhow!("decode getNode: {}", e))?;
+    if let Some(Token::Tuple(f)) = tokens.into_iter().next() {
+        let tee_url = match &f[0] {
+            Token::String(s) => s.clone(),
+            _ => String::new(),
+        };
+        let compose = match &f[3] {
+            Token::Bytes(b) => b.clone(),
+            _ => vec![],
+        };
+        let volumes = match &f[4] {
+            Token::Bytes(b) => b.clone(),
+            _ => vec![],
+        };
+        return Ok((tee_url, compose, volumes));
+    }
+    Err(anyhow!("unexpected getNode return shape"))
+}
+
 // ─── Transaction sender ───────────────────────────────────────────────────────
 
 async fn send_tx(
