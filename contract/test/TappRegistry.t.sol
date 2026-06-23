@@ -6,6 +6,7 @@ import {Vm} from "forge-std/Vm.sol";
 import {TappRegistry} from "../src/TappRegistry.sol";
 import {UpgradeableBeacon} from "../src/proxy/UpgradeableBeacon.sol";
 import {BeaconProxy} from "../src/proxy/BeaconProxy.sol";
+import {TappRegistryV1} from "./fixtures/TappRegistryV1.sol";
 
 contract TappRegistryTest is Test {
     TappRegistry public registry;
@@ -24,6 +25,10 @@ contract TappRegistryTest is Test {
     bytes   constant VOLUMES_HASH = hex"ccdd";
     string  constant TEE_URL_1    = "https://node1.example.com";
     string  constant TEE_URL_2    = "https://node2.example.com";
+
+    // Per-node code overrides (distinct from the app-level defaults above).
+    bytes   constant NODE_COMPOSE_OVERRIDE = hex"aa";
+    bytes   constant NODE_VOLUMES_OVERRIDE = hex"bb";
 
     bytes[] imageHashes;
 
@@ -54,7 +59,7 @@ contract TappRegistryTest is Test {
     function _registerTwo() internal {
         _register();
         vm.prank(owner);
-        registry.addNode{value: MIN_STAKE}(APP_ID, node2, TEE_URL_2);
+        registry.addNode{value: MIN_STAKE}(APP_ID, node2, TEE_URL_2, hex"", hex"");
     }
 
     // ─── registerApp ──────────────────────────────────────────────────────────
@@ -138,7 +143,7 @@ contract TappRegistryTest is Test {
     function test_AddNode() public {
         _register();
         vm.prank(owner);
-        registry.addNode{value: MIN_STAKE}(APP_ID, node2, TEE_URL_2);
+        registry.addNode{value: MIN_STAKE}(APP_ID, node2, TEE_URL_2, hex"", hex"");
 
         TappRegistry.NodeInfo memory node = registry.getNode(APP_ID, node2);
         assertEq(node.stakeAmount, MIN_STAKE);
@@ -152,7 +157,7 @@ contract TappRegistryTest is Test {
         _register();
         assertEq(registry.getAckVersion(APP_ID), 1);
         vm.prank(owner);
-        registry.addNode{value: MIN_STAKE}(APP_ID, node2, TEE_URL_2);
+        registry.addNode{value: MIN_STAKE}(APP_ID, node2, TEE_URL_2, hex"", hex"");
         assertEq(registry.getAckVersion(APP_ID), 2);
     }
 
@@ -163,7 +168,7 @@ contract TappRegistryTest is Test {
         assertTrue(registry.isAcknowledged(user, APP_ID));
 
         vm.prank(owner);
-        registry.addNode{value: MIN_STAKE}(APP_ID, node2, TEE_URL_2);
+        registry.addNode{value: MIN_STAKE}(APP_ID, node2, TEE_URL_2, hex"", hex"");
         assertFalse(registry.isAcknowledged(user, APP_ID));
     }
 
@@ -171,21 +176,21 @@ contract TappRegistryTest is Test {
         _register();
         vm.expectRevert("not app owner");
         vm.prank(hacker);
-        registry.addNode{value: MIN_STAKE}(APP_ID, node2, TEE_URL_2);
+        registry.addNode{value: MIN_STAKE}(APP_ID, node2, TEE_URL_2, hex"", hex"");
     }
 
     function test_AddNode_Revert_NodeAlreadyExists() public {
         _register();
         vm.expectRevert("node already exists");
         vm.prank(owner);
-        registry.addNode{value: MIN_STAKE}(APP_ID, node1, TEE_URL_1);
+        registry.addNode{value: MIN_STAKE}(APP_ID, node1, TEE_URL_1, hex"", hex"");
     }
 
     function test_AddNode_Revert_InsufficientStake() public {
         _register();
         vm.expectRevert("insufficient stake");
         vm.prank(owner);
-        registry.addNode{value: 0.1 ether}(APP_ID, node2, TEE_URL_2);
+        registry.addNode{value: 0.1 ether}(APP_ID, node2, TEE_URL_2, hex"", hex"");
     }
 
     // ─── updateNode ───────────────────────────────────────────────────────────
@@ -193,7 +198,7 @@ contract TappRegistryTest is Test {
     function test_UpdateNode_ReplacesSignerAndTeeUrl() public {
         _register();
         vm.prank(owner);
-        registry.updateNode(APP_ID, node1, node2, TEE_URL_2);
+        registry.updateNode(APP_ID, node1, node2, TEE_URL_2, hex"", hex"");
 
         // old node gone
         assertEq(registry.getNode(APP_ID, node1).addedAt, 0);
@@ -210,7 +215,7 @@ contract TappRegistryTest is Test {
     function test_UpdateNode_IncrementsAckVersion() public {
         _register();
         vm.prank(owner);
-        registry.updateNode(APP_ID, node1, node2, TEE_URL_2);
+        registry.updateNode(APP_ID, node1, node2, TEE_URL_2, hex"", hex"");
         assertEq(registry.getAckVersion(APP_ID), 2);
     }
 
@@ -221,7 +226,7 @@ contract TappRegistryTest is Test {
         assertTrue(registry.isAcknowledged(user, APP_ID));
 
         vm.prank(owner);
-        registry.updateNode(APP_ID, node1, node2, TEE_URL_2);
+        registry.updateNode(APP_ID, node1, node2, TEE_URL_2, hex"", hex"");
         assertFalse(registry.isAcknowledged(user, APP_ID));
     }
 
@@ -229,21 +234,146 @@ contract TappRegistryTest is Test {
         _register();
         vm.expectRevert("old node not found");
         vm.prank(owner);
-        registry.updateNode(APP_ID, node2, makeAddr("node3"), TEE_URL_2);
+        registry.updateNode(APP_ID, node2, makeAddr("node3"), TEE_URL_2, hex"", hex"");
     }
 
     function test_UpdateNode_Revert_NewSignerAlreadyExists() public {
         _registerTwo();
         vm.expectRevert("new signer already exists");
         vm.prank(owner);
-        registry.updateNode(APP_ID, node1, node2, TEE_URL_2);
+        registry.updateNode(APP_ID, node1, node2, TEE_URL_2, hex"", hex"");
     }
 
     function test_UpdateNode_Revert_NotOwner() public {
         _register();
         vm.expectRevert("not app owner");
         vm.prank(hacker);
-        registry.updateNode(APP_ID, node1, node2, TEE_URL_2);
+        registry.updateNode(APP_ID, node1, node2, TEE_URL_2, hex"", hex"");
+    }
+
+    // ─── per-node code override (composeHash/volumesHash) ─────────────────────
+
+    function test_AddNode_WithOverride_StoresPerNodeCode() public {
+        _register();
+        vm.prank(owner);
+        registry.addNode{value: MIN_STAKE}(
+            APP_ID, node2, TEE_URL_2, NODE_COMPOSE_OVERRIDE, NODE_VOLUMES_OVERRIDE
+        );
+
+        TappRegistry.NodeInfo memory n = registry.getNode(APP_ID, node2);
+        assertEq(n.composeHash, NODE_COMPOSE_OVERRIDE);
+        assertEq(n.volumesHash, NODE_VOLUMES_OVERRIDE);
+    }
+
+    function test_AddNode_EmptyOverride_InheritsAppDefault() public {
+        _register();
+        vm.prank(owner);
+        registry.addNode{value: MIN_STAKE}(APP_ID, node2, TEE_URL_2, hex"", hex"");
+
+        // Empty per-node override means "inherit the app-level default":
+        // the node carries no own code; the app-level COMPOSE_HASH/VOLUMES_HASH
+        // (in getAppInfo) remains authoritative.
+        TappRegistry.NodeInfo memory n = registry.getNode(APP_ID, node2);
+        assertEq(n.composeHash, hex"");
+        assertEq(n.volumesHash, hex"");
+    }
+
+    function test_RegisterApp_FirstNode_HasEmptyOverride() public {
+        _register();
+        // registerApp's first node inherits the app-level default => empty override.
+        TappRegistry.NodeInfo memory n = registry.getNode(APP_ID, node1);
+        assertEq(n.composeHash, hex"");
+        assertEq(n.volumesHash, hex"");
+    }
+
+    function test_UpdateNode_SetsPerNodeOverride() public {
+        _register();
+        vm.prank(owner);
+        registry.updateNode(
+            APP_ID, node1, node1, TEE_URL_1, NODE_COMPOSE_OVERRIDE, NODE_VOLUMES_OVERRIDE
+        );
+
+        TappRegistry.NodeInfo memory n = registry.getNode(APP_ID, node1);
+        assertEq(n.composeHash, NODE_COMPOSE_OVERRIDE);
+        assertEq(n.volumesHash, NODE_VOLUMES_OVERRIDE);
+    }
+
+    function test_UpdateNode_EmptyOverride_ClearsBackToInherit() public {
+        _register();
+        // First set an override...
+        vm.prank(owner);
+        registry.updateNode(
+            APP_ID, node1, node1, TEE_URL_1, NODE_COMPOSE_OVERRIDE, NODE_VOLUMES_OVERRIDE
+        );
+        assertEq(registry.getNode(APP_ID, node1).composeHash, NODE_COMPOSE_OVERRIDE);
+
+        // ...then clear it back to inherit (empty bytes).
+        vm.prank(owner);
+        registry.updateNode(APP_ID, node1, node1, TEE_URL_1, hex"", hex"");
+        TappRegistry.NodeInfo memory n = registry.getNode(APP_ID, node1);
+        assertEq(n.composeHash, hex"");
+        assertEq(n.volumesHash, hex"");
+    }
+
+    // ─── NodeCode event coverage ──────────────────────────────────────────────
+
+    function _findNodeCode(Vm.Log[] memory logs, address signer)
+        internal
+        pure
+        returns (bool found, bytes memory composeHash, bytes memory volumesHash)
+    {
+        bytes32 sig = keccak256("NodeCode(string,address,bytes,bytes)");
+        for (uint256 i = 0; i < logs.length; i++) {
+            if (logs[i].topics[0] == sig &&
+                logs[i].topics[2] == bytes32(uint256(uint160(signer)))) {
+                (composeHash, volumesHash) = abi.decode(logs[i].data, (bytes, bytes));
+                found = true;
+                break;
+            }
+        }
+    }
+
+    function test_RegisterApp_EmitsNodeCode_EmptyForFirstNode() public {
+        vm.recordLogs();
+        _register();
+
+        (bool found, bytes memory c, bytes memory v) =
+            _findNodeCode(vm.getRecordedLogs(), node1);
+        assertTrue(found, "NodeCode not emitted for first node");
+        assertEq(c, hex"");
+        assertEq(v, hex"");
+    }
+
+    function test_AddNode_EmitsNodeCode_WithOverride() public {
+        _register();
+
+        vm.recordLogs();
+        vm.prank(owner);
+        registry.addNode{value: MIN_STAKE}(
+            APP_ID, node2, TEE_URL_2, NODE_COMPOSE_OVERRIDE, NODE_VOLUMES_OVERRIDE
+        );
+
+        (bool found, bytes memory c, bytes memory v) =
+            _findNodeCode(vm.getRecordedLogs(), node2);
+        assertTrue(found, "NodeCode not emitted on addNode");
+        assertEq(c, NODE_COMPOSE_OVERRIDE);
+        assertEq(v, NODE_VOLUMES_OVERRIDE);
+    }
+
+    function test_UpdateNode_EmitsNodeCode_WithOverride() public {
+        _register();
+
+        vm.recordLogs();
+        vm.prank(owner);
+        registry.updateNode(
+            APP_ID, node1, node2, TEE_URL_2, NODE_COMPOSE_OVERRIDE, NODE_VOLUMES_OVERRIDE
+        );
+
+        (bool found, bytes memory c, bytes memory v) =
+            _findNodeCode(vm.getRecordedLogs(), node2);
+        assertTrue(found, "NodeCode not emitted on updateNode");
+        assertEq(c, NODE_COMPOSE_OVERRIDE);
+        assertEq(v, NODE_VOLUMES_OVERRIDE);
     }
 
     // ─── removeNode ───────────────────────────────────────────────────────────
@@ -544,6 +674,71 @@ contract TappRegistryTest is Test {
         assertTrue(registry.isAcknowledged(user, APP_ID));
     }
 
+    /// @notice Storage-compat for the per-node-override upgrade: register an app + a
+    ///         second node under the OLD impl (NodeInfo had no compose/volumes, addNode
+    ///         took none), upgrade the beacon to the NEW impl, and verify all old data
+    ///         still reads correctly and the appended per-node override fields default
+    ///         to empty (= inherit). Then exercise the new per-node override paths.
+    function test_Upgrade_FromV1_PreservesDataAndNodeOverrideDefaultsEmpty() public {
+        // 1. Deploy the OLD (V1) implementation behind its own beacon proxy.
+        TappRegistryV1 implV1 = new TappRegistryV1();
+        UpgradeableBeacon beacon = new UpgradeableBeacon(address(implV1), address(this));
+        bytes memory initData = abi.encodeCall(TappRegistryV1.initialize, (MIN_STAKE, LOCK_PERIOD));
+        BeaconProxy proxy = new BeaconProxy(address(beacon), initData);
+        TappRegistryV1 oldReg = TappRegistryV1(payable(address(proxy)));
+
+        // 2. Register an app + a second node using the OLD ABI (addNode had no compose/volumes).
+        vm.prank(owner);
+        oldReg.registerApp{value: MIN_STAKE}(APP_ID, COMPOSE_HASH, VOLUMES_HASH, imageHashes, node1, TEE_URL_1);
+        vm.prank(owner);
+        oldReg.addNode{value: MIN_STAKE}(APP_ID, node2, TEE_URL_2);
+
+        uint256 regAtBefore  = oldReg.getAppInfo(APP_ID).registeredAt;
+        uint256 node1AddedAt = oldReg.getNode(APP_ID, node1).addedAt;
+
+        // 3. Upgrade the beacon to the NEW implementation (same proxy/storage).
+        TappRegistry newImpl = new TappRegistry();
+        beacon.upgradeTo(address(newImpl));
+        TappRegistry reg = TappRegistry(payable(address(proxy)));
+
+        // 4a. App-level data preserved (AppInfo layout unchanged).
+        TappRegistry.AppInfo memory info = reg.getAppInfo(APP_ID);
+        assertEq(info.composeHash, COMPOSE_HASH);
+        assertEq(info.volumesHash, VOLUMES_HASH);
+        assertEq(info.imageHashes.length, imageHashes.length);
+        assertEq(info.imageHashes[0], imageHashes[0]);
+        assertEq(info.owner, owner);
+        assertEq(info.registeredAt, regAtBefore);
+
+        // 4b. Node list preserved.
+        address[] memory nodes = reg.getNodeList(APP_ID);
+        assertEq(nodes.length, 2);
+
+        // 4c. Old node fields preserved; appended override fields default to empty (= inherit).
+        TappRegistry.NodeInfo memory n1 = reg.getNode(APP_ID, node1);
+        assertEq(n1.teeUrl,      TEE_URL_1);
+        assertEq(n1.stakeAmount, MIN_STAKE);
+        assertEq(n1.addedAt,     node1AddedAt);
+        assertEq(n1.composeHash, hex"");
+        assertEq(n1.volumesHash, hex"");
+        TappRegistry.NodeInfo memory n2 = reg.getNode(APP_ID, node2);
+        assertEq(n2.teeUrl,      TEE_URL_2);
+        assertEq(n2.composeHash, hex"");
+        assertEq(n2.volumesHash, hex"");
+
+        // 5. New per-node override paths work on the upgraded proxy.
+        vm.prank(owner);
+        reg.updateNode(APP_ID, node1, node1, TEE_URL_1, NODE_COMPOSE_OVERRIDE, NODE_VOLUMES_OVERRIDE);
+        TappRegistry.NodeInfo memory n1b = reg.getNode(APP_ID, node1);
+        assertEq(n1b.composeHash, NODE_COMPOSE_OVERRIDE);
+        assertEq(n1b.volumesHash, NODE_VOLUMES_OVERRIDE);
+
+        address node3 = makeAddr("node3");
+        vm.prank(owner);
+        reg.addNode{value: MIN_STAKE}(APP_ID, node3, "https://node3", NODE_COMPOSE_OVERRIDE, NODE_VOLUMES_OVERRIDE);
+        assertEq(reg.getNode(APP_ID, node3).composeHash, NODE_COMPOSE_OVERRIDE);
+    }
+
     // ─── revokeAcknowledgement ────────────────────────────────────────────────
 
     function test_RevokeAcknowledgement_ClearsAck() public {
@@ -666,14 +861,14 @@ contract TappRegistryTest is Test {
         _register();
         vm.expectRevert("zero signer address");
         vm.prank(owner);
-        registry.addNode{value: MIN_STAKE}(APP_ID, address(0), TEE_URL_2);
+        registry.addNode{value: MIN_STAKE}(APP_ID, address(0), TEE_URL_2, hex"", hex"");
     }
 
     function test_UpdateNode_Revert_ZeroNewSigner() public {
         _register();
         vm.expectRevert("zero signer address");
         vm.prank(owner);
-        registry.updateNode(APP_ID, node1, address(0), TEE_URL_2);
+        registry.updateNode(APP_ID, node1, address(0), TEE_URL_2, hex"", hex"");
     }
 
     // ─── updateNode same-signer URL update ────────────────────────────────────
@@ -682,7 +877,7 @@ contract TappRegistryTest is Test {
         _register();
         string memory newUrl = "https://node1.new.example.com";
         vm.prank(owner);
-        registry.updateNode(APP_ID, node1, node1, newUrl);
+        registry.updateNode(APP_ID, node1, node1, newUrl, hex"", hex"");
 
         TappRegistry.NodeInfo memory n = registry.getNode(APP_ID, node1);
         assertEq(n.teeUrl,      newUrl);
@@ -700,7 +895,7 @@ contract TappRegistryTest is Test {
         assertTrue(registry.isAcknowledged(user, APP_ID));
 
         vm.prank(owner);
-        registry.updateNode(APP_ID, node1, node1, "https://changed");
+        registry.updateNode(APP_ID, node1, node1, "https://changed", hex"", hex"");
         assertFalse(registry.isAcknowledged(user, APP_ID));
     }
 
