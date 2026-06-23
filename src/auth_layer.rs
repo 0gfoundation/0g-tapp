@@ -203,8 +203,10 @@ enum MethodPermission {
 fn get_method_permission(method_name: &str) -> MethodPermission {
     match method_name {
         // Public methods (no authentication required)
-        "GetEvidence" | "GetAppKey" | "GetAppInfo" | "GetTaskStatus" | "GetServiceStatus"
-        | "GetAppSecretKey" | "GetTappInfo" | "GetSecretResource" => MethodPermission::Public,
+        "GetEvidence" | "GetAppKey" | "GetAppInfo" | "ListApps" | "GetTaskStatus"
+        | "GetServiceStatus" | "GetAppSecretKey" | "GetTappInfo" | "GetSecretResource" => {
+            MethodPermission::Public
+        }
 
         // Owner-only methods
         "StartApp"

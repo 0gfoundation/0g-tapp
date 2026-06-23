@@ -5,7 +5,7 @@ use tapp_service::proto::{
     DockerLogoutRequest, GetAppContainerStatusRequest, GetAppInfoRequest, GetAppKeyRequest,
     GetAppLogsRequest, GetAppSecretKeyRequest, GetEvidenceRequest, GetSecretResourceRequest,
     GetServiceLogsRequest, GetServiceStatusRequest, GetTappInfoRequest, GetTaskStatusRequest,
-    ListWhitelistRequest, MountFile, PruneImagesRequest, RemoveFromWhitelistRequest,
+    ListAppsRequest, ListWhitelistRequest, MountFile, PruneImagesRequest, RemoveFromWhitelistRequest,
     StartAppRequest, StartServiceRequest, StopAppRequest, StopServiceRequest, WithdrawBalanceRequest,
 };
 use tonic::{metadata::MetadataValue, Request};
@@ -82,6 +82,8 @@ enum Commands {
         #[arg(long, default_value = "47.237.201.184:50004")]
         as_endpoint: String,
     },
+    /// List all apps currently on the server
+    ListApps,
 
     /// Get application logs
     GetAppLogs {
@@ -94,7 +96,7 @@ enum Commands {
         lines: i32,
 
         /// Specific service name
-        #[arg(short, long)]
+        #[arg(long)]
         service: Option<String>,
     },
 
@@ -156,7 +158,7 @@ enum Commands {
         app_id: String,
 
         /// Service name
-        #[arg(short, long)]
+        #[arg(long)]
         service_name: String,
 
         /// Pull latest image before starting
@@ -171,7 +173,7 @@ enum Commands {
         app_id: String,
 
         /// Service name
-        #[arg(short, long)]
+        #[arg(long)]
         service_name: String,
     },
 
@@ -257,11 +259,11 @@ enum Commands {
         rpc_url: String,
 
         /// Chain ID
-        #[arg(short, long)]
+        #[arg(long)]
         chain_id: u64,
 
         /// Custom recipient address (defaults to tapp owner)
-        #[arg(short = 'r', long)]
+        #[arg(long)]
         recipient: Option<String>,
     },
 
@@ -287,7 +289,7 @@ enum Commands {
         message: String,
 
         /// Signature (hex)
-        #[arg(short, long)]
+        #[arg(long)]
         signature: String,
     },
 
@@ -309,7 +311,7 @@ enum Commands {
         contract: String,
 
         /// Stake amount in wei (must be >= minStakeAmount)
-        #[arg(short, long)]
+        #[arg(long)]
         stake_wei: u128,
     },
 
@@ -345,7 +347,7 @@ enum Commands {
         contract: String,
 
         /// Stake amount in wei (must be >= minStakeAmount)
-        #[arg(short, long)]
+        #[arg(long)]
         stake_wei: u128,
 
         /// Signer address of the new node (optional; fetched from --server if not set)
@@ -490,6 +492,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::VerifyApp { app_id, rpc_url, contract, as_endpoint } => {
             verify_app_cmd(&cli.server, &app_id, rpc_url, contract, &as_endpoint).await?;
+        }
+        Commands::ListApps => {
+            list_apps(&cli.server).await?;
         }
         Commands::GetAppLogs {
             app_id,
@@ -1065,6 +1070,33 @@ async fn verify_app_cmd(
         );
     }
     println!("\nResult: reconciliation {}", if all_ok { "ALL PASS ✅" } else { "has failures ❌" });
+    Ok(())
+}
+
+async fn list_apps(server: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let mut client = TappServiceClient::connect(server.to_string()).await?;
+
+    let response = client.list_apps(Request::new(ListAppsRequest {})).await?;
+    let result = response.into_inner();
+
+    if result.apps.is_empty() {
+        println!("No apps on this server.");
+        return Ok(());
+    }
+
+    println!("Apps ({}):", result.apps.len());
+    for a in &result.apps {
+        let compose = if a.compose_hash.len() > 16 {
+            format!("{}…", &a.compose_hash[..16])
+        } else {
+            a.compose_hash.clone()
+        };
+        println!(
+            "  {}\n    owner={}  compose={}  images={}",
+            a.app_id, a.owner, compose, a.image_count
+        );
+    }
+
     Ok(())
 }
 
