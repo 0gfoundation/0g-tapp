@@ -1,0 +1,49 @@
+[package]
+name = "tapp-cli"
+version = "0.1.0"
+edition = "2021"
+authors = ["TDX TAPP Developers"]
+description = "TAPP Service CLI - Standalone client for TAPP gRPC server and on-chain operations"
+license = "Apache-2.0"
+
+[[bin]]
+name = "tapp-cli"
+path = "src/main.rs"
+
+[dependencies]
+# gRPC and async runtime
+tonic = "0.12"
+prost = "0.13"
+tokio = { version = "1.0", features = [
+    "macros",
+    "rt-multi-thread",
+] }
+tower = "0.4"
+http = "1.0"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+base64 = "0.22"
+
+# Cryptography
+sha3 = "0.10"
+hex = "0.4"
+k256 = { version = "0.13", features = ["ecdsa", "std"] }
+
+# Ethereum
+ethers = { version = "2.0", default-features = false, features = [
+    "legacy",
+    "rustls",
+] }
+
+# Error handling and logging
+anyhow = "1.0"
+thiserror = "1.0"
+
+# CLI
+clap = { version = "4.0", features = ["derive"] }
+
+# Utilities
+chrono = { version = "0.4", features = ["serde"] }
