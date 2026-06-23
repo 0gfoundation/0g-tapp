@@ -14,9 +14,9 @@ Deploy and manage containerized applications on 0G Tapp TEE servers using `tapp-
 
 - **tapp-cli binary**: `/usr/local/bin/tapp-cli`
 - **Server**: `-s <url>` (e.g. `http://<host>:50051`). There are MANY tapp servers; always pass `-s` explicitly.
-- **Auth**: private key via `-k` flag or `TAPP_PRIVATE_KEY` env var. Read-only commands (`get-tapp-info`, `get-service-status`, `get-app-info`, `get-app-key`, `get-evidence`) work without `-k`; owner-only commands require it.
+- **Auth**: private key via `-k` flag or `TAPP_PRIVATE_KEY` env var. Read-only commands (`get-tapp-info`, `get-service-status`, `get-app-info`, `get-app-key`, `get-evidence`, `list-apps`, `verify-app` direct mode) work without `-k`; owner-only commands require it.
 - **TappRegistry (testnet)**: proxy `0x95a0BF4148b30F6F8D86870534c51df46Da5511c`, RPC `https://evmrpc-testnet.0g.ai`, chainId `16602`. See `contract/CONTRACTS.md`.
-- **⚠️ Short flag `-s` conflict**: the global `-s` / `--server` flag is shadowed by local `-s` in `register-onchain` (`--stake-wei`), `get-app-logs` (`--service`), and `verify-signature` (`--signature`). Always use `--server` (full name) with these subcommands.
+- **Short flags**: `-s` = `--server` and `-k` = `--private-key` (both global). The earlier `-s` collision is **fixed** — the formerly-clashing subcommand flags (`--stake-wei`, `--service`, `--service-name`, `--signature`, `--chain-id`) are long-only now, so `-s` always means `--server`.
 
 ## Keys & servers — read this first
 
@@ -40,8 +40,11 @@ tapp-cli -s <server> -k 0x<key> stop-service  --app-id <id> --service-name <svc>
 tapp-cli -s <server> -k 0x<key> start-service --app-id <id> --service-name <svc>
 tapp-cli -s <server> -k 0x<key> get-app-container-status --app-id <id>
 tapp-cli -s <server> -k 0x<key> get-app-info --app-id <id>        # compose/volume/image hashes the server holds
-tapp-cli -s <server> -k 0x<key> get-app-logs --app-id <id> --service <name> -n 100  # note: use --server, not -s (see above)
+tapp-cli -s <server> list-apps                                   # list all apps on this server (no key needed)
+tapp-cli -s <server> -k 0x<key> get-app-logs --app-id <id> --service <name> -n 100  # app's docker compose logs
 tapp-cli -s <server> -k 0x<key> get-app-key --app-id <id>         # TEE-derived app signing key (ethereum); --key-type / --x25519 for other types
+tapp-cli -s <server> verify-app --app-id <id>                     # direct: AS-verify this node's evidence+quote, show attested values (no chain)
+tapp-cli verify-app --app-id <id> --rpc-url <rpc> --contract 0x<reg>  # chain: verify all nodes + reconcile vs on-chain (--as-endpoint default 47.237.201.184:50004)
 tapp-cli -s <server> -k 0x<key> get-tapp-info                     # server version + Owner Address (no key needed)
 tapp-cli -s <server> -k 0x<key> prune-images [--all]              # delete UNUSED images (--all removes all unused, not just dangling)
 tapp-cli -s <server> -k 0x<key> get-service-logs -f <file> [-n 100] # tapp-server's own logs (-n limits lines; no -f lists files)

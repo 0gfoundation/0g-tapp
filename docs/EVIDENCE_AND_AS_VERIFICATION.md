@@ -1,5 +1,9 @@
 # 按 App ID 验证 tapp 节点（链上 → 取证 → 验签 → 对账）
 
+> **现在已内置到 CLI**：直接用 `tapp-cli verify-app --app-id <X> --rpc-url <RPC> --contract <Registry>`；
+> 未注册上链时用直连模式 `tapp-cli -s <server> verify-app --app-id <X>`。本文档描述它内部做的事 +
+> 等价的手搓 `cast`/`grpcurl` 流程（`docs/verify_app.py` 是同逻辑的脚本参考；CLI 实现见 `src/verify.rs`）。
+
 **验证器的唯一输入是 `app_id`。** 其余全自动：从链上读该 app 的注册信息和节点列表 →
 顺着每个节点链上记录的 `teeUrl` 取 evidence → 验 quote 签名/TCB → 把 evidence 里的度量与身份跟链上逐项对账。
 
