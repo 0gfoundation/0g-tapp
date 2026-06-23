@@ -64,6 +64,24 @@ enum Commands {
         app_id: String,
     },
 
+    /// Verify an app. Chain mode (with --contract + --rpc-url): discover nodes on-chain,
+    /// fetch each node's evidence, verify the quote via CoCo-AS, and reconcile against the
+    /// chain. Direct mode (no --contract, uses --server): verify one node's evidence + quote
+    /// and show what it attests, without on-chain reconciliation (for un-registered apps).
+    VerifyApp {
+        /// Application ID
+        #[arg(long)]
+        app_id: String,
+        /// EVM RPC URL (chain mode)
+        #[arg(long)]
+        rpc_url: Option<String>,
+        /// TappRegistry contract address 0x… (chain mode)
+        #[arg(long)]
+        contract: Option<String>,
+        /// CoCo Attestation Service gRPC endpoint (host:port)
+        #[arg(long, default_value = "47.237.201.184:50004")]
+        as_endpoint: String,
+    },
     /// List all apps currently on the server
     ListApps,
 
@@ -471,6 +489,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::GetAppInfo { app_id } => {
             get_app_info(&cli.server, app_id).await?;
+        }
+        Commands::VerifyApp { app_id, rpc_url, contract, as_endpoint } => {
+            verify_app_cmd(&cli.server, &app_id, rpc_url, contract, &as_endpoint).await?;
         }
         Commands::ListApps => {
             list_apps(&cli.server).await?;
@@ -980,6 +1001,75 @@ async fn get_app_info(server: &str, app_id: String) -> Result<(), Box<dyn std::e
     println!("  Volumes Hash: {:?}", result.volumes_hash);
     println!("  Image Hash: {:?}", result.image_hash);
 
+    Ok(())
+}
+
+async fn verify_app_cmd(
+    server: &str,
+    app_id: &str,
+    rpc_url: Option<String>,
+    contract: Option<String>,
+    as_endpoint: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Direct mode: no --contract → verify the single --server node without chain reconciliation.
+    if contract.is_none() {
+        let d = tapp_service::verify::verify_node_direct(server, app_id, as_endpoint).await?;
+        let quote_ok = d.ear_status == "affirming";
+        println!("Verifying app: {}  (direct mode — no on-chain reconciliation)", app_id);
+        println!("  server      : {}", d.server);
+        println!("  signer      : {}  (attested in report_data)", d.signer);
+        println!("  AS          : ear.status={} tcb_status={} advisories={}", d.ear_status, d.tcb_status, d.advisories);
+        if !d.compose_hash.is_empty() {
+            println!("  compose     : {}", d.compose_hash);
+        }
+        if !d.images.is_empty() {
+            println!("  images      : {:?}", d.images);
+        }
+        if !d.note.is_empty() {
+            println!("  note        : {}", d.note);
+        }
+        println!("\nQuote {}", if quote_ok { "trusted ✅".to_string() } else { format!("untrusted ⚠️ ({}/{})", d.ear_status, d.tcb_status) });
+        println!("(direct mode shows what the node attests; register on-chain + use --contract to reconcile)");
+        return Ok(());
+    }
+
+    // Chain mode.
+    let rpc_url = rpc_url.ok_or("chain mode requires --rpc-url (or omit --contract for direct mode)")?;
+    let contract = contract.unwrap();
+    let verdict = tapp_service::verify::verify_app(&rpc_url, &contract, app_id, as_endpoint).await?;
+
+    let yn = |b: bool| if b { "✓" } else { "✗" };
+    println!("Verifying app: {}  ({} node(s))", verdict.app_id, verdict.nodes.len());
+    let mut all_ok = true;
+    for n in &verdict.nodes {
+        let reconciled = n.reconciled();
+        let quote_ok = n.ear_status == "affirming";
+        all_ok &= reconciled;
+        println!("\n  node {}", n.signer);
+        println!("    teeUrl     : {}", n.tee_url);
+        if !n.reachable {
+            println!("    ✗ unreachable / {}", n.note);
+            all_ok = false;
+            continue;
+        }
+        println!(
+            "    AS         : ear.status={} tcb_status={} advisories={}",
+            n.ear_status, n.tcb_status, n.advisories
+        );
+        println!(
+            "    reconcile  : signer{} compose{} volumes{} image{}",
+            yn(n.signer_ok), yn(n.compose_ok), yn(n.volumes_ok), yn(n.image_ok)
+        );
+        if !n.note.is_empty() {
+            println!("    note       : {}", n.note);
+        }
+        println!(
+            "    => reconcile {} ; quote {}",
+            if reconciled { "PASS" } else { "FAIL" },
+            if quote_ok { "trusted".to_string() } else { format!("untrusted ({}/{})", n.ear_status, n.tcb_status) }
+        );
+    }
+    println!("\nResult: reconciliation {}", if all_ok { "ALL PASS ✅" } else { "has failures ❌" });
     Ok(())
 }
 

@@ -13,6 +13,7 @@ pub mod service_monitor;
 pub mod signature_auth;
 pub mod task_manager;
 pub mod utils;
+pub mod verify;
 pub use boot::BootService;
 pub use config::TappConfig;
 pub use error::{TappError, TappResult};
