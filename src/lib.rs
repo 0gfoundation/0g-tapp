@@ -572,6 +572,30 @@ impl TappService for TappServiceImpl {
         }))
     }
 
+    async fn list_apps(
+        &self,
+        _request: Request<ListAppsRequest>,
+    ) -> Result<Response<ListAppsResponse>, Status> {
+        info!("Calling ListApps");
+        let apps = self
+            .boot_service
+            .list_apps()
+            .await
+            .into_iter()
+            .map(|(app_id, owner, compose_hash, image_count)| AppSummary {
+                app_id,
+                owner,
+                compose_hash,
+                image_count: image_count as u32,
+            })
+            .collect();
+
+        Ok(Response::new(ListAppsResponse {
+            success: true,
+            apps,
+        }))
+    }
+
     async fn get_tapp_info(
         &self,
         _request: Request<GetTappInfoRequest>,
