@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Result};
 use ethers::{
-    abi::{encode, Token},
+    abi::{decode, encode, ParamType, Token},
     prelude::*,
     providers::{Http, Provider},
     types::{Address, Bytes, TransactionRequest, U256},
@@ -19,6 +19,50 @@ fn calldata(sig: &str, tokens: Vec<Token>) -> Vec<u8> {
     let mut data = selector(sig).to_vec();
     data.extend_from_slice(&encode(&tokens));
     data
+}
+
+// ─── Reads ──────────────────────────────────────────────────────────────────
+
+/// Read the app-level default (composeHash, volumesHash) via getAppInfo(string).
+/// Used to decide whether a node needs a per-node override (differs from default)
+/// or should inherit (equals default → store empty).
+pub async fn get_app_default_hashes(
+    rpc_url: &str,
+    contract: &str,
+    app_id: &str,
+) -> Result<(Vec<u8>, Vec<u8>)> {
+    let provider =
+        Provider::<Http>::try_from(rpc_url).map_err(|e| anyhow!("Invalid RPC URL: {}", e))?;
+    let to = Address::from_str(contract).map_err(|_| anyhow!("Invalid contract address"))?;
+    let data = calldata("getAppInfo(string)", vec![Token::String(app_id.to_owned())]);
+    let tx = TransactionRequest::new().to(to).data(Bytes::from(data));
+    let out = provider
+        .call(&tx.into(), None)
+        .await
+        .map_err(|e| anyhow!("getAppInfo call failed: {}", e))?;
+
+    // AppInfo = (bytes composeHash, bytes volumesHash, bytes[] imageHashes, address owner, uint256 registeredAt)
+    let tuple = ParamType::Tuple(vec![
+        ParamType::Bytes,
+        ParamType::Bytes,
+        ParamType::Array(Box::new(ParamType::Bytes)),
+        ParamType::Address,
+        ParamType::Uint(256),
+    ]);
+    let tokens = decode(&[tuple], &out).map_err(|e| anyhow!("decode getAppInfo: {}", e))?;
+    if let Some(Token::Tuple(fields)) = tokens.into_iter().next() {
+        let compose = match &fields[0] {
+            Token::Bytes(b) => b.clone(),
+            _ => vec![],
+        };
+        let volumes = match &fields[1] {
+            Token::Bytes(b) => b.clone(),
+            _ => vec![],
+        };
+        Ok((compose, volumes))
+    } else {
+        Err(anyhow!("unexpected getAppInfo return shape"))
+    }
 }
 
 // ─── Transaction sender ───────────────────────────────────────────────────────
@@ -176,6 +220,7 @@ impl OnchainParams {
 }
 
 /// registerApp(string,bytes,bytes,bytes[],address,string)
+/// compose/volumes are the app-level shared defaults; the first node inherits them.
 pub async fn register_app(
     params: &OnchainParams,
     app_id: &str,
@@ -200,7 +245,8 @@ pub async fn register_app(
     send_tx(&params.rpc_url, &params.private_key, params.contract_address()?, data, stake_wei).await
 }
 
-/// updateApp(string,bytes,bytes,bytes[])
+/// updateApp(string,bytes,bytes,bytes[]) — updates the app-level shared defaults.
+/// Per-node overrides are updated via update_node.
 pub async fn update_app(
     params: &OnchainParams,
     app_id: &str,
@@ -220,40 +266,48 @@ pub async fn update_app(
     send_tx(&params.rpc_url, &params.private_key, params.contract_address()?, data, U256::zero()).await
 }
 
-/// addNode(string,address,string)
+/// addNode(string,address,string,bytes,bytes)
 pub async fn add_node(
     params: &OnchainParams,
     app_id: &str,
     signer_address: Address,
     tee_url: &str,
+    compose_hash: Vec<u8>,
+    volumes_hash: Vec<u8>,
     stake_wei: U256,
 ) -> Result<TxHash> {
     let data = calldata(
-        "addNode(string,address,string)",
+        "addNode(string,address,string,bytes,bytes)",
         vec![
             Token::String(app_id.to_owned()),
             Token::Address(signer_address),
             Token::String(tee_url.to_owned()),
+            Token::Bytes(compose_hash),
+            Token::Bytes(volumes_hash),
         ],
     );
     send_tx(&params.rpc_url, &params.private_key, params.contract_address()?, data, stake_wei).await
 }
 
-/// updateNode(string,address,address,string)
+/// updateNode(string,address,address,string,bytes,bytes)
 pub async fn update_node(
     params: &OnchainParams,
     app_id: &str,
     old_signer: Address,
     new_signer: Address,
     tee_url: String,
+    compose_hash: Vec<u8>,
+    volumes_hash: Vec<u8>,
 ) -> Result<TxHash> {
     let data = calldata(
-        "updateNode(string,address,address,string)",
+        "updateNode(string,address,address,string,bytes,bytes)",
         vec![
             Token::String(app_id.to_owned()),
             Token::Address(old_signer),
             Token::Address(new_signer),
             Token::String(tee_url),
+            Token::Bytes(compose_hash),
+            Token::Bytes(volumes_hash),
         ],
     );
     send_tx(&params.rpc_url, &params.private_key, params.contract_address()?, data, U256::zero()).await

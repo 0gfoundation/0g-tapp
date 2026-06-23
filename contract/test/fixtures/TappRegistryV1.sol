@@ -9,11 +9,9 @@ pragma solidity ^0.8.24;
 ///         App model
 ///         ---------
 ///         Every app is logically a cluster. A "single-node app" is a cluster with
-///         one node. The app-level composeHash/volumesHash/imageHashes are the SHARED
-///         defaults for every node. A node MAY override composeHash/volumesHash in its
-///         NodeInfo (for node-specific config); the effective value for a node is its
-///         own override if non-empty, else the app-level default. imageHashes are
-///         always shared. registerApp always adds the first node atomically.
+///         one node. Shared code identity (composeHash, etc.) is at the app level;
+///         per-node differentiation (signerAddress, teeUrl) lives in NodeInfo.
+///         registerApp always adds the first node atomically.
 ///         When the last node is removed the app is automatically unregistered.
 ///
 ///         Staking
@@ -36,17 +34,16 @@ pragma solidity ^0.8.24;
 ///           3. Submit evidence to an RA service; confirm the returned signerAddress
 ///              and codeHash match on-chain values.
 ///           4. Call acknowledgeApp(appId) to record acknowledgement on-chain.
-contract TappRegistry {
+contract TappRegistryV1 {
 
     // ─── Structs ──────────────────────────────────────────────────────────────
 
     struct AppInfo {
-        /// @dev SHA384 of the docker-compose yaml — the SHARED DEFAULT for all nodes.
-        ///      A node may override this in NodeInfo; effective = node override ?? this.
+        /// @dev SHA384 of the normalised docker-compose yaml (shared by all nodes)
         bytes   composeHash;
-        /// @dev SHA384 of mount/volume files — shared default (see composeHash).
+        /// @dev SHA384 of all mount/volume files (shared by all nodes)
         bytes   volumesHash;
-        /// @dev Docker image digests, one per service in compose order (always shared)
+        /// @dev Docker image digests, one per service in compose order (shared)
         bytes[] imageHashes;
         address owner;
         uint256 registeredAt;
@@ -57,13 +54,6 @@ contract TappRegistry {
         string  teeUrl;
         uint256 addedAt;
         uint256 stakeAmount;
-        /// @dev OPTIONAL per-node override of the app-level composeHash. Empty in storage
-        ///      means "inherit the app-level default"; getNode() resolves it to the
-        ///      default on read (raw override is still observable via the NodeCode event).
-        ///      Appended after stakeAmount to keep the storage layout upgrade-compatible.
-        bytes   composeHash;
-        /// @dev OPTIONAL per-node override of the app-level volumesHash (see composeHash).
-        bytes   volumesHash;
     }
 
     struct LockedEntry {
@@ -111,9 +101,6 @@ contract TappRegistry {
     event AppRegistered(string indexed appId, address indexed owner, bytes composeHash, bytes volumesHash, bytes[] imageHashes);
     event AppUpdated(string indexed appId, uint256 newAckVersion, bytes composeHash, bytes volumesHash, bytes[] imageHashes);
     event AppUnregistered(string indexed appId, address indexed owner);
-    /// @dev Per-node compose/volumes override (empty = inherit app-level). Emitted on
-    ///      node add and update (not remove).
-    event NodeCode(string indexed appId, address indexed signerAddress, bytes composeHash, bytes volumesHash);
     /// @dev oldSigner==0 means add, newSigner==0 means remove, both non-zero means replace.
     ///      stakeAmount and unlockAt are only set on add/remove; zero for replace.
     ///      newAckVersion is non-zero whenever the ack version was bumped by this call
@@ -192,12 +179,9 @@ contract TappRegistry {
 
     /// @notice Register a new app and add its first node atomically.
     ///         msg.value is the stake for the first node (>= minStakeAmount).
-    ///         composeHash/volumesHash are the app-level shared defaults; the first
-    ///         node inherits them (no override). Add divergent nodes via addNode with
-    ///         their own compose/volumes, or override later via updateNode.
     /// @param appId               Unique application identifier
-    /// @param composeHash         SHA384 of the docker-compose yaml (shared default)
-    /// @param volumesHash         SHA384 of all mount/volume files (shared default)
+    /// @param composeHash         SHA384 of the normalised docker-compose yaml
+    /// @param volumesHash         SHA384 of all mount/volume files
     /// @param imageHashes         Docker image digests, one per service in compose order
     /// @param firstSignerAddress  TEE EVM address of the first node
     /// @param firstTeeUrl         Evidence URL of the first node
@@ -221,15 +205,13 @@ contract TappRegistry {
         });
 
         ++_appAckVersions[appId];
-        // first node inherits the app-level defaults (empty per-node override).
-        _addNode(appId, firstSignerAddress, firstTeeUrl, "", "", msg.value, 0);
+        _addNode(appId, firstSignerAddress, firstTeeUrl, msg.value, 0);
 
         emit AppRegistered(appId, msg.sender, composeHash, volumesHash, imageHashes);
     }
 
-    /// @notice Update the app-level shared defaults (e.g. after re-deployment).
+    /// @notice Update the shared code metadata for an app (e.g. after re-deployment).
     ///         Increments ackVersion, invalidating all prior acknowledgements.
-    ///         Per-node overrides are updated separately via updateNode.
     function updateApp(
         string  calldata appId,
         bytes   calldata composeHash,
@@ -249,34 +231,29 @@ contract TappRegistry {
 
     /// @notice Add a node to an existing app. Only the app owner may add nodes.
     ///         msg.value is the stake for this node (>= minStakeAmount).
-    ///         composeHash/volumesHash are this node's OPTIONAL override — pass empty
-    ///         to inherit the app-level defaults. Increments ackVersion.
+    ///         Increments ackVersion because a new cluster member changes trust assumptions.
     function addNode(
         string  calldata appId,
         address          signerAddress,
-        string  calldata teeUrl,
-        bytes   calldata composeHash,
-        bytes   calldata volumesHash
+        string  calldata teeUrl
     ) external payable onlyAppOwner(appId) {
         require(msg.value >= minStakeAmount, "insufficient stake");
         require(_nodes[appId][signerAddress].addedAt == 0, "node already exists");
 
         uint256 newVersion = ++_appAckVersions[appId];
-        _addNode(appId, signerAddress, teeUrl, composeHash, volumesHash, msg.value, newVersion);
+        _addNode(appId, signerAddress, teeUrl, msg.value, newVersion);
     }
 
-    /// @notice Update a node's signer address, teeUrl, and/or code identity
-    ///         (composeHash/volumesHash). Requires the old node to exist; applies new
-    ///         values unconditionally. Stake carries over. Always increments ackVersion.
-    ///         Pass newSigner == oldSigner to keep the signer and update the rest.
+    /// @notice Update a node's signer address and/or teeUrl.
+    ///         Requires the old node to exist; applies new values unconditionally.
+    ///         Stake carries over. Always increments ackVersion.
+    ///         Pass newSigner == oldSigner to update only the teeUrl.
     ///         Only the app owner may call this.
     function updateNode(
         string  calldata appId,
         address          oldSigner,
         address          newSigner,
-        string  calldata teeUrl,
-        bytes   calldata composeHash,
-        bytes   calldata volumesHash
+        string  calldata teeUrl
     ) external onlyAppOwner(appId) {
         require(newSigner != address(0), "zero signer address");
         require(_nodes[appId][oldSigner].addedAt != 0, "old node not found");
@@ -294,17 +271,10 @@ contract TappRegistry {
             }
             delete _nodes[appId][oldSigner];
         }
-        _nodes[appId][newSigner] = NodeInfo({
-            teeUrl:      teeUrl,
-            addedAt:     block.timestamp,
-            stakeAmount: stake,
-            composeHash: composeHash,
-            volumesHash: volumesHash
-        });
+        _nodes[appId][newSigner] = NodeInfo({teeUrl: teeUrl, addedAt: block.timestamp, stakeAmount: stake});
 
         uint256 newVersion = ++_appAckVersions[appId];
         emit NodeUpdated(appId, oldSigner, newSigner, 0, 0, newVersion);
-        emit NodeCode(appId, newSigner, composeHash, volumesHash);
     }
 
     /// @notice Remove a node. Stake is locked for lockPeriod seconds in the owner's
@@ -496,22 +466,11 @@ contract TappRegistry {
         return _appAckVersions[appId];
     }
 
-    /// @notice Returns a node's info with its EFFECTIVE compose/volumes resolved: if the
-    ///         node's per-node override is empty (inherit), the app-level default is
-    ///         substituted in the returned struct. (Storage still holds empty = inherit;
-    ///         the raw override is observable via the NodeCode event.) A non-existent
-    ///         node (addedAt == 0) is returned as-is without substitution.
     function getNode(
         string  calldata appId,
         address          signerAddress
     ) external view returns (NodeInfo memory) {
-        NodeInfo memory node = _nodes[appId][signerAddress];
-        if (node.addedAt != 0) {
-            AppInfo storage app = _apps[appId];
-            if (node.composeHash.length == 0) node.composeHash = app.composeHash;
-            if (node.volumesHash.length == 0) node.volumesHash = app.volumesHash;
-        }
-        return node;
+        return _nodes[appId][signerAddress];
     }
 
     /// @notice Active node list. Entries are removed immediately when a node is removed.
@@ -541,8 +500,6 @@ contract TappRegistry {
         string  memory appId,
         address        signerAddress,
         string  memory teeUrl,
-        bytes   memory composeHash,
-        bytes   memory volumesHash,
         uint256        stakeAmount,
         uint256        newAckVersion
     ) internal {
@@ -550,13 +507,10 @@ contract TappRegistry {
         _nodes[appId][signerAddress] = NodeInfo({
             teeUrl:      teeUrl,
             addedAt:     block.timestamp,
-            stakeAmount: stakeAmount,
-            composeHash: composeHash,
-            volumesHash: volumesHash
+            stakeAmount: stakeAmount
         });
         _nodeList[appId].push(signerAddress);
 
         emit NodeUpdated(appId, address(0), signerAddress, stakeAmount, 0, newAckVersion);
-        emit NodeCode(appId, signerAddress, composeHash, volumesHash);
     }
 }

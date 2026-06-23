@@ -1713,6 +1713,23 @@ async fn fetch_app_hashes(
     Ok((compose_hash, volumes_hash, image_hashes))
 }
 
+/// Decide the per-node override to store on-chain: compare the node's own
+/// (compose, volumes) against the app-level defaults read from chain and return empty
+/// for whichever matches (so the node inherits the default and follows updateApp).
+async fn node_override_hashes(
+    rpc_url: &str,
+    contract: &str,
+    app_id: &str,
+    node_compose: Vec<u8>,
+    node_volumes: Vec<u8>,
+) -> Result<(Vec<u8>, Vec<u8>), Box<dyn std::error::Error>> {
+    let (app_compose, app_volumes) =
+        tapp_service::onchain::get_app_default_hashes(rpc_url, contract, app_id).await?;
+    let compose = if node_compose == app_compose { Vec::new() } else { node_compose };
+    let volumes = if node_volumes == app_volumes { Vec::new() } else { node_volumes };
+    Ok((compose, volumes))
+}
+
 async fn register_onchain(
     server: &str,
     app_id: String,
@@ -1728,6 +1745,7 @@ async fn register_onchain(
     let signer_address = fetch_signer_address(server, &app_id).await?;
 
     let params = OnchainParams { rpc_url, contract, private_key };
+    // compose/volumes become the app-level shared defaults; the first node inherits them.
     let tx = tapp_service::onchain::register_app(
         &params,
         &app_id,
@@ -1757,6 +1775,8 @@ async fn update_onchain(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use tapp_service::onchain::OnchainParams;
 
+    // updates the app-level shared defaults (compose/volumes/images); per-node
+    // overrides are updated via update-node-onchain.
     let (compose_hash, volumes_hash, image_hashes) = fetch_app_hashes(server, &app_id).await?;
 
     let params = OnchainParams { rpc_url, contract, private_key };
@@ -1792,8 +1812,18 @@ async fn add_node_onchain(
         (fetched, tee_url_arg.unwrap_or_else(|| server.to_string()))
     };
 
+    // This node's own compose/volumes (fetched from the node being added). Store a
+    // per-node override only when it differs from the app-level default; otherwise
+    // pass empty so the node inherits the default (and follows future updateApp).
+    let (node_compose, node_volumes, _image_hashes) = fetch_app_hashes(server, &app_id).await?;
+    let (compose_hash, volumes_hash) =
+        node_override_hashes(&rpc_url, &contract, &app_id, node_compose, node_volumes).await?;
+
     let params = OnchainParams { rpc_url, contract, private_key };
-    let tx = tapp_service::onchain::add_node(&params, &app_id, signer, &tee_url, U256::from(stake_wei)).await?;
+    let tx = tapp_service::onchain::add_node(
+        &params, &app_id, signer, &tee_url, compose_hash, volumes_hash, U256::from(stake_wei),
+    )
+    .await?;
 
     println!("✓ Node added on-chain");
     println!("  App ID: {}", app_id);
@@ -1861,8 +1891,17 @@ async fn update_node_onchain(
         (fetched, tee_url_arg.unwrap_or_else(|| server.to_string()))
     };
 
+    // refresh this node's compose/volumes from its server; store as a per-node override
+    // only when it differs from the app-level default (else empty = inherit).
+    let (node_compose, node_volumes, _image_hashes) = fetch_app_hashes(server, &app_id).await?;
+    let (compose_hash, volumes_hash) =
+        node_override_hashes(&rpc_url, &contract, &app_id, node_compose, node_volumes).await?;
+
     let params = OnchainParams { rpc_url, contract, private_key };
-    let tx = tapp_service::onchain::update_node(&params, &app_id, old_signer_addr, new_signer, tee_url.clone()).await?;
+    let tx = tapp_service::onchain::update_node(
+        &params, &app_id, old_signer_addr, new_signer, tee_url.clone(), compose_hash, volumes_hash,
+    )
+    .await?;
 
     println!("✓ Node updated on-chain");
     println!("  App ID: {}", app_id);

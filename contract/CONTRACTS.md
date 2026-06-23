@@ -34,6 +34,26 @@ RPC: https://evmrpc-testnet.0g.ai
 TAPP_REGISTRY_CONTRACT=0x95a0BF4148b30F6F8D86870534c51df46Da5511c
 ```
 
+#### Per-node-compose e2e test instance (branch `fix/tappregistry-per-node-compose-hash`)
+
+> Standalone throwaway instance deployed to e2e-test the per-node compose/volumes
+> change (issue #535). NOT the canonical Dev registry above — the live beacon was
+> not touched. Safe to discard. All three contracts source-verified on the explorer.
+
+**Deployed:** 2026-06-23  **Deployer:** `0xea695C312CE119dE347425B29AFf85371c9d1837`
+**Min stake:** 1 0G  **Lock:** 86400 s
+
+| Contract | Address |
+|----------|---------|
+| TappRegistry Implementation (initial) | `0xaeddc6b6A6b9d4a9513Cc2322bbb78DFF97DA459` |
+| **TappRegistry Implementation (current, getNode resolves inherit)** | `0x6987fD9afe6e2430bF5AD85cfBC8c63487d4e4BD` |
+| UpgradeableBeacon | `0x1Cd7544068AdC525b9Cb21cC13aF25D95a53645E` |
+| **BeaconProxy (stable)** | `0x2Ce80374318B1d7Fb3345724457a182E0ad165c9` |
+
+e2e exercised on app `0g-kms`: register-onchain (app-level default + first node
+inherit), add-node-onchain (per-node override), update-node-onchain — all verified
+on-chain via getNode/getAppInfo.
+
 ### Testnet
 
 > To be deployed.
@@ -59,6 +79,13 @@ tapp-cli / user  ──►  BeaconProxy  (stable address, all state lives here)
 ```
 
 **The proxy address never changes.** Upgrades only replace the implementation.
+
+**App model:** `composeHash`/`volumesHash`/`imageHashes` at the app level are the
+**shared defaults** for all nodes. A node MAY override `composeHash`/`volumesHash` in
+its `NodeInfo` (for node-specific config); the effective value for a node is its own
+override if non-empty, else the app-level default. `imageHashes` are always shared.
+`registerApp`/`updateApp` set the app-level defaults; `addNode`/`updateNode` take an
+optional per-node override (empty = inherit).
 
 ---
 
@@ -152,6 +179,11 @@ tapp-cli \
 
 ### Update app hashes (after redeployment)
 
+`update-onchain` updates the app-level shared defaults (compose/volumes/images). If a
+specific node diverges from the defaults, set its per-node override with
+`update-node-onchain` (same old/new signer to keep the node; it fetches that node's
+current compose/volumes from `--server`).
+
 ```bash
 tapp-cli \
   --server http://<TAPP_SERVER>:50051 \
@@ -175,7 +207,14 @@ docker run --rm --entrypoint cast ghcr.io/foundry-rs/foundry:latest \
 docker run --rm --entrypoint cast ghcr.io/foundry-rs/foundry:latest \
   call <PROXY> "minStakeAmount()(uint256)" --rpc-url <RPC_URL>
 
-# App info
+# App info — composeHash/volumesHash here are the app-level SHARED DEFAULTS; imageHashes
+# is always shared. A node may override compose/volumes (see getNode below).
 docker run --rm --entrypoint cast ghcr.io/foundry-rs/foundry:latest \
   call <PROXY> "getAppInfo(string)((bytes,bytes,bytes[],address,uint256))" "<APP_ID>" --rpc-url <RPC_URL>
+
+# Node info — teeUrl, addedAt, stakeAmount, composeHash, volumesHash. getNode returns the
+# node's EFFECTIVE compose/volumes: its own override if set, else the app-level default
+# resolved in. (Storage holds empty = inherit; the raw override is in the NodeCode event.)
+docker run --rm --entrypoint cast ghcr.io/foundry-rs/foundry:latest \
+  call <PROXY> "getNode(string,address)((string,uint256,uint256,bytes,bytes))" "<APP_ID>" "<SIGNER>" --rpc-url <RPC_URL>
 ```
