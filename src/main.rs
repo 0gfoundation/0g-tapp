@@ -53,7 +53,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Step 3: Initialize tracing with config
     init_tracing(&config.logging)?;
 
-    info!("🚀 Starting TDX TAPP Service Server");
+    info!("🚀 Starting TDX TAPP Service Server v{}", VERSION);
     info!("Version: {}", VERSION);
     info!("Configuration loaded from: {}", args.config);
     info!(

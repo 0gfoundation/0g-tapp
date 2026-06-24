@@ -1,9 +1,9 @@
 [package]
 name = "tapp-cli"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
 description = "Standalone CLI for TAPP gRPC server and on-chain operations"
-license = "Apache-2.0"
+license.workspace = true
 
 [[bin]]
 name = "tapp-cli"

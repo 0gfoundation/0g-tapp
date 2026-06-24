@@ -1,14 +1,19 @@
-[package]
-name = "tapp-service"
-version = "0.1.0"
-edition = "2021"
-authors = ["TDX TAPP Developers"]
-description = "TDX Trusted Application Platform Service - Rust Implementation"
-license = "Apache-2.0"
-
 [workspace]
 members = ["tapp-common", "tapp-cli"]
 default-run = "tapp-server"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[package]
+name = "tapp-service"
+version.workspace = true
+edition.workspace = true
+authors = ["TDX TAPP Developers"]
+description = "TDX Trusted Application Platform Service - Rust Implementation"
+license.workspace = true
 
 [dependencies]
 # gRPC and async runtime
