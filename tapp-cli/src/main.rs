@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
-use tapp_service::proto::{
+use tapp_common::proto::{
     tapp_service_client::TappServiceClient, AddToWhitelistRequest, DockerLoginRequest,
     DockerLogoutRequest, GetAppContainerStatusRequest, GetAppInfoRequest, GetAppKeyRequest,
     GetAppLogsRequest, GetAppSecretKeyRequest, GetEvidenceRequest, GetSecretResourceRequest,
@@ -1013,7 +1013,7 @@ async fn verify_app_cmd(
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Direct mode: no --contract → verify the single --server node without chain reconciliation.
     if contract.is_none() {
-        let d = tapp_service::verify::verify_node_direct(server, app_id, as_endpoint).await?;
+        let d = tapp_common::verify::verify_node_direct(server, app_id, as_endpoint).await?;
         let quote_ok = d.ear_status == "affirming";
         println!("Verifying app: {}  (direct mode — no on-chain reconciliation)", app_id);
         println!("  server      : {}", d.server);
@@ -1036,7 +1036,7 @@ async fn verify_app_cmd(
     // Chain mode.
     let rpc_url = rpc_url.ok_or("chain mode requires --rpc-url (or omit --contract for direct mode)")?;
     let contract = contract.unwrap();
-    let verdict = tapp_service::verify::verify_app(&rpc_url, &contract, app_id, as_endpoint).await?;
+    let verdict = tapp_common::verify::verify_app(&rpc_url, &contract, app_id, as_endpoint).await?;
 
     let yn = |b: bool| if b { "✓" } else { "✗" };
     println!("Verifying app: {}  ({} node(s))", verdict.app_id, verdict.nodes.len());
@@ -1740,7 +1740,7 @@ fn sign_message(
     let private_key = hex::decode(private_key_hex)?;
     let message_bytes = message.as_bytes();
 
-    let signature = tapp_service::app_key::sign_message(&private_key, message_bytes)?;
+    let signature = tapp_common::app_key::sign_message(&private_key, message_bytes)?;
 
     println!("✓ Message signed");
     println!("  Message: {}", message);
@@ -1774,7 +1774,7 @@ fn verify_signature(
     let signature = hex::decode(signature_hex)?;
     let message_bytes = message.as_bytes();
 
-    let is_valid = tapp_service::app_key::verify_signature(&public_key, message_bytes, &signature)?;
+    let is_valid = tapp_common::app_key::verify_signature(&public_key, message_bytes, &signature)?;
 
     if is_valid {
         println!("✓ Signature is VALID");
@@ -1817,7 +1817,7 @@ async fn fetch_app_hashes(
     server: &str,
     app_id: &str,
 ) -> Result<(Vec<u8>, Vec<u8>, Vec<Vec<u8>>), Box<dyn std::error::Error>> {
-    use tapp_service::onchain;
+    use tapp_common::onchain;
     let mut client = TappServiceClient::connect(server.to_string()).await?;
     let info_resp = client
         .get_app_info(Request::new(GetAppInfoRequest {
@@ -1847,7 +1847,7 @@ async fn node_override_hashes(
     node_volumes: Vec<u8>,
 ) -> Result<(Vec<u8>, Vec<u8>), Box<dyn std::error::Error>> {
     let (app_compose, app_volumes) =
-        tapp_service::onchain::get_app_default_hashes(rpc_url, contract, app_id).await?;
+        tapp_common::onchain::get_app_default_hashes(rpc_url, contract, app_id).await?;
     let compose = if node_compose == app_compose { Vec::new() } else { node_compose };
     let volumes = if node_volumes == app_volumes { Vec::new() } else { node_volumes };
     Ok((compose, volumes))
@@ -1862,14 +1862,14 @@ async fn register_onchain(
     private_key: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use ethers::types::U256;
-    use tapp_service::onchain::OnchainParams;
+    use tapp_common::onchain::OnchainParams;
 
     let (compose_hash, volumes_hash, image_hashes) = fetch_app_hashes(server, &app_id).await?;
     let signer_address = fetch_signer_address(server, &app_id).await?;
 
     let params = OnchainParams { rpc_url, contract, private_key };
     // compose/volumes become the app-level shared defaults; the first node inherits them.
-    let tx = tapp_service::onchain::register_app(
+    let tx = tapp_common::onchain::register_app(
         &params,
         &app_id,
         compose_hash,
@@ -1896,14 +1896,14 @@ async fn update_onchain(
     contract: String,
     private_key: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use tapp_service::onchain::OnchainParams;
+    use tapp_common::onchain::OnchainParams;
 
     // updates the app-level shared defaults (compose/volumes/images); per-node
     // overrides are updated via update-node-onchain.
     let (compose_hash, volumes_hash, image_hashes) = fetch_app_hashes(server, &app_id).await?;
 
     let params = OnchainParams { rpc_url, contract, private_key };
-    let tx = tapp_service::onchain::update_app(&params, &app_id, compose_hash, volumes_hash, image_hashes).await?;
+    let tx = tapp_common::onchain::update_app(&params, &app_id, compose_hash, volumes_hash, image_hashes).await?;
 
     println!("✓ App updated on-chain");
     println!("  App ID: {}", app_id);
@@ -1924,7 +1924,7 @@ async fn add_node_onchain(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use ethers::types::{Address, U256};
     use std::str::FromStr;
-    use tapp_service::onchain::OnchainParams;
+    use tapp_common::onchain::OnchainParams;
 
     let (signer, tee_url) = if let Some(addr) = signer_arg {
         let parsed = Address::from_str(addr.trim_start_matches("0x"))
@@ -1943,7 +1943,7 @@ async fn add_node_onchain(
         node_override_hashes(&rpc_url, &contract, &app_id, node_compose, node_volumes).await?;
 
     let params = OnchainParams { rpc_url, contract, private_key };
-    let tx = tapp_service::onchain::add_node(
+    let tx = tapp_common::onchain::add_node(
         &params, &app_id, signer, &tee_url, compose_hash, volumes_hash, U256::from(stake_wei),
     )
     .await?;
@@ -1965,7 +1965,7 @@ async fn remove_node_onchain(
     private_key: String,
     signer_address: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use tapp_service::onchain::OnchainParams;
+    use tapp_common::onchain::OnchainParams;
 
     let signer = if let Some(addr) = signer_address {
         addr.trim_start_matches("0x").parse::<ethers::types::Address>()?
@@ -1974,7 +1974,7 @@ async fn remove_node_onchain(
     };
 
     let params = OnchainParams { rpc_url, contract, private_key };
-    let tx = tapp_service::onchain::remove_node(&params, &app_id, signer).await?;
+    let tx = tapp_common::onchain::remove_node(&params, &app_id, signer).await?;
 
     println!("✓ Node removal initiated on-chain");
     println!("  App ID: {}", app_id);
@@ -1997,7 +1997,7 @@ async fn update_node_onchain(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use ethers::types::Address;
     use std::str::FromStr;
-    use tapp_service::onchain::OnchainParams;
+    use tapp_common::onchain::OnchainParams;
 
     let old_signer_addr = if let Some(addr) = old_signer_arg {
         Address::from_str(addr.trim_start_matches("0x"))
@@ -2021,7 +2021,7 @@ async fn update_node_onchain(
         node_override_hashes(&rpc_url, &contract, &app_id, node_compose, node_volumes).await?;
 
     let params = OnchainParams { rpc_url, contract, private_key };
-    let tx = tapp_service::onchain::update_node(
+    let tx = tapp_common::onchain::update_node(
         &params, &app_id, old_signer_addr, new_signer, tee_url.clone(), compose_hash, volumes_hash,
     )
     .await?;
@@ -2041,7 +2041,7 @@ async fn withdraw_onchain(
     contract: String,
     private_key: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use tapp_service::onchain::{self, OnchainParams};
+    use tapp_common::onchain::{self, OnchainParams};
 
     let params = OnchainParams { rpc_url, contract, private_key };
     let tx = onchain::withdraw(&params).await?;
@@ -2061,7 +2061,7 @@ async fn authorize_invalidator_onchain(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use ethers::types::Address;
     use std::str::FromStr;
-    use tapp_service::onchain::{self, OnchainParams};
+    use tapp_common::onchain::{self, OnchainParams};
 
     let invalidator_addr = Address::from_str(invalidator.trim_start_matches("0x"))
         .map_err(|_| format!("Invalid invalidator address: {}", invalidator))?;
@@ -2086,7 +2086,7 @@ async fn revoke_invalidator_onchain(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use ethers::types::Address;
     use std::str::FromStr;
-    use tapp_service::onchain::{self, OnchainParams};
+    use tapp_common::onchain::{self, OnchainParams};
 
     let invalidator_addr = Address::from_str(invalidator.trim_start_matches("0x"))
         .map_err(|_| format!("Invalid invalidator address: {}", invalidator))?;

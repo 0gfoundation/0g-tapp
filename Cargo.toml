@@ -1,10 +1,18 @@
-[package]
-name = "tapp-service"
-version = "0.1.0"
+[workspace]
+members = ["tapp-common", "tapp-cli"]
+
+[workspace.package]
 edition = "2021"
+license = "Apache-2.0"
+
+[package]
+name = "tapp-server"
+version = "0.1.0"
+edition.workspace = true
 authors = ["TDX TAPP Developers"]
 description = "TDX Trusted Application Platform Service - Rust Implementation"
-license = "Apache-2.0"
+license.workspace = true
+default-run = "tapp-server"
 
 [dependencies]
 # gRPC and async runtime
@@ -63,6 +71,9 @@ ethers = { version = "2.0", default-features = false, features = [
     "rustls",
 ] }
 
+# Shared library (proto, onchain, app_key, verify, error)
+tapp-common = { path = "tapp-common" }
+
 # Error handling and logging
 anyhow = "1.0"
 thiserror = "1.0"
@@ -111,6 +122,4 @@ wiremock = "0.6"
 name = "tapp-server"
 path = "src/main.rs"
 
-[[bin]]
-name = "tapp-cli"
-path = "src/cli.rs"
+

@@ -1,0 +1,48 @@
+[package]
+name = "tapp-common"
+version = "0.1.0"
+edition.workspace = true
+description = "Shared library for tapp-cli and tapp-server: proto types, onchain, app_key, verify, error"
+license.workspace = true
+
+[lib]
+name = "tapp_common"
+path = "src/lib.rs"
+
+[dependencies]
+# gRPC
+tonic = "0.12"
+prost = "0.13"
+tower = "0.4"
+http = "1.0"
+
+# Async runtime (Mutex etc.)
+tokio = { version = "1.0", features = ["sync"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+base64 = "0.22"
+
+# Cryptography
+sha3 = "0.10"
+hex = "0.4"
+k256 = { version = "0.13", features = ["ecdsa", "std"] }
+x25519-dalek = { version = "2.0", features = ["static_secrets"] }
+
+# Logging (used by app_key, onchain, verify)
+tracing = "0.1"
+
+# Ethereum
+ethers = { version = "2.0", default-features = false, features = ["legacy", "rustls"] }
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Utilities
+chrono = { version = "0.4", features = ["serde"] }
+
+[build-dependencies]
+tonic-build = "0.12"

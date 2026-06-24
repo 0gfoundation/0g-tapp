@@ -1,11 +1,17 @@
-pub mod app_key;
+// Shared modules re-exported from tapp-common (no TEE/Docker deps)
+pub use tapp_common::app_key;
+pub use tapp_common::onchain;
+pub use tapp_common::error;
+pub use tapp_common::verify;
+pub use tapp_common::proto;
+pub use tapp_common::as_proto;
+
+// Server-only modules
 pub mod auth_layer;
 pub mod balance_withdrawal;
 pub mod kms_client;
-pub mod onchain;
 pub mod boot;
 pub mod config;
-pub mod error;
 pub mod measurement_service;
 pub mod nonce_manager;
 pub mod permission;
@@ -13,20 +19,16 @@ pub mod service_monitor;
 pub mod signature_auth;
 pub mod task_manager;
 pub mod utils;
-pub mod verify;
+
 pub use boot::BootService;
 pub use config::TappConfig;
-pub use error::{TappError, TappResult};
+pub use tapp_common::error::{TappError, TappResult};
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 pub use task_manager::TaskStatus;
 use tonic::{Request, Response, Status};
 use tracing::{debug, error, info};
 
-// Re-export generated protobuf types
-pub mod proto {
-    tonic::include_proto!("tapp_service");
-}
 
 // // Re-export common types
 pub use proto::{

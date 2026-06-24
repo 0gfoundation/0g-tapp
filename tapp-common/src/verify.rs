@@ -11,12 +11,8 @@ use std::collections::{HashMap, HashSet};
 use crate::onchain;
 use crate::proto::{tapp_service_client::TappServiceClient, GetEvidenceRequest};
 
-// CoCo Attestation Service gRPC client (proto/attestation.proto).
-pub mod as_proto {
-    tonic::include_proto!("attestation");
-}
-use as_proto::attestation_service_client::AttestationServiceClient;
-use as_proto::{AttestationRequest, IndividualAttestationRequest};
+use crate::as_proto::attestation_service_client::AttestationServiceClient;
+use crate::as_proto::{AttestationRequest, IndividualAttestationRequest};
 
 const B64: base64::engine::general_purpose::GeneralPurpose = base64::engine::general_purpose::STANDARD;
 const B64URL: base64::engine::general_purpose::GeneralPurpose =
