@@ -19,7 +19,7 @@ This workspace produces two independent binaries — **tapp-server** and **tapp-
 cargo build --release -p tapp-cli
 
 # Build tapp-server only (requires Linux + TEE dependencies)
-cargo build --release -p tapp-service
+cargo build --release -p tapp-server
 
 # Build everything
 cargo build --release

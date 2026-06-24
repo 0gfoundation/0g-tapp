@@ -6,7 +6,7 @@ edition = "2021"
 license = "Apache-2.0"
 
 [package]
-name = "tapp-service"
+name = "tapp-server"
 version = "0.1.0"
 edition.workspace = true
 authors = ["TDX TAPP Developers"]
