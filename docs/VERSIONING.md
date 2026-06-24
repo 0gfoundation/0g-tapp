@@ -12,6 +12,23 @@ This workspace produces two independent binaries — **tapp-server** and **tapp-
 | tapp-cli | `tapp-cli/Cargo.toml` → `[package] version` | `tapp-cli --version` |
 | tapp-common | `tapp-common/Cargo.toml` → `[package] version` | (internal, no standalone release) |
 
+## How to Build
+
+```bash
+# Build tapp-cli only (works on macOS, no TEE deps)
+cargo build --release -p tapp-cli
+
+# Build tapp-server only (requires Linux + TEE dependencies)
+cargo build --release -p tapp-service
+
+# Build everything
+cargo build --release
+```
+
+Note: in a workspace with multiple binaries, you must use `-p <package>`
+to select which one to build/run. `cargo build --bin tapp-cli` without
+`-p` only searches the default-run package.
+
 ## How to Check Version at Runtime
 
 ```bash

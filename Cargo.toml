@@ -1,6 +1,5 @@
 [workspace]
 members = ["tapp-common", "tapp-cli"]
-default-run = "tapp-server"
 
 [workspace.package]
 edition = "2021"
@@ -13,6 +12,7 @@ edition.workspace = true
 authors = ["TDX TAPP Developers"]
 description = "TDX Trusted Application Platform Service - Rust Implementation"
 license.workspace = true
+default-run = "tapp-server"
 
 [dependencies]
 # gRPC and async runtime
