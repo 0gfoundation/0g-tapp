@@ -30,31 +30,53 @@ import rego.v1
 #   digest is in .digests[_].digest (hex), alg = "SHA-384"
 
 # --- Reference values (SHA-384, hex) ---------------------------------------
-# WARNING: placeholder/sample values below were measured from one node of the
-# 6.17.0-1018-gcp image. Confirm/replace per the target release before publishing;
-# initrd in particular varies per image.
-ref_shim := {
+# Two sources, RVPS takes priority, embedded is the fallback:
+#   * RVPS path (local self-hosted trustee): register values under the
+#     "measurement.<component>.SHA-384" keys; they appear under data.reference and
+#     override the embedded defaults below.
+#   * Embedded path (shared remote AS where RVPS is not writable): the values below
+#     are used directly, so the policy is self-contained.
+# Same policy works for both. Update these for the target release image.
+embedded_shim := {
 	"4637fb5cd30847e5f09ae24f8a50ce1611c4d21afd0ecb69c8ec40bc82dc11bc48abda1f8044fe340bfb70b29606eb47",
 }
 
-ref_grub := {
+embedded_grub := {
 	"d9c40784e214bb829477f46245758e74f6b145dbf012960d4053c2fe27545738d89833297b4fd9ec348dde75910bfa33",
 }
 
-ref_kernel := {
+embedded_kernel := {
 	"34d6ebfb021bfa10edc6e925fa3d93606a8d9da6c97d331ec936fd4c36dc5cf34a154f6405ee1a84e5568f02ee93ccca",
 }
 
-ref_initrd := {
-	"b7b49c3a87e1314324f5a10a72345680f2e82dadbb6f72127fb5a3c8033d4b6c40b3d2a3a836da240dfd488889893ed4",
+embedded_initrd := {
+	"311a57077c4490adfe3c7605da9f1dd809df3bcfa059803d70c2c43bf9b6dc6907aa3b03145adb5f91f5f6e89a69a6d9",
 }
 
 # kernel_cmdline may have several allowed values (new/old grub path spellings);
 # matching any one is enough (OR).
-ref_kernel_cmdline := {
+embedded_kernel_cmdline := {
 	"7dd3d3d1ddb00dda05d63676ff8759bd82b933ce930fa13deb811fa4faa09604f6b029aea4f98dabf23675d91162ea19",
 	"bad43ebbd92a8dde1d5b4198cff9cc268e93b771a402fbfe14718879bbb5735a1fd095c98f06d276509ae354805971e5",
 }
+
+# RVPS values for a key as a set (empty if RVPS / data.reference is absent).
+rvps_set(key) := {x | x := object.get(data, ["reference", key], [])[_]}
+
+# Use RVPS values when present, else the embedded fallback.
+pick(key, fallback) := rvps_set(key) if count(rvps_set(key)) > 0
+
+pick(key, fallback) := fallback if count(rvps_set(key)) == 0
+
+ref_shim := pick("measurement.shim.SHA-384", embedded_shim)
+
+ref_grub := pick("measurement.grub.SHA-384", embedded_grub)
+
+ref_kernel := pick("measurement.kernel.SHA-384", embedded_kernel)
+
+ref_initrd := pick("measurement.initrd.SHA-384", embedded_initrd)
+
+ref_kernel_cmdline := pick("measurement.kernel_cmdline.SHA-384", embedded_kernel_cmdline)
 
 # --- Extract component digests from uefi_event_logs ------------------------
 # Digests of EV_EFI_BOOT_SERVICES_APPLICATION events whose device_paths contain `needle`.
