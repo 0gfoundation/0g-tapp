@@ -71,11 +71,13 @@ WORKDIR /build
 # Copy project files
 COPY . .
 
-# Build both binaries in release mode
+# Build both binaries in release mode. --workspace is required: the root package is
+# tapp-server, and tapp-cli is a separate workspace member (not a dependency of the
+# root), so a plain `cargo build` would not produce target/release/tapp-cli.
 # This produces:
 # - /build/target/release/tapp-server
 # - /build/target/release/tapp-cli
-RUN cargo build --release
+RUN cargo build --release --workspace
 
 # Copy build artifacts to output directory
 RUN mkdir -p /output && \
