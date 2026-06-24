@@ -3,13 +3,12 @@ members = ["tapp-common", "tapp-cli"]
 default-run = "tapp-server"
 
 [workspace.package]
-version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 
 [package]
 name = "tapp-service"
-version.workspace = true
+version = "0.1.0"
 edition.workspace = true
 authors = ["TDX TAPP Developers"]
 description = "TDX Trusted Application Platform Service - Rust Implementation"

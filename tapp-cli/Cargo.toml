@@ -1,6 +1,6 @@
 [package]
 name = "tapp-cli"
-version.workspace = true
+version = "0.1.0"
 edition.workspace = true
 description = "Standalone CLI for TAPP gRPC server and on-chain operations"
 license.workspace = true

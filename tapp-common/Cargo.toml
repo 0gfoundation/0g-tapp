@@ -1,6 +1,6 @@
 [package]
 name = "tapp-common"
-version.workspace = true
+version = "0.1.0"
 edition.workspace = true
 description = "Shared library for tapp-cli and tapp-server: proto types, onchain, app_key, verify, error"
 license.workspace = true
