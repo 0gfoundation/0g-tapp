@@ -149,6 +149,19 @@ if [ -z "$kernel_version" ]; then ... return 1; fi
 **7.5 `rw_overlay="ram"` 运行时未生效（已解决，归因于 7.3）**
 此前观察到 rootfs 只读、`rw_overlay` 不生效，曾疑为独立问题。实为 **7.3 的表现**：可写层由 `cryptpilot-fde-before-sysroot.service` 在 initrd 里建立，而该 service 不在所启动 gcp 内核的 initrd 中，故未运行。应用修复 A 后，QEMU 实测可写层（zram + dm-snapshot）正常建立、`Read-only file system` 错误归零。非独立 bug。
 
+**7.6 `show-reference-value` 硬性要求 grubenv 里有 `saved_entry`（参考值提取）**
+`cryptpilot-fde show-reference-value` 在 `load_kernel_artifacts`（`src/cmd/fde/disk.rs:395-397`）里：
+```rust
+let saved_entry = grub_vars
+    .get("saved_entry")
+    .ok_or_else(|| anyhow::anyhow!("saved_entry not found in GRUB environment"))?;
+```
+**问题**：刚构建、从未启动过的镜像 grubenv 为空 → 直接报 `saved_entry not found in GRUB environment`，无法提取启动项的内核/initrd/cmdline 参考值。而这些镜像的 grub.cfg 默认选择逻辑是 `set default="0"`（与 `saved_entry` 无关），grub 实际启动的就是第一条 menuentry。
+
+**正确修复（在消费者侧，不碰镜像）**：`saved_entry` 缺失时按 grub 真实默认逻辑回落——`next_entry > saved_entry > set default(=0) > 第一条 menuentry`，再据此从 grub.cfg/loader entry 解析；而不是 `?` 报错。
+
+**⚠️ 当前的本地 workaround（不推荐作为正式修复）**：在 `cryptpilot-convert` 的 `update_rootfs_inner` 末尾，从 grub.cfg 第一条 menuentry 提取 id 并写进 grubenv 的 `saved_entry`（正则 `'\K[^']+(?=' \{)`）。它**改错了层**（改生产者 + 改镜像内容去迁就消费者的严格检查），且 `saved_entry` 本是运行时状态、不应构建期伪造。仅用于让本机构建跑通，正解应在 `disk.rs` 上述位置。
+
 ## 8. 另一侧修复：tapp-server / guest-components 的 RTMR 扩展探测误判
 
 > 与上面镜像构建（convert/grub）问题相互独立。即使镜像侧全部修好（内核具备接口、cryptpilot 栈在正确 initrd 中），运行时 RTMR 仍会失败，根因在 **应用侧 `tapp-server` 依赖的 guest-components**。
