@@ -81,6 +81,10 @@ enum Commands {
         /// CoCo Attestation Service gRPC endpoint (host:port)
         #[arg(long, default_value = "47.237.201.184:50004")]
         as_endpoint: String,
+        /// AS policy id to enforce (enables boot-chain check). Empty = AS default
+        /// policy (no boot-chain check). E.g. --policy-ids 0g-tapp
+        #[arg(long)]
+        policy_ids: Vec<String>,
     },
     /// List all apps currently on the server
     ListApps,
@@ -490,8 +494,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::GetAppInfo { app_id } => {
             get_app_info(&cli.server, app_id).await?;
         }
-        Commands::VerifyApp { app_id, rpc_url, contract, as_endpoint } => {
-            verify_app_cmd(&cli.server, &app_id, rpc_url, contract, &as_endpoint).await?;
+        Commands::VerifyApp { app_id, rpc_url, contract, as_endpoint, policy_ids } => {
+            verify_app_cmd(&cli.server, &app_id, rpc_url, contract, &as_endpoint, &policy_ids).await?;
         }
         Commands::ListApps => {
             list_apps(&cli.server).await?;
@@ -1010,15 +1014,31 @@ async fn verify_app_cmd(
     rpc_url: Option<String>,
     contract: Option<String>,
     as_endpoint: &str,
+    policy_ids: &[String],
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // boot-chain line is meaningful only when WE selected a policy (otherwise the AS
+    // default policy's executables claim is not our boot-chain check).
+    let show_boot = !policy_ids.is_empty();
+    let boot = |ex: Option<i64>| -> String {
+        if !show_boot {
+            return String::new();
+        }
+        match ex {
+            Some(3) => "boot-chain : ✓ (executables=3, matches policy reference)".to_string(),
+            Some(n) => format!("boot-chain : ✗ (executables={}, no policy match)", n),
+            None => "boot-chain : ? (policy set no executables claim)".to_string(),
+        }
+    };
     // Direct mode: no --contract → verify the single --server node without chain reconciliation.
     if contract.is_none() {
-        let d = tapp_common::verify::verify_node_direct(server, app_id, as_endpoint).await?;
+        let d = tapp_common::verify::verify_node_direct(server, app_id, as_endpoint, policy_ids).await?;
         let quote_ok = d.ear_status == "affirming";
         println!("Verifying app: {}  (direct mode — no on-chain reconciliation)", app_id);
         println!("  server      : {}", d.server);
         println!("  signer      : {}  (attested in report_data)", d.signer);
         println!("  AS          : ear.status={} tcb_status={} advisories={}", d.ear_status, d.tcb_status, d.advisories);
+        let b = boot(d.boot_executables);
+        if !b.is_empty() { println!("{}", b.trim_start()); }
         if !d.compose_hash.is_empty() {
             println!("  compose     : {}", d.compose_hash);
         }
@@ -1036,7 +1056,7 @@ async fn verify_app_cmd(
     // Chain mode.
     let rpc_url = rpc_url.ok_or("chain mode requires --rpc-url (or omit --contract for direct mode)")?;
     let contract = contract.unwrap();
-    let verdict = tapp_common::verify::verify_app(&rpc_url, &contract, app_id, as_endpoint).await?;
+    let verdict = tapp_common::verify::verify_app(&rpc_url, &contract, app_id, as_endpoint, policy_ids).await?;
 
     let yn = |b: bool| if b { "✓" } else { "✗" };
     println!("Verifying app: {}  ({} node(s))", verdict.app_id, verdict.nodes.len());
@@ -1060,6 +1080,8 @@ async fn verify_app_cmd(
             "    reconcile  : signer{} compose{} volumes{} image{}",
             yn(n.signer_ok), yn(n.compose_ok), yn(n.volumes_ok), yn(n.image_ok)
         );
+        let b = boot(n.boot_executables);
+        if !b.is_empty() { println!("  {}", b); }
         if !n.note.is_empty() {
             println!("    note       : {}", n.note);
         }

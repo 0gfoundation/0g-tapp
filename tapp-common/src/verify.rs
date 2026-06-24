@@ -30,6 +30,7 @@ pub struct NodeVerdict {
     pub compose_ok: bool, // start_app compose == node effective compose
     pub volumes_ok: bool,
     pub image_ok: bool,
+    pub boot_executables: Option<i64>, // AR4SI executables claim (3 = boot chain matched policy)
     pub note: String,
 }
 
@@ -156,8 +157,18 @@ fn json_str_map(v: &serde_json::Value) -> HashMap<String, String> {
     m
 }
 
-/// Submit evidence to CoCo-AS (gRPC) and return (ear_status, tcb_status, advisory_count).
-async fn verify_with_as(as_endpoint: &str, raw_evidence: &[u8]) -> Result<(String, String, usize)> {
+/// AS verification result: (ear_status, tcb_status, advisory_count, executables_claim).
+/// `executables` is the AR4SI executables trust claim (3 = boot chain matched the policy
+/// reference values); None if the policy didn't set it / no policy was applied.
+type AsVerdict = (String, String, usize, Option<i64>);
+
+/// Submit evidence to CoCo-AS (gRPC). `policy_ids` selects the policy to enforce; pass an
+/// empty slice to use the AS default policy (which does NOT check our boot chain).
+async fn verify_with_as(
+    as_endpoint: &str,
+    raw_evidence: &[u8],
+    policy_ids: &[String],
+) -> Result<AsVerdict> {
     let mut client = AttestationServiceClient::connect(format!("http://{}", as_endpoint))
         .await
         .map_err(|e| anyhow!("connect AS {}: {}", as_endpoint, e))?;
@@ -169,7 +180,7 @@ async fn verify_with_as(as_endpoint: &str, raw_evidence: &[u8]) -> Result<(Strin
             init_data: None,
             runtime_data_hash_algorithm: String::new(),
         }],
-        policy_ids: vec![],
+        policy_ids: policy_ids.to_vec(),
     };
     let token = client
         .attestation_evaluate(req)
@@ -189,10 +200,11 @@ async fn verify_with_as(as_endpoint: &str, raw_evidence: &[u8]) -> Result<(Strin
     let claims: serde_json::Value = serde_json::from_slice(&payload)?;
     let cpu0 = &claims["submods"]["cpu0"];
     let ear_status = cpu0["ear.status"].as_str().unwrap_or("unknown").to_string();
+    let executables = cpu0["ear.trustworthiness-vector"]["executables"].as_i64();
     let tdx = &cpu0["ear.veraison.annotated-evidence"]["tdx"];
     let tcb = tdx["tcb_status"].as_str().unwrap_or("unknown").to_string();
     let adv = tdx["advisory_ids"].as_array().map(|a| a.len()).unwrap_or(0);
-    Ok((ear_status, tcb, adv))
+    Ok((ear_status, tcb, adv, executables))
 }
 
 async fn fetch_evidence(tee_url: &str, app_id: &str) -> Result<Vec<u8>> {
@@ -218,6 +230,7 @@ pub struct DirectVerdict {
     pub ear_status: String,
     pub tcb_status: String,
     pub advisories: usize,
+    pub boot_executables: Option<i64>, // AR4SI executables claim (3 = boot chain matched policy)
     pub compose_hash: String, // from latest successful start_app, if any
     pub images: Vec<String>,
     pub note: String,
@@ -227,6 +240,7 @@ pub async fn verify_node_direct(
     server: &str,
     app_id: &str,
     as_endpoint: &str,
+    policy_ids: &[String],
 ) -> Result<DirectVerdict> {
     let mut v = DirectVerdict {
         server: server.to_string(),
@@ -234,6 +248,7 @@ pub async fn verify_node_direct(
         ear_status: "-".to_string(),
         tcb_status: "-".to_string(),
         advisories: 0,
+        boot_executables: None,
         compose_hash: String::new(),
         images: Vec::new(),
         note: String::new(),
@@ -250,11 +265,12 @@ pub async fn verify_node_direct(
         v.note = "quote parse failed; ".to_string();
     }
 
-    match verify_with_as(as_endpoint, &raw).await {
-        Ok((s, t, a)) => {
+    match verify_with_as(as_endpoint, &raw, policy_ids).await {
+        Ok((s, t, a, ex)) => {
             v.ear_status = s;
             v.tcb_status = t;
             v.advisories = a;
+            v.boot_executables = ex;
         }
         Err(e) => v.note = format!("{}AS: {}", v.note, e),
     }
@@ -273,6 +289,7 @@ pub async fn verify_app(
     contract: &str,
     app_id: &str,
     as_endpoint: &str,
+    policy_ids: &[String],
 ) -> Result<AppVerdict> {
     let signers = onchain::get_node_list(rpc_url, contract, app_id).await?;
     if signers.is_empty() {
@@ -296,6 +313,7 @@ pub async fn verify_app(
             compose_ok: false,
             volumes_ok: false,
             image_ok: false,
+            boot_executables: None,
             note: String::new(),
         };
 
@@ -341,11 +359,12 @@ pub async fn verify_app(
         }
 
         // ③ AS quote verification
-        match verify_with_as(as_endpoint, &raw).await {
-            Ok((s, t, a)) => {
+        match verify_with_as(as_endpoint, &raw, policy_ids).await {
+            Ok((s, t, a, ex)) => {
                 v.ear_status = s;
                 v.tcb_status = t;
                 v.advisories = a;
+                v.boot_executables = ex;
             }
             Err(e) => v.note = format!("{}AS: {}", v.note, e),
         }
