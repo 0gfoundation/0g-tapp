@@ -347,3 +347,37 @@ network:
 （DNS 仍靠 §9 的静态 `/etc/resolv.conf`。）
 
 以上加固已集成在 `build-gcp-tapp.sh` 段A 末尾（`apt-get purge` + `systemctl mask` + 替换 netplan），随 convert 一并密封进 verity 测量层。
+
+## 12. 提取参考值：`show-reference-value`（需含 saved_entry 修复）
+
+构建出 `gcp-tapp.qcow2` 后，用 `cryptpilot-fde` 从镜像**离线**提取远程证明（RA）所需的参考值，写进 KBS/attestation 策略。
+
+### 前提：cryptpilot-fde 需含 §7.6 的修复
+从未启动的镜像 grubenv 为空，**原版** `show-reference-value` 会报 `saved_entry not found in GRUB environment`（见 §7.6）。需用含修复（openanolis/cryptpilot PR #126）的版本。合并前可从 fork 分支自行构建：
+```bash
+git clone -b fix/show-reference-value-no-saved-entry https://github.com/0gfoundation/cryptpilot.git
+cd cryptpilot
+# 构建依赖（Anolis/RHEL 系）：
+dnf install -y device-mapper-devel clang
+LIBCLANG_PATH=/usr/lib64 cargo build --release        # 产物 target/release/cryptpilot（含 fde 多调用别名）
+```
+> 有了此修复后，**不再需要** §7.6 那个"convert 端伪造 saved_entry"的 workaround。
+
+### 用法
+```bash
+# 安装版二进制（cryptpilot-fde 是 `cryptpilot fde` 的多调用别名）：
+cryptpilot-fde show-reference-value --disk gcp-tapp.qcow2 --hash-algo sha384
+# 源码构建版等价：
+./target/release/cryptpilot fde --disk gcp-tapp.qcow2 show-reference-value --hash-algo sha384
+```
+- `--disk <路径>`：对镜像文件/块设备离线计算（不加则对当前运行系统）。
+- `--hash-algo`：`sha1,sha256,sha384,sm3`，可多次指定；默认 `sha384,sm3`。
+- `--stage initrd|system`：可选；`--stage system` 会额外注入 `initrd_switch_root` 声明。
+
+### 输出（AAEL 参考值 → 喂给 KBS 策略）
+- `AA.eventlog.cryptpilot.alibabacloud.com.load_config` —— FDE 配置 bundle 哈希
+- `AA.eventlog.cryptpilot.alibabacloud.com.fde_rootfs_hash` —— rootfs verity `root_hash`
+- `AA.eventlog.cryptpilot.alibabacloud.com.initrd_switch_root` —— 仅 `--stage system`
+- 启动组件（grub / kernel / initrd / kernel cmdline）的 SHA-384（及所选算法）参考值
+
+> 顺序提醒（见 §6）：若用 §7.6 的 convert workaround（而非 #126 修复），`show-reference-value` 必须在"同步 ESP（修复 B）"**之后**运行，确保参考值 == 实际启动测量。用 #126 修复 + 干净镜像则按上面直接跑即可。

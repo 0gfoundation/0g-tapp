@@ -37,6 +37,13 @@ purge：openssh-server / cloud-init / snapd / google-guest-agent / google-comput
 - 运行时（真 TDX）：SSH 连不上；app 经 tapp 正常启动 + 度量 + RA。
 - 内部监听面权威核验：实例内 `ss -tlnp`（锁死后无登录入口，可用开机审计服务输出到串口 console，见文档 §同名建议）。
 
+## 提取参考值（远程证明用）
+构建后用含修复（openanolis/cryptpilot#126）的 `cryptpilot-fde` 从镜像离线提取 RA 参考值：
+```bash
+cryptpilot-fde show-reference-value --disk gcp-tapp.qcow2 --hash-algo sha384
+```
+原版会因新镜像 grubenv 空报 `saved_entry not found`；详见主文档 **§12**（含从 fork 分支构建带修复的 cryptpilot-fde 的步骤）。
+
 ## 待办（可选，"零残留"收尾，不阻塞）
 - 删残留 `authorized_keys`（root + 4 真人账号）+ 锁/删真人账号；
 - 清 Tier3：`rpcbind`(监听 111)/`lxd-installer.socket` 等。
