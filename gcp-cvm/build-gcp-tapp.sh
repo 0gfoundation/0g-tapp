@@ -17,8 +17,8 @@ export DEBIAN_FRONTEND=noninteractive
 # ===== Tunables =====
 TAPP_SERVER_BIN="${TAPP_SERVER_BIN:-}"                              # path to a local tapp-server binary; empty -> download from URL
 TAPP_SERVER_URL="${TAPP_SERVER_URL:-https://github.com/0gfoundation/0g-tapp/releases/download/v0.1.0/tapp-server}"
-OWNER_ADDRESS="${OWNER_ADDRESS:-0xea695C312CE119dE347425B29AFf85371c9d1837}"
-KBS_URLS="${KBS_URLS:-\"http://8.222.225.233:9091\", \"http://47.245.117.71:9091\"}"
+OWNER_ADDRESS="${OWNER_ADDRESS:-}"   # REQUIRED: tapp-server owner address (0x...), written to config.toml [server.permission]
+KBS_URLS="${KBS_URLS:-}"             # REQUIRED: KBS node URLs for [kbs] node_urls, comma-separated and quoted, e.g. KBS_URLS='"http://host1:9091", "http://host2:9091"'
 DNS_FALLBACK="${DNS_FALLBACK:-8.8.8.8 8.8.4.4 1.1.1.1}"
 HARDEN="${HARDEN:-1}"                                   # 1=hardened (purge Tier1/2 + mask getty + replace netplan); 0=dev
 # passed through to prepare-gcp-tapp.sh (used by convert)
@@ -32,6 +32,8 @@ export INSTALL_KERNEL=1
 IN="${1:?usage: $0 <ubuntu-24.04-base.qcow2> <output.qcow2>}"
 OUT="${2:?usage: $0 <ubuntu-24.04-base.qcow2> <output.qcow2>}"
 [ -f "$IN" ] || { echo "input image not found: $IN" >&2; exit 1; }
+[ -n "$OWNER_ADDRESS" ] || { echo "OWNER_ADDRESS is required, e.g. OWNER_ADDRESS=0x... $0 ..." >&2; exit 1; }
+[ -n "$KBS_URLS" ] || { echo "KBS_URLS is required, e.g. KBS_URLS='\"http://host1:9091\", \"http://host2:9091\"' $0 ..." >&2; exit 1; }
 [ -f "$HERE/prepare-gcp-tapp.sh" ] || { echo "missing prepare-gcp-tapp.sh (must be in the same directory as this script)" >&2; exit 1; }
 [ -d "$CONFIG_DIR" ] || { echo "CONFIG_DIR not found: $CONFIG_DIR" >&2; exit 1; }
 [ -f "$FDE_PACKAGE" ] || { echo "FDE_PACKAGE not found: $FDE_PACKAGE" >&2; exit 1; }

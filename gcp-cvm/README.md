@@ -19,8 +19,13 @@ Build a bootable, measurable, remotely-attestable, security-hardened cryptpilot 
 ## One-shot build
 ```bash
 export LIBGUESTFS_BACKEND=direct
+OWNER_ADDRESS=0x<your-owner-address> \
+KBS_URLS='"http://<kbs-host-1>:9091", "http://<kbs-host-2>:9091"' \
 ./build-gcp-tapp.sh <bare-ubuntu-24.04.qcow2> gcp-tapp.qcow2
 ```
+- **Required** (no defaults — the build aborts if unset, so no deployment-specific value is ever baked in):
+  - `OWNER_ADDRESS` — tapp-server owner address, written to `config.toml` `[server.permission]`.
+  - `KBS_URLS` — KBS node URLs for `[kbs] node_urls`, comma-separated and quoted as shown.
 - tapp-server is downloaded by default from GitHub v0.1.0 (includes the guest-components `8d71a3b4` fix, RTMR OK); if you have it locally, set `TAPP_SERVER_BIN=<path>`.
 - Other environment variables: `DNS_FALLBACK` `PURGE_KERNEL` `CONFIG_DIR` `FDE_PACKAGE` `ROOTFS_MODE` `IN_PLACE` `INSTALL_KERNEL` `NBD_RESET` (see the top of the script).
 

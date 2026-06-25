@@ -10,9 +10,9 @@
 
 ---
 
-## 0. Preparation: building the base Ubuntu image (temp-fixed.qcow2)
+## 0. Preparation: building the base Ubuntu image
 
-`temp-fixed.qcow2` (the input to the build pipeline below) is itself a produced artifact: the official Ubuntu 24.04 (noble) cloud image with the GCP gVNIC network driver installed (required for GCP Confidential VMs).
+The input to the build pipeline below is a base image produced **reproducibly from the official Ubuntu cloud image**: the official Ubuntu 24.04 (noble) cloud image, resized to 20 GiB, with the GCP gVNIC network driver installed (required for GCP Confidential VMs). Build it from the official image with the steps below — do not rely on any pre-built/opaque base blob, so the whole image stays reproducible and attestable.
 
 Material:
 - Ubuntu cloud image: https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img
@@ -43,18 +43,7 @@ sudo modprobe gve
 sudo lsmod | grep -i gve
 ```
 
-A pre-prepared image (already with the steps above applied) can be downloaded directly:
-```bash
-wget -c https://storage.googleapis.com/yilin-public-bucket/temp-fixed.qcow2
-```
-
-> Note — the published `temp-fixed.qcow2` is **not** a pristine "official image + gVNIC". When reproducing the base from the official cloud image we found it also carried two GCP items beyond the steps above:
-> 1. the root partition already resized to 20 GiB (the resize step above);
-> 2. the **`google-guest-agent`** package installed (plus a `169.254.169.254 metadata.google.internal` line in `/etc/hosts`).
->
-> `google-guest-agent` is what injects the instance's SSH public key (from the metadata server, via the `169.254.169.254` IP — independent of DNS) into `~ubuntu/.ssh/authorized_keys`. Because the build pins `/etc/resolv.conf` to public DNS (fix C, §9), `metadata.google.internal` no longer resolves, so the `/etc/hosts` line is required for the agent to reach the metadata server by name. Without these, a freshly built image **cannot be reached over SSH**.
->
-> The build therefore reinstalls `google-guest-agent` (+ the `/etc/hosts` line) **only for the dev variant** (`HARDEN=0`). The hardened variant intentionally omits it — `google-guest-agent` is exactly the kind of component that can push changes into the instance from outside, so the hardened image is not SSH-reachable by design.
+> Note on SSH access — the stock Ubuntu cloud image relies on `google-guest-agent` to inject the instance's SSH public key (from the metadata server, via the `169.254.169.254` IP — independent of DNS) into `~ubuntu/.ssh/authorized_keys`. Because the build pins `/etc/resolv.conf` to public DNS (fix C, §9), `metadata.google.internal` no longer resolves, so a `169.254.169.254 metadata.google.internal` line in `/etc/hosts` is also needed for the agent to reach the metadata server by name. The build handles this **only for the dev variant** (`HARDEN=0`): it (re)installs `google-guest-agent` and adds the `/etc/hosts` line. The hardened variant intentionally omits both — `google-guest-agent` is exactly the kind of component that can push changes into the instance from outside, so the hardened image is not SSH-reachable by design.
 
 The full build (`gcp-cvm/build-gcp-tapp.sh`, §9) then takes this base image and adds the application, Docker, the gcp kernel, runs `cryptpilot-convert`, syncs the ESP, and (for the hardened variant) removes back-door software.
 
