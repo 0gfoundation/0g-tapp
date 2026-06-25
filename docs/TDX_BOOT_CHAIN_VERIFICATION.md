@@ -77,7 +77,14 @@ same values — no need to trust a running node. (cryptpilot
 never-booted images by falling back to GRUB's default menuentry when `grubenv` has no
 `saved_entry`.)
 
-Output is registered as reference values keyed `measurement.<component>.SHA-384`.
+Output is keyed `measurement.<component>.SHA-384`. Because `cryptpilot-convert` /
+`cryptpilot-fde` only run on an Alinux host, generation is **manual, not CI-automated**.
+
+The values are checked into this repo under
+[`reference-values/<tapp-server-version>/<env>.json`](../reference-values/) — **one set per
+tapp-server release × environment** (`dev`/`prod` images differ), starting at `v0.1.0`. See
+that directory's README. The policy itself is image-/version-/env-agnostic; only these
+values vary.
 
 ## 5. Verification — CoCo-AS + Rego policy
 
@@ -85,13 +92,19 @@ The AS verifies the TDX quote signature chain + TCB and parses the cc_eventlog; 
 policy compares the 5 boot-chain measurements from `uefi_event_logs` against the reference
 values and sets the AR4SI `executables` claim (3 = matched).
 
-- Policy: `verifier/policy.rego` (this repo). Reads reference values via the AS
-  `query_reference_value()` builtin (RVPS), with an embedded fallback.
-- Two deployments, same policy:
-  - **Local self-hosted trustee** (`coco-as-grpc` + `rvps`): reference values registered
-    to RVPS → `query_reference_value()`. See `0g-tapp-verifier` (`tdx-boot-chain/`).
-  - **Shared remote AS** (RVPS not writable): the policy's embedded reference values are used.
-- Client: `tapp-cli verify-app --as-endpoint <as>:50004 --policy-ids 0g-tapp`.
+- Policy: `verifier/policy.rego` (this repo) — a **single canonical, image-/version-/env-agnostic**
+  policy. It reads reference values from RVPS via the AS `query_reference_value()` builtin;
+  no values are baked in.
+- **Two verification methods, same policy** — they differ only in how the reference values
+  reach the AS:
+  - **Self-hosted AS** (`coco-as-grpc` + `rvps`, RVPS writable): register the release's
+    `reference-values/<version>/<env>.json` to RVPS → policy reads via `query_reference_value()`.
+    The full stack lives in **[`0g-tapp-verifier`](https://github.com/0gfoundation/0g-tapp-verifier)**.
+  - **Shared remote AS** (RVPS not writable): inject the values into a copy of the policy at
+    registration time, registered under id `0g-tapp-<version>-<env>` —
+    `verifier/register-shared-as.sh <version> <env> [as-endpoint]`.
+- Client: `tapp-cli verify-app --as-endpoint <as>:50004 --policy-ids 0g-tapp-<version>-<env>`
+  (e.g. `0g-tapp-v0.1.0-dev`).
 
 ## 6. rootfs
 

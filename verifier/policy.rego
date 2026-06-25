@@ -3,23 +3,24 @@ package policy
 import rego.v1
 
 # =============================================================================
-# 0g-tapp boot-chain verification policy (policy_id = "0g-tapp")
+# 0g-tapp boot-chain verification policy (canonical, tapp-level)
 # =============================================================================
-# Verifies a confidential VM (Intel TDX) boot-chain measurement against the
-# reference values of a known-good image:
-#   shim / grub / kernel / initrd / kernel_cmdline
-# These measurements come from the TDX evidence's uefi_event_logs (RTMR0-2).
-# rootfs integrity is folded into the initrd, so it is not checked separately.
+# Verifies a TDX confidential VM boot chain (shim / grub / kernel / initrd /
+# kernel_cmdline) against an image's reference values. These measurements come from
+# the TDX evidence's uefi_event_logs (RTMR0-2). rootfs integrity is folded into the
+# initrd, so it is not checked separately.
 #
-# Reference values are EMBEDDED in this file (no RVPS dependency; self-contained,
-# third-party reproducible).
+# ONE canonical policy — image-/version-/env-agnostic. What differs per
+# release × {dev,prod} is the REFERENCE VALUES, NOT this logic. The values are NOT
+# baked in here; they are read from RVPS via the query_reference_value() builtin under
+# the "measurement.<component>.SHA-384" keys. See reference-values/<version>/<env>.json.
 #
-# Register with the CoCo Attestation Service:
-#   POLICY=$(base64 -w0 policy.rego | tr '+/' '-_' | tr -d '=')   # base64url no-pad
-#   grpcurl -plaintext -import-path <protos> -proto attestation.proto \
-#     -d '{"policy_id":"0g-tapp","policy":"'"$POLICY"'"}' \
-#     <AS>:50004 attestation.AttestationService/SetAttestationPolicy
-# Then AttestationEvaluate(policy_ids:["0g-tapp"]) uses this policy.
+# How the reference values reach the AS (two verification methods, same policy):
+#   * Self-hosted AS (RVPS writable): register the image's reference-values json to
+#     RVPS; this policy reads them via query_reference_value(). See 0g-tapp-verifier.
+#   * Shared AS (RVPS not writable): inject the values into a copy of this policy at
+#     registration time and register it under a per-release/env id, e.g.
+#     0g-tapp-<version>-<env> (the _cpu device-class suffix is appended by the AS).
 #
 # uefi_event_logs field formats (measured on a cryptpilot image, kernel 6.17.0-1018-gcp):
 #   shim   : type_name=EV_EFI_BOOT_SERVICES_APPLICATION, details.device_paths contains "shimx64.efi"
@@ -29,39 +30,8 @@ import rego.v1
 #   kernel_cmdline : type_name=EV_IPL, details.string starts with "kernel_cmdline:"
 #   digest is in .digests[_].digest (hex), alg = "SHA-384"
 
-# --- Reference values (SHA-384, hex) ---------------------------------------
-# Two sources, RVPS takes priority, embedded is the fallback:
-#   * RVPS path (local self-hosted trustee): register values under the
-#     "measurement.<component>.SHA-384" keys; the policy reads them via the AS-injected
-#     query_reference_value() builtin and they override the embedded defaults below.
-#   * Embedded path (shared remote AS where RVPS is not writable): the values below
-#     are used directly, so the policy is self-contained.
-# Same policy works for both. Update these for the target release image.
-embedded_shim := {
-	"4637fb5cd30847e5f09ae24f8a50ce1611c4d21afd0ecb69c8ec40bc82dc11bc48abda1f8044fe340bfb70b29606eb47",
-}
-
-embedded_grub := {
-	"d9c40784e214bb829477f46245758e74f6b145dbf012960d4053c2fe27545738d89833297b4fd9ec348dde75910bfa33",
-}
-
-embedded_kernel := {
-	"34d6ebfb021bfa10edc6e925fa3d93606a8d9da6c97d331ec936fd4c36dc5cf34a154f6405ee1a84e5568f02ee93ccca",
-}
-
-embedded_initrd := {
-	"311a57077c4490adfe3c7605da9f1dd809df3bcfa059803d70c2c43bf9b6dc6907aa3b03145adb5f91f5f6e89a69a6d9",
-}
-
-# kernel_cmdline may have several allowed values (new/old grub path spellings);
-# matching any one is enough (OR).
-embedded_kernel_cmdline := {
-	"7dd3d3d1ddb00dda05d63676ff8759bd82b933ce930fa13deb811fa4faa09604f6b029aea4f98dabf23675d91162ea19",
-	"bad43ebbd92a8dde1d5b4198cff9cc268e93b771a402fbfe14718879bbb5735a1fd095c98f06d276509ae354805971e5",
-}
-
-# RVPS values for a key as a set, read via the AS-injected query_reference_value()
-# builtin (returns null when the key is absent → treated as empty).
+# --- Reference values: from RVPS only (no baked-in values) ------------------
+# query_reference_value() returns null when the key is absent → treated as empty.
 qrv(key) := v if {
 	v := query_reference_value(key)
 	v != null
@@ -69,22 +39,16 @@ qrv(key) := v if {
 
 qrv(key) := [] if query_reference_value(key) == null
 
-rvps_set(key) := {x | some x in qrv(key)}
+ref_shim := {x | some x in qrv("measurement.shim.SHA-384")}
 
-# Use RVPS values when present, else the embedded fallback.
-pick(key, fallback) := rvps_set(key) if count(rvps_set(key)) > 0
+ref_grub := {x | some x in qrv("measurement.grub.SHA-384")}
 
-pick(key, fallback) := fallback if count(rvps_set(key)) == 0
+ref_kernel := {x | some x in qrv("measurement.kernel.SHA-384")}
 
-ref_shim := pick("measurement.shim.SHA-384", embedded_shim)
+ref_initrd := {x | some x in qrv("measurement.initrd.SHA-384")}
 
-ref_grub := pick("measurement.grub.SHA-384", embedded_grub)
-
-ref_kernel := pick("measurement.kernel.SHA-384", embedded_kernel)
-
-ref_initrd := pick("measurement.initrd.SHA-384", embedded_initrd)
-
-ref_kernel_cmdline := pick("measurement.kernel_cmdline.SHA-384", embedded_kernel_cmdline)
+# kernel_cmdline may have several allowed values (grub path spellings); OR-match.
+ref_kernel_cmdline := {x | some x in qrv("measurement.kernel_cmdline.SHA-384")}
 
 # --- Extract component digests from uefi_event_logs ------------------------
 # Digests of EV_EFI_BOOT_SERVICES_APPLICATION events whose device_paths contain `needle`.
