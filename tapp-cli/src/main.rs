@@ -82,7 +82,7 @@ enum Commands {
         #[arg(long, default_value = "47.237.201.184:50004")]
         as_endpoint: String,
         /// AS policy id to enforce (enables boot-chain check). Empty = AS default
-        /// policy (no boot-chain check). E.g. --policy-ids 0g-tapp
+        /// policy (no boot-chain check). E.g. --policy-ids 0g-tapp-v0.1.0-dev
         #[arg(long)]
         policy_ids: Vec<String>,
     },
