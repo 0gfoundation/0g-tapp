@@ -1,46 +1,79 @@
-# cryptpilot-convert 在 GCP Ubuntu 镜像上换内核后启动崩溃 —— 根因分析与修复
+# cryptpilot-convert boot crash after switching the kernel on a GCP Ubuntu image — root-cause analysis and fix
 
-> 目的：为在 GCP Ubuntu 镜像上启用 **RTMR extend** 而更换内核（generic → gcp）。过程中遇到四类问题并已全部解决、RTMR extend 在真 TDX 上确认成功：
-> 1. **镜像启动崩溃**（grub 找不到内核/模块）——根因 GCP 双 grub.cfg，见 §4/§5 修复 B；
-> 2. **rootfs 只读 / RTMR 未 extend / verity 被绕过**——根因 convert 把 cryptpilot 栈装进了错误内核的 initrd，见 §7.3/§5 修复 A；
-> 3. **运行时 RTMR 扩展失败**（"Cannot extend runtime measurement"）——根因应用侧 guest-components 探测误判，见 §8；
-> 4. **实例 DNS 不通**（需手动 `echo nameserver … > /etc/resolv.conf`）——根因 virt-customize 收尾清理 resolv.conf、resolved 兜底失效，须用 guestfish 写静态 resolv.conf，见 §9。
+> Goal: switch the kernel (generic → gcp) to enable **RTMR extend** on a GCP Ubuntu image. Along the way we hit four classes of problems, all now resolved, and RTMR extend has been confirmed working on real TDX:
+> 1. **Image boot crash** (grub cannot find the kernel/modules) — root cause is GCP's dual grub.cfg, see §4 / §5 fix B;
+> 2. **read-only rootfs / RTMR not extended / verity bypassed** — root cause is convert installing the cryptpilot stack into the wrong kernel's initrd, see §7.3 / §5 fix A;
+> 3. **runtime RTMR extend failure** ("Cannot extend runtime measurement") — root cause is a misdetection in the application-side guest-components, see §8;
+> 4. **instance DNS broken** (requires a manual `echo nameserver … > /etc/resolv.conf`) — root cause is virt-customize cleaning up resolv.conf during teardown and the resolved fallback being ineffective; a static resolv.conf must be written with guestfish, see §9.
 >
-> §1–§7 镜像构建侧（含请 cryptpilot 维护方确认的 convert 问题），§8 应用侧（guest-components）修复，**§9 完整可复现 build 流程（SOP）**，§10 脚本附录。
+> §1–§7 cover the image-build side (including convert issues to confirm with the cryptpilot maintainers), §8 covers the application-side (guest-components) fix, **§9 is the complete reproducible build flow (SOP)**, §10 is the script appendix.
 
 ---
 
-## 1. 环境
+## 0. Preparation: building the base Ubuntu image (temp-fixed.qcow2)
 
-| 项 | 值 |
+`temp-fixed.qcow2` (the input to the build pipeline below) is itself a produced artifact: the official Ubuntu 24.04 (noble) cloud image with the GCP gVNIC network driver installed (required for GCP Confidential VMs).
+
+Materials:
+- Ubuntu cloud image: https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img
+- cryptpilot-fde deb, matching the cryptpilot-fde version used by `cryptpilot-convert`, from https://github.com/openanolis/cryptpilot/releases (the preparation referenced `cryptpilot-fde_0.6.0_amd64.deb`; this kit's convert uses `cryptpilot-fde_0.7.0_amd64.deb` — keep them consistent).
+
+Prepare the Ubuntu image for a GCP Confidential VM (install the gVNIC driver):
+```bash
+sudo apt install dkms build-essential linux-headers-$(uname -r)
+sudo apt --fix-broken install
+
+# download the latest gVNIC driver
+wget https://github.com/GoogleCloudPlatform/compute-virtual-ethernet-linux/releases/download/v1.4.9/gve-dkms_1.4.9_all.deb
+
+# install the gVNIC driver
+sudo dpkg -i gve-dkms_1.4.9_all.deb
+
+# load the new gVNIC driver
+sudo modprobe gve
+
+# confirm the driver loaded (output should be similar to "gve  159744  0")
+sudo lsmod | grep -i gve
+```
+
+A pre-prepared image (already with the steps above applied) can be downloaded directly:
+```bash
+wget -c https://storage.googleapis.com/yilin-public-bucket/temp-fixed.qcow2
+```
+
+The full build (`gcp-cvm/build-gcp-tapp.sh`, §9) then takes this base image and adds the application, Docker, the gcp kernel, runs `cryptpilot-convert`, syncs the ESP, and (for the hardened variant) removes back-door software.
+
+## 1. Environment
+
+| Item | Value |
 |---|---|
-| 基础镜像 | GCP Ubuntu 24.04 cloud image |
-| 磁盘布局 | `sda1`=rootfs(ext4), `sda14`=bios-grub, `sda15`=**ESP/EFI**(vfat), `sda16`=**/boot**(ext4) |
-| 原内核 | `6.8.0-106-generic` |
-| 目标内核 | `linux-image-gcp` → 实际为 `6.17.0-1018-gcp` |
-| 转换工具 | `cryptpilot-convert`，由 **cryptpilot-fde 0.7.0** 提供（转换主机上为 `cryptpilot-fde-0.7.0-1.al8`，装入目标镜像的为 `cryptpilot-fde_0.7.0_amd64.deb`） |
-| attestation-agent | 目标镜像内实际版本**待确认**（用于 `ExtendRuntimeMeasurement`） |
-| 转换参数 | `--rootfs-no-encryption`（仅 measuring，不加密） |
+| Base image | GCP Ubuntu 24.04 cloud image |
+| Disk layout | `sda1`=rootfs(ext4), `sda14`=bios-grub, `sda15`=**ESP/EFI**(vfat), `sda16`=**/boot**(ext4) |
+| Original kernel | `6.8.0-106-generic` |
+| Target kernel | `linux-image-gcp` → actually `6.17.0-1018-gcp` |
+| Conversion tool | `cryptpilot-convert`, provided by **cryptpilot-fde 0.7.0** (on the conversion host it is `cryptpilot-fde-0.7.0-1.al8`; the one installed into the target image is `cryptpilot-fde_0.7.0_amd64.deb`) |
+| attestation-agent | Actual version inside the target image **to be confirmed** (used for `ExtendRuntimeMeasurement`) |
+| Conversion parameters | `--rootfs-no-encryption` (measuring only, no encryption) |
 
-## 2. 原始诉求：为什么要换内核
+## 2. Original requirement: why switch the kernel
 
-cryptpilot 通过 attestation-agent(AA) 的 `ExtendRuntimeMeasurement` 接口 extend RTMR；AA 的 TDX attester 走两条路之一：
+cryptpilot extends RTMR via the attestation-agent (AA) `ExtendRuntimeMeasurement` interface; AA's TDX attester takes one of two paths:
 
-1. ioctl：`/dev/tdx_guest` 的 `TDX_CMD_EXTEND_RTMR`
-2. sysfs（降级）：`/sys/devices/virtual/misc/tdx_guest/measurements/rtmr{N}:sha384`
+1. ioctl: `TDX_CMD_EXTEND_RTMR` on `/dev/tdx_guest`
+2. sysfs (fallback): `/sys/devices/virtual/misc/tdx_guest/measurements/rtmr{N}:sha384`
 
-而原 generic 内核 `6.8.0-106` 的 `tdx_guest` uapi（`/usr/src/linux-headers-*/include/uapi/linux/tdx-guest.h`）**只定义了 `TDX_CMD_GET_REPORT0`**，既无 extend ioctl，也无上述 sysfs measurement 接口 → **无法 extend RTMR**。
+But the `tdx_guest` uapi of the original generic kernel `6.8.0-106` (`/usr/src/linux-headers-*/include/uapi/linux/tdx-guest.h`) **only defines `TDX_CMD_GET_REPORT0`** — it has neither the extend ioctl nor the sysfs measurement interface above → **RTMR cannot be extended**.
 
-- extend ioctl(`TDX_CMD_EXTEND_RTMR`) 是 Intel/Anolis out-of-tree 补丁，未进 Linux 主线；
-- sysfs measurement 接口随主线 TSM measurement register 框架引入（约 6.14 起）。
+- The extend ioctl (`TDX_CMD_EXTEND_RTMR`) is an Intel/Anolis out-of-tree patch that never landed in mainline Linux;
+- The sysfs measurement interface was introduced with the mainline TSM measurement register framework (around 6.14).
 
-实测确认目标内核 `6.17.0-1018-gcp` 的内核配置含 `CONFIG_TSM_MEASUREMENTS=y`、`CONFIG_TSM_GUEST=y`、`CONFIG_TSM_REPORTS=y`、`CONFIG_INTEL_TDX_GUEST=y`、`CONFIG_TDX_GUEST_DRIVER=m`，具备 sysfs RTMR extend 接口的前提。因此换到该内核以获得 extend 能力，方向正确。
+Testing confirmed that the target kernel `6.17.0-1018-gcp` has the kernel config `CONFIG_TSM_MEASUREMENTS=y`, `CONFIG_TSM_GUEST=y`, `CONFIG_TSM_REPORTS=y`, `CONFIG_INTEL_TDX_GUEST=y`, `CONFIG_TDX_GUEST_DRIVER=m`, meeting the prerequisites for the sysfs RTMR extend interface. Switching to this kernel to obtain the extend capability is therefore the right direction.
 
-> 注意：换内核只解决了"内核侧接口缺失"。最终在真 TDX 上 RTMR 仍一度失败，根因在**应用侧 guest-components 的探测误判**（见 §8）。须**镜像侧（§5 修复 A/B）+ 应用侧（§8）两处都修**，RTMR extend 才成功。
+> Note: switching the kernel only addresses the "kernel-side interface missing" issue. RTMR still failed once on real TDX, the root cause being a **misdetection in the application-side guest-components** (see §8). Both the **image side (§5 fixes A/B) and the application side (§8)** must be fixed before RTMR extend succeeds.
 
-## 3. 故障现象
+## 3. Failure symptoms
 
-换内核后的镜像启动报：
+The image with the switched kernel reports at boot:
 
 ```
 error: file '/EFI/ubuntu/x86_64-efi/bli.mod' not found.
@@ -49,141 +82,141 @@ error: you need to load the kernel first.
 Failed to boot both default and fallback entries.
 ```
 
-注意 `vmlinuz-6.8.0-106-generic` 是**已被 purge 的旧内核**。
+Note that `vmlinuz-6.8.0-106-generic` is the **old kernel that has already been purged**.
 
-## 4. 根因
+## 4. Root cause
 
-GCP Ubuntu 镜像存在**两份 grub.cfg**：
+The GCP Ubuntu image has **two grub.cfg files**:
 
-| 文件 | 位置 | 谁更新 | grub 启动时是否读取 |
+| File | Location | Who updates it | Read by grub at boot |
 |---|---|---|---|
-| `/boot/grub/grub.cfg` | boot 分区 sda16 | `update-grub` / `cryptpilot-convert` | 否 |
-| `/EFI/ubuntu/grub.cfg` | **ESP 分区 sda15** | 仅 `grub-install`（一般构建期一次性生成）| **是（grubx64.efi 的 prefix=`/EFI/ubuntu`）** |
+| `/boot/grub/grub.cfg` | boot partition sda16 | `update-grub` / `cryptpilot-convert` | No |
+| `/EFI/ubuntu/grub.cfg` | **ESP partition sda15** | only `grub-install` (typically generated once at build time) | **Yes (grubx64.efi prefix=`/EFI/ubuntu`)** |
 
-- `update-grub`（以及 `cryptpilot-convert` 内部调用的 update-grub）**只写 `/boot/grub/grub.cfg`**，不更新 ESP 上那份；
-- 换内核 + purge 旧内核后，ESP 上的 grub.cfg 仍指向被删的 `6.8.0-106-generic` → `vmlinuz not found`；
-- ESP 上没有 `x86_64-efi/` 模块目录（`insmod bli` 来自 `/etc/grub.d/25_bli`）→ `bli.mod not found`（此条非致命，但说明 ESP 的 grub 环境不完整）。
+- `update-grub` (and the update-grub called internally by `cryptpilot-convert`) **only writes `/boot/grub/grub.cfg`**, not the one on the ESP;
+- After switching the kernel and purging the old one, the grub.cfg on the ESP still points to the deleted `6.8.0-106-generic` → `vmlinuz not found`;
+- The ESP has no `x86_64-efi/` module directory (`insmod bli` comes from `/etc/grub.d/25_bli`) → `bli.mod not found` (not fatal, but it shows the ESP grub environment is incomplete).
 
-**与 cryptpilot 无直接关系，是 GCP 镜像 grub 布局 + update-grub 行为导致**；但 cryptpilot-convert 内部同样调用 update-grub，故转换后仍会复现该问题。
+**This is not directly related to cryptpilot — it stems from the GCP image grub layout plus update-grub behavior**; however, cryptpilot-convert also calls update-grub internally, so the problem still reproduces after conversion.
 
-## 5. 修复方案（已端到端验证）
+## 5. Fix (end-to-end verified)
 
-需要**两个独立修复点，缺一不可**：
+**Two independent fix points are required, neither optional**:
 
-**修复 A —— convert 前把 `/boot/vmlinuz` 软链指向 gcp 内核**（解决只读 / RTMR 未 extend / verity 被绕过，详见 §7.3）：
-GCP 镜像上装 `linux-image-gcp` 后，`/boot/vmlinuz` 仍指向 generic 内核；convert 按此软链选内核做 `dracut --add cryptpilot`，导致 cryptpilot 栈被装进 generic 的 initrd，而 grub 默认启动的 gcp 内核 initrd 里没有 cryptpilot。把软链改指 gcp 即可让 convert 给正确内核建 initrd。
+**Fix A — before convert, point the `/boot/vmlinuz` symlink at the gcp kernel** (resolves read-only / RTMR not extended / verity bypassed, see §7.3):
+After installing `linux-image-gcp` on the GCP image, `/boot/vmlinuz` still points at the generic kernel; convert selects the kernel via this symlink to run `dracut --add cryptpilot`, so the cryptpilot stack ends up in the generic kernel's initrd, while the gcp kernel that grub boots by default has no cryptpilot in its initrd. Repointing the symlink at gcp makes convert build the initrd for the correct kernel.
 
-**修复 B —— convert 后把 boot 分区 grub.cfg + 模块同步到 ESP**（解决启动崩溃，详见 §4）：
+**Fix B — after convert, sync the boot-partition grub.cfg + modules to the ESP** (resolves the boot crash, see §4):
 ```
-cp    /boot/grub/grub.cfg   /EFI/ubuntu/grub.cfg          # 同步最新配置
-cp -a /boot/grub/x86_64-efi /EFI/ubuntu/x86_64-efi        # 同步 grub 模块(修 bli.mod)
+cp    /boot/grub/grub.cfg   /EFI/ubuntu/grub.cfg          # sync the latest config
+cp -a /boot/grub/x86_64-efi /EFI/ubuntu/x86_64-efi        # sync grub modules (fixes bli.mod)
 ```
 
-完整流程：
+Full flow:
 ```bash
-# 1) 换内核 + 把默认内核软链指向 gcp（修复 A：最后一行 ln 是关键）
+# 1) switch the kernel + point the default kernel symlink at gcp (fix A: the final ln is the key line)
 virt-customize -a gcp-base.qcow2 \
   --install linux-image-gcp,linux-modules-extra-gcp \
   --run-command 'apt-get autoremove --purge linux-image-6.8.0-106-generic -y || true' \
   --run-command 'update-grub' \
   --run-command 'k=$(ls /boot/vmlinuz-*-gcp | sort -V | tail -1 | sed "s#/boot/##"); ln -sf "$k" /boot/vmlinuz; ln -sf "initrd.img-${k#vmlinuz-}" /boot/initrd.img'
 
-# 2) convert（注意 TMPDIR，见 §7.4）
+# 2) convert (mind TMPDIR, see §7.4)
 TMPDIR=/tmp cryptpilot-convert --in gcp-base.qcow2 --out gcp-tapp.qcow2 \
   --config-dir ./config_dir/ --rootfs-no-encryption \
   --package cryptpilot-fde_0.7.0_amd64.deb
 
-# 3) 同步 ESP（修复 B，必须在 convert 之后；convert 内部也只更新 boot 分区那份）
+# 3) sync the ESP (fix B, must run after convert; convert internally only updates the boot-partition copy)
 ./fix-esp-grub.sh gcp-tapp.qcow2
 ```
 
-> 顺序约束：若需计算参考值 `cryptpilot-fde show-reference-value`，必须在第 3 步**之后**执行（见 §6）。
+> Ordering constraint: if you need to compute reference values with `cryptpilot-fde show-reference-value`, it must be run **after** step 3 (see §6).
 
-**验证（QEMU 软件模拟，KVM=N）**：
-- 仅做修复 B（未做 A）：grub 能引导 6.17-gcp，但 `cryptpilot-fde-before-sysroot.service` 不在 gcp initrd 里→不运行→rootfs 只读、满屏 `Read-only file system`、cloud-init/docker/snapd 全失败，且 verity/RTMR 均未生效。
-- A+B 都做：`cryptpilot-fde-before-sysroot` 正常运行（激活 LVM→加载 root-hash→建 dm-verity→建 zram+dm-snapshot 可写层），`Read-only` 错误归零，启动到 login。
-- RTMR extend：镜像侧 A+B 消除了 initrd 缺 cryptpilot 栈的拦路；真 TDX 上最终成功还需应用侧修复（§8 的 guest-components 更新）。两侧齐备后已确认 extend 成功。
+**Verification (QEMU software emulation, KVM=N)**:
+- Fix B only (without A): grub can boot 6.17-gcp, but `cryptpilot-fde-before-sysroot.service` is not in the gcp initrd → it does not run → rootfs is read-only, the screen fills with `Read-only file system`, cloud-init/docker/snapd all fail, and neither verity nor RTMR takes effect.
+- Both A+B: `cryptpilot-fde-before-sysroot` runs normally (activate LVM → load root-hash → build dm-verity → build zram + dm-snapshot writable layer), the `Read-only` errors drop to zero, and boot reaches login.
+- RTMR extend: image-side A+B removes the blocker of a missing cryptpilot stack in the initrd; success on real TDX additionally requires the application-side fix (the guest-components update in §8). With both sides in place, extend has been confirmed working.
 
-## 6. 对镜像完整性 / 测量的影响
+## 6. Impact on image integrity / measurement
 
-| 层面 | 影响 | 说明 |
+| Aspect | Impact | Notes |
 |---|---|---|
-| rootfs dm-verity / `root_hash` | **不受影响** | ESP 与 /boot 不在 verity 保护范围；脚本不碰 verity 数据与 hash 树，initrd 内嵌的 root_hash 不变 |
-| qcow2 / 文件系统结构 | **不损坏** | 经 guestfish 规范挂载/卸载，仅向 vfat ESP 写文件 |
-| 启动 RTMR 测量值 | **会变（预期）** | grub 会把 kernel/initrd/cmdline 测进 RTMR；同步 ESP 改了 grub.cfg（cmdline 含 `rd.neednet=1 ip=dhcp`）→ 测量值随之变化 |
+| rootfs dm-verity / `root_hash` | **Not affected** | The ESP and /boot are outside verity's protection scope; the script does not touch verity data or the hash tree, and the root_hash embedded in the initrd is unchanged |
+| qcow2 / filesystem structure | **Not corrupted** | Mounted/unmounted properly via guestfish; only files are written to the vfat ESP |
+| boot-time RTMR measurement | **Changes (expected)** | grub measures kernel/initrd/cmdline into RTMR; syncing the ESP changes grub.cfg (the cmdline includes `rd.neednet=1 ip=dhcp`) → the measurement changes accordingly |
 
-**结论**：不破坏 rootfs 完整性，也不损坏镜像；只改变启动测量值。只要**先做第 3 步、再算参考值**，即可保证"参考值 == 实际启动测量"。反之若不做第 3 步，ESP 配置过期，要么启动崩溃，要么实际启动与参考值不一致导致远程证明失败。
+**Conclusion**: rootfs integrity is not broken and the image is not corrupted; only the boot-time measurement changes. As long as you **run step 3 first, then compute the reference values**, you guarantee "reference value == actual boot measurement". Conversely, if step 3 is skipped, the ESP config is stale and either boot crashes or the actual boot differs from the reference value, causing remote attestation to fail.
 
-## 7. 请 cryptpilot 维护方确认的问题
+## 7. Questions to confirm with the cryptpilot maintainers
 
-以下为在 Ubuntu/GCP 镜像上使用 `cryptpilot-convert` 时观察到的 convert 侧问题，建议确认是否应在 convert 内修复，使其原生支持该场景：
+The following are convert-side issues observed when using `cryptpilot-convert` on Ubuntu/GCP images. We recommend confirming whether they should be fixed inside convert so it natively supports this scenario:
 
-**7.1 convert 未同步 ESP 上的 grub.cfg（核心）**
-convert 内部调用 `update-grub` 仅更新 `/boot/grub/grub.cfg`，未同步 GCP 镜像 ESP 上的 `/EFI/ubuntu/grub.cfg`。建议 convert 在更新 grub 后，检测并同步 ESP 副本（或确保走 UKI 模式绕过 grub）。
+**7.1 convert does not sync the grub.cfg on the ESP (core)**
+convert internally calls `update-grub`, which only updates `/boot/grub/grub.cfg` and does not sync the `/EFI/ubuntu/grub.cfg` on the GCP image's ESP. We suggest that after updating grub, convert detect and sync the ESP copy (or ensure a UKI mode that bypasses grub).
 
-**7.2 内核版本探测写死 `-generic`**
-（`cryptpilot-convert` 中 zram 模块安装段，约 line 448）
+**7.2 kernel-version detection hardcodes `-generic`**
+(the zram-module install section in `cryptpilot-convert`, around line 448)
 ```bash
 kernel_version=$(chroot ... "dpkg -l | grep -oP 'linux-image-\K[0-9.-]+-generic' | head -n1")
 if [ -z "$kernel_version" ]; then ... return 1; fi
 ```
-该正则只匹配 `-generic` 内核，遇 `-gcp`（或其他 flavor）会抓到残留 generic 或返回空而中止。建议改为探测实际默认内核 flavor。
+This regex only matches `-generic` kernels; with `-gcp` (or other flavors) it grabs a leftover generic or returns empty and aborts. We suggest detecting the actual default kernel flavor instead.
 
-**7.3 【核心 bug】dracut 目标内核与 grub 默认启动内核不一致 → cryptpilot 栈装错内核**
-（约 line 1069–1081）convert 经 `/boot/vmlinuz` 软链选内核执行 `dracut --add cryptpilot --include metadata.toml fde.toml`。在 GCP 镜像上换 gcp 内核后，`/boot/vmlinuz` 仍指向 **generic** 内核，于是：
-- generic 内核 initrd：**有** `91cryptpilot` 模块（cryptpilot-fde-before-sysroot.service 等）；
-- gcp 内核 initrd：由包 postinst 重建，**没有** cryptpilot 模块；
-- 而 grub 默认按版本号启动 **gcp** 内核 → 启动的 initrd 里 cryptpilot 栈完全缺席。
+**7.3 [core bug] the dracut target kernel differs from the grub default boot kernel → the cryptpilot stack is installed into the wrong kernel**
+(around lines 1069–1081) convert selects the kernel via the `/boot/vmlinuz` symlink and runs `dracut --add cryptpilot --include metadata.toml fde.toml`. After switching to the gcp kernel on the GCP image, `/boot/vmlinuz` still points at the **generic** kernel, so:
+- generic kernel initrd: **has** the `91cryptpilot` module (cryptpilot-fde-before-sysroot.service, etc.);
+- gcp kernel initrd: rebuilt by the package postinst, **without** the cryptpilot module;
+- yet grub boots the **gcp** kernel by version → the booted initrd is entirely missing the cryptpilot stack.
 
-**后果（实测确认，非隐患）**：启动 gcp 内核时 `cryptpilot-fde-before-sysroot.service` 不运行 →
-1. 不建可写层 → rootfs 只读 → cloud-init/docker/snapd 等全部失败；
-2. **RTMR 完全未 extend**（measure 阶段在该 service 内，根本没跑）；
-3. **dm-verity 完整性校验被绕过**，直接挂裸 LV —— 机密计算保障失效。
+**Consequences (confirmed in testing, not hypothetical)**: when the gcp kernel boots, `cryptpilot-fde-before-sysroot.service` does not run →
+1. no writable layer is built → rootfs is read-only → cloud-init/docker/snapd etc. all fail;
+2. **RTMR is never extended** (the measure stage lives inside that service and simply never runs);
+3. **dm-verity integrity checking is bypassed** and the bare LV is mounted directly — confidential-computing guarantees are voided.
 
-**临时规避**：convert 前把 `/boot/vmlinuz`/`initrd.img` 软链指向 gcp 内核（见 §5 修复 A）。
-**建议**：convert 应以 **grub 默认/将实际启动的内核** 为 dracut 目标，而非 `/boot/vmlinuz` 软链；或显式接受 `--kernel-version` 参数。
+**Temporary workaround**: before convert, point the `/boot/vmlinuz` / `initrd.img` symlinks at the gcp kernel (see §5 fix A).
+**Suggestion**: convert should make the dracut target the **grub default / actually-booting kernel**, not the `/boot/vmlinuz` symlink; or accept an explicit `--kernel-version` parameter.
 
-**7.4 chroot 内 dracut 继承宿主 TMPDIR 导致失败**
-若调用方环境 `TMPDIR` 指向 chroot 内不存在的路径（如 CI 容器的 `/tmp/xxx`），chroot 内 dracut 报 `Invalid tmpdir` 而失败，并触发 7.2 的中止分支。建议 convert 在 chroot 内显式设置合法 `TMPDIR`（如 `/tmp`）。
+**7.4 dracut inside chroot inherits the host TMPDIR and fails**
+If the caller's environment has `TMPDIR` pointing at a path that does not exist inside the chroot (e.g. a CI container's `/tmp/xxx`), dracut inside the chroot reports `Invalid tmpdir` and fails, triggering the abort branch from 7.2. We suggest convert explicitly set a valid `TMPDIR` (e.g. `/tmp`) inside the chroot.
 
-**7.5 `rw_overlay="ram"` 运行时未生效（已解决，归因于 7.3）**
-此前观察到 rootfs 只读、`rw_overlay` 不生效，曾疑为独立问题。实为 **7.3 的表现**：可写层由 `cryptpilot-fde-before-sysroot.service` 在 initrd 里建立，而该 service 不在所启动 gcp 内核的 initrd 中，故未运行。应用修复 A 后，QEMU 实测可写层（zram + dm-snapshot）正常建立、`Read-only file system` 错误归零。非独立 bug。
+**7.5 `rw_overlay="ram"` not effective at runtime (resolved, attributed to 7.3)**
+We previously observed a read-only rootfs and `rw_overlay` not taking effect, and suspected an independent issue. It was actually a **manifestation of 7.3**: the writable layer is created by `cryptpilot-fde-before-sysroot.service` in the initrd, and that service is not in the booted gcp kernel's initrd, so it never runs. After applying fix A, QEMU testing confirmed the writable layer (zram + dm-snapshot) is built normally and the `Read-only file system` errors drop to zero. Not an independent bug.
 
-**7.6 `show-reference-value` 硬性要求 grubenv 里有 `saved_entry`（参考值提取）**
-`cryptpilot-fde show-reference-value` 在 `load_kernel_artifacts`（`cryptpilot-fde/src/disk/grub.rs`）里：
+**7.6 `show-reference-value` rigidly requires `saved_entry` in grubenv (reference-value extraction)**
+In `cryptpilot-fde show-reference-value`, inside `load_kernel_artifacts` (`cryptpilot-fde/src/disk/grub.rs`):
 ```rust
 let saved_entry = grub_vars
     .get("saved_entry")
     .ok_or_else(|| anyhow::anyhow!("saved_entry not found in GRUB environment"))?;
 ```
-**问题**：刚构建、从未启动过的镜像 grubenv 为空 → 直接报 `saved_entry not found in GRUB environment`，无法提取启动项的内核/initrd/cmdline 参考值。而这些镜像的 grub.cfg 默认选择逻辑是 `set default="0"`（与 `saved_entry` 无关），grub 实际启动的就是第一条 menuentry。
+**Problem**: a freshly built image that has never booted has an empty grubenv → it directly reports `saved_entry not found in GRUB environment`, and the kernel/initrd/cmdline reference values of the boot entry cannot be extracted. Yet the default-selection logic of these images' grub.cfg is `set default="0"` (independent of `saved_entry`), and the entry grub actually boots is the first menuentry.
 
-**正确修复（在消费者侧，不碰镜像）**：`saved_entry` 缺失时按 grub 真实默认逻辑回落——`next_entry > saved_entry > set default(=0) > 第一条 menuentry`，再据此从 grub.cfg/loader entry 解析；而不是 `?` 报错。
+**Correct fix (on the consumer side, without touching the image)**: when `saved_entry` is missing, fall back per grub's real default logic — `next_entry > saved_entry > set default(=0) > first menuentry` — and then parse the grub.cfg / loader entry accordingly, rather than erroring with `?`.
 
-**⚠️ 当前的本地 workaround（不推荐作为正式修复）**：在 `cryptpilot-convert` 的 `update_rootfs_inner` 末尾，从 grub.cfg 第一条 menuentry 提取 id 并写进 grubenv 的 `saved_entry`（正则 `'\K[^']+(?=' \{)`）。它**改错了层**（改生产者 + 改镜像内容去迁就消费者的严格检查），且 `saved_entry` 本是运行时状态、不应构建期伪造。仅用于让本机构建跑通，正解应在 `disk.rs` 上述位置。
+**⚠️ Current local workaround (not recommended as the official fix)**: at the end of `cryptpilot-convert`'s `update_rootfs_inner`, extract the id from the first menuentry in grub.cfg and write it into grubenv's `saved_entry` (regex `'\K[^']+(?=' \{)`). This **fixes the wrong layer** (modifying the producer + modifying the image content to accommodate the consumer's strict check), and `saved_entry` is runtime state that should not be fabricated at build time. Use it only to get the local build to pass; the proper fix belongs at the `disk.rs` location above.
 
-## 8. 另一侧修复：tapp-server / guest-components 的 RTMR 扩展探测误判
+## 8. The other-side fix: RTMR-extend misdetection in tapp-server / guest-components
 
-> 与上面镜像构建（convert/grub）问题相互独立。即使镜像侧全部修好（内核具备接口、cryptpilot 栈在正确 initrd 中），运行时 RTMR 仍会失败，根因在 **应用侧 `tapp-server` 依赖的 guest-components**。
+> Independent of the image-build (convert/grub) issues above. Even if the image side is fully fixed (kernel has the interface, the cryptpilot stack is in the correct initrd), runtime RTMR still fails, the root cause being the guest-components that the application-side `tapp-server` depends on.
 
-**症状**：app 启动后 `tapp-server` 调用 extend RTMR 报：
+**Symptom**: after the app starts, `tapp-server` calling extend RTMR reports:
 ```
 Failed to extend measurement: Internal error: TDX Attester: Cannot extend runtime measurement on this system
     at src/boot/mod.rs:257
 ```
 
-**根因**：`Cargo.lock` 钉住的 `guest-components@5683fa5` 中的启发式判断有误：
+**Root cause**: the heuristic in `guest-components@5683fa5` (pinned by `Cargo.lock`) is wrong:
 ```rust
 fn runtime_measurement_extend_available() -> bool {
     if Path::new("/sys/kernel/config/tsm/report").exists() {
-        return false;   // 存在 TSM report 就认为内核不支持 RTMR 扩展
+        return false;   // presence of a TSM report is taken to mean the kernel does not support RTMR extend
     }
     true
 }
 ```
-该逻辑假设"有 TSM report sysfs ⇒ 内核不支持 RTMR 扩展"。但 Linux 6.17 上 **TSM report 与 RTMR 扩展两者都支持**，于是被误判为不可用 → 直接报 "Cannot extend runtime measurement on this system"。
+This logic assumes "TSM report sysfs present ⇒ kernel does not support RTMR extend". But on Linux 6.17 **both TSM report and RTMR extend are supported**, so it is misdetected as unavailable → it directly reports "Cannot extend runtime measurement on this system".
 
-**修复**：将 guest-components 更新到 `8d71a3b4`，新版改为检查实际可用路径：
+**Fix**: update guest-components to `8d71a3b4`, which instead checks the actually-available paths:
 ```rust
 fn runtime_measurement_extend_available() -> bool {
     Path::new("/dev/tdx_guest").exists() ||
@@ -191,34 +224,34 @@ fn runtime_measurement_extend_available() -> bool {
 }
 ```
 
-**操作步骤**：
-1. 拉取最新 `fix/volume-path-and-cli-relative-paths` 分支；
-2. `cargo update -p attestation-agent` 更新 lock 文件；
-3. 安装构建依赖：`libtdx-attest-dev`、`protobuf-compiler`；
-4. 重新构建并替换 `/usr/local/bin/tapp-server`。
+**Steps**:
+1. Pull the latest `fix/volume-path-and-cli-relative-paths` branch;
+2. `cargo update -p attestation-agent` to update the lock file;
+3. Install build dependencies: `libtdx-attest-dev`, `protobuf-compiler`;
+4. Rebuild and replace `/usr/local/bin/tapp-server`.
 
-**结果**：真 TDX 上 RTMR extend 成功。
+**Result**: RTMR extend succeeds on real TDX.
 
-> 说明：这印证了 §2 的判断——`6.17.0-1018-gcp` 内核本身具备 RTMR extend 接口（`/dev/tdx_guest` + `/sys/devices/virtual/misc/tdx_guest/measurements/`），此前失败纯属 guest-components 的误判，与内核/convert 无关。
+> Note: this confirms the judgment in §2 — the `6.17.0-1018-gcp` kernel itself has the RTMR extend interface (`/dev/tdx_guest` + `/sys/devices/virtual/misc/tdx_guest/measurements/`); the earlier failure was purely a guest-components misdetection, unrelated to the kernel/convert.
 
-## 9. 完整 build 流程（裸 Ubuntu 24.04 → gcp-tapp.qcow2）
+## 9. Complete build flow (bare Ubuntu 24.04 → gcp-tapp.qcow2)
 
-把上面所有修复整合成一条可复现流水线。分两段：**段A** 把裸镜像装成 base（应用 + 依赖 + DNS），**段B** 换内核 + convert + 同步 ESP。全程在宿主机用 `virt-customize`/`guestfish`/`cryptpilot-convert` 离线操作。
+This integrates all the fixes above into one reproducible pipeline, in two stages: **stage A** turns the bare image into a base (app + dependencies + DNS), **stage B** switches the kernel + convert + syncs the ESP. Everything runs offline on the host with `virt-customize` / `guestfish` / `cryptpilot-convert`.
 
-**前置物料**（与脚本同目录）：
-- 裸 `ubuntu-24.04` cloud 镜像（generic 内核，无应用）；
-- `config_dir/`（含 `fde.toml`，`rw_overlay="ram"`）；
-- `cryptpilot-fde_0.7.0_amd64.deb`；
-- `tapp-server`（GitHub release **v0.1.0**，已含 guest-components `8d71a3b4` 修复，见 §8）。
+**Prerequisite materials** (in the same directory as the scripts):
+- bare `ubuntu-24.04` cloud image (generic kernel, no app);
+- `config_dir/` (containing `fde.toml`, `rw_overlay="ram"`);
+- `cryptpilot-fde_0.7.0_amd64.deb`;
+- `tapp-server` (GitHub release **v0.1.0**, already includes the guest-components `8d71a3b4` fix, see §8).
 
-> 全程需 `export LIBGUESTFS_BACKEND=direct`（否则 libguestfs 走 libvirt 后端会因权限失败）。
+> Throughout, `export LIBGUESTFS_BACKEND=direct` is required (otherwise libguestfs uses the libvirt backend and fails on permissions).
 
-### 段A：裸镜像 → base（应用与依赖）
+### Stage A: bare image → base (app and dependencies)
 
-1. **tapp-server**：`virt-customize --upload tapp-server:/usr/local/bin/tapp-server --chmod 0755:/usr/local/bin/tapp-server`
-2. **service**：上传 `tapp-server.service` 到 `/etc/systemd/system/`，`systemctl enable tapp-server`
-3. **`/etc/tapp/config.toml`**：`--mkdir /etc/tapp` + 上传 config（含 `owner_address`、`[kbs] node_urls`）
-4. **Intel SGX 源 + `libtdx-attest`**（tapp-server 运行时依赖，TDX attest）：
+1. **tapp-server**: `virt-customize --upload tapp-server:/usr/local/bin/tapp-server --chmod 0755:/usr/local/bin/tapp-server`
+2. **service**: upload `tapp-server.service` to `/etc/systemd/system/`, `systemctl enable tapp-server`
+3. **`/etc/tapp/config.toml`**: `--mkdir /etc/tapp` + upload config (includes `owner_address`, `[kbs] node_urls`)
+4. **Intel SGX repo + `libtdx-attest`** (tapp-server runtime dependency, TDX attest):
    ```bash
    curl -fsSL https://download.01.org/intel-sgx/sgx_repo/ubuntu/intel-sgx-deb.key \
      | gpg --dearmor -o /etc/apt/keyrings/intel-sgx.gpg
@@ -226,12 +259,12 @@ fn runtime_measurement_extend_available() -> bool {
      > /etc/apt/sources.list.d/intel-sgx.list
    apt-get update && apt-get install -y libtdx-attest
    ```
-5. **Docker**（官方源 `docker-ce` 全家桶）
-6. **DNS**（关键，见下方注意）：systemd-resolved `FallbackDNS` 兜底 + **静态 `/etc/resolv.conf`**
+5. **Docker** (the full official `docker-ce` set)
+6. **DNS** (critical, see the note below): systemd-resolved `FallbackDNS` + a **static `/etc/resolv.conf`**
 
-> **⚠️ DNS 必须用 guestfish 写 `/etc/resolv.conf`，不能用 virt-customize。**
-> 现象：实例 DNS 不通（`Temporary failure in name resolution`），需手动 `echo nameserver 8.8.8.8 > /etc/resolv.conf`。原因：该镜像里 systemd-resolved 的 stub 未真正服务，`FallbackDNS` 无效；唯一可靠解是把 `/etc/resolv.conf` 做成**静态文件**。但 **`virt-customize` 为 `--run-command` 联网会临时放一份 resolv.conf 并在收尾删掉**——用它写（无论 `printf`/`for`）最终都是空/不存在。`cryptpilot-convert` 也会备份原 resolv.conf→bind-mount 主机的→收尾恢复。
-> 正确做法：用 **guestfish** 写（不做这套），且放在**所有 virt-customize 之后、convert 之前**；convert 的备份/恢复会保留它：
+> **⚠️ DNS must be written to `/etc/resolv.conf` with guestfish, not virt-customize.**
+> Symptom: instance DNS is broken (`Temporary failure in name resolution`), requiring a manual `echo nameserver 8.8.8.8 > /etc/resolv.conf`. Reason: in this image systemd-resolved's stub is not actually serving, `FallbackDNS` is ineffective, and the only reliable fix is to make `/etc/resolv.conf` a **static file**. But **`virt-customize` temporarily drops in a resolv.conf so `--run-command` can reach the network and deletes it during teardown** — anything written via it (whether `printf` or `for`) ends up empty/nonexistent. `cryptpilot-convert` also backs up the original resolv.conf → bind-mounts the host's → restores it during teardown.
+> Correct approach: write it with **guestfish** (which does none of that), and do it **after all virt-customize, before convert**; convert's backup/restore preserves it:
 > ```bash
 > printf 'nameserver 8.8.8.8\nnameserver 8.8.4.4\nnameserver 1.1.1.1\n' > /tmp/resolv
 > guestfish --rw -a <img> <<'GF'
@@ -242,55 +275,55 @@ fn runtime_measurement_extend_available() -> bool {
 > GF
 > ```
 
-7. **安全加固**（移除可绕过 tapp 改环境的软件）：`apt-get purge` Tier1/2 包 + `systemctl mask` 控制台 getty + 替换 netplan 为 MAC 无关 DHCP，详见 **§11**。
+7. **Security hardening** (remove software that can bypass tapp to change the environment): `apt-get purge` Tier1/2 packages + `systemctl mask` console getty + replace netplan with MAC-independent DHCP, see **§11**.
 
-### 段B：base → gcp-tapp（内核 + convert + ESP）
+### Stage B: base → gcp-tapp (kernel + convert + ESP)
 
-1. **装 gcp 内核**：`virt-customize --install linux-image-gcp,linux-modules-extra-gcp`（保留至少一个 `-generic`，convert 的 line-448 检查需要）
-2. **修复 A**：`/boot/vmlinuz`、`initrd.img` 软链指向 gcp 内核（见 §5/§7.3）
-3. **DNS**（若段A未做则在此用 guestfish 写静态 resolv.conf）
-4. **nbd 重置**（convert 用 qemu-nbd 挂盘，避免残留/缺 max_part）：
+1. **Install the gcp kernel**: `virt-customize --install linux-image-gcp,linux-modules-extra-gcp` (keep at least one `-generic`, required by convert's line-448 check)
+2. **Fix A**: point the `/boot/vmlinuz`, `initrd.img` symlinks at the gcp kernel (see §5 / §7.3)
+3. **DNS** (if not done in stage A, write the static resolv.conf here with guestfish)
+4. **nbd reset** (convert mounts the disk with qemu-nbd; avoid leftovers / missing max_part):
    ```bash
    qemu-nbd -d /dev/nbd0; qemu-nbd -d /dev/nbd1; rmmod nbd; modprobe nbd max_part=16; partprobe /dev/nbd0
    ```
-5. **convert**：`cryptpilot-convert --in <base> --out gcp-tapp.qcow2 --config-dir ./config_dir/ --rootfs-no-encryption --package cryptpilot-fde_0.7.0_amd64.deb`
-   （若调用方 `TMPDIR` 指向 chroot 内不存在的路径，需 `TMPDIR=/tmp`，见 §7.4）
-6. **修复 B**：`fix-esp-grub.sh gcp-tapp.qcow2`（同步 ESP，见 §5/§10）
+5. **convert**: `cryptpilot-convert --in <base> --out gcp-tapp.qcow2 --config-dir ./config_dir/ --rootfs-no-encryption --package cryptpilot-fde_0.7.0_amd64.deb`
+   (if the caller's `TMPDIR` points at a path that does not exist inside the chroot, use `TMPDIR=/tmp`, see §7.4)
+6. **Fix B**: `fix-esp-grub.sh gcp-tapp.qcow2` (sync the ESP, see §5 / §10)
 
-### 一键脚本
+### One-shot scripts
 
-仓库提供三个脚本：
-- **`build-gcp-tapp.sh <裸ubuntu.qcow2> <out.qcow2>`** —— 串起段A+段B 全流程；
-- **`prepare-gcp-tapp.sh <base.qcow2> <out.qcow2>`** —— 仅段B（已有 base 时用）；含修复A、DNS(guestfish)、nbd 重置、convert、修复B；
-- **`fix-esp-grub.sh <img.qcow2>`** —— 仅同步 ESP（修复B）。
+The repository provides three scripts:
+- **`build-gcp-tapp.sh <bare-ubuntu.qcow2> <out.qcow2>`** — chains the full stage A + stage B flow;
+- **`prepare-gcp-tapp.sh <base.qcow2> <out.qcow2>`** — stage B only (use when a base already exists); includes fix A, DNS (guestfish), nbd reset, convert, fix B;
+- **`fix-esp-grub.sh <img.qcow2>`** — sync the ESP only (fix B).
 
 ```bash
-# 裸 Ubuntu 24.04 → 最终 gcp-tapp.qcow2（一条命令）
+# bare Ubuntu 24.04 → final gcp-tapp.qcow2 (one command)
 ./build-gcp-tapp.sh ubuntu-24.04.qcow2 gcp-tapp.qcow2
 ```
-关键环境变量：`TAPP_SERVER_BIN`（本地 tapp-server，留空则下 v0.1.0）、`DNS_FALLBACK`、`PURGE_KERNEL`、`CONFIG_DIR`、`FDE_PACKAGE`、`ROOTFS_MODE`、`IN_PLACE`（1=直接改输入不复制）、`INSTALL_KERNEL`、`NBD_RESET`。
+Key environment variables: `TAPP_SERVER_BIN` (local tapp-server; if empty, downloads v0.1.0), `DNS_FALLBACK`, `PURGE_KERNEL`, `CONFIG_DIR`, `FDE_PACKAGE`, `ROOTFS_MODE`, `IN_PLACE` (1 = modify the input directly without copying), `INSTALL_KERNEL`, `NBD_RESET`.
 
-### 产物验证清单（已全部通过）
+### Artifact verification checklist (all passed)
 
-| 检查 | 命令/方法 | 期望 |
+| Check | Command/method | Expected |
 |---|---|---|
-| gcp initrd 含 cryptpilot | `lsinitrd initrd.img-*-gcp \| grep -c cryptpilot` | 16（含 `cryptpilot-fde-before-sysroot.service`） |
-| ESP 默认项 | `cat /EFI/ubuntu/grub.cfg`(sda15) | 指向 `vmlinuz-*-gcp` + `rd.neednet=1 ip=dhcp` |
-| verity | `list-filesystems` | `/dev/cryptpilot/rootfs`(ext4) + `rootfs_hash`(DM_verity_hash) |
-| **`/etc/resolv.conf`** | 挂 verity LV(`vg-activate-all`) 后 `cat` | **静态文件，3 行 nameserver**（非空、非软链） |
-| tapp-server | `strings tapp-server \| grep guest-components` | `…/8d71a3b`（修复版） |
-| docker/libtdx | `ls /usr/bin/dockerd /usr/lib/.../libtdx_attest.so.1` | 存在 |
+| gcp initrd contains cryptpilot | `lsinitrd initrd.img-*-gcp \| grep -c cryptpilot` | 16 (includes `cryptpilot-fde-before-sysroot.service`) |
+| ESP default entry | `cat /EFI/ubuntu/grub.cfg` (sda15) | points to `vmlinuz-*-gcp` + `rd.neednet=1 ip=dhcp` |
+| verity | `list-filesystems` | `/dev/cryptpilot/rootfs` (ext4) + `rootfs_hash` (DM_verity_hash) |
+| **`/etc/resolv.conf`** | `cat` after mounting the verity LV (`vg-activate-all`) | **static file, 3 nameserver lines** (non-empty, not a symlink) |
+| tapp-server | `strings tapp-server \| grep guest-components` | `…/8d71a3b` (fixed version) |
+| docker/libtdx | `ls /usr/bin/dockerd /usr/lib/.../libtdx_attest.so.1` | present |
 
-> 真 TDX 上还需确认：`journalctl \| grep -i rtmr` 显示 extend 成功；`getent hosts github.com` 能解析。
+> On real TDX, also confirm: `journalctl \| grep -i rtmr` shows extend succeeded; `getent hosts github.com` resolves.
 
-## 10. 附：临时修复脚本 `fix-esp-grub.sh`
+## 10. Appendix: temporary fix script `fix-esp-grub.sh`
 
 ```bash
 #!/bin/bash
-# 把 boot 分区最新 grub.cfg + 模块同步到 GCP 镜像的 ESP，修复换内核后启动崩溃。
-# 仅读写 ESP(sda15)/boot(sda16)，不碰 verity rootfs；幂等。放在 convert 之后执行。
+# Sync the latest boot-partition grub.cfg + modules to the GCP image's ESP, fixing the boot crash after switching the kernel.
+# Reads/writes only the ESP (sda15) / boot (sda16), does not touch the verity rootfs; idempotent. Run it after convert.
 set -euo pipefail
-IMG="${1:?用法: $0 <image.qcow2>}"
+IMG="${1:?Usage: $0 <image.qcow2>}"
 export LIBGUESTFS_BACKEND=direct
 guestfish --rw -a "$IMG" <<'GF'
 run
@@ -304,36 +337,36 @@ cp   /grub/grub.cfg /efi/EFI/ubuntu/grub.cfg
 rm-rf /efi/EFI/ubuntu/x86_64-efi
 cp-a  /grub/x86_64-efi /efi/EFI/ubuntu/x86_64-efi
 GF
-echo "[OK] ESP grub 已同步: $IMG"
+echo "[OK] ESP grub synced: $IMG"
 ```
 
-## 11. 安全加固：移除可绕过 tapp 改变实例环境的软件
+## 11. Security hardening: remove software that can bypass tapp to change the instance environment
 
-机密 appliance 的目标是"除了经 tapp 的受测路径，外部无法改变实例内部环境"。GCP Ubuntu 镜像默认带大量**带外访问 / metadata 驱动改环境**的组件，需在 **convert 之前**（rootfs 被 verity 密封后不可改）从 base 移除。
+The goal of a confidential appliance is that "the instance's internal environment cannot be changed from outside except via tapp's measured path". The GCP Ubuntu image ships by default with many components that provide **out-of-band access / metadata-driven environment changes**, which must be removed from the base **before convert** (the rootfs becomes immutable once sealed by verity).
 
-**审计（在产物 rootfs 上 `dpkg`/枚举 systemd 启用项得出）与处置：**
+**Audit (derived from `dpkg` on the artifact rootfs / enumerating enabled systemd units) and disposition:**
 
-| 层级 | 组件 | 风险（如何绕过 tapp） | 处置 |
+| Tier | Component | Risk (how it bypasses tapp) | Disposition |
 |---|---|---|---|
-| 🔴 T1 | `openssh-server`(ssh.socket) | 远程 shell | purge |
-| 🔴 T1 | `google-guest-agent` | 从 metadata 注入 SSH key/账号、OS Login | purge |
-| 🔴 T1 | `google-compute-engine`(+startup/shutdown-scripts) | 从 metadata 跑任意启动/关机脚本（最强后门） | purge |
-| 🔴 T1 | `google-osconfig-agent` | GCP 远程下发包/补丁/策略 | purge |
-| 🔴 T1 | `google-compute-engine-oslogin` | OS Login（IAM→SSH） | purge |
-| 🔴 T1 | `cloud-init` | 从 metadata/user-data 建用户、写文件、执行命令 | purge |
-| 🔴 T1 | `serial-getty@ttyS0` | GCP 串口控制台登录 | mask |
-| 🟠 T2 | `snapd` | 远程装/刷新 snap | purge + 清 /snap |
-| 🟠 T2 | `unattended-upgrades` | 自动改包 | purge |
-| 🟠 T2 | `open-vm-tools` | hypervisor→guest 操作 | purge |
-| 🟠 T2 | `google-cloud-ops-agent` | 监控/日志外发 | purge |
-| 🟠 T2 | `pollinate` | 启动联外部服务器 | purge |
-| 🟠 T2 | `landscape-common`/`ubuntu-pro-client` | Canonical 管理/订阅 agent | purge |
+| 🔴 T1 | `openssh-server` (ssh.socket) | remote shell | purge |
+| 🔴 T1 | `google-guest-agent` | inject SSH key/account from metadata, OS Login | purge |
+| 🔴 T1 | `google-compute-engine` (+startup/shutdown-scripts) | run arbitrary startup/shutdown scripts from metadata (the strongest back door) | purge |
+| 🔴 T1 | `google-osconfig-agent` | GCP remote package/patch/policy delivery | purge |
+| 🔴 T1 | `google-compute-engine-oslogin` | OS Login (IAM → SSH) | purge |
+| 🔴 T1 | `cloud-init` | create users, write files, run commands from metadata/user-data | purge |
+| 🔴 T1 | `serial-getty@ttyS0` | GCP serial console login | mask |
+| 🟠 T2 | `snapd` | remotely install/refresh snaps | purge + clean /snap |
+| 🟠 T2 | `unattended-upgrades` | automatically change packages | purge |
+| 🟠 T2 | `open-vm-tools` | hypervisor → guest operations | purge |
+| 🟠 T2 | `google-cloud-ops-agent` | exfiltrate monitoring/logs | purge |
+| 🟠 T2 | `pollinate` | contact an external server at boot | purge |
+| 🟠 T2 | `landscape-common` / `ubuntu-pro-client` | Canonical management/subscription agent | purge |
 
-> 🟡 T3（按需评估，暂保留）：`cron`、`networkd-dispatcher`、`apport`、`lxd-installer.socket`、`rpcbind`/`nfs-client`、`polkitd`。
-> 🟢 保留：`tapp-server`、`docker`/`containerd`（应用运行时）、`systemd-networkd`、`ufw`、`rsyslog` 等。
+> 🟡 T3 (assess as needed, kept for now): `cron`, `networkd-dispatcher`, `apport`, `lxd-installer.socket`, `rpcbind` / `nfs-client`, `polkitd`.
+> 🟢 Kept: `tapp-server`, `docker` / `containerd` (application runtime), `systemd-networkd`, `ufw`, `rsyslog`, etc.
 
-**⚠️ 配套（必做）：移除 `cloud-init` 后必须替换 netplan。**
-GCP 镜像的 `/etc/netplan/50-cloud-init.yaml` **按构建时 MAC 匹配网卡**，靠 cloud-init 每次开机按新实例重生成。一旦删掉 cloud-init，新实例 MAC 变了就不匹配 → networkd 不管网卡 → **无网**。故同时删除该文件、换成 MAC 无关的 DHCP：
+> **⚠️ Companion step (mandatory): after removing `cloud-init`, netplan must be replaced.**
+> The GCP image's `/etc/netplan/50-cloud-init.yaml` **matches the NIC by the build-time MAC** and relies on cloud-init regenerating it for each new instance at boot. Once cloud-init is removed, a new instance's MAC changes and no longer matches → networkd ignores the NIC → **no network**. So also delete that file and replace it with MAC-independent DHCP:
 ```yaml
 # /etc/netplan/01-dhcp.yaml
 network:
@@ -344,42 +377,42 @@ network:
       dhcp4: true
       dhcp6: false
 ```
-（DNS 仍靠 §9 的静态 `/etc/resolv.conf`。）
+(DNS still relies on the static `/etc/resolv.conf` from §9.)
 
-以上加固已集成在 `build-gcp-tapp.sh` 段A 末尾（`apt-get purge` + `systemctl mask` + 替换 netplan），随 convert 一并密封进 verity 测量层。
+The hardening above is integrated at the end of stage A in `build-gcp-tapp.sh` (`apt-get purge` + `systemctl mask` + netplan replacement), and is sealed into the verity measurement layer together with convert.
 
-## 12. 提取参考值：`show-reference-value`（需含 saved_entry 修复）
+## 12. Extracting reference values: `show-reference-value` (requires the saved_entry fix)
 
-构建出 `gcp-tapp.qcow2` 后，用 `cryptpilot-fde` 从镜像**离线**提取远程证明（RA）所需的参考值，写进 KBS/attestation 策略。
+After building `gcp-tapp.qcow2`, use `cryptpilot-fde` to extract the reference values needed for remote attestation (RA) **offline** from the image, and write them into the KBS/attestation policy.
 
-### 前提：cryptpilot-fde 需含 §7.6 的修复
-从未启动的镜像 grubenv 为空，**原版** `show-reference-value` 会报 `saved_entry not found in GRUB environment`（见 §7.6）。需用含修复（openanolis/cryptpilot PR #128）的版本。合并前可从 fork 分支自行构建：
+### Prerequisite: cryptpilot-fde must include the §7.6 fix
+A never-booted image has an empty grubenv, so the **original** `show-reference-value` reports `saved_entry not found in GRUB environment` (see §7.6). A version with the fix (openanolis/cryptpilot PR #128) is required. Before it is merged, you can build it yourself from the fork branch:
 ```bash
 git clone -b fix/srv-default-entry https://github.com/0gfoundation/cryptpilot.git
 cd cryptpilot
-# 构建依赖（Anolis/RHEL 系）：
+# build dependencies (Anolis/RHEL family):
 dnf install -y device-mapper-devel clang cryptsetup-devel
 LIBCLANG_PATH=/usr/lib64 cargo build --release -p cryptpilot-fde
-# 产物：target/release/cryptpilot-fde-host（host 端，离线算参考值）+ cryptpilot-fde-guest（VM 内 boot-service）
-# 注：0.8.0 起 cryptpilot-fde 拆成 -host/-guest；部署的 0.7.0 是单个 cryptpilot-fde
+# artifacts: target/release/cryptpilot-fde-host (host side, computes reference values offline) + cryptpilot-fde-guest (in-VM boot-service)
+# note: as of 0.8.0, cryptpilot-fde is split into -host/-guest; the deployed 0.7.0 is a single cryptpilot-fde
 ```
-> 有了此修复后，**不再需要** §7.6 那个"convert 端伪造 saved_entry"的 workaround。
+> With this fix, the §7.6 "fabricate saved_entry on the convert side" workaround is **no longer needed**.
 
-### 用法
+### Usage
 ```bash
-# 源码构建版（0.8.0，host 端）：
+# source-built version (0.8.0, host side):
 ./target/release/cryptpilot-fde-host show-reference-value --disk gcp-tapp.qcow2 --hash-algo sha384
-# 已部署的 0.7.0（单个二进制）：
+# already-deployed 0.7.0 (single binary):
 cryptpilot-fde show-reference-value --disk gcp-tapp.qcow2 --hash-algo sha384
 ```
-- `--disk <路径>`：对镜像文件/块设备离线计算（不加则对当前运行系统）。
-- `--hash-algo`：`sha1,sha256,sha384,sm3`，可多次指定；默认 `sha384`（0.8.0；0.7.0 默认 `sha384,sm3`）。
-- `--stage initrd|system`：可选；`--stage system` 会额外注入 `initrd_switch_root` 声明。
+- `--disk <path>`: compute offline against an image file / block device (without it, against the currently running system).
+- `--hash-algo`: `sha1,sha256,sha384,sm3`, may be specified multiple times; default `sha384` (0.8.0; 0.7.0 defaults to `sha384,sm3`).
+- `--stage initrd|system`: optional; `--stage system` additionally injects the `initrd_switch_root` declaration.
 
-### 输出（AAEL 参考值 → 喂给 KBS 策略）
-- `AA.eventlog.cryptpilot.alibabacloud.com.load_config` —— FDE 配置 bundle 哈希
-- `AA.eventlog.cryptpilot.alibabacloud.com.fde_rootfs_hash` —— rootfs verity `root_hash`
-- `AA.eventlog.cryptpilot.alibabacloud.com.initrd_switch_root` —— 仅 `--stage system`
-- 启动组件（grub / kernel / initrd / kernel cmdline）的 SHA-384（及所选算法）参考值
+### Output (AAEL reference values → fed into the KBS policy)
+- `AA.eventlog.cryptpilot.alibabacloud.com.load_config` — FDE config bundle hash
+- `AA.eventlog.cryptpilot.alibabacloud.com.fde_rootfs_hash` — rootfs verity `root_hash`
+- `AA.eventlog.cryptpilot.alibabacloud.com.initrd_switch_root` — only with `--stage system`
+- SHA-384 (and the chosen algorithms) reference values for the boot components (grub / kernel / initrd / kernel cmdline)
 
-> 顺序提醒（见 §6）：若用 §7.6 的 convert workaround（而非 #128 修复），`show-reference-value` 必须在"同步 ESP（修复 B）"**之后**运行，确保参考值 == 实际启动测量。用 #128 修复 + 干净镜像则按上面直接跑即可。
+> Ordering reminder (see §6): if you use the §7.6 convert workaround (instead of the #128 fix), `show-reference-value` must run **after** "sync the ESP (fix B)" to ensure reference value == actual boot measurement. With the #128 fix + a clean image, run it directly as above.
