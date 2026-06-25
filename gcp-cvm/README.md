@@ -13,20 +13,20 @@
 | `cryptpilot-fde_0.7.0_amd64.deb` | FDE 包（提供 cryptpilot-convert + 运行时）。**二进制，已 gitignore 不入库**，需本地放在本目录 |
 
 > 产物 `gcp-tapp.qcow2`（约 6G，已 convert/verity 密封/加固）是 `build-gcp-tapp.sh` 的**输出**，不纳入版本库（已 gitignore）。
-> `cryptpilot-fde_*.deb` 与 tapp-server 二进制同理：deb 需本地放在本目录；tapp-server 默认从 GitHub release v0.0.5 拉取（见下）。
+> `cryptpilot-fde_*.deb` 与 tapp-server 二进制同理：deb 需本地放在本目录；tapp-server 默认从 GitHub release v0.1.0 拉取（见下）。
 
 ## 一键构建
 ```bash
 export LIBGUESTFS_BACKEND=direct
 ./build-gcp-tapp.sh <裸ubuntu-24.04.qcow2> gcp-tapp.qcow2
 ```
-- tapp-server 默认下 GitHub v0.0.5（含 guest-components `8d71a3b4` 修复，RTMR OK）；本地有则 `TAPP_SERVER_BIN=<路径>`。
+- tapp-server 默认下 GitHub v0.1.0（含 guest-components `8d71a3b4` 修复，RTMR OK）；本地有则 `TAPP_SERVER_BIN=<路径>`。
 - 其它环境变量：`DNS_FALLBACK` `PURGE_KERNEL` `CONFIG_DIR` `FDE_PACKAGE` `ROOTFS_MODE` `IN_PLACE` `INSTALL_KERNEL` `NBD_RESET`（详见脚本顶部）。
 
 ## 三个核心修复（缺一不可）
 - **修复 A**：convert 前 `/boot/vmlinuz` 软链指向 gcp 内核 → cryptpilot 栈进对的 initrd（修只读/RTMR/verity）。
 - **修复 B**：convert 后同步 boot 分区 grub.cfg+模块到 ESP（修启动崩溃 bli.mod/vmlinuz not found）。
-- **应用侧（§8）**：tapp-server 用 guest-components `8d71a3b4`（v0.0.5 已含）→ RTMR extend 不再误判。
+- **应用侧（§8）**：tapp-server 用 guest-components `8d71a3b4`（v0.1.0 已含）→ RTMR extend 不再误判。
 - 另：DNS 须用 **guestfish** 写静态 `/etc/resolv.conf`（virt-customize 会清掉自己写的）；convert 前 nbd 重置 `modprobe nbd max_part=16`。
 
 ## 安全加固（已集成在 build 段A，详见文档 §11）
@@ -38,7 +38,7 @@ purge：openssh-server / cloud-init / snapd / google-guest-agent / google-comput
 - 内部监听面权威核验：实例内 `ss -tlnp`（锁死后无登录入口，可用开机审计服务输出到串口 console，见文档 §同名建议）。
 
 ## 提取参考值（远程证明用）
-构建后用含修复（openanolis/cryptpilot#126）的 `cryptpilot-fde` 从镜像离线提取 RA 参考值：
+构建后用含修复（openanolis/cryptpilot#128）的 `cryptpilot-fde` 从镜像离线提取 RA 参考值：
 ```bash
 cryptpilot-fde show-reference-value --disk gcp-tapp.qcow2 --hash-algo sha384
 ```

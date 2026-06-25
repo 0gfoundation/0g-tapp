@@ -16,10 +16,11 @@ export DEBIAN_FRONTEND=noninteractive
 
 # ===== 可调配置 =====
 TAPP_SERVER_BIN="${TAPP_SERVER_BIN:-}"                              # 本机已有 tapp-server 路径；留空则从 URL 下载
-TAPP_SERVER_URL="${TAPP_SERVER_URL:-https://github.com/0gfoundation/0g-tapp/releases/download/v0.0.5/tapp-server}"
+TAPP_SERVER_URL="${TAPP_SERVER_URL:-https://github.com/0gfoundation/0g-tapp/releases/download/v0.1.0/tapp-server}"
 OWNER_ADDRESS="${OWNER_ADDRESS:-0xea695C312CE119dE347425B29AFf85371c9d1837}"
 KBS_URLS="${KBS_URLS:-\"http://8.222.225.233:9091\", \"http://47.245.117.71:9091\"}"
 DNS_FALLBACK="${DNS_FALLBACK:-8.8.8.8 8.8.4.4 1.1.1.1}"
+HARDEN="${HARDEN:-1}"                                   # 1=安全加固(purge Tier1/2+mask getty+换netplan); 0=不加固
 # 传给 prepare-gcp-tapp.sh（convert 用）
 export CONFIG_DIR="${CONFIG_DIR:-$HERE/config_dir}"
 export FDE_PACKAGE="${FDE_PACKAGE:-$HERE/cryptpilot-fde_0.7.0_amd64.deb}"
@@ -47,7 +48,7 @@ else
   wget -q -O "$TMPD/tapp-server" "$TAPP_SERVER_URL" || { echo "下载失败，请改用 TAPP_SERVER_BIN=<本地路径>" >&2; exit 1; }
 fi
 echo "⚠️  注意：RTMR extend 是否可用取决于 tapp-server 是否基于 guest-components 8d71a3b4 构建（见文档 §8）。"
-echo "    GitHub v0.0.5 若为旧版(5683fa5)，最终镜像仍会报 'Cannot extend runtime measurement'。"
+echo "    GitHub release tapp-server 若为旧版(5683fa5)，最终镜像仍会报 'Cannot extend runtime measurement'。"
 
 # ---- 生成 service / config / dns 临时文件 ----
 cat > "$TMPD/tapp-server.service" <<'EOF'
@@ -114,8 +115,12 @@ apt-get update
 apt-get install -y libtdx-attest docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
 mkdir -p /var/log/tapp
 systemctl enable docker tapp-server
+EOF
 
-# ===== 加固：移除可绕过 tapp 改环境的软件（Tier1+Tier2，审计见文档 §11）=====
+# ===== 加固（HARDEN=1 时追加）：移除可绕过 tapp 改环境的软件（Tier1+Tier2，审计见文档 §11）=====
+if [ "${HARDEN:-1}" = 1 ]; then
+  echo "==> [加固] HARDEN=1：purge Tier1/2 + mask 控制台 getty + 换 MAC 无关 netplan"
+  cat >> "$TMPD/provision-base.sh" <<'EOF'
 PURGE_PKGS="openssh-server \
   google-guest-agent google-compute-engine google-compute-engine-oslogin google-osconfig-agent \
   cloud-init cloud-initramfs-copymods cloud-initramfs-dyn-netconf \
@@ -142,6 +147,9 @@ network:
 NETEOF
 chmod 600 /etc/netplan/01-dhcp.yaml
 EOF
+else
+  echo "==> [加固] HARDEN=0：跳过安全加固（保留 ssh/cloud-init/google agents 等）"
+fi
 chmod +x "$TMPD/provision-base.sh"
 
 # ---- 段 A：直接在输入镜像上装配 base（不复制，会修改 $IN）----

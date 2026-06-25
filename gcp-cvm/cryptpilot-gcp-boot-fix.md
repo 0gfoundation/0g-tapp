@@ -150,7 +150,7 @@ if [ -z "$kernel_version" ]; then ... return 1; fi
 此前观察到 rootfs 只读、`rw_overlay` 不生效，曾疑为独立问题。实为 **7.3 的表现**：可写层由 `cryptpilot-fde-before-sysroot.service` 在 initrd 里建立，而该 service 不在所启动 gcp 内核的 initrd 中，故未运行。应用修复 A 后，QEMU 实测可写层（zram + dm-snapshot）正常建立、`Read-only file system` 错误归零。非独立 bug。
 
 **7.6 `show-reference-value` 硬性要求 grubenv 里有 `saved_entry`（参考值提取）**
-`cryptpilot-fde show-reference-value` 在 `load_kernel_artifacts`（`src/cmd/fde/disk.rs:395-397`）里：
+`cryptpilot-fde show-reference-value` 在 `load_kernel_artifacts`（`cryptpilot-fde/src/disk/grub.rs`）里：
 ```rust
 let saved_entry = grub_vars
     .get("saved_entry")
@@ -209,7 +209,7 @@ fn runtime_measurement_extend_available() -> bool {
 - 裸 `ubuntu-24.04` cloud 镜像（generic 内核，无应用）；
 - `config_dir/`（含 `fde.toml`，`rw_overlay="ram"`）；
 - `cryptpilot-fde_0.7.0_amd64.deb`；
-- `tapp-server`（GitHub release **v0.0.5**，已含 guest-components `8d71a3b4` 修复，见 §8）。
+- `tapp-server`（GitHub release **v0.1.0**，已含 guest-components `8d71a3b4` 修复，见 §8）。
 
 > 全程需 `export LIBGUESTFS_BACKEND=direct`（否则 libguestfs 走 libvirt 后端会因权限失败）。
 
@@ -268,7 +268,7 @@ fn runtime_measurement_extend_available() -> bool {
 # 裸 Ubuntu 24.04 → 最终 gcp-tapp.qcow2（一条命令）
 ./build-gcp-tapp.sh ubuntu-24.04.qcow2 gcp-tapp.qcow2
 ```
-关键环境变量：`TAPP_SERVER_BIN`（本地 tapp-server，留空则下 v0.0.5）、`DNS_FALLBACK`、`PURGE_KERNEL`、`CONFIG_DIR`、`FDE_PACKAGE`、`ROOTFS_MODE`、`IN_PLACE`（1=直接改输入不复制）、`INSTALL_KERNEL`、`NBD_RESET`。
+关键环境变量：`TAPP_SERVER_BIN`（本地 tapp-server，留空则下 v0.1.0）、`DNS_FALLBACK`、`PURGE_KERNEL`、`CONFIG_DIR`、`FDE_PACKAGE`、`ROOTFS_MODE`、`IN_PLACE`（1=直接改输入不复制）、`INSTALL_KERNEL`、`NBD_RESET`。
 
 ### 产物验证清单（已全部通过）
 
@@ -353,25 +353,27 @@ network:
 构建出 `gcp-tapp.qcow2` 后，用 `cryptpilot-fde` 从镜像**离线**提取远程证明（RA）所需的参考值，写进 KBS/attestation 策略。
 
 ### 前提：cryptpilot-fde 需含 §7.6 的修复
-从未启动的镜像 grubenv 为空，**原版** `show-reference-value` 会报 `saved_entry not found in GRUB environment`（见 §7.6）。需用含修复（openanolis/cryptpilot PR #126）的版本。合并前可从 fork 分支自行构建：
+从未启动的镜像 grubenv 为空，**原版** `show-reference-value` 会报 `saved_entry not found in GRUB environment`（见 §7.6）。需用含修复（openanolis/cryptpilot PR #128）的版本。合并前可从 fork 分支自行构建：
 ```bash
-git clone -b fix/show-reference-value-no-saved-entry https://github.com/0gfoundation/cryptpilot.git
+git clone -b fix/srv-default-entry https://github.com/0gfoundation/cryptpilot.git
 cd cryptpilot
 # 构建依赖（Anolis/RHEL 系）：
-dnf install -y device-mapper-devel clang
-LIBCLANG_PATH=/usr/lib64 cargo build --release        # 产物 target/release/cryptpilot（含 fde 多调用别名）
+dnf install -y device-mapper-devel clang cryptsetup-devel
+LIBCLANG_PATH=/usr/lib64 cargo build --release -p cryptpilot-fde
+# 产物：target/release/cryptpilot-fde-host（host 端，离线算参考值）+ cryptpilot-fde-guest（VM 内 boot-service）
+# 注：0.8.0 起 cryptpilot-fde 拆成 -host/-guest；部署的 0.7.0 是单个 cryptpilot-fde
 ```
 > 有了此修复后，**不再需要** §7.6 那个"convert 端伪造 saved_entry"的 workaround。
 
 ### 用法
 ```bash
-# 安装版二进制（cryptpilot-fde 是 `cryptpilot fde` 的多调用别名）：
+# 源码构建版（0.8.0，host 端）：
+./target/release/cryptpilot-fde-host show-reference-value --disk gcp-tapp.qcow2 --hash-algo sha384
+# 已部署的 0.7.0（单个二进制）：
 cryptpilot-fde show-reference-value --disk gcp-tapp.qcow2 --hash-algo sha384
-# 源码构建版等价：
-./target/release/cryptpilot fde --disk gcp-tapp.qcow2 show-reference-value --hash-algo sha384
 ```
 - `--disk <路径>`：对镜像文件/块设备离线计算（不加则对当前运行系统）。
-- `--hash-algo`：`sha1,sha256,sha384,sm3`，可多次指定；默认 `sha384,sm3`。
+- `--hash-algo`：`sha1,sha256,sha384,sm3`，可多次指定；默认 `sha384`（0.8.0；0.7.0 默认 `sha384,sm3`）。
 - `--stage initrd|system`：可选；`--stage system` 会额外注入 `initrd_switch_root` 声明。
 
 ### 输出（AAEL 参考值 → 喂给 KBS 策略）
@@ -380,4 +382,4 @@ cryptpilot-fde show-reference-value --disk gcp-tapp.qcow2 --hash-algo sha384
 - `AA.eventlog.cryptpilot.alibabacloud.com.initrd_switch_root` —— 仅 `--stage system`
 - 启动组件（grub / kernel / initrd / kernel cmdline）的 SHA-384（及所选算法）参考值
 
-> 顺序提醒（见 §6）：若用 §7.6 的 convert workaround（而非 #126 修复），`show-reference-value` 必须在"同步 ESP（修复 B）"**之后**运行，确保参考值 == 实际启动测量。用 #126 修复 + 干净镜像则按上面直接跑即可。
+> 顺序提醒（见 §6）：若用 §7.6 的 convert workaround（而非 #128 修复），`show-reference-value` 必须在"同步 ESP（修复 B）"**之后**运行，确保参考值 == 实际启动测量。用 #128 修复 + 干净镜像则按上面直接跑即可。
