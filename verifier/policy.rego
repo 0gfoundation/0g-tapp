@@ -32,8 +32,8 @@ import rego.v1
 # --- Reference values (SHA-384, hex) ---------------------------------------
 # Two sources, RVPS takes priority, embedded is the fallback:
 #   * RVPS path (local self-hosted trustee): register values under the
-#     "measurement.<component>.SHA-384" keys; they appear under data.reference and
-#     override the embedded defaults below.
+#     "measurement.<component>.SHA-384" keys; the policy reads them via the AS-injected
+#     query_reference_value() builtin and they override the embedded defaults below.
 #   * Embedded path (shared remote AS where RVPS is not writable): the values below
 #     are used directly, so the policy is self-contained.
 # Same policy works for both. Update these for the target release image.
@@ -60,8 +60,16 @@ embedded_kernel_cmdline := {
 	"bad43ebbd92a8dde1d5b4198cff9cc268e93b771a402fbfe14718879bbb5735a1fd095c98f06d276509ae354805971e5",
 }
 
-# RVPS values for a key as a set (empty if RVPS / data.reference is absent).
-rvps_set(key) := {x | x := object.get(data, ["reference", key], [])[_]}
+# RVPS values for a key as a set, read via the AS-injected query_reference_value()
+# builtin (returns null when the key is absent → treated as empty).
+qrv(key) := v if {
+	v := query_reference_value(key)
+	v != null
+}
+
+qrv(key) := [] if query_reference_value(key) == null
+
+rvps_set(key) := {x | some x in qrv(key)}
 
 # Use RVPS values when present, else the embedded fallback.
 pick(key, fallback) := rvps_set(key) if count(rvps_set(key)) > 0
