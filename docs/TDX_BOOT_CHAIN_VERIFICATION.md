@@ -121,4 +121,4 @@ chain, so verifying the boot chain (incl. initrd) covers it — no separate root
 - CoCo AS policy docs: https://github.com/confidential-containers/trustee/blob/main/attestation-service/docs/policy.md
 - dm-verity: https://docs.kernel.org/admin-guide/device-mapper/verity.html
 - Intel TDX: https://www.intel.com/content/www/us/en/developer/tools/trust-domain-extensions/overview.html
-- This repo: `verifier/policy.rego`, `src/verify.rs` (`tapp-cli verify-app`)
+- This repo: `verifier/policy.rego`, `tapp-common/src/verify.rs` (`tapp-cli verify-app`)

@@ -83,8 +83,16 @@ boot_chain_ok if {
 }
 
 # --- AR4SI trust claims ----------------------------------------------------
-# executables=3: "only a recognized set of approved executables was loaded".
-# This is the core conclusion of this policy.
+# Each claim is an AR4SI/EAR trustworthiness tier (see veraison `ear`): values in
+# 2..31 are "affirming", 32..95 "warning", 96..127 "contraindicated". We default each
+# claim to a NON-affirming tier so it only becomes affirming when its positive check
+# passes:
+#   executables   : default 33 (warning, "unrecognized")        → 3  when boot_chain_ok
+#   hardware      : default 97 (contraindicated)                → 2  when Intel TDX + TCB ok
+#   configuration : default 36 (warning, config not affirmed)   → 2  when debug == false
+#
+# executables=3 ("only a recognized set of approved executables was loaded") is the core
+# conclusion of this policy.
 default executables := 33
 
 executables := 3 if boot_chain_ok

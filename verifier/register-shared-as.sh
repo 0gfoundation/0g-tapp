@@ -29,6 +29,10 @@ POLICY_ID="0g-tapp-${VERSION}-${ENV}"
 
 [ -f "$REF" ]    || { echo "error: reference file not found: $REF"; exit 1; }
 [ -f "$POLICY" ] || { echo "error: policy not found: $POLICY"; exit 1; }
+if grep -q '"_TODO"' "$REF"; then
+	echo "error: $REF is a placeholder — fill in the reference values first" >&2
+	exit 1
+fi
 
 # Inject the reference values: replace each `ref_X := {x | some x in qrv("...")}`
 # line in the canonical policy with a literal set from the json.
@@ -54,11 +58,21 @@ sys.stdout.write(policy)
 PY
 )
 
+# Guard: if a ref_* line no longer matches the regex (renamed loop var, whitespace, etc.),
+# injection silently no-ops and the values never land. Detect leftover qrv() calls on the
+# ref_* assignment lines only — the qrv(key) helper definition legitimately keeps its own.
+if printf '%s\n' "$INJECTED" | grep '^ref_' | grep -q 'qrv('; then
+	echo "error: a ref_* line still calls qrv() after injection — policy.rego format" >&2
+	echo "       changed; update the ref_* regex in this script to match." >&2
+	exit 1
+fi
+
+TMP="/tmp/setp.$$.json"
+trap 'rm -f "$TMP"' EXIT
 B64=$(printf '%s' "$INJECTED" | base64 -w0 | tr '+/' '-_' | tr -d '=')
 python3 -c 'import json,sys; print(json.dumps({"policy_id":sys.argv[1],"policy":sys.argv[2]}))' \
-  "${POLICY_ID}_cpu" "$B64" > /tmp/setp.$$.json
+  "${POLICY_ID}_cpu" "$B64" > "$TMP"
 grpcurl -plaintext -import-path "$PROTO_DIR" -proto attestation.proto -d @ \
-  "$AS" attestation.AttestationService/SetAttestationPolicy < /tmp/setp.$$.json
-rm -f /tmp/setp.$$.json
+  "$AS" attestation.AttestationService/SetAttestationPolicy < "$TMP"
 echo "registered policy ${POLICY_ID} (as ${POLICY_ID}_cpu) on ${AS}"
 echo "verify with: tapp-cli verify-app --app-id <id> --as-endpoint ${AS} --policy-ids ${POLICY_ID}"
