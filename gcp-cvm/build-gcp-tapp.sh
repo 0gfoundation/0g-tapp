@@ -148,7 +148,19 @@ NETEOF
 chmod 600 /etc/netplan/01-dhcp.yaml
 EOF
 else
-  echo "==> [加固] HARDEN=0：跳过安全加固（保留 ssh/cloud-init/google agents 等）"
+  echo "==> [加固] HARDEN=0: dev variant, reinstall google-guest-agent to restore GCP SSH key injection"
+  cat >> "$TMPD/provision-base.sh" <<'EOF'
+# dev variant only: google-guest-agent (from Ubuntu universe) injects the instance
+# SSH public key from metadata into ~ubuntu/.ssh/authorized_keys. It talks to the
+# metadata server by the hostname metadata.google.internal by default; since we pin
+# resolv.conf to public DNS (see fix C) that name will not resolve, so we also add a
+# direct IP mapping (169.254.169.254) to /etc/hosts. Both are GCP back-door-class
+# components and are intentionally NOT installed on the hardened variant.
+apt-get install -y google-guest-agent
+systemctl enable google-guest-agent.service || true
+grep -q 'metadata.google.internal' /etc/hosts || \
+  printf '169.254.169.254 metadata.google.internal metadata\n' >> /etc/hosts
+EOF
 fi
 chmod +x "$TMPD/provision-base.sh"
 
