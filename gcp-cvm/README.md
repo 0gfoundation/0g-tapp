@@ -9,6 +9,7 @@ Build a bootable, measurable, remotely-attestable, security-hardened cryptpilot 
 | `build-gcp-tapp.sh` | **One-shot full chain**: bare image → final gcp-tapp (stage A installs app/docker/SGX/DNS + hardening / stage B kernel + convert + ESP) |
 | `prepare-gcp-tapp.sh` | Stage B only (when a base already exists): fix A + DNS (guestfish) + nbd reset + convert + fix B |
 | `fix-esp-grub.sh` | Sync the ESP grub only (fix B, can be run standalone against an already-converted image) |
+| `boot-smoke-test.sh` | **Local boot smoke test**: boots a converted image under QEMU/OVMF (no real GCP CVM needed) and checks the boot chain reaches multi-user / tapp-server |
 | `config_dir/` | cryptpilot convert config (`fde.toml`, `rw_overlay="ram"`) |
 | `cryptpilot-fde_0.7.0_amd64.deb` | FDE package (provides cryptpilot-convert + runtime). **Binary, gitignored**, must be placed locally in this directory |
 
@@ -22,6 +23,15 @@ export LIBGUESTFS_BACKEND=direct
 ```
 - tapp-server is downloaded by default from GitHub v0.1.0 (includes the guest-components `8d71a3b4` fix, RTMR OK); if you have it locally, set `TAPP_SERVER_BIN=<path>`.
 - Other environment variables: `DNS_FALLBACK` `PURGE_KERNEL` `CONFIG_DIR` `FDE_PACKAGE` `ROOTFS_MODE` `IN_PLACE` `INSTALL_KERNEL` `NBD_RESET` (see the top of the script).
+
+## Local boot smoke test
+Before uploading an image to GCP, sanity-check that it actually boots, locally, without a real Confidential VM:
+```bash
+./boot-smoke-test.sh gcp-tapp.qcow2
+```
+It boots the image under QEMU/OVMF (UEFI) in the `qemux/qemu` container — using `/dev/kvm` if present, otherwise TCG software emulation — and scans the serial console for the full chain: grub → gcp kernel → `cryptpilot-fde` (dm-verity + zram + dm-snapshot) → `/sysroot` mount → switch-root → multi-user / `tapp-server.service`. Exit code `0` means the boot was confirmed.
+
+This validates everything except the TDX-specific bits (RTMR extend, remote attestation), which require real hardware — so it is a fast pre-flight check, not a replacement for on-hardware testing. Tunables: `MAX` (timeout seconds), `RAM_SIZE`, `CPU_CORES`.
 
 ## Three core fixes (all required)
 - **Fix A**: before convert, point the `/boot/vmlinuz` symlink at the gcp kernel → the cryptpilot stack goes into the correct initrd (fixes read-only / RTMR / verity).
