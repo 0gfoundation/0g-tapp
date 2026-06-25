@@ -17,8 +17,6 @@
 Material:
 - Ubuntu cloud image: https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img
 
-> The `cryptpilot-fde` deb is **not** part of this base-image preparation — it is a build-time prerequisite consumed later by the conversion step (see §9 and the kit).
-
 Prepare the Ubuntu image for a GCP Confidential VM (install the gVNIC driver):
 ```bash
 sudo apt install dkms build-essential linux-headers-$(uname -r)
