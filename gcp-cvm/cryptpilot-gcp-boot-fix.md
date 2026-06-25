@@ -14,9 +14,10 @@
 
 `temp-fixed.qcow2` (the input to the build pipeline below) is itself a produced artifact: the official Ubuntu 24.04 (noble) cloud image with the GCP gVNIC network driver installed (required for GCP Confidential VMs).
 
-Materials:
+Material:
 - Ubuntu cloud image: https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img
-- cryptpilot-fde deb, matching the cryptpilot-fde version used by `cryptpilot-convert`, from https://github.com/openanolis/cryptpilot/releases (the preparation referenced `cryptpilot-fde_0.6.0_amd64.deb`; this kit's convert uses `cryptpilot-fde_0.7.0_amd64.deb` — keep them consistent).
+
+> The `cryptpilot-fde` deb is **not** part of this base-image preparation — it is a build-time prerequisite consumed later by the conversion step (see §9 and the kit).
 
 Prepare the Ubuntu image for a GCP Confidential VM (install the gVNIC driver):
 ```bash
