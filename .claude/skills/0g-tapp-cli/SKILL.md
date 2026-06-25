@@ -43,13 +43,20 @@ tapp-cli -s <server> -k 0x<key> get-app-info --app-id <id>        # compose/volu
 tapp-cli -s <server> list-apps                                   # list all apps on this server (no key needed)
 tapp-cli -s <server> -k 0x<key> get-app-logs --app-id <id> --service <name> -n 100  # app's docker compose logs
 tapp-cli -s <server> -k 0x<key> get-app-key --app-id <id>         # TEE-derived app signing key (ethereum); --key-type / --x25519 for other types
-tapp-cli -s <server> verify-app --app-id <id>                     # direct: AS-verify this node's evidence+quote, show attested values (no chain)
-tapp-cli verify-app --app-id <id> --rpc-url <rpc> --contract 0x<reg>  # chain: verify all nodes + reconcile vs on-chain (--as-endpoint default 47.237.201.184:50004)
+tapp-cli -s <server> verify-app --app-id <id> [--policy-ids <id>]                    # direct: AS-verify this node's evidence+quote, show attested values (no chain)
+tapp-cli verify-app --app-id <id> --rpc-url <rpc> --contract 0x<reg> [--policy-ids <id>]  # chain: verify all nodes + reconcile vs on-chain
 tapp-cli -s <server> -k 0x<key> get-tapp-info                     # server version + Owner Address (no key needed)
 tapp-cli -s <server> -k 0x<key> prune-images [--all]              # delete UNUSED images (--all removes all unused, not just dangling)
 tapp-cli -s <server> -k 0x<key> get-service-logs -f <file> [-n 100] # tapp-server's own logs (-n limits lines; no -f lists files)
 tapp-cli -s <server> -k 0x<key> docker-logout                    # logout from Docker registry on this server
 ```
+
+### verify-app: boot-chain check (`--policy-ids`)
+- **`--policy-ids <id>` is what triggers the boot-chain check** (shim/grub/kernel/initrd/kernel_cmdline vs an image's reference values). **Without it**, the AS uses its default policy and **no `boot-chain` line is printed** — only `ear.status`/`tcb_status`.
+- Output line: `boot-chain : ✓ (executables=3, matches policy reference)` = matched; `✗ (executables=33, ...)` = did not match; `?` = policy set no executables claim. (`executables` is the AR4SI claim: **3** = approved boot chain, **33** = unrecognized.)
+- **`--as-endpoint <host:port>`** picks the Attestation Service (default `47.237.201.184:50004`, the shared AS). Point it at a self-hosted local AS (e.g. `127.0.0.1:50004`, see `0g-tapp-verifier`) to use RVPS-backed reference values.
+- **Policy ids** must be registered on that AS first (the AS appends `_cpu`, so register `<id>_cpu`). Known ids: `0g-tapp` (sample/target values) and image-specific ones like `0g-tapp-gcp-dev`. Use the id whose reference values match the node's image.
+- Note: `ear.status=affirming` also needs platform TCB `UpToDate`; `executables=3` alone (boot chain matched) is the boot-chain conclusion independent of TCB.
 
 ### Server health & whitelist
 ```bash
