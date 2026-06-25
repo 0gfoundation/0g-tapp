@@ -1,0 +1,4 @@
+[submodule "verifier/0g-tapp-verifier"]
+	path = verifier/0g-tapp-verifier
+	url = git@github.com:0gfoundation/0g-tapp-verifier.git
+	branch = feat/tdx-boot-chain-verifier

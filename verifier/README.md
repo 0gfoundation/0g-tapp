@@ -44,8 +44,14 @@ how to (re)generate them with `cryptpilot-fde` on an Alinux host).
 
 Register the release's `reference-values/<version>/<env>.json` into your own RVPS, then use
 `policy.rego` unchanged; it reads the values via `query_reference_value()`. The full
-self-hosted stack (coco-as-grpc + rvps + compose + run script) lives in the
-**[`0g-tapp-verifier`](https://github.com/0gfoundation/0g-tapp-verifier)** repo.
+self-hosted stack (coco-as-grpc + rvps + compose + run script) is vendored in as a git
+submodule at [`0g-tapp-verifier/`](./0g-tapp-verifier) (upstream:
+[`0g-tapp-verifier`](https://github.com/0gfoundation/0g-tapp-verifier),
+`tdx-boot-chain/`). Pull it with:
+
+```bash
+git submodule update --init verifier/0g-tapp-verifier   # or clone --recursive
+```
 
 ### 2. Shared AS (RVPS not writable)
 

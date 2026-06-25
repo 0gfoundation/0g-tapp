@@ -99,7 +99,10 @@ values and sets the AR4SI `executables` claim (3 = matched).
   reach the AS:
   - **Self-hosted AS** (`coco-as-grpc` + `rvps`, RVPS writable): register the release's
     `reference-values/<version>/<env>.json` to RVPS → policy reads via `query_reference_value()`.
-    The full stack lives in **[`0g-tapp-verifier`](https://github.com/0gfoundation/0g-tapp-verifier)**.
+    The full stack is vendored as a git submodule at `verifier/0g-tapp-verifier/`
+    (`tdx-boot-chain/`; upstream
+    [`0g-tapp-verifier`](https://github.com/0gfoundation/0g-tapp-verifier)). Pull it with
+    `git submodule update --init verifier/0g-tapp-verifier`.
   - **Shared remote AS** (RVPS not writable): inject the values into a copy of the policy at
     registration time, registered under id `0g-tapp-<version>-<env>` —
     `verifier/register-shared-as.sh <version> <env> [as-endpoint]`.
