@@ -1,0 +1,8 @@
+{
+  "_TODO": "prod image reference values — generate on an alinux host with `cryptpilot-fde show-reference-value --disk <prod-image>` and fill in. The prod image differs from dev.",
+  "measurement.shim.SHA-384": [],
+  "measurement.grub.SHA-384": [],
+  "measurement.kernel.SHA-384": [],
+  "measurement.initrd.SHA-384": [],
+  "measurement.kernel_cmdline.SHA-384": []
+}

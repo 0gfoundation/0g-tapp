@@ -54,8 +54,8 @@ tapp-cli -s <server> -k 0x<key> docker-logout                    # logout from D
 ### verify-app: boot-chain check (`--policy-ids`)
 - **`--policy-ids <id>` is what triggers the boot-chain check** (shim/grub/kernel/initrd/kernel_cmdline vs an image's reference values). **Without it**, the AS uses its default policy and **no `boot-chain` line is printed** — only `ear.status`/`tcb_status`.
 - Output line: `boot-chain : ✓ (executables=3, matches policy reference)` = matched; `✗ (executables=33, ...)` = did not match; `?` = policy set no executables claim. (`executables` is the AR4SI claim: **3** = approved boot chain, **33** = unrecognized.)
-- **`--as-endpoint <host:port>`** picks the Attestation Service (default `47.237.201.184:50004`, the shared AS). Point it at a self-hosted local AS (e.g. `127.0.0.1:50004`, see `0g-tapp-verifier`) to use RVPS-backed reference values.
-- **Policy ids** must be registered on that AS first (the AS appends `_cpu`, so register `<id>_cpu`). Known ids: `0g-tapp` (sample/target values) and image-specific ones like `0g-tapp-gcp-dev`. Use the id whose reference values match the node's image.
+- **`--as-endpoint <host:port>`** picks the Attestation Service (default `47.237.201.184:50004`, the shared AS). Point it at a self-hosted local AS (e.g. `127.0.0.1:50004`, see the `verifier/0g-tapp-verifier` submodule) to use RVPS-backed reference values.
+- **Policy ids** follow `0g-tapp-<tapp-server-version>-<env>` (e.g. `0g-tapp-v0.1.0-dev`), one per release × `{dev,prod}` — reference values live in `verifier/reference-values/<version>/<env>.json`. They must be registered on that AS first (the AS appends `_cpu`, so the id is stored as `<id>_cpu`); on the shared AS use `verifier/register-shared-as.sh <version> <env> [as-endpoint]`. Use the id whose reference values match the node's image.
 - Note: `ear.status=affirming` also needs platform TCB `UpToDate`; `executables=3` alone (boot chain matched) is the boot-chain conclusion independent of TCB.
 
 ### Server health & whitelist
