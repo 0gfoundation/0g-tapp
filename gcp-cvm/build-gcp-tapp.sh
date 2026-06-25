@@ -1,56 +1,56 @@
 #!/bin/bash
 # build-gcp-tapp.sh <ubuntu-24.04-base.qcow2> <output gcp-tapp.qcow2>
 #
-# 从一个“裸 Ubuntu 24.04 cloud 镜像”一键做出最终的 cryptpilot tapp 镜像。
-# 两段：
-#   [A] 装 base：tapp-server + service + /etc/tapp/config.toml + libtdx-attest(SGX repo)
-#       + docker + systemd-resolved 兜底 DNS
-#   [B] 复用 prepare-gcp-tapp.sh：装 gcp 内核 → 修 /boot/vmlinuz 软链 → convert → 同步 ESP
+# One-command pipeline that turns a stock Ubuntu 24.04 cloud image into the final
+# cryptpilot tapp image. Two stages:
+#   [A] provision base: tapp-server + service + /etc/tapp/config.toml + libtdx-attest (SGX repo)
+#       + docker + systemd-resolved fallback DNS
+#   [B] reuse prepare-gcp-tapp.sh: install gcp kernel -> fix /boot/vmlinuz symlink -> convert -> sync ESP
 #
-# 不修改输入镜像（全程副本）。需要本机/appliance 有网络（apt + 下载）。
+# Requires network access on the host/appliance (apt + downloads).
 
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 export LIBGUESTFS_BACKEND=direct
 export DEBIAN_FRONTEND=noninteractive
 
-# ===== 可调配置 =====
-TAPP_SERVER_BIN="${TAPP_SERVER_BIN:-}"                              # 本机已有 tapp-server 路径；留空则从 URL 下载
+# ===== Tunables =====
+TAPP_SERVER_BIN="${TAPP_SERVER_BIN:-}"                              # path to a local tapp-server binary; empty -> download from URL
 TAPP_SERVER_URL="${TAPP_SERVER_URL:-https://github.com/0gfoundation/0g-tapp/releases/download/v0.1.0/tapp-server}"
 OWNER_ADDRESS="${OWNER_ADDRESS:-0xea695C312CE119dE347425B29AFf85371c9d1837}"
 KBS_URLS="${KBS_URLS:-\"http://8.222.225.233:9091\", \"http://47.245.117.71:9091\"}"
 DNS_FALLBACK="${DNS_FALLBACK:-8.8.8.8 8.8.4.4 1.1.1.1}"
-HARDEN="${HARDEN:-1}"                                   # 1=安全加固(purge Tier1/2+mask getty+换netplan); 0=不加固
-# 传给 prepare-gcp-tapp.sh（convert 用）
+HARDEN="${HARDEN:-1}"                                   # 1=hardened (purge Tier1/2 + mask getty + replace netplan); 0=dev
+# passed through to prepare-gcp-tapp.sh (used by convert)
 export CONFIG_DIR="${CONFIG_DIR:-$HERE/config_dir}"
 export FDE_PACKAGE="${FDE_PACKAGE:-$HERE/cryptpilot-fde_0.7.0_amd64.deb}"
 export ROOTFS_MODE="${ROOTFS_MODE:---rootfs-no-encryption}"
-export PURGE_KERNEL="${PURGE_KERNEL:-}"   # 注意：convert 需要镜像里至少保留一个 *-generic 内核，勿全删
+export PURGE_KERNEL="${PURGE_KERNEL:-}"   # NOTE: convert needs at least one *-generic kernel left in the image; do not purge them all
 export INSTALL_KERNEL=1
 # ====================
 
-IN="${1:?用法: $0 <ubuntu-24.04-base.qcow2> <output.qcow2>}"
-OUT="${2:?用法: $0 <ubuntu-24.04-base.qcow2> <output.qcow2>}"
-[ -f "$IN" ] || { echo "找不到输入镜像: $IN" >&2; exit 1; }
-[ -f "$HERE/prepare-gcp-tapp.sh" ] || { echo "缺少 prepare-gcp-tapp.sh（应与本脚本同目录）" >&2; exit 1; }
-[ -d "$CONFIG_DIR" ] || { echo "找不到 CONFIG_DIR: $CONFIG_DIR" >&2; exit 1; }
-[ -f "$FDE_PACKAGE" ] || { echo "找不到 FDE_PACKAGE: $FDE_PACKAGE" >&2; exit 1; }
+IN="${1:?usage: $0 <ubuntu-24.04-base.qcow2> <output.qcow2>}"
+OUT="${2:?usage: $0 <ubuntu-24.04-base.qcow2> <output.qcow2>}"
+[ -f "$IN" ] || { echo "input image not found: $IN" >&2; exit 1; }
+[ -f "$HERE/prepare-gcp-tapp.sh" ] || { echo "missing prepare-gcp-tapp.sh (must be in the same directory as this script)" >&2; exit 1; }
+[ -d "$CONFIG_DIR" ] || { echo "CONFIG_DIR not found: $CONFIG_DIR" >&2; exit 1; }
+[ -f "$FDE_PACKAGE" ] || { echo "FDE_PACKAGE not found: $FDE_PACKAGE" >&2; exit 1; }
 
 TMPD="$(mktemp -d)"
 trap 'rm -rf "$TMPD"' EXIT
 
-# ---- 取 tapp-server ----
+# ---- obtain tapp-server ----
 if [ -n "$TAPP_SERVER_BIN" ]; then
-  [ -f "$TAPP_SERVER_BIN" ] || { echo "TAPP_SERVER_BIN 不存在: $TAPP_SERVER_BIN" >&2; exit 1; }
+  [ -f "$TAPP_SERVER_BIN" ] || { echo "TAPP_SERVER_BIN does not exist: $TAPP_SERVER_BIN" >&2; exit 1; }
   cp "$TAPP_SERVER_BIN" "$TMPD/tapp-server"
 else
-  echo "==> 下载 tapp-server: $TAPP_SERVER_URL"
-  wget -q -O "$TMPD/tapp-server" "$TAPP_SERVER_URL" || { echo "下载失败，请改用 TAPP_SERVER_BIN=<本地路径>" >&2; exit 1; }
+  echo "==> downloading tapp-server: $TAPP_SERVER_URL"
+  wget -q -O "$TMPD/tapp-server" "$TAPP_SERVER_URL" || { echo "download failed; use TAPP_SERVER_BIN=<local path> instead" >&2; exit 1; }
 fi
-echo "⚠️  注意：RTMR extend 是否可用取决于 tapp-server 是否基于 guest-components 8d71a3b4 构建（见文档 §8）。"
-echo "    GitHub release tapp-server 若为旧版(5683fa5)，最终镜像仍会报 'Cannot extend runtime measurement'。"
+echo "⚠️  NOTE: RTMR extend works only if tapp-server is built on guest-components 8d71a3b4 (see doc §8)."
+echo "    An older GitHub-release tapp-server (5683fa5) will still report 'Cannot extend runtime measurement'."
 
-# ---- 生成 service / config / dns 临时文件 ----
+# ---- generate temporary service / config / dns files ----
 cat > "$TMPD/tapp-server.service" <<'EOF'
 [Unit]
 Description=TAPP gRPC Server - Trusted Application
@@ -93,7 +93,7 @@ EOF
 
 printf '[Resolve]\nFallbackDNS=%s\n' "$DNS_FALLBACK" > "$TMPD/99-fallback-dns.conf"
 
-# ---- 在 guest 内执行的 base 装配脚本 ----
+# ---- base provisioning script run inside the guest ----
 cat > "$TMPD/provision-base.sh" <<'EOF'
 #!/bin/bash
 set -e
@@ -101,12 +101,12 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update
 apt-get install -y curl gnupg ca-certificates
 install -d -m0755 /etc/apt/keyrings
-# Intel SGX 源（libtdx-attest，tapp-server 运行时依赖）
+# Intel SGX repo (libtdx-attest, a runtime dependency of tapp-server)
 curl -fsSL https://download.01.org/intel-sgx/sgx_repo/ubuntu/intel-sgx-deb.key \
   | gpg --dearmor -o /etc/apt/keyrings/intel-sgx.gpg
 echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/intel-sgx.gpg] https://download.01.org/intel-sgx/sgx_repo/ubuntu noble main" \
   > /etc/apt/sources.list.d/intel-sgx.list
-# Docker 官方源
+# Docker official repo
 curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
   | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
 echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu noble stable" \
@@ -117,9 +117,9 @@ mkdir -p /var/log/tapp
 systemctl enable docker tapp-server
 EOF
 
-# ===== 加固（HARDEN=1 时追加）：移除可绕过 tapp 改环境的软件（Tier1+Tier2，审计见文档 §11）=====
+# ===== Hardening (appended when HARDEN=1): remove software that can bypass tapp and mutate the environment (Tier1+Tier2, audit in doc §11) =====
 if [ "${HARDEN:-1}" = 1 ]; then
-  echo "==> [加固] HARDEN=1：purge Tier1/2 + mask 控制台 getty + 换 MAC 无关 netplan"
+  echo "==> [harden] HARDEN=1: purge Tier1/2 + mask console getty + replace netplan with a MAC-agnostic one"
   cat >> "$TMPD/provision-base.sh" <<'EOF'
 PURGE_PKGS="openssh-server \
   google-guest-agent google-compute-engine google-compute-engine-oslogin google-osconfig-agent \
@@ -131,9 +131,9 @@ for p in $PURGE_PKGS; do dpkg -s "$p" >/dev/null 2>&1 && to_purge="$to_purge $p"
 [ -n "$to_purge" ] && { echo "purging: $to_purge"; apt-get purge -y $to_purge || true; }
 apt-get autoremove --purge -y || true
 rm -rf /snap /var/snap /var/lib/snapd
-# 关闭控制台登录（GCP 串口 ttyS0 + 本地 tty1）
+# disable console login (GCP serial ttyS0 + local tty1)
 systemctl mask serial-getty@ttyS0.service getty@tty1.service || true
-# 移除 cloud-init 后原按 MAC 匹配的 netplan 失效 → 换成 MAC 无关的 DHCP（否则新实例无网）
+# after removing cloud-init the original MAC-matched netplan breaks -> replace with a MAC-agnostic DHCP config (otherwise a new instance has no network)
 rm -f /etc/netplan/50-cloud-init.yaml /etc/netplan/90-default.yaml
 cat > /etc/netplan/01-dhcp.yaml <<'NETEOF'
 network:
@@ -148,7 +148,7 @@ NETEOF
 chmod 600 /etc/netplan/01-dhcp.yaml
 EOF
 else
-  echo "==> [加固] HARDEN=0: dev variant, reinstall google-guest-agent to restore GCP SSH key injection"
+  echo "==> [harden] HARDEN=0: dev variant, reinstall google-guest-agent to restore GCP SSH key injection"
   cat >> "$TMPD/provision-base.sh" <<'EOF'
 # dev variant only: google-guest-agent (from Ubuntu universe) injects the instance
 # SSH public key from metadata into ~ubuntu/.ssh/authorized_keys. It talks to the
@@ -164,8 +164,8 @@ EOF
 fi
 chmod +x "$TMPD/provision-base.sh"
 
-# ---- 段 A：直接在输入镜像上装配 base（不复制，会修改 $IN）----
-echo "==> [A] 在 $IN 上装配 base（app/docker/SGX/config/DNS）"
+# ---- stage A: provision base directly on the input image (no copy, $IN is modified) ----
+echo "==> [A] provisioning base on $IN (app/docker/SGX/config/DNS)"
 virt-customize -a "$IN" \
   --upload "$TMPD/tapp-server":/usr/local/bin/tapp-server \
   --chmod 0755:/usr/local/bin/tapp-server \
@@ -176,10 +176,10 @@ virt-customize -a "$IN" \
   --upload "$TMPD/99-fallback-dns.conf":/etc/systemd/resolved.conf.d/99-fallback-dns.conf \
   --run "$TMPD/provision-base.sh"
 
-# ---- 段 B：内核 + convert + ESP（IN_PLACE 直接用输入，复用已验证脚本）----
-echo "==> [B] prepare-gcp-tapp.sh (IN_PLACE): 装 gcp 内核 → 修复A → convert → 修复B"
+# ---- stage B: kernel + convert + ESP (IN_PLACE operates on the input, reusing the validated script) ----
+echo "==> [B] prepare-gcp-tapp.sh (IN_PLACE): install gcp kernel -> fix A -> convert -> fix B"
 IN_PLACE=1 "$HERE/prepare-gcp-tapp.sh" "$IN" "$OUT"
 
 echo ""
-echo "[完成] 最终镜像: $OUT"
-echo "（注意：$IN 已被就地修改，需要原始基础镜像请重新下载）"
+echo "[done] final image: $OUT"
+echo "(note: $IN was modified in place; re-download the original base image if you need it again)"
