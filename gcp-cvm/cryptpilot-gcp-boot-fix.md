@@ -17,6 +17,14 @@
 Material:
 - Ubuntu cloud image: https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img
 
+Resize the root partition to 20 GiB (the stock cloud image ships a ~3.5 GiB disk, too small for the kernel + application + Docker layers added later). Use `qemu-img resize` + `growpart` + `resize2fs` so the partition **numbering is preserved** — do **not** use `virt-resize --expand`, which renumbers the partitions (e.g. `sda1` → `sda4`) and breaks the `sda1`=rootfs / `sda16`=/boot assumptions the rest of this flow relies on:
+```bash
+qemu-img resize noble-server-cloudimg-amd64.img 20G
+# grow the in-image partition table + filesystem in place (keeps sda1/sda16 numbering)
+sudo growpart /dev/sda 1     # run against the attached image, e.g. via virt-customize --run-command
+sudo resize2fs /dev/sda1
+```
+
 Prepare the Ubuntu image for a GCP Confidential VM (install the gVNIC driver):
 ```bash
 sudo apt install dkms build-essential linux-headers-$(uname -r)
