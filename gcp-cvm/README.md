@@ -9,7 +9,7 @@ Build a bootable, measurable, remotely-attestable, security-hardened cryptpilot 
 | `build-gcp-tapp.sh` | **One-shot full chain**: bare image → final gcp-tapp (stage A installs app/docker/SGX/DNS + hardening / stage B kernel + convert + ESP) |
 | `prepare-gcp-tapp.sh` | Stage B only (when a base already exists): fix A + DNS (guestfish) + nbd reset + convert + fix B |
 | `fix-esp-grub.sh` | Sync the ESP grub only (fix B, can be run standalone against an already-converted image) |
-| `boot-smoke-test.sh` | **Local boot smoke test**: boots a converted image under QEMU/OVMF (no real GCP CVM needed) and checks the boot chain reaches multi-user / tapp-server |
+| `test/boot-smoke-test.sh` | **Local boot smoke test**: boots a converted image under QEMU/OVMF (no real GCP CVM needed) and checks the boot chain reaches multi-user / tapp-server |
 | `config_dir/` | cryptpilot convert config (`fde.toml`, `rw_overlay="ram"`) |
 | `cryptpilot-fde_0.7.0_amd64.deb` | FDE package (provides cryptpilot-convert + runtime). **Binary, gitignored**, must be placed locally in this directory |
 
@@ -27,7 +27,7 @@ export LIBGUESTFS_BACKEND=direct
 ## Local boot smoke test
 Before uploading an image to GCP, sanity-check that it actually boots, locally, without a real Confidential VM:
 ```bash
-./boot-smoke-test.sh gcp-tapp.qcow2
+./test/boot-smoke-test.sh gcp-tapp.qcow2
 ```
 It boots the image under QEMU/OVMF (UEFI) in the `qemux/qemu` container — using `/dev/kvm` if present, otherwise TCG software emulation — and scans the serial console for the full chain: grub → gcp kernel → `cryptpilot-fde` (dm-verity + zram + dm-snapshot) → `/sysroot` mount → switch-root → multi-user / `tapp-server.service`. Exit code `0` means the boot was confirmed.
 
