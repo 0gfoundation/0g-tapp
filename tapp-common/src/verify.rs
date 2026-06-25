@@ -157,10 +157,19 @@ fn json_str_map(v: &serde_json::Value) -> HashMap<String, String> {
     m
 }
 
-/// AS verification result: (ear_status, tcb_status, advisory_count, executables_claim).
-/// `executables` is the AR4SI executables trust claim (3 = boot chain matched the policy
-/// reference values); None if the policy didn't set it / no policy was applied.
-type AsVerdict = (String, String, usize, Option<i64>);
+/// CoCo-AS AR4SI `executables` trust-claim value meaning the boot chain matched the
+/// policy's reference values ("only a recognized set of approved executables was loaded").
+pub const EXECUTABLES_MATCHED: i64 = 3;
+
+/// Result of submitting evidence to the AS.
+pub struct AsVerdict {
+    pub ear_status: String,
+    pub tcb_status: String,
+    pub advisories: usize,
+    /// AR4SI executables trust claim (== EXECUTABLES_MATCHED when the boot chain matched
+    /// the policy reference values); None if the policy set no executables / no policy applied.
+    pub executables: Option<i64>,
+}
 
 /// Submit evidence to CoCo-AS (gRPC). `policy_ids` selects the policy to enforce; pass an
 /// empty slice to use the AS default policy (which does NOT check our boot chain).
@@ -204,7 +213,7 @@ async fn verify_with_as(
     let tdx = &cpu0["ear.veraison.annotated-evidence"]["tdx"];
     let tcb = tdx["tcb_status"].as_str().unwrap_or("unknown").to_string();
     let adv = tdx["advisory_ids"].as_array().map(|a| a.len()).unwrap_or(0);
-    Ok((ear_status, tcb, adv, executables))
+    Ok(AsVerdict { ear_status, tcb_status: tcb, advisories: adv, executables })
 }
 
 async fn fetch_evidence(tee_url: &str, app_id: &str) -> Result<Vec<u8>> {
@@ -266,11 +275,11 @@ pub async fn verify_node_direct(
     }
 
     match verify_with_as(as_endpoint, &raw, policy_ids).await {
-        Ok((s, t, a, ex)) => {
-            v.ear_status = s;
-            v.tcb_status = t;
-            v.advisories = a;
-            v.boot_executables = ex;
+        Ok(av) => {
+            v.ear_status = av.ear_status;
+            v.tcb_status = av.tcb_status;
+            v.advisories = av.advisories;
+            v.boot_executables = av.executables;
         }
         Err(e) => v.note = format!("{}AS: {}", v.note, e),
     }
@@ -360,11 +369,11 @@ pub async fn verify_app(
 
         // ③ AS quote verification
         match verify_with_as(as_endpoint, &raw, policy_ids).await {
-            Ok((s, t, a, ex)) => {
-                v.ear_status = s;
-                v.tcb_status = t;
-                v.advisories = a;
-                v.boot_executables = ex;
+            Ok(av) => {
+                v.ear_status = av.ear_status;
+                v.tcb_status = av.tcb_status;
+                v.advisories = av.advisories;
+                v.boot_executables = av.executables;
             }
             Err(e) => v.note = format!("{}AS: {}", v.note, e),
         }

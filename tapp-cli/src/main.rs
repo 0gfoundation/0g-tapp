@@ -1008,6 +1008,24 @@ async fn get_app_info(server: &str, app_id: String) -> Result<(), Box<dyn std::e
     Ok(())
 }
 
+/// Render the boot-chain result line from the AS `executables` claim.
+/// Returns None when no policy was selected (`show=false`) — the AS default policy's
+/// executables claim is not our boot-chain check, so we don't show it. The caller adds
+/// section-appropriate indentation.
+fn boot_chain_line(executables: Option<i64>, show: bool) -> Option<String> {
+    use tapp_common::verify::EXECUTABLES_MATCHED;
+    if !show {
+        return None;
+    }
+    Some(match executables {
+        Some(n) if n == EXECUTABLES_MATCHED => {
+            format!("boot-chain : ✓ (executables={}, matches policy reference)", n)
+        }
+        Some(n) => format!("boot-chain : ✗ (executables={}, no policy match)", n),
+        None => "boot-chain : ? (policy set no executables claim)".to_string(),
+    })
+}
+
 async fn verify_app_cmd(
     server: &str,
     app_id: &str,
@@ -1019,16 +1037,6 @@ async fn verify_app_cmd(
     // boot-chain line is meaningful only when WE selected a policy (otherwise the AS
     // default policy's executables claim is not our boot-chain check).
     let show_boot = !policy_ids.is_empty();
-    let boot = |ex: Option<i64>| -> String {
-        if !show_boot {
-            return String::new();
-        }
-        match ex {
-            Some(3) => "boot-chain : ✓ (executables=3, matches policy reference)".to_string(),
-            Some(n) => format!("boot-chain : ✗ (executables={}, no policy match)", n),
-            None => "boot-chain : ? (policy set no executables claim)".to_string(),
-        }
-    };
     // Direct mode: no --contract → verify the single --server node without chain reconciliation.
     if contract.is_none() {
         let d = tapp_common::verify::verify_node_direct(server, app_id, as_endpoint, policy_ids).await?;
@@ -1037,8 +1045,9 @@ async fn verify_app_cmd(
         println!("  server      : {}", d.server);
         println!("  signer      : {}  (attested in report_data)", d.signer);
         println!("  AS          : ear.status={} tcb_status={} advisories={}", d.ear_status, d.tcb_status, d.advisories);
-        let b = boot(d.boot_executables);
-        if !b.is_empty() { println!("{}", b.trim_start()); }
+        if let Some(l) = boot_chain_line(d.boot_executables, show_boot) {
+            println!("  {}", l);
+        }
         if !d.compose_hash.is_empty() {
             println!("  compose     : {}", d.compose_hash);
         }
@@ -1080,8 +1089,9 @@ async fn verify_app_cmd(
             "    reconcile  : signer{} compose{} volumes{} image{}",
             yn(n.signer_ok), yn(n.compose_ok), yn(n.volumes_ok), yn(n.image_ok)
         );
-        let b = boot(n.boot_executables);
-        if !b.is_empty() { println!("  {}", b); }
+        if let Some(l) = boot_chain_line(n.boot_executables, show_boot) {
+            println!("    {}", l);
+        }
         if !n.note.is_empty() {
             println!("    note       : {}", n.note);
         }
@@ -2195,6 +2205,34 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    #[test]
+    fn boot_chain_line_hidden_when_no_policy() {
+        // show=false (no --policy-ids) → no line regardless of executables
+        assert_eq!(boot_chain_line(Some(3), false), None);
+        assert_eq!(boot_chain_line(Some(33), false), None);
+        assert_eq!(boot_chain_line(None, false), None);
+    }
+
+    #[test]
+    fn boot_chain_line_match() {
+        let l = boot_chain_line(Some(3), true).unwrap();
+        assert!(l.starts_with("boot-chain : ✓"), "got: {}", l);
+        assert!(l.contains("executables=3"));
+    }
+
+    #[test]
+    fn boot_chain_line_no_match() {
+        let l = boot_chain_line(Some(33), true).unwrap();
+        assert!(l.starts_with("boot-chain : ✗"), "got: {}", l);
+        assert!(l.contains("executables=33"));
+    }
+
+    #[test]
+    fn boot_chain_line_no_claim() {
+        let l = boot_chain_line(None, true).unwrap();
+        assert!(l.starts_with("boot-chain : ?"), "got: {}", l);
+    }
 
     fn write_file(dir: &std::path::Path, name: &str, content: &str) {
         let path = dir.join(name);
