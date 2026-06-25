@@ -21,8 +21,8 @@ by RTMR0-2):
 - **rootfs is not checked separately**: its integrity is folded into the initrd, so
   verifying the initrd covers it.
 
-> The field formats above were measured from real evidence of the GCP Ubuntu
-> `6.17.0-1018-gcp` image.
+> The field formats above were measured from real evidence of a cryptpilot image
+> (kernel `6.17.0-1018-gcp`). The scheme is cryptpilot's and is platform-agnostic.
 
 ## Reference values
 
@@ -67,5 +67,5 @@ grpcurl -plaintext -import-path "$PROTO_DIR" -proto attestation.proto \
   Current nodes report `tcb_status=OutOfDate` → ops must update the platform TCB, otherwise
   the overall status will not be affirming.
 
-See `docs/GCP_TDX_MEASUREMENT_RESEARCH.md` for the measurement background and the
-gce-tcb-verifier research.
+See `docs/TDX_BOOT_CHAIN_VERIFICATION.md` for the measurement background (cryptpilot-fde
+reference values, platform-agnostic).

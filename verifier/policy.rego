@@ -21,7 +21,7 @@ import rego.v1
 #     <AS>:50004 attestation.AttestationService/SetAttestationPolicy
 # Then AttestationEvaluate(policy_ids:["0g-tapp"]) uses this policy.
 #
-# uefi_event_logs field formats (measured on GCP Ubuntu 6.17.0-1018-gcp):
+# uefi_event_logs field formats (measured on a cryptpilot image, kernel 6.17.0-1018-gcp):
 #   shim   : type_name=EV_EFI_BOOT_SERVICES_APPLICATION, details.device_paths contains "shimx64.efi"
 #   grub   : type_name=EV_EFI_BOOT_SERVICES_APPLICATION, details.device_paths contains "grubx64.efi"
 #   kernel         : type_name=EV_IPL, details.string starts with "/vmlinuz"
