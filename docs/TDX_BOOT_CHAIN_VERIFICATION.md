@@ -81,7 +81,7 @@ Output is keyed `measurement.<component>.SHA-384`. Because `cryptpilot-convert` 
 `cryptpilot-fde` only run on an Alinux host, generation is **manual, not CI-automated**.
 
 The values are checked into this repo under
-[`reference-values/<tapp-server-version>/<env>.json`](../reference-values/) — **one set per
+[`verifier/reference-values/<tapp-server-version>/<env>.json`](../verifier/reference-values/) — **one set per
 tapp-server release × environment** (`dev`/`prod` images differ), starting at `v0.1.0`. See
 that directory's README. The policy itself is image-/version-/env-agnostic; only these
 values vary.
@@ -98,7 +98,7 @@ values and sets the AR4SI `executables` claim (3 = matched).
 - **Two verification methods, same policy** — they differ only in how the reference values
   reach the AS:
   - **Self-hosted AS** (`coco-as-grpc` + `rvps`, RVPS writable): register the release's
-    `reference-values/<version>/<env>.json` to RVPS → policy reads via `query_reference_value()`.
+    `verifier/reference-values/<version>/<env>.json` to RVPS → policy reads via `query_reference_value()`.
     The full stack is vendored as a git submodule at `verifier/0g-tapp-verifier/`
     (`tdx-boot-chain/`; upstream
     [`0g-tapp-verifier`](https://github.com/0gfoundation/0g-tapp-verifier)). Pull it with

@@ -6,7 +6,7 @@ a TDX confidential node against a known-good image, consumed by `verifier/policy
 ## Layout
 
 ```
-reference-values/<tapp-server-version>/<env>.json   # env ∈ {dev, prod}
+verifier/reference-values/<tapp-server-version>/<env>.json   # env ∈ {dev, prod}
 ```
 
 - **One set per tapp-server release × environment**, starting at **v0.1.0**. Each release
@@ -25,13 +25,13 @@ cryptpilot-fde show-reference-value --disk <release-image>
 # → kernel / initrd / grub / shim / kernel_cmdline digests
 ```
 
-Put the output into `reference-values/<version>/<env>.json` keyed by
+Put the output into `verifier/reference-values/<version>/<env>.json` keyed by
 `measurement.<component>.SHA-384` (kernel_cmdline may list multiple allowed values).
 
 ## Using
 
 - **Self-hosted AS** (RVPS writable): register the json to RVPS; the policy reads it via
-  `query_reference_value()`. See `0g-tapp-verifier`.
+  `query_reference_value()`. See the `../0g-tapp-verifier/` submodule (`tdx-boot-chain/`).
 - **Shared AS** (RVPS not writable): inject the json into the policy at registration —
   `verifier/register-shared-as.sh <version> <env> <as-endpoint>` registers it as
   `0g-tapp-<version>-<env>`.

@@ -13,7 +13,7 @@ import rego.v1
 # ONE canonical policy — image-/version-/env-agnostic. What differs per
 # release × {dev,prod} is the REFERENCE VALUES, NOT this logic. The values are NOT
 # baked in here; they are read from RVPS via the query_reference_value() builtin under
-# the "measurement.<component>.SHA-384" keys. See reference-values/<version>/<env>.json.
+# the "measurement.<component>.SHA-384" keys. See verifier/reference-values/<version>/<env>.json.
 #
 # How the reference values reach the AS (two verification methods, same policy):
 #   * Self-hosted AS (RVPS writable): register the image's reference-values json to

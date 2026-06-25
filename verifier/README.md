@@ -5,7 +5,7 @@ known-good release image. Used with the CoCo Attestation Service (CoCo-AS, gRPC 
 
 `policy.rego` here is the **single canonical policy** — one logic for all releases,
 images, and environments. What differs per release × environment is the **reference
-values**, kept under [`../reference-values/`](../reference-values/), not this file.
+values**, kept under [`reference-values/`](./reference-values/), not this file.
 
 ## What it checks
 
@@ -34,7 +34,7 @@ by RTMR0-2):
 The policy reads reference values from RVPS via the `query_reference_value()` builtin
 under `measurement.<component>.SHA-384` keys — **no values are baked into `policy.rego`**.
 
-The values themselves live in [`../reference-values/<version>/<env>.json`](../reference-values/),
+The values themselves live in [`reference-values/<version>/<env>.json`](./reference-values/),
 one set per tapp-server release × `{dev,prod}` (see that directory's README for layout and
 how to (re)generate them with `cryptpilot-fde` on an Alinux host).
 

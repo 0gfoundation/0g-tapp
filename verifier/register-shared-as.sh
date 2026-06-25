@@ -10,7 +10,7 @@
 #
 # Usage:
 #   ./register-shared-as.sh <version> <env> [as-endpoint]
-#     <version>     e.g. v0.1.0   (→ reference-values/<version>/<env>.json)
+#     <version>     e.g. v0.1.0   (→ verifier/reference-values/<version>/<env>.json)
 #     <env>         dev | prod
 #     as-endpoint   default 47.237.201.184:50004
 #
@@ -22,7 +22,7 @@ cd "$(dirname "$0")/.."   # repo root
 VERSION="${1:?usage: register-shared-as.sh <version> <env> [as-endpoint]}"
 ENV="${2:?usage: register-shared-as.sh <version> <env> [as-endpoint]}"
 AS="${3:-47.237.201.184:50004}"
-REF="reference-values/${VERSION}/${ENV}.json"
+REF="verifier/reference-values/${VERSION}/${ENV}.json"
 POLICY="verifier/policy.rego"
 PROTO_DIR="tapp-common/proto"
 POLICY_ID="0g-tapp-${VERSION}-${ENV}"
