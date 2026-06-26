@@ -27,6 +27,29 @@ IMG="${1:?usage: $0 <image.qcow2>}"
 [ -f "$IMG" ] || { echo "image not found: $IMG" >&2; exit 2; }
 command -v docker >/dev/null || { echo "docker is required" >&2; exit 2; }
 
+# Optional static check for sysbox-enabled images (issue #21). The runtime
+# `docker info | grep sysbox-runc` check runs on the deployed enclave (sandbox CI);
+# here we statically verify, offline, that the image was provisioned correctly:
+# sysbox-runc binary present, registered in daemon.json, sysbox.service enabled,
+# and docker data-root pinned off the RAM rootfs overlay (onto /data).
+if [ "${CHECK_SYSBOX:-0}" = 1 ]; then
+    echo "==> [sysbox] static image check"
+    export LIBGUESTFS_BACKEND=direct
+    OUT=$(guestfish --ro -a "$IMG" <<'GF' 2>&1
+run
+vgscan
+vg-activate-all true
+mount-ro /dev/cryptpilot/rootfs /
+is-file /usr/bin/sysbox-runc
+cat /etc/docker/daemon.json
+is-file /etc/systemd/system/multi-user.target.wants/sysbox.service
+GF
+)
+    echo "$OUT" | grep -q sysbox-runc && echo "$OUT" | grep -q '"data-root"' \
+        && echo "  sysbox-runc + daemon.json data-root: OK" \
+        || { echo "  SYSBOX CHECK FAILED:"; echo "$OUT"; exit 1; }
+fi
+
 MAX="${MAX:-600}"             # max seconds to wait for the boot to reach multi-user
 RAM_SIZE="${RAM_SIZE:-4G}"
 CPU_CORES="${CPU_CORES:-4}"

@@ -47,6 +47,19 @@ KBS_URLS='"http://<kbs-host-1>:9091", "http://<kbs-host-2>:9091"' \
 - tapp-server is downloaded by default from GitHub v0.1.0 (includes the guest-components `8d71a3b4` fix, RTMR OK); if you have it locally, set `TAPP_SERVER_BIN=<path>`.
 - Other environment variables: `DNS_FALLBACK` `PURGE_KERNEL` `CONFIG_DIR` `FDE_PACKAGE` `ROOTFS_MODE` `IN_PLACE` `INSTALL_KERNEL` `NBD_RESET` (see the top of the script).
 
+## Multi-tenant container isolation — Sysbox (issue #21, opt-in)
+For hostile-multi-tenant workloads (e.g. 0g-sandbox), build with `ENABLE_SYSBOX=1` to install [Sysbox](https://github.com/nestybox/sysbox) and register `sysbox-runc` as a dockerd runtime so in-container `root` is user-namespace-remapped (a kernel CVE in a sandbox is no longer host-equivalent):
+```bash
+ENABLE_SYSBOX=1 OWNER_ADDRESS=0x... KBS_URLS='...' ./build-gcp-tapp.sh base.qcow2 gcp-tapp.qcow2
+```
+This also pins docker `data-root` to **`/data/docker`** (configurable via `DATA_ROOT`). This is mandatory, not cosmetic: the cryptpilot rootfs writable overlay is **RAM-backed (zram) and ephemeral** — leaving docker/sysbox data on it would vanish on reboot and OOM the host under many image pulls. So:
+
+- **Deploy requirement**: attach a persistent disk to the instance, `mkfs.ext4 -L tapp-data`, before first boot. The image adds an fstab entry (`LABEL=tapp-data /data ext4`) and a `docker.service` drop-in `RequiresMountsFor=/data`, so **docker will not start until `/data` is mounted** (fail-loud; it never silently writes to the RAM root).
+- **Kernel**: the gcp kernel (≥5.12, `CONFIG_USER_NS=y`) supports the idmapped mounts Sysbox needs. The alinux 5.10 image does **not** (would need shiftfs).
+- **Phase 1 = isolation only.** `/data` confidentiality is deferred: it relies on GCP's default at-rest encryption (Google-managed keys), which does **not** protect against the cloud operator. Phase 2 will encrypt `/data` with a KBS/attestation-bound key (no image change, mount-layer dm-crypt). Do not treat Phase 1 `/data` as confidential vs the host.
+- **Validate on hardware**: confirm `docker info | grep sysbox-runc` and that `docker run --runtime=sysbox-runc` actually starts on the enclave kernel before relying on it. Static build-side check: `CHECK_SYSBOX=1 ./test/boot-smoke-test.sh <img>`.
+- **Measurement**: enabling Sysbox changes the rootfs/initrd measurements → regenerate reference values (see #19).
+
 ## Local boot smoke test
 Before uploading an image to GCP, sanity-check that it actually boots, locally, without a real Confidential VM:
 ```bash
