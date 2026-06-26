@@ -10,7 +10,33 @@
 
 ---
 
-## 0. Preparation: building the base Ubuntu image
+## 0. Preparation
+
+### 0.1 Build / conversion host
+
+`cryptpilot-convert` is packaged only for **Anolis / Alibaba Cloud Linux 3 (al8)**, so the conversion must run on such a host (e.g. an Alibaba Cloud ECS running Alibaba Cloud Linux 3, or an Anolis 8 VM). A plain Ubuntu/macOS host cannot run `cryptpilot-convert`.
+
+On that host:
+
+```bash
+# 1) cryptpilot-convert itself (host tool), from the openanolis/cryptpilot v0.7.0 release:
+#    https://github.com/openanolis/cryptpilot/releases/tag/v0.7.0
+sudo rpm -i cryptpilot-fde-0.7.0-1.al8.x86_64.rpm     # provides /usr/bin/cryptpilot-convert
+
+# 2) host tooling used by the build scripts
+sudo dnf install -y libguestfs-tools qemu-img         # guestfish, virt-customize, qemu-img, qemu-nbd
+sudo modprobe nbd max_part=16
+export LIBGUESTFS_BACKEND=direct                       # required for libguestfs in this environment
+# docker is only needed for the local boot smoke test (test/boot-smoke-test.sh)
+```
+
+Run the build as **root** (libguestfs direct backend + nbd + chroot in convert).
+
+Materials to place in `gcp-cvm/` (gitignored binaries, not committed):
+- `cryptpilot-fde_0.7.0_amd64.deb` — the FDE **runtime installed into the target Ubuntu image** (passed via `--package`). From the same [v0.7.0 release](https://github.com/openanolis/cryptpilot/releases/tag/v0.7.0). Note this is the `.deb` for the *target image*, distinct from the `.al8.rpm` for the *host* above.
+- `tapp-server` — pulled automatically from the 0g-tapp v0.1.0 release by `build-gcp-tapp.sh`, or supply a local one via `TAPP_SERVER_BIN=<path>`.
+
+### 0.2 Base Ubuntu image
 
 The input to the build pipeline below is a base image produced **reproducibly from the official Ubuntu cloud image**: the official Ubuntu 24.04 (noble) cloud image, resized to 20 GiB, with the GCP gVNIC network driver installed (required for GCP Confidential VMs). Build it from the official image with the steps below — do not rely on any pre-built/opaque base blob, so the whole image stays reproducible and attestable.
 
@@ -21,8 +47,8 @@ Resize the root partition to 20 GiB (the stock cloud image ships a ~3.5 GiB disk
 ```bash
 qemu-img resize noble-server-cloudimg-amd64.img 20G
 # grow the in-image partition table + filesystem in place (keeps sda1/sda16 numbering)
-sudo growpart /dev/sda 1     # run against the attached image, e.g. via virt-customize --run-command
-sudo resize2fs /dev/sda1
+sudo virt-customize -a noble-server-cloudimg-amd64.img \
+  --run-command 'growpart /dev/sda 1 && resize2fs /dev/sda1'
 ```
 
 Prepare the Ubuntu image for a GCP Confidential VM (install the gVNIC driver):

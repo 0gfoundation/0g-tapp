@@ -11,10 +11,28 @@ Build a bootable, measurable, remotely-attestable, security-hardened cryptpilot 
 | `fix-esp-grub.sh` | Sync the ESP grub only (fix B, can be run standalone against an already-converted image) |
 | `test/boot-smoke-test.sh` | **Local boot smoke test**: boots a converted image under QEMU/OVMF (no real GCP CVM needed) and checks the boot chain reaches multi-user / tapp-server |
 | `config_dir/` | cryptpilot convert config (`fde.toml`, `rw_overlay="ram"`) |
-| `cryptpilot-fde_0.7.0_amd64.deb` | FDE package (provides cryptpilot-convert + runtime). **Binary, gitignored**, must be placed locally in this directory |
+| `cryptpilot-fde_0.7.0_amd64.deb` | FDE **runtime installed into the target image**. **Binary, gitignored**, must be placed locally in this directory (see Prerequisites) |
 
 > The artifact `gcp-tapp.qcow2` (~6G, converted / verity-sealed / hardened) is the **output** of `build-gcp-tapp.sh` and is not committed (gitignored).
 > The same applies to `cryptpilot-fde_*.deb` and the tapp-server binary: the deb must be placed locally in this directory; tapp-server is pulled by default from GitHub release v0.1.0 (see below).
+
+## Prerequisites
+- **Conversion host = Anolis / Alibaba Cloud Linux 3 (al8).** `cryptpilot-convert` is only packaged for al8; a plain Ubuntu/macOS host cannot run it.
+- Install the host tool and dependencies (run the build as **root**):
+  ```bash
+  # cryptpilot-convert (host tool), from openanolis/cryptpilot v0.7.0 release:
+  #   https://github.com/openanolis/cryptpilot/releases/tag/v0.7.0
+  sudo rpm -i cryptpilot-fde-0.7.0-1.al8.x86_64.rpm     # provides /usr/bin/cryptpilot-convert
+  sudo dnf install -y libguestfs-tools qemu-img          # guestfish, virt-customize, qemu-img, qemu-nbd
+  sudo modprobe nbd max_part=16
+  export LIBGUESTFS_BACKEND=direct
+  # docker is only needed for test/boot-smoke-test.sh
+  ```
+- Place into this directory (gitignored binaries):
+  - `cryptpilot-fde_0.7.0_amd64.deb` — the FDE runtime for the **target image**, from the same [v0.7.0 release](https://github.com/openanolis/cryptpilot/releases/tag/v0.7.0) (the `.deb`, distinct from the host `.al8.rpm`).
+  - `tapp-server` is optional locally — pulled from the 0g-tapp v0.1.0 release by default, or set `TAPP_SERVER_BIN=<path>`.
+
+See `cryptpilot-gcp-boot-fix.md` §0.1 for details.
 
 ## One-shot build
 ```bash
