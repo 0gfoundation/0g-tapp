@@ -95,10 +95,10 @@ done
 
 if [ -n "$SOCKET_PATH" ]; then
     TARGET_ADDRESS="$SOCKET_PATH"
-    GRPCURL_TRANSPORT=(-unix -plaintext "$SOCKET_PATH")
+    GRPCURL_TRANSPORT=(-unix -plaintext)
 else
     TARGET_ADDRESS="$TARGET_HOST:$TARGET_PORT"
-    GRPCURL_TRANSPORT=(-plaintext "$TARGET_ADDRESS")
+    GRPCURL_TRANSPORT=(-plaintext)
 fi
 
 # Apply defaults
@@ -175,6 +175,7 @@ response=$(grpcurl "${GRPCURL_TRANSPORT[@]}" \
         \"key_type\": \"$KEY_TYPE\",
         \"x25519\": \"$X25519\"
     }" \
+    "$TARGET_ADDRESS" \
     tapp_service.TappService/GetAppKey 2>&1)
 
 # Check if request was successful

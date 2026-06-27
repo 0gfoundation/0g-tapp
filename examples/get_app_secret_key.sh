@@ -98,10 +98,10 @@ done
 
 if [ -n "$SOCKET_PATH" ]; then
     TARGET_ADDRESS="$SOCKET_PATH"
-    GRPCURL_TRANSPORT=(-unix -plaintext "$SOCKET_PATH")
+    GRPCURL_TRANSPORT=(-unix -plaintext)
 else
     TARGET_ADDRESS="$TARGET_HOST:$TARGET_PORT"
-    GRPCURL_TRANSPORT=(-plaintext "$TARGET_ADDRESS")
+    GRPCURL_TRANSPORT=(-plaintext)
 fi
 
 # Validate app ID
@@ -274,6 +274,7 @@ response=$(printf "%s" "$request_json" | tr -d '\n' | \
         -import-path "$SCRIPT_DIR/../proto" \
         -proto tapp_service.proto \
         -d @ \
+        "$TARGET_ADDRESS" \
         tapp_service.TappService/GetAppSecretKey 2>&1)
 exit_code=$?
 set -e
