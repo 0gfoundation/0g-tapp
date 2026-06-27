@@ -7,6 +7,10 @@ format = "json" # Log format: "json" or "pretty"
 
 [server]
 bind_address = "0.0.0.0:50051"
+# Unix socket path — when set, the server listens on this Unix domain socket
+# instead of TCP. Recommended for local key retrieval: Docker containers mount
+# the socket file instead of using extra_hosts: host.docker.internal:host-gateway.
+# unix_socket_path = "/run/tapp/tapp.sock"
 max_connections = 1000
 request_timeout_seconds = 30
 tls_enabled = false

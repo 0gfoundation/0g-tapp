@@ -339,9 +339,41 @@ tapp-cli -k 0x<owner-key> revoke-invalidator-onchain \
 
 When `[kms]` is configured, apps running inside the TEE can retrieve a hardware-independent, KMS-derived secret via the `GetSecretResource` gRPC call. This call is **local access only** (localhost / same-host Docker network).
 
+### Recommended: Unix Socket
+
+Set `unix_socket_path` in the server config to avoid exposing a TCP port for local key retrieval. Docker containers mount the socket file instead of using `extra_hosts: host.docker.internal:host-gateway`.
+
+```toml
+[server]
+unix_socket_path = "/run/tapp/tapp.sock"
+```
+
+```yaml
+# docker-compose.yml for the app container
+services:
+  app:
+    volumes:
+      - /run/tapp/tapp.sock:/run/tapp/tapp.sock
+```
+
 ```bash
-# From inside the TEE or a local container:
-grpcurl -plaintext -d '{"app_id": "my-app"}' localhost:50051 tapp.TappService/GetSecretResource
+# From inside the container or on the host:
+grpcurl -unix -d '{"app_id": "my-app"}' /run/tapp/tapp.sock tapp_service.TappService/GetSecretResource
+```
+
+### Fallback: TCP
+
+If Unix sockets are not available, the server listens on `bind_address` (default `0.0.0.0:50051`). Docker containers need `extra_hosts` to reach the host:
+
+```yaml
+services:
+  app:
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+```
+
+```bash
+grpcurl -plaintext -d '{"app_id": "my-app"}' host.docker.internal:50051 tapp_service.TappService/GetSecretResource
 ```
 
 The returned `secret` bytes are the HKDF-derived app key from the KMS cluster, decrypted inside the TEE. The KMS authenticates the request by verifying the TEE node's on-chain registered `signerAddress`.

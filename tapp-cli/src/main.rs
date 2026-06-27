@@ -10,12 +10,49 @@ use tapp_common::proto::{
 };
 use tonic::{metadata::MetadataValue, Request};
 
+/// Create a gRPC client from a server address.
+/// Supports:
+/// - TCP: `http://host:port`
+/// - Unix socket: `/path/to/socket` or `unix:///path/to/socket`
+async fn create_client(
+    server: &str,
+) -> Result<TappServiceClient<tonic::transport::Channel>, Box<dyn std::error::Error>> {
+    use hyper_util::rt::TokioIo;
+    use tower::service_fn;
+
+    // Detect Unix socket: absolute path or unix:// prefix
+    let unix_path = if server.starts_with('/') {
+        Some(server.to_string())
+    } else if let Some(rest) = server.strip_prefix("unix://") {
+        // unix:///path or unix://path
+        let path = rest.trim_start_matches('/');
+        Some(format!("/{}", path))
+    } else {
+        None
+    };
+
+    if let Some(path) = unix_path {
+        let channel = tonic::transport::Endpoint::from_static("http://[::]:50051")
+            .connect_with_connector(service_fn(move |_: http::Uri| {
+                let path = path.clone();
+                async move {
+                    let stream = tokio::net::UnixStream::connect(&path).await?;
+                    Ok::<_, std::io::Error>(TokioIo::new(stream))
+                }
+            }))
+            .await?;
+        Ok(TappServiceClient::new(channel))
+    } else {
+        Ok(TappServiceClient::connect(server.to_string()).await?)
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "tapp-cli")]
 #[command(about = "TAPP Service CLI - Interact with TAPP gRPC server", long_about = None)]
 #[command(version)]
 struct Cli {
-    /// gRPC server address
+    /// gRPC server address (TCP: http://host:port, Unix: /path/to/socket or unix:///path)
     #[arg(short, long, default_value = "http://127.0.0.1:50051", global = true)]
     server: String,
 
@@ -849,7 +886,7 @@ async fn start_app(
     app_id: String,
     private_key: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut client = TappServiceClient::connect(server.to_string()).await?;
+    let mut client = create_client(server).await?;
 
     // Read compose file
     let compose_content = std::fs::read_to_string(&compose_file)?;
@@ -894,7 +931,7 @@ async fn stop_app(
     app_id: String,
     private_key: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut client = TappServiceClient::connect(server.to_string()).await?;
+    let mut client = create_client(server).await?;
 
     let mut request = Request::new(StopAppRequest {
         app_id: app_id.clone(),
@@ -937,7 +974,7 @@ fn format_timestamp(timestamp: i64) -> String {
 }
 
 async fn get_task_status(server: &str, task_id: String) -> Result<(), Box<dyn std::error::Error>> {
-    let mut client = TappServiceClient::connect(server.to_string()).await?;
+    let mut client = create_client(server).await?;
 
     let request = Request::new(GetTaskStatusRequest {
         task_id: task_id.clone(),
@@ -980,7 +1017,7 @@ async fn get_task_status(server: &str, task_id: String) -> Result<(), Box<dyn st
 }
 
 async fn get_app_info(server: &str, app_id: String) -> Result<(), Box<dyn std::error::Error>> {
-    let mut client = TappServiceClient::connect(server.to_string()).await?;
+    let mut client = create_client(server).await?;
 
     let request = Request::new(GetAppInfoRequest {
         app_id: app_id.clone(),
@@ -1074,7 +1111,7 @@ async fn verify_app_cmd(
 }
 
 async fn list_apps(server: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let mut client = TappServiceClient::connect(server.to_string()).await?;
+    let mut client = create_client(server).await?;
 
     let response = client.list_apps(Request::new(ListAppsRequest {})).await?;
     let result = response.into_inner();
@@ -1107,7 +1144,7 @@ async fn get_app_logs(
     service: Option<String>,
     private_key: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut client = TappServiceClient::connect(server.to_string()).await?;
+    let mut client = create_client(server).await?;
 
     let mut request = Request::new(GetAppLogsRequest {
         app_id,
@@ -1135,7 +1172,7 @@ async fn get_app_container_status(
     app_id: String,
     private_key: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut client = TappServiceClient::connect(server.to_string()).await?;
+    let mut client = create_client(server).await?;
 
     let mut request = Request::new(GetAppContainerStatusRequest {
         app_id: app_id.clone(),
@@ -1170,7 +1207,7 @@ async fn get_app_container_status(
 }
 
 async fn get_evidence(server: &str, app_id: String) -> Result<(), Box<dyn std::error::Error>> {
-    let mut client = TappServiceClient::connect(server.to_string()).await?;
+    let mut client = create_client(server).await?;
 
     let request = Request::new(GetEvidenceRequest { app_id });
 
@@ -1191,7 +1228,7 @@ async fn get_app_key(
     key_type: String,
     x25519: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut client = TappServiceClient::connect(server.to_string()).await?;
+    let mut client = create_client(server).await?;
 
     let request = Request::new(GetAppKeyRequest {
         app_id: app_id.clone(),
@@ -1235,7 +1272,7 @@ async fn get_app_secret_key(
     json_output: bool,
     x25519: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut client = TappServiceClient::connect(server.to_string()).await?;
+    let mut client = create_client(server).await?;
 
     let request = Request::new(GetAppSecretKeyRequest {
         app_id: app_id.clone(),
@@ -1289,7 +1326,7 @@ async fn get_secret_resource(
     server: &str,
     app_id: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut client = TappServiceClient::connect(server.to_string()).await?;
+    let mut client = create_client(server).await?;
 
     let request = Request::new(GetSecretResourceRequest {
         app_id: app_id.clone(),
@@ -1326,7 +1363,7 @@ async fn start_service(
     pull: bool,
     private_key: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut client = TappServiceClient::connect(server.to_string()).await?;
+    let mut client = create_client(server).await?;
 
     let mut request = Request::new(StartServiceRequest {
         app_id: app_id.clone(),
@@ -1369,7 +1406,7 @@ async fn stop_service(
     service_name: String,
     private_key: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut client = TappServiceClient::connect(server.to_string()).await?;
+    let mut client = create_client(server).await?;
 
     let mut request = Request::new(StopServiceRequest {
         app_id: app_id.clone(),
@@ -1398,7 +1435,7 @@ async fn add_to_whitelist(
     address: String,
     private_key: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut client = TappServiceClient::connect(server.to_string()).await?;
+    let mut client = create_client(server).await?;
 
     let mut request = Request::new(AddToWhitelistRequest {
         evm_address: address.clone(),
@@ -1425,7 +1462,7 @@ async fn remove_from_whitelist(
     address: String,
     private_key: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut client = TappServiceClient::connect(server.to_string()).await?;
+    let mut client = create_client(server).await?;
 
     let mut request = Request::new(RemoveFromWhitelistRequest {
         evm_address: address.clone(),
@@ -1451,7 +1488,7 @@ async fn list_whitelist(
     server: &str,
     private_key: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut client = TappServiceClient::connect(server.to_string()).await?;
+    let mut client = create_client(server).await?;
 
     let mut request = Request::new(ListWhitelistRequest {});
 
@@ -1484,7 +1521,7 @@ async fn docker_login(
     password: String,
     private_key: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut client = TappServiceClient::connect(server.to_string()).await?;
+    let mut client = create_client(server).await?;
 
     let mut request = Request::new(DockerLoginRequest {
         registry: registry.unwrap_or_default(),
@@ -1513,7 +1550,7 @@ async fn docker_logout(
     registry: Option<String>,
     private_key: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut client = TappServiceClient::connect(server.to_string()).await?;
+    let mut client = create_client(server).await?;
 
     let mut request = Request::new(DockerLogoutRequest {
         registry: registry.unwrap_or_default(),
@@ -1542,11 +1579,7 @@ async fn prune_images(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use std::time::Duration;
 
-    // Use longer timeout for prune operation (5 minutes)
-    let endpoint = tonic::transport::Endpoint::from_shared(server.to_string())?
-        .timeout(Duration::from_secs(300));
-
-    let mut client = TappServiceClient::connect(endpoint).await?;
+    let mut client = create_client(server).await?;
 
     let mut request = Request::new(PruneImagesRequest { all });
 
@@ -1554,7 +1587,8 @@ async fn prune_images(
 
     println!("Pruning Docker images... (this may take a while)");
 
-    let response = client.prune_images(request).await?;
+    let response =
+        tokio::time::timeout(Duration::from_secs(300), client.prune_images(request)).await??;
     let result = response.into_inner();
 
     if result.success {
@@ -1579,7 +1613,7 @@ async fn prune_images(
 }
 
 async fn get_tapp_info(server: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let mut client = TappServiceClient::connect(server.to_string()).await?;
+    let mut client = create_client(server).await?;
 
     let request = Request::new(GetTappInfoRequest {});
 
@@ -1617,7 +1651,7 @@ async fn get_service_status(
     server: &str,
     log_lines: i32,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut client = TappServiceClient::connect(server.to_string()).await?;
+    let mut client = create_client(server).await?;
 
     let request = Request::new(GetServiceStatusRequest { log_lines });
 
@@ -1653,7 +1687,7 @@ async fn get_service_logs(
     download_full: bool,
     private_key: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut client = TappServiceClient::connect(server.to_string()).await?;
+    let mut client = create_client(server).await?;
 
     let mut request = Request::new(GetServiceLogsRequest {
         file_name: file_name.unwrap_or_default(),
@@ -1691,7 +1725,7 @@ async fn withdraw_balance(
     recipient: Option<String>,
     private_key: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut client = TappServiceClient::connect(server.to_string()).await?;
+    let mut client = create_client(server).await?;
 
     let mut request = Request::new(WithdrawBalanceRequest {
         app_id: app_id.clone(),
@@ -1792,7 +1826,7 @@ async fn fetch_signer_address(
     server: &str,
     app_id: &str,
 ) -> Result<ethers::types::Address, Box<dyn std::error::Error>> {
-    let mut client = TappServiceClient::connect(server.to_string()).await?;
+    let mut client = create_client(server).await?;
     let key_resp = client
         .get_app_key(Request::new(GetAppKeyRequest {
             app_id: app_id.to_owned(),
@@ -1818,7 +1852,7 @@ async fn fetch_app_hashes(
     app_id: &str,
 ) -> Result<(Vec<u8>, Vec<u8>, Vec<Vec<u8>>), Box<dyn std::error::Error>> {
     use tapp_common::onchain;
-    let mut client = TappServiceClient::connect(server.to_string()).await?;
+    let mut client = create_client(server).await?;
     let info_resp = client
         .get_app_info(Request::new(GetAppInfoRequest {
             app_id: app_id.to_owned(),

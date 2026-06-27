@@ -25,7 +25,7 @@ tokio = { version = "1.0", features = [
     "process",
     "signal",
 ] }
-tokio-stream = "0.1"
+tokio-stream = { version = "0.1", features = ["net"] }
 async-recursion = "1.0"
 
 # Attestation
