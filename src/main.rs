@@ -158,9 +158,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::fs::remove_file(socket_path)?;
         }
 
-        // Ensure parent directory exists
+        // Ensure parent directory exists with restrictive permissions
         if let Some(parent) = socket_path.parent() {
             std::fs::create_dir_all(parent)?;
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Ok(metadata) = std::fs::metadata(parent) {
+                    let mut perms = metadata.permissions();
+                    perms.set_mode(0o700);
+                    std::fs::set_permissions(parent, perms)?;
+                }
+            }
         }
 
         let uds = UnixListener::bind(socket_path)?;

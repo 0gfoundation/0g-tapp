@@ -358,8 +358,14 @@ services:
 
 ```bash
 # From inside the container or on the host:
-grpcurl -unix -d '{"app_id": "my-app"}' /run/tapp/tapp.sock tapp_service.TappService/GetSecretResource
+grpcurl -unix -plaintext -d '{"app_id": "my-app"}' /run/tapp/tapp.sock tapp_service.TappService/GetSecretResource
 ```
+
+> **⚠️ Security note:** The Unix socket grants access to all app keys and secret
+> resources on the server — any process that can open the socket can request any
+> app's secrets. This is safe in the standard deployment model (one tapp = one
+> owner, single trust domain) but must not be bind-mounted into untrusted or
+> multi-tenant containers.
 
 ### Fallback: TCP
 
