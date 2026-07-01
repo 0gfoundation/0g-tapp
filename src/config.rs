@@ -71,9 +71,11 @@ pub struct ServerConfig {
     pub bind_address: String,
 
     /// Unix socket path for gRPC server. When set, the server listens on this
-    /// Unix domain socket instead of TCP. This is the recommended mode for
-    /// local key retrieval — Docker containers mount the socket file instead
-    /// of using `extra_hosts: host.docker.internal:host-gateway`.
+    /// Unix domain socket IN ADDITION TO the TCP `bind_address` (not instead of it),
+    /// so remote clients keep using TCP while same-host clients can use the socket.
+    /// This is the recommended path for local key retrieval — a Docker container
+    /// mounts the socket file instead of using `extra_hosts:
+    /// host.docker.internal:host-gateway`.
     ///
     /// Example: "/run/tapp/tapp.sock"
     #[serde(default)]

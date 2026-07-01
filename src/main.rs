@@ -147,11 +147,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let layer = ServiceBuilder::new().layer(auth_layer).into_inner();
 
-    let server = Server::builder()
-        .layer(layer)
-        .add_service(TappServiceServer::new(service));
+    let grpc = TappServiceServer::new(service);
 
-    // Decide transport: Unix socket if configured, otherwise TCP
+    // Always serve TCP on bind_address. When unix_socket_path is set, ADDITIONALLY
+    // serve the same service on a Unix domain socket — so same-host clients (e.g. a
+    // Docker container fetching its key via get-app-secret-key) can use the socket
+    // while remote clients keep using TCP :50051. Both listeners share the service;
+    // each keeps its native connect-info, so remote_addr()-based local-only checks
+    // behave correctly (TCP => Some(ip), Unix socket => None).
+    let addr: SocketAddr = bind_address
+        .parse()
+        .map_err(|e| format!("Invalid bind address '{}': {}", bind_address, e))?;
+
+    info!("🌐 TAPP gRPC server listening on {}", addr);
+    let tcp_server = Server::builder()
+        .layer(layer.clone())
+        .add_service(grpc.clone())
+        .serve(addr);
+
     if let Some(ref socket_path) = config.server.unix_socket_path {
         // Clean up stale socket file from a previous run
         if socket_path.exists() {
@@ -188,15 +201,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         info!(
             socket_path = %socket_path.display(),
-            "🌐 TAPP gRPC server listening on Unix socket"
+            "🌐 TAPP gRPC server also listening on Unix socket"
         );
 
-        let incoming = UnixListenerStream::new(uds);
+        let uds_server = Server::builder()
+            .layer(layer)
+            .add_service(grpc)
+            .serve_with_incoming(UnixListenerStream::new(uds));
 
         tokio::select! {
-            result = server.serve_with_incoming(incoming) => {
+            result = tcp_server => {
                 if let Err(e) = result {
-                    error!("Server error: {}", e);
+                    error!("Server error (tcp): {}", e);
+                    std::process::exit(1);
+                }
+            }
+            result = uds_server => {
+                if let Err(e) = result {
+                    error!("Server error (unix socket): {}", e);
                     std::process::exit(1);
                 }
             }
@@ -208,14 +230,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Clean up socket file on shutdown
         let _ = std::fs::remove_file(socket_path);
     } else {
-        let addr: SocketAddr = bind_address
-            .parse()
-            .map_err(|e| format!("Invalid bind address '{}': {}", bind_address, e))?;
-
-        info!("🌐 TAPP gRPC server listening on {}", addr);
-
         tokio::select! {
-            result = server.serve(addr) => {
+            result = tcp_server => {
                 if let Err(e) = result {
                     error!("Server error: {}", e);
                     std::process::exit(1);

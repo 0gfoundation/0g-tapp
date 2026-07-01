@@ -339,9 +339,9 @@ tapp-cli -k 0x<owner-key> revoke-invalidator-onchain \
 
 When `[kms]` is configured, apps running inside the TEE can retrieve a hardware-independent, KMS-derived secret via the `GetSecretResource` gRPC call. This call is **local access only** (localhost / same-host Docker network).
 
-### Recommended: Unix Socket
+### Local key retrieval: Unix socket (recommended)
 
-Set `unix_socket_path` in the server config to avoid exposing a TCP port for local key retrieval. Docker containers mount the socket file instead of using `extra_hosts: host.docker.internal:host-gateway`.
+Set `unix_socket_path` in the server config. The server then listens on this Unix domain socket **in addition to** the TCP `bind_address` (not instead of it) — so a same-host client (e.g. a Docker container fetching its key) uses the socket, while remote clients keep using TCP. The container mounts the socket file instead of using `extra_hosts: host.docker.internal:host-gateway`.
 
 ```toml
 [server]
@@ -367,9 +367,9 @@ grpcurl -unix -plaintext -d '{"app_id": "my-app"}' /run/tapp/tapp.sock tapp_serv
 > owner, single trust domain) but must not be bind-mounted into untrusted or
 > multi-tenant containers.
 
-### Fallback: TCP
+### Remote / TCP access
 
-If Unix sockets are not available, the server listens on `bind_address` (default `0.0.0.0:50051`). Docker containers need `extra_hosts` to reach the host:
+The server always listens on `bind_address` (default `0.0.0.0:50051`) for remote clients (management, on-chain `teeUrl`, verify-app) — the Unix socket above is additional, not a replacement. A container reaching the server over TCP instead of the socket needs `extra_hosts`:
 
 ```yaml
 services:
