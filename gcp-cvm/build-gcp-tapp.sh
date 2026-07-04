@@ -21,15 +21,24 @@ OWNER_ADDRESS="${OWNER_ADDRESS:-}"   # REQUIRED: tapp-server owner address (0x..
 KBS_URLS="${KBS_URLS:-}"             # REQUIRED: KBS node URLs for [kbs] node_urls, comma-separated and quoted, e.g. KBS_URLS='"http://host1:9091", "http://host2:9091"'
 DNS_FALLBACK="${DNS_FALLBACK:-8.8.8.8 8.8.4.4 1.1.1.1}"
 HARDEN="${HARDEN:-1}"                                   # 1=hardened (purge Tier1/2 + mask getty + replace netplan); 0=dev
+# Docker version pin. Current docker-ce (28+/29+) breaks Sysbox: Docker 28+ emits the Linux time
+# namespace in the OCI spec, which sysbox-runc rejects ("namespace ... does not exist"), and calls
+# `sysbox-runc features` (unsupported) on startup. Nestybox officially supports Docker 20.10-27.x.
+# Pin to the last 27.x; set DOCKER_VERSION="" to install the (unpinned) repo default instead.
+DOCKER_VERSION="${DOCKER_VERSION:-5:27.5.1-1~ubuntu.24.04~noble}"
+# Container storage is ALWAYS pinned off the RAM rootfs (rw_overlay="ram") onto the persistent /data
+# disk -- this is independent of Sysbox. Two stores must be moved: docker's data-root (metadata)
+# and containerd's root (image layers/snapshots; docker-ce defaults to the containerd image store).
+# The /data disk is provisioned per-instance at deploy time (attach a disk, mkfs.ext4 -L tapp-data);
+# docker + containerd wait for it and fail loud if it is absent (never write to the RAM root).
+DATA_ROOT="${DATA_ROOT:-/data/docker}"                 # docker data-root (metadata/volumes/buildkit)
+CONTAINERD_ROOT="${CONTAINERD_ROOT:-/data/containerd}" # containerd root (image layers + snapshots)
 # Sysbox (issue #21): hostile-multi-tenant container isolation (sysbox-runc). Opt-in; default OFF.
-# When ON: installs sysbox-ce, registers sysbox-runc as a dockerd runtime, and pins docker
-# data-root to a persistent /data disk (the RAM rootfs overlay is ephemeral + RAM-capped, so
-# docker/sysbox data MUST NOT live on it). The /data disk is provisioned per-instance at deploy
-# time (attach a disk, format ext4, label "tapp-data"); docker will not start until it is mounted.
+# When ON: installs sysbox-ce and registers sysbox-runc as a dockerd runtime (storage pinning above
+# happens regardless). Requires Docker <=27.x (see DOCKER_VERSION).
 ENABLE_SYSBOX="${ENABLE_SYSBOX:-0}"
-SYSBOX_VERSION="${SYSBOX_VERSION:-0.6.5}"
+SYSBOX_VERSION="${SYSBOX_VERSION:-0.7.0}"
 SYSBOX_DEB_URL="${SYSBOX_DEB_URL:-https://downloads.nestybox.com/sysbox/releases/v${SYSBOX_VERSION}/sysbox-ce_${SYSBOX_VERSION}-0.linux_amd64.deb}"
-DATA_ROOT="${DATA_ROOT:-/data/docker}"                 # docker data-root when ENABLE_SYSBOX=1 (must be on the persistent /data disk)
 # passed through to prepare-gcp-tapp.sh (used by convert)
 export CONFIG_DIR="${CONFIG_DIR:-$HERE/config_dir}"
 export FDE_PACKAGE="${FDE_PACKAGE:-$HERE/cryptpilot-fde_0.7.0_amd64.deb}"
@@ -105,10 +114,17 @@ EOF
 printf '[Resolve]\nFallbackDNS=%s\n' "$DNS_FALLBACK" > "$TMPD/99-fallback-dns.conf"
 
 # ---- base provisioning script run inside the guest ----
-cat > "$TMPD/provision-base.sh" <<'EOF'
+# preamble: interpolate host-side tunables into the guest script (unquoted heredoc)
+cat > "$TMPD/provision-base.sh" <<EOF
 #!/bin/bash
 set -e
 export DEBIAN_FRONTEND=noninteractive
+DOCKER_VERSION="$DOCKER_VERSION"
+DATA_ROOT="$DATA_ROOT"
+CONTAINERD_ROOT="$CONTAINERD_ROOT"
+EOF
+# main body (quoted heredoc: no host-side interpolation; uses the vars set above)
+cat >> "$TMPD/provision-base.sh" <<'EOF'
 apt-get update
 apt-get install -y curl gnupg ca-certificates
 install -d -m0755 /etc/apt/keyrings
@@ -123,9 +139,131 @@ curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
 echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu noble stable" \
   > /etc/apt/sources.list.d/docker.list
 apt-get update
-apt-get install -y libtdx-attest docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+# Pin Docker to a Sysbox-compatible release (see DOCKER_VERSION note in the caller). Empty
+# DOCKER_VERSION -> install the unpinned repo default.
+if [ -n "${DOCKER_VERSION:-}" ]; then
+  DOCKER_PKGS="docker-ce=$DOCKER_VERSION docker-ce-cli=$DOCKER_VERSION containerd.io docker-buildx-plugin docker-compose-plugin"
+else
+  DOCKER_PKGS="docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin"
+fi
+apt-get install -y libtdx-attest $DOCKER_PKGS
 mkdir -p /var/log/tapp
 systemctl enable docker tapp-server
+
+# ---- pin container storage OFF the ephemeral RAM rootfs (rw_overlay="ram") -- UNCONDITIONAL ----
+# The cryptpilot writable rootfs overlay is RAM-backed and RAM-capped, so container state MUST NOT
+# accumulate on "/". Independent of Sysbox. Two distinct stores must both move to the /data disk:
+#   - docker's data-root : metadata, volumes, buildkit                              -> $DATA_ROOT
+#   - containerd's root  : image layers + snapshots (docker-ce defaults to the      -> $CONTAINERD_ROOT
+#                          containerd image store, so layers live here, NOT data-root)
+# docker + containerd must wait for /data and FAIL LOUD if absent (never write to the RAM root).
+mkdir -p /data /etc/docker /etc/containerd
+printf '%s\n' '{' "  \"data-root\": \"$DATA_ROOT\"" '}' > /etc/docker/daemon.json
+containerd config default > /etc/containerd/config.toml
+sed -i "s|^root = .*|root = \"$CONTAINERD_ROOT\"|" /etc/containerd/config.toml
+mkdir -p /etc/systemd/system/docker.service.d /etc/systemd/system/containerd.service.d
+printf '%s\n' '[Unit]' 'RequiresMountsFor=/data' > /etc/systemd/system/docker.service.d/10-data-mount.conf
+printf '%s\n' '[Unit]' 'RequiresMountsFor=/data' > /etc/systemd/system/containerd.service.d/10-data-mount.conf
+# fstab: nofail so a missing/blank /data disk NEVER blocks boot (a non-nofail mount failure drops the
+# whole system into emergency mode -> no network/SSH). With nofail only docker/containerd fail loud
+# (RequiresMountsFor). x-systemd.requires pulls the provisioner first. device-timeout must comfortably
+# exceed the provisioner's first-boot mkfs time: on a blank disk the by-label device only appears AFTER
+# tapp-data-provision formats it, and the .device wait (which starts early in boot) must not expire
+# before then, or data.mount fails on first boot. 60s >> the few seconds mkfs needs; it only ever
+# delays boot in the (misconfigured) no-data-disk case, where nofail then lets boot proceed anyway.
+grep -q 'LABEL=tapp-data' /etc/fstab || printf '%s\n' 'LABEL=tapp-data /data ext4 defaults,nofail,x-systemd.device-timeout=60s,x-systemd.requires=tapp-data-provision.service 0 2' >> /etc/fstab
+
+# Auto-provision /data on first boot with NO SSH: if no tapp-data filesystem exists yet, auto-mkfs a
+# truly-blank, non-boot whole disk as tapp-data. SAFE: only ever formats a real disk (sd*/nvme*/vd*)
+# that is NOT the boot disk, has NO partitions, and carries NO existing signature at all; with zero
+# or more-than-one such candidates it refuses to guess. An operator-preformatted tapp-data disk is
+# detected and used as-is. Idempotent.
+cat > /usr/local/sbin/tapp-data-provision.sh <<'PROVSH'
+#!/bin/bash
+set -u
+udevadm settle 2>/dev/null || true
+# already have a tapp-data fs (formatted on an earlier boot, or operator-provided)? done.
+blkid -L tapp-data >/dev/null 2>&1 && exit 0
+# the boot disk carries the ESP (UEFI label) -- never touch it
+esp="$(blkid -L UEFI 2>/dev/null)" || true
+bootdisk=""
+[ -n "${esp:-}" ] && bootdisk="$(lsblk -no pkname "$esp" 2>/dev/null | head -1)"
+# collect truly-blank candidate disks
+cands=()
+while read -r name type; do
+  [ "$type" = disk ] || continue
+  case "$name" in sd*|nvme*|vd*) ;; *) continue ;; esac                            # real disks only (skip zram/loop/dm/sr)
+  [ "$name" = "$bootdisk" ] && continue                                            # never the boot disk
+  [ -n "$(lsblk -rno NAME "/dev/$name" 2>/dev/null | tail -n +2)" ] && continue    # must have no partitions
+  [ -n "$(blkid -p -o value "/dev/$name" 2>/dev/null)" ] && continue               # must carry no signature
+  cands+=("/dev/$name")
+done < <(lsblk -dno NAME,TYPE 2>/dev/null)
+if [ "${#cands[@]}" -eq 1 ]; then
+  mkfs.ext4 -q -F -L tapp-data "${cands[0]}"
+  echo "tapp-data-provision: formatted ${cands[0]} as LABEL=tapp-data"
+elif [ "${#cands[@]}" -eq 0 ]; then
+  echo "tapp-data-provision: no blank data disk found; /data stays unmounted (docker will fail loud)" >&2
+else
+  echo "tapp-data-provision: multiple blank disks (${cands[*]}); refusing to guess, not formatting" >&2
+fi
+PROVSH
+chmod 0755 /usr/local/sbin/tapp-data-provision.sh
+cat > /etc/systemd/system/tapp-data-provision.service <<'PROVUNIT'
+[Unit]
+Description=Auto-provision /data (carve from boot-disk free space if no tapp-data fs exists)
+After=systemd-udev-settle.service
+Wants=systemd-udev-settle.service
+Before=data.mount
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/tapp-data-provision.sh
+PROVUNIT
+
+# Auto-grow /data to fill its disk on boot. A hardened image has no SSH and no cloud-init/growpart,
+# so an oversized persistent disk would otherwise strip nothing back -- the extra space is wasted
+# forever. This oneshot resizes the /data ext4 online to consume the whole device (idempotent;
+# no-op once full), so operators can attach an arbitrarily large /data disk and it is fully used.
+# NOTE: the BOOT disk is NOT grown -- the rootfs is verity + RAM overlay, so extra boot-disk space
+# is unusable by design; size the boot disk ~= the image and put capacity on the /data disk.
+cat > /usr/local/sbin/tapp-data-grow.sh <<'GROWSH'
+#!/bin/bash
+# grow the ext4 fs mounted at /data to fill its backing device (online resize; idempotent)
+set -u
+dev="$(findmnt -no SOURCE /data 2>/dev/null)" || exit 0
+[ -n "$dev" ] || exit 0
+dev="$(readlink -f "$dev")"
+# if /data lives on a partition (not a whole disk), grow the partition first -- best-effort,
+# needs growpart (cloud-guest-utils), which the hardened image does not ship; whole-disk ext4
+# (the documented deploy: mkfs.ext4 -L tapp-data on the raw disk) needs no growpart.
+base=""; partnum=""
+[[ "$dev" =~ ^(/dev/nvme[0-9]+n[0-9]+)p([0-9]+)$ ]] && { base="${BASH_REMATCH[1]}"; partnum="${BASH_REMATCH[2]}"; }
+[[ "$dev" =~ ^(/dev/[sv]d[a-z]+)([0-9]+)$ ]]        && { base="${BASH_REMATCH[1]}"; partnum="${BASH_REMATCH[2]}"; }
+if [ -n "$base" ]; then
+  if command -v growpart >/dev/null 2>&1; then growpart "$base" "$partnum" || true; partprobe "$base" 2>/dev/null || true
+  else echo "tapp-data-grow: $dev is a partition but growpart is unavailable; only the filesystem will be resized" >&2; fi
+fi
+resize2fs "$dev" || true
+GROWSH
+chmod 0755 /usr/local/sbin/tapp-data-grow.sh
+cat > /etc/systemd/system/tapp-data-grow.service <<'GROWUNIT'
+[Unit]
+Description=Grow the /data filesystem to fill its disk (no-SSH auto-expand)
+After=data.mount
+Requires=data.mount
+Before=docker.service containerd.service
+ConditionPathIsMountPoint=/data
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/tapp-data-grow.sh
+
+[Install]
+WantedBy=multi-user.target
+GROWUNIT
+systemctl enable tapp-data-grow.service || true
 EOF
 
 # ===== Hardening (appended when HARDEN=1): remove software that can bypass tapp and mutate the environment (Tier1+Tier2, audit in doc §11) =====
@@ -176,27 +314,35 @@ fi
 
 # ===== Sysbox (issue #21, Phase 1: container isolation; opt-in) =====
 if [ "$ENABLE_SYSBOX" = 1 ]; then
-  echo "==> [sysbox] ENABLE_SYSBOX=1: install sysbox-ce $SYSBOX_VERSION, register sysbox-runc, pin docker data-root to $DATA_ROOT"
-  # NOTE: heredoc is unquoted so $SYSBOX_DEB_URL / $DATA_ROOT are interpolated here (host side).
+  echo "==> [sysbox] ENABLE_SYSBOX=1: install sysbox-ce $SYSBOX_VERSION, register sysbox-runc runtime"
+  # NOTE: heredoc is unquoted so $SYSBOX_DEB_URL is interpolated here (host side).
   cat >> "$TMPD/provision-base.sh" <<EOF
 # --- Sysbox: hostile-multi-tenant container isolation (sysbox-runc, userns remap) ---
+# Only the runtime registration is gated behind ENABLE_SYSBOX; the /data storage pinning above is
+# unconditional. Requires Docker <=27.x (pinned above) -- sysbox-runc rejects the Linux time
+# namespace that Docker 28+/29+ emits in the OCI spec.
 export DEBIAN_FRONTEND=noninteractive
-apt-get install -y jq rsync fuse || true
+# fuse3 (not fuse/fuse2): sysbox-fs 0.7.0 uses libfuse3 and needs `fusermount3` to mount its
+# per-container FUSE fs, else container launch fails with "fusermount3: not found / FuseServer InitWait".
+apt-get install -y jq rsync fuse3 || true
 wget -qO /tmp/sysbox-ce.deb "$SYSBOX_DEB_URL"
 dpkg -i /tmp/sysbox-ce.deb || apt-get -f install -y
 rm -f /tmp/sysbox-ce.deb
 systemctl enable sysbox.service || true
-# docker daemon.json: data-root on the persistent /data disk (the cryptpilot RAM rootfs overlay is
-# ephemeral + RAM-capped, so docker/sysbox state MUST NOT live on it), plus sysbox-runc runtime.
-# Written AFTER the sysbox deb so it wins over the deb's own daemon.json edits.
-mkdir -p /etc/docker
-printf '%s\n' '{' '  "data-root": "$DATA_ROOT",' '  "runtimes": { "sysbox-runc": { "path": "/usr/bin/sysbox-runc" } }' '}' > /etc/docker/daemon.json
-# /data is a per-instance persistent disk; docker must wait for it and FAIL LOUD if absent
-# (never silently fall back to the RAM root). Deploy step: attach a disk, mkfs.ext4 -L tapp-data.
-mkdir -p /data
-mkdir -p /etc/systemd/system/docker.service.d
-printf '%s\n' '[Unit]' 'RequiresMountsFor=/data' > /etc/systemd/system/docker.service.d/10-data-mount.conf
-grep -q 'LABEL=tapp-data' /etc/fstab || printf '%s\n' 'LABEL=tapp-data /data ext4 defaults 0 2' >> /etc/fstab
+# Keep sysbox's data store off the RAM rootfs: it holds per-container state AND inner-container
+# images (docker-in-sysbox), which would otherwise pile onto "/". Relocate sysbox-mgr --data-root
+# to /data via a drop-in that preserves the vendor ExecStart args, and make it wait for /data too.
+sbx_unit="\$(ls /lib/systemd/system/sysbox-mgr.service /usr/lib/systemd/system/sysbox-mgr.service 2>/dev/null | head -1)"
+if [ -n "\$sbx_unit" ]; then
+  mkdir -p /data/sysbox /etc/systemd/system/sysbox-mgr.service.d
+  sbx_exec="\$(sed -n 's/^ExecStart=//p' "\$sbx_unit" | head -1)"
+  printf '%s\n' '[Unit]' 'RequiresMountsFor=/data' '[Service]' 'ExecStart=' "ExecStart=\$sbx_exec --data-root /data/sysbox" \
+    > /etc/systemd/system/sysbox-mgr.service.d/10-data-root.conf
+fi
+# Merge the sysbox-runc runtime into the existing daemon.json (which already pins data-root),
+# preserving it. Written AFTER the sysbox deb so it wins over the deb's own daemon.json edits.
+tmp_dj="\$(mktemp)"
+jq '.runtimes."sysbox-runc" = {"path": "/usr/bin/sysbox-runc"}' /etc/docker/daemon.json > "\$tmp_dj" && mv "\$tmp_dj" /etc/docker/daemon.json
 EOF
 fi
 chmod +x "$TMPD/provision-base.sh"

@@ -45,19 +45,31 @@ KBS_URLS='"http://<kbs-host-1>:9091", "http://<kbs-host-2>:9091"' \
   - `OWNER_ADDRESS` — tapp-server owner address, written to `config.toml` `[server.permission]`.
   - `KBS_URLS` — KBS node URLs for `[kbs] node_urls`, comma-separated and quoted as shown.
 - tapp-server is downloaded by default from GitHub v0.1.0 (includes the guest-components `8d71a3b4` fix, RTMR OK); if you have it locally, set `TAPP_SERVER_BIN=<path>`.
+- Storage / Sysbox knobs: `DATA_ROOT` (docker data-root, default `/data/docker`), `CONTAINERD_ROOT` (default `/data/containerd`), `DOCKER_VERSION` (default `5:27.5.1-…noble`; empty = repo default), `ENABLE_SYSBOX` / `SYSBOX_VERSION` (default `0.7.0`).
 - Other environment variables: `DNS_FALLBACK` `PURGE_KERNEL` `CONFIG_DIR` `FDE_PACKAGE` `ROOTFS_MODE` `IN_PLACE` `INSTALL_KERNEL` `NBD_RESET` (see the top of the script).
 
+## Persistent data disk (`/data`) — always configured
+The cryptpilot rootfs writable overlay is **RAM-backed (zram) and ephemeral** — anything written to `/` lives in RAM and is lost on reboot. So all persistent container state is pinned off the root onto a separate **`/data`** disk. This is **unconditional** (independent of Sysbox); every image does it:
+
+- **docker `data-root` → `/data/docker`** *and* **containerd `root` → `/data/containerd`** — both, because current docker-ce keeps image layers under containerd's root, which moving `data-root` alone does **not** cover. Configurable via `DATA_ROOT` / `CONTAINERD_ROOT`.
+- `docker.service` + `containerd.service` get `RequiresMountsFor=/data` → they **fail loud** (won't start) if `/data` is missing, never silently writing to the RAM root.
+- fstab mounts `LABEL=tapp-data` at `/data` with **`nofail`** (+ `x-systemd.device-timeout=60s`). A missing/blank data disk therefore does **not** brick boot — without `nofail` a failed `/data` mount drops the whole system into **emergency mode → no SSH**; with it, only docker/containerd stay down.
+
+**Two-disk deploy model:**
+- **Boot disk = the image size (~20 GB). Do not oversize it.** The writable layer is RAM (zram, bounded by *instance memory*) and the rootfs is read-only verity, so extra boot-disk space is unreachable and wasted. Want more writable capacity → give the instance more **RAM**, not a bigger boot disk.
+- **Attach one persistent disk for `/data`** (any size; detach / snapshot / migrate it independently). **No manual formatting needed**: on first boot the image **auto-`mkfs.ext4 -L tapp-data`** a truly-blank non-boot disk (safe — only a real disk with no partitions and no signature, and only when exactly one such candidate exists; otherwise it refuses to guess), then mounts and **auto-grows** (`resize2fs`) it to fill the disk. So *attach a blank disk of any size → it becomes `/data`, no SSH, no reboot.* A disk pre-formatted `-L tapp-data` is detected and used as-is.
+- **`/data` confidentiality is Phase 2.** Today `/data` is plaintext ext4 relying on GCP's default at-rest encryption (Google-managed keys), which does **not** protect against the cloud operator. Phase 2 binds it to a KBS/attestation key (mount-layer dm-crypt, no image change). Do not treat Phase 1 `/data` as confidential vs the host.
+
 ## Multi-tenant container isolation — Sysbox (issue #21, opt-in)
-For hostile-multi-tenant workloads (e.g. 0g-sandbox), build with `ENABLE_SYSBOX=1` to install [Sysbox](https://github.com/nestybox/sysbox) and register `sysbox-runc` as a dockerd runtime so in-container `root` is user-namespace-remapped (a kernel CVE in a sandbox is no longer host-equivalent):
+For hostile-multi-tenant workloads (e.g. 0g-sandbox), build with `ENABLE_SYSBOX=1` to install [Sysbox](https://github.com/nestybox/sysbox) and register `sysbox-runc` as a dockerd runtime, so in-container `root` is user-namespace-remapped (a kernel CVE in a sandbox is no longer host-equivalent):
 ```bash
 ENABLE_SYSBOX=1 OWNER_ADDRESS=0x... KBS_URLS='...' ./build-gcp-tapp.sh base.qcow2 gcp-tapp.qcow2
 ```
-This also pins docker `data-root` to **`/data/docker`** (configurable via `DATA_ROOT`). This is mandatory, not cosmetic: the cryptpilot rootfs writable overlay is **RAM-backed (zram) and ephemeral** — leaving docker/sysbox data on it would vanish on reboot and OOM the host under many image pulls. So:
-
-- **Deploy requirement**: attach a persistent disk to the instance, `mkfs.ext4 -L tapp-data`, before first boot. The image adds an fstab entry (`LABEL=tapp-data /data ext4`) and a `docker.service` drop-in `RequiresMountsFor=/data`, so **docker will not start until `/data` is mounted** (fail-loud; it never silently writes to the RAM root).
-- **Kernel**: the gcp kernel (≥5.12, `CONFIG_USER_NS=y`) supports the idmapped mounts Sysbox needs. The alinux 5.10 image does **not** (would need shiftfs).
-- **Phase 1 = isolation only.** `/data` confidentiality is deferred: it relies on GCP's default at-rest encryption (Google-managed keys), which does **not** protect against the cloud operator. Phase 2 will encrypt `/data` with a KBS/attestation-bound key (no image change, mount-layer dm-crypt). Do not treat Phase 1 `/data` as confidential vs the host.
-- **Validate on hardware**: confirm `docker info | grep sysbox-runc` and that `docker run --runtime=sysbox-runc` actually starts on the enclave kernel before relying on it. Static build-side check: `CHECK_SYSBOX=1 ./test/boot-smoke-test.sh <img>`.
+- Only the runtime registration is gated behind `ENABLE_SYSBOX`; the `/data` storage pinning above happens regardless. Sysbox's own data store is also moved off the RAM root: `sysbox-mgr --data-root` → **`/data/sysbox`** (it holds inner-container images).
+- **Docker is pinned to 27.5.1** (`DOCKER_VERSION`). Docker 28+/29+ emit the Linux *time namespace* in the OCI spec, which `sysbox-runc` rejects (`namespace ... does not exist`); Nestybox supports Docker 20.10–27.x only.
+- The image ships **`fuse3`** (`fusermount3`), which `sysbox-fs` 0.7.0 needs to mount its per-container FUSE fs (without it container launch fails with `FuseServer InitWait`).
+- **Kernel**: the gcp kernel (≥5.12, idmapped mounts) is supported (**6.17 verified on hardware**); the alinux 5.10 image is not (would need shiftfs).
+- **Validate on hardware**: `docker run --rm --runtime=sysbox-runc alpine cat /proc/self/uid_map` should show a remapped range (e.g. `0 100000 65536`). Static build-side check: `CHECK_SYSBOX=1 ./test/boot-smoke-test.sh <img>`.
 - **Measurement**: enabling Sysbox changes the rootfs/initrd measurements → regenerate reference values (see #19).
 
 ## Local boot smoke test
