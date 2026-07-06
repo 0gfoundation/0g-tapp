@@ -57,7 +57,11 @@ The cryptpilot rootfs writable overlay is **RAM-backed (zram) and ephemeral** �
 
 **Two-disk deploy model:**
 - **Boot disk = the image size (~20 GB). Do not oversize it.** The writable layer is RAM (zram, bounded by *instance memory*) and the rootfs is read-only verity, so extra boot-disk space is unreachable and wasted. Want more writable capacity → give the instance more **RAM**, not a bigger boot disk.
-- **Attach one persistent disk for `/data`** (any size; detach / snapshot / migrate it independently). **No manual formatting needed**: on first boot the image **auto-`mkfs.ext4 -L tapp-data`** a truly-blank non-boot disk (safe — only a real disk with no partitions and no signature, and only when exactly one such candidate exists; otherwise it refuses to guess), then mounts and **auto-grows** (`resize2fs`) it to fill the disk. So *attach a blank disk of any size → it becomes `/data`, no SSH, no reboot.* A disk pre-formatted `-L tapp-data` is detected and used as-is.
+- **Attach one persistent disk for `/data`** (any size; detach / snapshot / migrate it independently). **No manual formatting or labelling needed** — on first boot `tapp-data-provision.service` finds the single non-boot disk and:
+  - **blank disk** → `mkfs.ext4 -L tapp-data`, mount, then **auto-grow** (`resize2fs`) to fill it (fresh node);
+  - **disk that already has an ext4 filesystem** (e.g. a migrated chain-data disk) → **adopted as-is** (`e2label tapp-data`, **never reformatted** — data preserved), then mounted.
+
+  Safe: only real disks (`sd*`/`nvme*`/`vd*`), never the boot disk, never a partitioned disk; with zero or more-than-one candidate it refuses to guess (`/data` stays unmounted → docker fails loud). So *attach any single data disk — brand-new or carrying data — and it becomes `/data`, no SSH, no reboot, no `mkfs`/`e2label`.* A disk already labelled `tapp-data` short-circuits.
 - **`/data` confidentiality is Phase 2.** Today `/data` is plaintext ext4 relying on GCP's default at-rest encryption (Google-managed keys), which does **not** protect against the cloud operator. Phase 2 binds it to a KBS/attestation key (mount-layer dm-crypt, no image change). Do not treat Phase 1 `/data` as confidential vs the host.
 
 ## Multi-tenant container isolation — Sysbox (issue #21, opt-in)
@@ -68,6 +72,7 @@ ENABLE_SYSBOX=1 OWNER_ADDRESS=0x... KBS_URLS='...' ./build-gcp-tapp.sh base.qcow
 - Only the runtime registration is gated behind `ENABLE_SYSBOX`; the `/data` storage pinning above happens regardless. Sysbox's own data store is also moved off the RAM root: `sysbox-mgr --data-root` → **`/data/sysbox`** (it holds inner-container images).
 - **Docker is pinned to 27.5.1** (`DOCKER_VERSION`). Docker 28+/29+ emit the Linux *time namespace* in the OCI spec, which `sysbox-runc` rejects (`namespace ... does not exist`); Nestybox supports Docker 20.10–27.x only.
 - The image ships **`fuse3`** (`fusermount3`), which `sysbox-fs` 0.7.0 needs to mount its per-container FUSE fs (without it container launch fails with `FuseServer InitWait`).
+- **`br_netfilter`** is auto-loaded (`/etc/modules-load.d/`, baked for **all** images). Docker 28's `icc=false` bridges — created by the 0g-sandbox runner — hard-require `/proc/sys/net/bridge/bridge-nf-call-iptables`, which only exists once `br_netfilter` is loaded; a fresh CVM without it crash-loops the runner.
 - **Kernel**: the gcp kernel (≥5.12, idmapped mounts) is supported (**6.17 verified on hardware**); the alinux 5.10 image is not (would need shiftfs).
 - **Validate on hardware**: `docker run --rm --runtime=sysbox-runc alpine cat /proc/self/uid_map` should show a remapped range (e.g. `0 100000 65536`). Static build-side check: `CHECK_SYSBOX=1 ./test/boot-smoke-test.sh <img>`.
 - **Measurement**: enabling Sysbox changes the rootfs/initrd measurements → regenerate reference values (see #19).

@@ -150,6 +150,12 @@ apt-get install -y libtdx-attest $DOCKER_PKGS
 mkdir -p /var/log/tapp
 systemctl enable docker tapp-server
 
+# br_netfilter: container bridge networking with iptables -- and Docker 28's icc=false bridges (used
+# by the 0g-sandbox runner) -- hard-require /proc/sys/net/bridge/bridge-nf-call-iptables, which only
+# exists once br_netfilter is loaded. This minimal image does not autoload it, so a fresh CVM would
+# crash the runner ("bridge-nf-call-iptables: no such file"). Persist it so every boot has it.
+echo br_netfilter > /etc/modules-load.d/br_netfilter.conf
+
 # ---- pin container storage OFF the ephemeral RAM rootfs (rw_overlay="ram") -- UNCONDITIONAL ----
 # The cryptpilot writable rootfs overlay is RAM-backed and RAM-capped, so container state MUST NOT
 # accumulate on "/". Independent of Sysbox. Two distinct stores must both move to the /data disk:
@@ -173,38 +179,47 @@ printf '%s\n' '[Unit]' 'RequiresMountsFor=/data' > /etc/systemd/system/container
 # delays boot in the (misconfigured) no-data-disk case, where nofail then lets boot proceed anyway.
 grep -q 'LABEL=tapp-data' /etc/fstab || printf '%s\n' 'LABEL=tapp-data /data ext4 defaults,nofail,x-systemd.device-timeout=60s,x-systemd.requires=tapp-data-provision.service 0 2' >> /etc/fstab
 
-# Auto-provision /data on first boot with NO SSH: if no tapp-data filesystem exists yet, auto-mkfs a
-# truly-blank, non-boot whole disk as tapp-data. SAFE: only ever formats a real disk (sd*/nvme*/vd*)
-# that is NOT the boot disk, has NO partitions, and carries NO existing signature at all; with zero
-# or more-than-one such candidates it refuses to guess. An operator-preformatted tapp-data disk is
-# detected and used as-is. Idempotent.
+# Auto-provision /data on first boot with NO SSH. Find the single non-boot whole disk and:
+#   - blank (no filesystem signature)      -> mkfs.ext4 -L tapp-data     (fresh node)
+#   - already ext4 (e.g. a migrated disk)  -> e2label tapp-data          (adopt, NEVER reformat)
+# SAFE: only real disks (sd*/nvme*/vd*), never the boot disk, never a partitioned disk; with zero or
+# more-than-one candidates it refuses to guess; an existing fs is adopted (labelled), never wiped.
+# So attaching ANY single data disk -- brand-new or an old one carrying data -- just works, no SSH,
+# no manual mkfs/label. A disk already labelled tapp-data short-circuits at the top. Idempotent.
 cat > /usr/local/sbin/tapp-data-provision.sh <<'PROVSH'
 #!/bin/bash
 set -u
 udevadm settle 2>/dev/null || true
-# already have a tapp-data fs (formatted on an earlier boot, or operator-provided)? done.
+# already have a tapp-data fs (labelled on an earlier boot, or operator-provided)? done.
 blkid -L tapp-data >/dev/null 2>&1 && exit 0
 # the boot disk carries the ESP (UEFI label) -- never touch it
 esp="$(blkid -L UEFI 2>/dev/null)" || true
 bootdisk=""
 [ -n "${esp:-}" ] && bootdisk="$(lsblk -no pkname "$esp" 2>/dev/null | head -1)"
-# collect truly-blank candidate disks
+# collect candidate non-boot whole disks (no partitions)
 cands=()
 while read -r name type; do
   [ "$type" = disk ] || continue
   case "$name" in sd*|nvme*|vd*) ;; *) continue ;; esac                            # real disks only (skip zram/loop/dm/sr)
   [ "$name" = "$bootdisk" ] && continue                                            # never the boot disk
-  [ -n "$(lsblk -rno NAME "/dev/$name" 2>/dev/null | tail -n +2)" ] && continue    # must have no partitions
-  [ -n "$(blkid -p -o value "/dev/$name" 2>/dev/null)" ] && continue               # must carry no signature
+  [ -n "$(lsblk -rno NAME "/dev/$name" 2>/dev/null | tail -n +2)" ] && continue    # skip partitioned disks
   cands+=("/dev/$name")
 done < <(lsblk -dno NAME,TYPE 2>/dev/null)
-if [ "${#cands[@]}" -eq 1 ]; then
-  mkfs.ext4 -q -F -L tapp-data "${cands[0]}"
-  echo "tapp-data-provision: formatted ${cands[0]} as LABEL=tapp-data"
-elif [ "${#cands[@]}" -eq 0 ]; then
-  echo "tapp-data-provision: no blank data disk found; /data stays unmounted (docker will fail loud)" >&2
+if [ "${#cands[@]}" -eq 0 ]; then
+  echo "tapp-data-provision: no candidate data disk; /data stays unmounted (docker fails loud)" >&2; exit 0
+elif [ "${#cands[@]}" -gt 1 ]; then
+  echo "tapp-data-provision: multiple candidate disks (${cands[*]}); refusing to guess" >&2; exit 0
+fi
+dev="${cands[0]}"
+fstype="$(blkid -p -s TYPE -o value "$dev" 2>/dev/null || true)"
+if [ -z "$fstype" ]; then
+  mkfs.ext4 -q -F -L tapp-data "$dev"
+  echo "tapp-data-provision: formatted blank $dev as LABEL=tapp-data"
+elif [ "$fstype" = ext4 ]; then
+  e2label "$dev" tapp-data                                                         # adopt existing data, no reformat
+  echo "tapp-data-provision: adopted existing ext4 $dev -> LABEL=tapp-data (data preserved)"
 else
-  echo "tapp-data-provision: multiple blank disks (${cands[*]}); refusing to guess, not formatting" >&2
+  echo "tapp-data-provision: $dev has unexpected fs '$fstype'; not touching it" >&2; exit 0
 fi
 PROVSH
 chmod 0755 /usr/local/sbin/tapp-data-provision.sh
