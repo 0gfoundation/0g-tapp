@@ -22,6 +22,7 @@ DEFAULT_X25519="true"
 # Parse command line arguments
 TARGET_HOST="$DEFAULT_HOST"
 TARGET_PORT="$DEFAULT_PORT"
+SOCKET_PATH=""
 APP_ID=""
 KEY_TYPE=""
 
@@ -33,6 +34,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --port)
             TARGET_PORT="$2"
+            shift 2
+            ;;
+        --socket)
+            SOCKET_PATH="$2"
             shift 2
             ;;
         --app-id)
@@ -53,6 +58,7 @@ while [[ $# -gt 0 ]]; do
             echo "Options:"
             echo "  --host HOST             gRPC server host (default: $DEFAULT_HOST)"
             echo "  --port PORT             gRPC server port (default: $DEFAULT_PORT)"
+            echo "  --socket PATH           Unix socket path (overrides host/port)"
             echo "  --app-id APP_ID         Application ID (default: $DEFAULT_APP_ID)"
             echo "  --key-type KEY_TYPE     Key type (default: $DEFAULT_KEY_TYPE)"
             echo "  --x25519 X25519         X25519 key type (default: true)"
@@ -87,7 +93,13 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-TARGET_ADDRESS="$TARGET_HOST:$TARGET_PORT"
+if [ -n "$SOCKET_PATH" ]; then
+    TARGET_ADDRESS="$SOCKET_PATH"
+    GRPCURL_TRANSPORT=(-unix -plaintext)
+else
+    TARGET_ADDRESS="$TARGET_HOST:$TARGET_PORT"
+    GRPCURL_TRANSPORT=(-plaintext)
+fi
 
 # Apply defaults
 if [ -z "$APP_ID" ]; then
@@ -155,7 +167,7 @@ echo "Querying app key..."
 echo ""
 
 # Call gRPC service
-response=$(grpcurl -plaintext \
+response=$(grpcurl "${GRPCURL_TRANSPORT[@]}" \
     -import-path "$SCRIPT_DIR/../proto" \
     -proto tapp_service.proto \
     -d "{

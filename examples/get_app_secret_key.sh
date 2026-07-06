@@ -38,6 +38,7 @@ WHITELIST_PRIVATE_KEY="${TAPP_WHITELIST_PRIVATE_KEY:-}"
 # Parse command line arguments
 TARGET_HOST="$DEFAULT_HOST"
 TARGET_PORT="$DEFAULT_PORT"
+SOCKET_PATH=""
 APP_ID=""
 PRIVATE_KEY=""
 USE_OWNER=false
@@ -54,6 +55,10 @@ while [[ $# -gt 0 ]]; do
             TARGET_PORT="$2"
             shift 2
             ;;
+        --socket)
+            SOCKET_PATH="$2"
+            shift 2
+            ;;
         --app-id)
             APP_ID="$2"
             shift 2
@@ -68,6 +73,7 @@ while [[ $# -gt 0 ]]; do
             echo "Options:"
             echo "  --host HOST             gRPC server host (default: $DEFAULT_HOST)"
             echo "  --port PORT             gRPC server port (default: $DEFAULT_PORT)"
+            echo "  --socket PATH           Unix socket path (overrides host/port)"
             echo "  --app-id APP_ID         Application ID (required)"
             echo "  --x25519                Use X25519 key pair (default: $DEFAULT_X25519)"
             echo "  --help, -h              Show this help message"
@@ -90,7 +96,13 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-TARGET_ADDRESS="$TARGET_HOST:$TARGET_PORT"
+if [ -n "$SOCKET_PATH" ]; then
+    TARGET_ADDRESS="$SOCKET_PATH"
+    GRPCURL_TRANSPORT=(-unix -plaintext)
+else
+    TARGET_ADDRESS="$TARGET_HOST:$TARGET_PORT"
+    GRPCURL_TRANSPORT=(-plaintext)
+fi
 
 # Validate app ID
 if [ -z "$APP_ID" ]; then
@@ -256,7 +268,7 @@ echo ""
 # Send request with signature headers and capture both stdout and stderr
 set +e  # Don't exit on error
 response=$(printf "%s" "$request_json" | tr -d '\n' | \
-    grpcurl -plaintext \
+    grpcurl "${GRPCURL_TRANSPORT[@]}" \
         -H "x-signature: $SIGNATURE" \
         -H "x-timestamp: $TIMESTAMP" \
         -import-path "$SCRIPT_DIR/../proto" \

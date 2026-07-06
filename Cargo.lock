@@ -5520,6 +5520,8 @@ dependencies = [
  "clap 4.5.48",
  "ethers",
  "hex",
+ "http 1.3.1",
+ "hyper-util",
  "k256",
  "serde",
  "serde_json",
@@ -5529,6 +5531,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tonic",
+ "tower 0.4.13",
 ]
 
 [[package]]
@@ -5558,7 +5561,7 @@ dependencies = [
 
 [[package]]
 name = "tapp-server"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-recursion",

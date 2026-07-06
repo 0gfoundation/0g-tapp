@@ -16,9 +16,14 @@ tapp-common = { path = "../tapp-common" }
 clap = { version = "4.0", features = ["derive"] }
 
 # Runtime
-tokio = { version = "1.0", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1.0", features = ["macros", "rt-multi-thread", "net", "io-util"] }
 tonic = "0.12"
 anyhow = "1.0"
+
+# Unix socket client support
+tower = { version = "0.4", features = ["util"] }
+http = "1.0"
+hyper-util = { version = "0.1", features = ["tokio"] }
 
 # Serialization (used in CLI output formatting)
 serde = { version = "1.0", features = ["derive"] }

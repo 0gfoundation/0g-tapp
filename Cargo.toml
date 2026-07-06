@@ -7,7 +7,7 @@ license = "Apache-2.0"
 
 [package]
 name = "tapp-server"
-version = "0.1.0"
+version = "0.1.1"
 edition.workspace = true
 authors = ["TDX TAPP Developers"]
 description = "TDX Trusted Application Platform Service - Rust Implementation"
@@ -25,7 +25,7 @@ tokio = { version = "1.0", features = [
     "process",
     "signal",
 ] }
-tokio-stream = "0.1"
+tokio-stream = { version = "0.1", features = ["net"] }
 async-recursion = "1.0"
 
 # Attestation

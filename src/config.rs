@@ -66,9 +66,20 @@ impl TappConfig {
 /// Server configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
-    /// Bind address for gRPC server
+    /// Bind address for gRPC server (used when unix_socket_path is not set)
     #[serde(default = "default_bind_address")]
     pub bind_address: String,
+
+    /// Unix socket path for gRPC server. When set, the server listens on this
+    /// Unix domain socket IN ADDITION TO the TCP `bind_address` (not instead of it),
+    /// so remote clients keep using TCP while same-host clients can use the socket.
+    /// This is the recommended path for local key retrieval — a Docker container
+    /// mounts the socket file instead of using `extra_hosts:
+    /// host.docker.internal:host-gateway`.
+    ///
+    /// Example: "/run/tapp/tapp.sock"
+    #[serde(default)]
+    pub unix_socket_path: Option<PathBuf>,
 
     /// Maximum number of concurrent connections
     #[serde(default = "default_max_connections")]
@@ -222,6 +233,7 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             bind_address: default_bind_address(),
+            unix_socket_path: None,
             max_connections: default_max_connections(),
             request_timeout_seconds: default_request_timeout(),
             tls_enabled: false,

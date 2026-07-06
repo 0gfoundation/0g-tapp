@@ -6,6 +6,8 @@ use tapp_server::{
     auth_layer::AuthLayer, config::TappConfig, init_tracing, permission::PermissionManager,
     TappServiceImpl, TappServiceServer, VERSION,
 };
+use tokio::net::UnixListener;
+use tokio_stream::wrappers::UnixListenerStream;
 use tonic::transport::Server;
 use tower::ServiceBuilder;
 use tracing::{error, info};
@@ -63,16 +65,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Logging initialized"
     );
 
-    // Step 4: Determine bind address
+    // Step 4: Determine bind address (used when unix_socket_path is not set)
     let bind_address = args
         .bind
         .unwrap_or_else(|| config.server.bind_address.clone());
-
-    let addr: SocketAddr = bind_address
-        .parse()
-        .map_err(|e| format!("Invalid bind address '{}': {}", bind_address, e))?;
-
-    info!("Binding to address: {}", addr);
 
     // Step 5: Initialize PermissionManager if configured
     let permission_manager = if let Some(ref perm_config) = config.server.permission {
@@ -151,23 +147,99 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let layer = ServiceBuilder::new().layer(auth_layer).into_inner();
 
-    let server = Server::builder()
-        .layer(layer)
-        .add_service(TappServiceServer::new(service))
-        .serve(addr);
+    let grpc = TappServiceServer::new(service);
+
+    // Always serve TCP on bind_address. When unix_socket_path is set, ADDITIONALLY
+    // serve the same service on a Unix domain socket — so same-host clients (e.g. a
+    // Docker container fetching its key via get-app-secret-key) can use the socket
+    // while remote clients keep using TCP :50051. Both listeners share the service;
+    // each keeps its native connect-info, so remote_addr()-based local-only checks
+    // behave correctly (TCP => Some(ip), Unix socket => None).
+    let addr: SocketAddr = bind_address
+        .parse()
+        .map_err(|e| format!("Invalid bind address '{}': {}", bind_address, e))?;
 
     info!("🌐 TAPP gRPC server listening on {}", addr);
+    let tcp_server = Server::builder()
+        .layer(layer.clone())
+        .add_service(grpc.clone())
+        .serve(addr);
 
-    // Step 8: Handle shutdown gracefully
-    tokio::select! {
-        result = server => {
-            if let Err(e) = result {
-                error!("Server error: {}", e);
-                std::process::exit(1);
+    if let Some(ref socket_path) = config.server.unix_socket_path {
+        // Clean up stale socket file from a previous run
+        if socket_path.exists() {
+            std::fs::remove_file(socket_path)?;
+        }
+
+        // Ensure parent directory exists with restrictive permissions
+        if let Some(parent) = socket_path.parent() {
+            std::fs::create_dir_all(parent)?;
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Ok(metadata) = std::fs::metadata(parent) {
+                    let mut perms = metadata.permissions();
+                    perms.set_mode(0o700);
+                    std::fs::set_permissions(parent, perms)?;
+                }
             }
         }
-        _ = tokio::signal::ctrl_c() => {
-            info!("Received shutdown signal, stopping server");
+
+        let uds = UnixListener::bind(socket_path)?;
+
+        // Set restrictive permissions on the socket (owner read/write only)
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(metadata) = std::fs::metadata(socket_path) {
+                let mut perms = metadata.permissions();
+                perms.set_mode(0o600);
+                std::fs::set_permissions(socket_path, perms)?;
+            }
+        }
+
+        info!(
+            socket_path = %socket_path.display(),
+            "🌐 TAPP gRPC server also listening on Unix socket"
+        );
+
+        let uds_server = Server::builder()
+            .layer(layer)
+            .add_service(grpc)
+            .serve_with_incoming(UnixListenerStream::new(uds));
+
+        tokio::select! {
+            result = tcp_server => {
+                if let Err(e) = result {
+                    error!("Server error (tcp): {}", e);
+                    std::process::exit(1);
+                }
+            }
+            result = uds_server => {
+                if let Err(e) = result {
+                    error!("Server error (unix socket): {}", e);
+                    std::process::exit(1);
+                }
+            }
+            _ = tokio::signal::ctrl_c() => {
+                info!("Received shutdown signal, stopping server");
+            }
+        }
+
+        // Clean up socket file on shutdown
+        let _ = std::fs::remove_file(socket_path);
+    } else {
+        tokio::select! {
+            result = tcp_server => {
+                if let Err(e) = result {
+                    error!("Server error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+            _ = tokio::signal::ctrl_c() => {
+                info!("Received shutdown signal, stopping server");
+            }
         }
     }
 
