@@ -6,9 +6,9 @@ Turn tapp from a manually-assembled, single-platform deployment into an **automa
 
 Three phases, built sequentially:
 
-1. **Consolidate** (M1) — finish the in-flight interface work, lock versioning & compatibility, and unblock the release pipeline.
-2. **Automate the release** (M2–M4) — bring CVM image builds and attestation reference values under CI, tie the three release artifacts into one verifiable manifest, and harden node operation.
-3. **Open up** (M5–M6) — add a second TEE platform and expose tapp through a stable SDK.
+1. **Stabilize** (M1) — lock the interfaces and compatibility rules everything downstream builds on.
+2. **Productionize** (M2–M4) — automate the release into one verifiable manifest, and make nodes reliably operable.
+3. **Extend** (M5–M6) — add a second TEE platform and open a stable SDK.
 
 > **Sequencing principle:** decisions that are expensive to reverse (versioning & compatibility rules, the attestation-reference-value framework, the platform abstraction, the SDK interface) are locked first. Everything else is additive.
 
