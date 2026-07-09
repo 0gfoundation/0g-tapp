@@ -5528,6 +5528,7 @@ dependencies = [
  "serde_yaml",
  "sha3",
  "tapp-common",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "tonic",
