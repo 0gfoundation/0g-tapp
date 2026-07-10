@@ -12,10 +12,14 @@ pub enum TaskStatus {
     Failed(String),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct TaskSuccessResult {
     pub app_id: String,
     pub deployer: String, // EVM address from signature authentication
+    // Measurements, populated only by measure-only StartApp tasks
+    pub compose_hash: String,
+    pub volumes_hash: std::collections::BTreeMap<String, String>, // file_name -> hash
+    pub image_hash: std::collections::BTreeMap<String, String>,   // service_name -> digest
 }
 
 #[derive(Debug, Clone)]
@@ -52,11 +56,17 @@ impl Task {
                 app_id: result.app_id.clone(),
                 deployer: result.deployer.clone(),
                 error: String::new(),
+                compose_hash: result.compose_hash.clone(),
+                volumes_hash: result.volumes_hash.clone().into_iter().collect(),
+                image_hash: result.image_hash.clone().into_iter().collect(),
             }),
             TaskStatus::Failed(error) => Some(TaskResult {
                 app_id: String::new(),
                 deployer: String::new(),
                 error: error.clone(),
+                compose_hash: String::new(),
+                volumes_hash: Default::default(),
+                image_hash: Default::default(),
             }),
             _ => None,
         }

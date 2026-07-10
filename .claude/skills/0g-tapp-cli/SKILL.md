@@ -34,6 +34,11 @@ Record which key maps to which server/owner in memory — it changes per deploym
 ```bash
 tapp-cli -s <server> -k 0x<key> docker-login -r <registry-host> -u <user> -p <password>
 tapp-cli -s <server> -k 0x<key> start-app -f docker-compose.yaml --app-id <id>   # async → task-id
+tapp-cli -s <server> -k 0x<key> start-app -f <compose> --app-id <id> \
+  --register-onchain --rpc-url <rpc> --contract 0x<reg> --stake-wei 1000000000000000000
+  # ↑ idempotent register-BEFORE-start: pulls+measures first, tx confirms, THEN containers start.
+  #   not registered→registerApp; registered but this node's signer missing→addNode; signer present→skip.
+  #   Requires a server with measure_only support; older servers → CLI aborts ("Server did not return measurements").
 tapp-cli -s <server> -k 0x<key> get-task-status --task-id <task-id>
 tapp-cli -s <server> -k 0x<key> stop-app --app-id <id>
 tapp-cli -s <server> -k 0x<key> stop-service  --app-id <id> --service-name <svc>  # flag is --service-name
@@ -92,6 +97,8 @@ A failed task prints the docker compose `Stderr:` (the actual root cause). A com
 `--server` is also recorded on-chain as the node's `teeUrl` (the `:50051` URL). Key must be the app owner (see Keys above).
 
 ```bash
+# Preferred for new deploys: start-app --register-onchain (see Core Commands) registers
+# BEFORE containers start and is idempotent. The commands below register a RUNNING app.
 register-onchain    --app-id <id> --rpc-url <rpc> --contract 0x<reg> --stake-wei 1000000000000000000  # 1 0G
 update-onchain      --app-id <id> --rpc-url <rpc> --contract 0x<reg>                                   # re-fetch hashes after redeploy
 add-node-onchain    --app-id <id> --rpc-url <rpc> --contract 0x<reg> --stake-wei <wei>                 # -s = new node

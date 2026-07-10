@@ -17,6 +17,10 @@
 | 1 | 配 tapp-server config 的 owner，起 tapp 服务器 | 该 owner key 之后用于所有 start/stop/register | ✅ | ✅ |
 | 2 | `start-app` 起服务 | `PROVIDER_ADDRESS` 必须 == 该 app 的链上 owner；先 `docker-login` 私有 registry；`.env` 的 `TAPP_REGISTRY`/`SETTLEMENT_CONTRACT` 要齐 | ✅ | ✅ |
 | 3 | `register-onchain` 注册上链 | 各质押 1 0G | ✅ | ✅ |
+
+> 步骤 2+3 可合并为一条：`start-app --register-onchain --rpc-url … --contract … --stake-wei …`
+> 会在容器启动**之前**幂等注册（未注册→registerApp；已注册但本节点 signer 不在 node list→addNode；已在→跳过）。
+> server 先 pull 镜像算好 hash，交易确认后才 up；重启后 signer 变的场景会自动走 addNode（旧 node 仍需手动 remove/update）。
 | 4 | `authorizeInvalidator(appId, <SandboxServing 合约地址>)` | 授权兄弟合约 SandboxServing 调 `invalidateAcks`，使改价能作废用户 ack；**必须在第 5 步前** | ✅ | — |
 | 5 | `cmd/provider register` 绑服务到 SandboxServing | 设 `services[provider].appId` + 价格 | ✅ | — |
 
@@ -28,6 +32,11 @@ tapp-cli -s http://<server>:50051 -k 0x<owner-key> start-app -f <compose> --app-
 # 3. 注册上链（key 必须既是 server owner 又是有钱的 app owner）
 tapp-cli -s http://<server>:50051 -k 0x<owner-key> register-onchain \
   --app-id <appId> --rpc-url https://evmrpc-testnet.0g.ai \
+  --contract 0x95a0BF4148b30F6F8D86870534c51df46Da5511c --stake-wei 1000000000000000000
+
+# 2+3 合并版：先注册再起（幂等，可反复跑）
+tapp-cli -s http://<server>:50051 -k 0x<owner-key> start-app -f <compose> --app-id <appId> \
+  --register-onchain --rpc-url https://evmrpc-testnet.0g.ai \
   --contract 0x95a0BF4148b30F6F8D86870534c51df46Da5511c --stake-wei 1000000000000000000
 
 # 4. 授权 invalidator（注意：授权的是 SandboxServing 合约地址，不是 owner 钱包）

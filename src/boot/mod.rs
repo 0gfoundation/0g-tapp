@@ -144,6 +144,63 @@ enable_eventlog = true
             })
             .collect();
 
+        // Measure-only: pull images and compute hashes, but don't start containers.
+        // Result (compose/volumes/image hashes) is returned via the task result so
+        // the CLI can register the app on-chain before actually starting it.
+        if request.measure_only {
+            let image_hash = match DockerComposeManager::pull_and_measure(
+                &app_id,
+                &request.compose_content,
+                &mount_files,
+            )
+            .await
+            {
+                Ok(map) => map,
+                Err(e) => {
+                    self.task_manager
+                        .mark_failed(&task_id, format!("Failed to pull/measure images: {}", e))
+                        .await;
+                    return;
+                }
+            };
+
+            let measurement = match self
+                .calculate_app_measurement(
+                    &request,
+                    &mount_files,
+                    &app_id,
+                    &deployer,
+                    crate::measurement_service::OPERATION_NAME_START_APP,
+                    image_hash.clone(),
+                )
+                .await
+            {
+                Ok((m, _, _)) => m,
+                Err(e) => {
+                    self.task_manager
+                        .mark_failed(&task_id, format!("Failed to calculate measurement: {}", e))
+                        .await;
+                    return;
+                }
+            };
+
+            // Note: no extend_measurement and no AppInfo registration here — the
+            // app has not run; the follow-up real StartApp does both as usual.
+            self.task_manager
+                .mark_completed(
+                    &task_id,
+                    TaskSuccessResult {
+                        app_id,
+                        deployer,
+                        compose_hash: measurement.compose_hash,
+                        volumes_hash: measurement.volumes_hash,
+                        image_hash,
+                    },
+                )
+                .await;
+            return;
+        }
+
         // Try to start the application
         let deploy_result = async {
             info!(
@@ -279,7 +336,10 @@ enable_eventlog = true
 
                 // Mark task as completed
                 self.task_manager
-                    .mark_completed(&task_id, TaskSuccessResult { app_id, deployer })
+                    .mark_completed(
+                        &task_id,
+                        TaskSuccessResult { app_id, deployer, ..Default::default() },
+                    )
                     .await;
             }
             Err(e) => {
@@ -1039,6 +1099,7 @@ enable_eventlog = true
                         TaskSuccessResult {
                             app_id,
                             deployer: app_info.owner,
+                            ..Default::default()
                         },
                     )
                     .await;
