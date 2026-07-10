@@ -459,3 +459,31 @@ The rootfs writable overlay is `rw_overlay = "ram"` (zram) — **anything writte
 - **Sysbox data store** (`sysbox-mgr --data-root`, holds inner-container images) is also moved to `/data/sysbox` via a drop-in that preserves the vendor `ExecStart`.
 - **Kernel**: idmapped mounts (gcp kernel ≥5.12) are required; **6.17.0-*-gcp verified on hardware** (`docker run --runtime=sysbox-runc alpine cat /proc/self/uid_map` → `0 100000 65536`).
 - **`br_netfilter` must be loaded** (baked via `/etc/modules-load.d/`, unconditional). Docker 28's `icc=false` bridges — created by the 0g-sandbox runner (`INTER_SANDBOX_NETWORK_ENABLED=false`) — hard-require `/proc/sys/net/bridge/bridge-nf-call-iptables`, which exists only once `br_netfilter` is loaded. On a fresh CVM without it the runner crash-loops (`bridge-nf-call-iptables: no such file`); a node where it happened to be loaded worked, masking the gap.
+
+## 14. Stage C: publish the image to GCP
+
+A built qcow2 (§9 output) cannot be uploaded to GCP directly — GCP wants a raw disk named exactly `disk.raw` inside a **sparse `oldgnu`-format tarball**, imported as an image with the confidential guest-os-features. `gcp-cvm/publish-gcp-image.sh <image.qcow2> <gcp-image-name>` runs the four steps:
+
+```bash
+# [C1] qcow2 -> raw
+qemu-img convert -p -f qcow2 -O raw og-tdx.qcow2 disk.raw
+# [C2] raw -> sparse oldgnu tarball (member MUST be exactly "disk.raw")
+tar --format=oldgnu -Szcf og-tdx.tar.gz -C <dir> disk.raw
+# [C3] upload
+gsutil cp og-tdx.tar.gz gs://tapp-image/
+# [C4] create the GCP image (confidential features)
+gcloud compute images create og-tdx --project=g-devops \
+  --source-uri=gs://tapp-image/og-tdx.tar.gz \
+  --guest-os-features=UEFI_COMPATIBLE,GVNIC,SEV_CAPABLE,TDX_CAPABLE
+```
+
+Notes:
+- **Auth**: needs `gcloud auth login` and write access to the bucket/project. This is why Stage C is separate from the build (which needs no cloud creds) — run it after §9, or fold it in with `PUBLISH_AS=<name>` on `build-gcp-tapp.sh`.
+- **`--format=oldgnu -S`**: GCP's importer requires the GNU-old tar format; `-S` keeps the (mostly-empty) 20 GiB raw sparse so the tarball stays small (~few GB).
+- **`-C <dir> disk.raw`**: the archive member must be the bare name `disk.raw`, not a path.
+- **Guest-OS features**: `UEFI_COMPATIBLE` (cryptpilot boots via UEFI/ESP), `GVNIC` (network driver), `SEV_CAPABLE`+`TDX_CAPABLE` (usable as an AMD-SEV or Intel-TDX confidential VM).
+- The script refuses to overwrite an existing image name (delete it first, or publish a versioned name, e.g. `og-tdx-YYYYMMDD`).
+- Boot a confidential instance from it: `gcloud compute instances create … --image=og-tdx --image-project=g-devops --confidential-compute-type=TDX --maintenance-policy=TERMINATE`.
+
+### Stages at a glance
+**Stage 0** (§0, one-time base prep: official Ubuntu → resize 20 GiB + gVNIC) → **Stage A** (provision + harden + Sysbox + /data/br_netfilter) → **Stage B** (gcp kernel + convert + ESP) → *(optional local boot smoke test, README)* → **Stage C** (publish to GCP).
