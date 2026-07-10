@@ -108,6 +108,27 @@ pub async fn get_app_image_hashes(
     Err(anyhow!("unexpected getAppInfo return shape"))
 }
 
+/// The app owner via getAppInfo(string). Address::zero() means "not registered"
+/// (the contract returns an empty struct for unknown app ids).
+pub async fn get_app_owner(rpc_url: &str, contract: &str, app_id: &str) -> Result<Address> {
+    let data = calldata("getAppInfo(string)", vec![Token::String(app_id.to_owned())]);
+    let out = call_raw(rpc_url, contract, data).await?;
+    let tuple = ParamType::Tuple(vec![
+        ParamType::Bytes,
+        ParamType::Bytes,
+        ParamType::Array(Box::new(ParamType::Bytes)),
+        ParamType::Address,
+        ParamType::Uint(256),
+    ]);
+    let tokens = decode(&[tuple], &out).map_err(|e| anyhow!("decode getAppInfo: {}", e))?;
+    if let Some(Token::Tuple(fields)) = tokens.into_iter().next() {
+        if let Token::Address(owner) = &fields[3] {
+            return Ok(*owner);
+        }
+    }
+    Err(anyhow!("unexpected getAppInfo return shape"))
+}
+
 /// Registered node signer addresses for an app (getNodeList).
 pub async fn get_node_list(rpc_url: &str, contract: &str, app_id: &str) -> Result<Vec<Address>> {
     let data = calldata("getNodeList(string)", vec![Token::String(app_id.to_owned())]);

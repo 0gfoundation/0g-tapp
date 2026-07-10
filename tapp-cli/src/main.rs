@@ -78,6 +78,26 @@ enum Commands {
         /// Application ID
         #[arg(short, long)]
         app_id: String,
+
+        /// Idempotently ensure the app is registered on-chain BEFORE it starts:
+        /// not registered -> registerApp; registered but this node's signer is
+        /// not in the node list -> addNode; signer already a node -> skip.
+        /// Images are pulled and measured first; containers only start after
+        /// the transaction is confirmed.
+        #[arg(long, requires_all = ["rpc_url", "contract", "stake_wei"])]
+        register_onchain: bool,
+
+        /// Ethereum RPC URL (with --register-onchain)
+        #[arg(long)]
+        rpc_url: Option<String>,
+
+        /// TappRegistry contract address 0x... (with --register-onchain)
+        #[arg(long)]
+        contract: Option<String>,
+
+        /// Stake in wei for registerApp/addNode, >= minStakeAmount (with --register-onchain)
+        #[arg(long)]
+        stake_wei: Option<u128>,
     },
 
     /// Stop a running application
@@ -517,8 +537,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::StartApp {
             compose_file,
             app_id,
+            register_onchain,
+            rpc_url,
+            contract,
+            stake_wei,
         } => {
             let private_key = require_private_key(&cli.private_key)?;
+            if register_onchain {
+                // requires_all guarantees these are present
+                ensure_registered_onchain(
+                    &cli.server,
+                    &compose_file,
+                    &app_id,
+                    rpc_url.unwrap(),
+                    contract.unwrap(),
+                    stake_wei.unwrap(),
+                    &private_key,
+                )
+                .await?;
+            }
             start_app(&cli.server, compose_file, app_id, private_key).await?;
         }
         Commands::StopApp { app_id } => {
@@ -884,48 +921,210 @@ fn extract_volume_mounts(
     Ok(mount_files)
 }
 
+/// Send a StartApp request (optionally measure-only) and return the task id.
+async fn send_start_app(
+    server: &str,
+    compose_file: &PathBuf,
+    app_id: &str,
+    private_key: &str,
+    measure_only: bool,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut client = create_client(server).await?;
+
+    // Read compose file
+    let compose_content = std::fs::read_to_string(compose_file)?;
+
+    // Auto-extract volume mounts from compose file
+    let mount_files = extract_volume_mounts(compose_file, &compose_content)?;
+
+    // Create authenticated request with signature
+    let mut request = Request::new(StartAppRequest {
+        compose_content,
+        app_id: app_id.to_owned(),
+        mount_files,
+        measure_only,
+    });
+
+    // Add signature metadata
+    add_signature_metadata(&mut request, private_key, "StartApp")?;
+
+    let response = client.start_app(request).await?;
+    let result = response.into_inner();
+    if !result.success {
+        return Err(format!("StartApp request failed: {}", result.message).into());
+    }
+    Ok(result.task_id)
+}
+
 async fn start_app(
     server: &str,
     compose_file: PathBuf,
     app_id: String,
     private_key: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut client = create_client(server).await?;
-
-    // Read compose file
-    let compose_content = std::fs::read_to_string(&compose_file)?;
-
-    // Auto-extract volume mounts from compose file
-    let mount_files = extract_volume_mounts(&compose_file, &compose_content)?;
-
-    // Create authenticated request with signature
-    let mut request = Request::new(StartAppRequest {
-        compose_content,
-        app_id: app_id.clone(),
-        mount_files,
-    });
-
-    // Add signature metadata
-    add_signature_metadata(&mut request, &private_key, "StartApp")?;
-
-    let response = client.start_app(request).await?;
-    let result = response.into_inner();
+    let task_id = send_start_app(server, &compose_file, &app_id, &private_key, false).await?;
 
     println!("✓ Application start requested");
     println!("  App ID: {}", app_id);
-    println!("  Task ID: {}", result.task_id);
-    println!("  Message: {}", result.message);
+    println!("  Task ID: {}", task_id);
 
     // Show command to check progress with server parameter if not using default
     let check_command = if server == "http://127.0.0.1:50051" {
-        format!("tapp-cli get-task-status --task-id {}", result.task_id)
+        format!("tapp-cli get-task-status --task-id {}", task_id)
     } else {
         format!(
             "tapp-cli --server {} get-task-status --task-id {}",
-            server, result.task_id
+            server, task_id
         )
     };
     println!("\nUse '{}' to check progress", check_command);
+
+    Ok(())
+}
+
+/// Poll a task until it completes (returning its result) or fails.
+async fn wait_for_task(
+    server: &str,
+    task_id: &str,
+    timeout_secs: u64,
+) -> Result<tapp_common::proto::TaskResult, Box<dyn std::error::Error>> {
+    let mut client = create_client(server).await?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+
+    loop {
+        let resp = client
+            .get_task_status(Request::new(GetTaskStatusRequest {
+                task_id: task_id.to_owned(),
+            }))
+            .await?
+            .into_inner();
+        // Note: resp.success is true ONLY for completed tasks; pending/running
+        // also report success=false, so branch on status instead.
+        if resp.created_at == 0 {
+            return Err(format!("GetTaskStatus failed: {}", resp.message).into());
+        }
+        match resp.status {
+            2 => return Ok(resp.result.unwrap_or_default()), // Completed
+            3 => {
+                let error = resp.result.map(|r| r.error).unwrap_or_default();
+                return Err(format!("Task {} failed: {}", task_id, error).into());
+            }
+            _ => {
+                if std::time::Instant::now() > deadline {
+                    return Err(format!(
+                        "Timed out after {}s waiting for task {}",
+                        timeout_secs, task_id
+                    )
+                    .into());
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            }
+        }
+    }
+}
+
+/// Idempotently make sure the app is registered on-chain BEFORE it starts:
+/// - app not registered            -> measure + registerApp (this node = first node)
+/// - registered, signer not a node -> measure + addNode
+/// - signer already a node         -> no-op
+/// "Measure" = a measure_only StartApp: the server pulls images and computes
+/// compose/volumes/image hashes without starting containers.
+async fn ensure_registered_onchain(
+    server: &str,
+    compose_file: &PathBuf,
+    app_id: &str,
+    rpc_url: String,
+    contract: String,
+    stake_wei: u128,
+    private_key: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use ethers::signers::Signer;
+    use ethers::types::{Address, U256};
+    use tapp_common::onchain::{self, OnchainParams};
+
+    let signer = fetch_signer_address(server, app_id).await?;
+    let owner = onchain::get_app_owner(&rpc_url, &contract, app_id).await?;
+
+    let is_first_node = if owner == Address::zero() {
+        true
+    } else {
+        let key_bytes = hex::decode(private_key.trim_start_matches("0x"))
+            .map_err(|e| format!("Invalid private key: {}", e))?;
+        let wallet = ethers::signers::LocalWallet::from_bytes(&key_bytes)
+            .map_err(|e| format!("Invalid private key: {}", e))?;
+        if owner != wallet.address() {
+            return Err(format!(
+                "App {} is owned by 0x{:x} on-chain, but the provided key is 0x{:x}",
+                app_id,
+                owner,
+                wallet.address()
+            )
+            .into());
+        }
+        let nodes = onchain::get_node_list(&rpc_url, &contract, app_id).await?;
+        if nodes.contains(&signer) {
+            println!(
+                "✓ Already registered on-chain (signer 0x{:x} is in the node list), skipping",
+                signer
+            );
+            return Ok(());
+        }
+        false
+    };
+
+    // Measure without starting: pull images, compute hashes
+    println!("⏳ Measuring app before on-chain registration (pulling images)...");
+    let task_id = send_start_app(server, compose_file, app_id, private_key, true).await?;
+    let measured = wait_for_task(server, &task_id, 900).await?;
+
+    // An old server ignores measure_only (unknown proto field) and returns no
+    // measurements — registering empty hashes would be silently wrong.
+    if measured.compose_hash.is_empty() {
+        return Err(
+            "Server did not return measurements: it likely predates measure_only support. \
+             Upgrade tapp-server or register with the standalone register-onchain command."
+                .into(),
+        );
+    }
+
+    let compose_hash = onchain::hex_to_bytes(&measured.compose_hash)?;
+    let volumes_hash = onchain::combine_map_hashes(&measured.volumes_hash);
+    let image_hashes = onchain::map_to_bytes_array(&measured.image_hash);
+
+    let params = OnchainParams { rpc_url: rpc_url.clone(), contract: contract.clone(), private_key: private_key.to_owned() };
+    if is_first_node {
+        let tx = onchain::register_app(
+            &params,
+            app_id,
+            compose_hash,
+            volumes_hash,
+            image_hashes,
+            signer,
+            server, // recorded on-chain as the node's evidence URL
+            U256::from(stake_wei),
+        )
+        .await?;
+        println!("✓ App registered on-chain");
+        println!("  Signer Address: 0x{:x}", signer);
+        println!("  Tx Hash: 0x{:x}", tx);
+    } else {
+        // Store a per-node override only when it differs from the app-level default
+        let (compose_override, volumes_override) =
+            node_override_hashes(&rpc_url, &contract, app_id, compose_hash, volumes_hash).await?;
+        let tx = onchain::add_node(
+            &params,
+            app_id,
+            signer,
+            server,
+            compose_override,
+            volumes_override,
+            U256::from(stake_wei),
+        )
+        .await?;
+        println!("✓ Node added on-chain");
+        println!("  Signer Address: 0x{:x}", signer);
+        println!("  Tx Hash: 0x{:x}", tx);
+    }
 
     Ok(())
 }

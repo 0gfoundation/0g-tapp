@@ -136,17 +136,13 @@ impl DockerComposeManager {
         Ok(source_to_host)
     }
 
-    /// Deploy Docker Compose application
-    pub async fn deploy_compose(
+    /// Store the compose file and mount files into the app directory.
+    /// Shared staging step for deploy_compose and pull_and_measure.
+    async fn stage_app_files(
         app_id: &str,
         compose_content: &str,
         mount_files: &[MountFile],
-    ) -> TappResult<std::collections::BTreeMap<String, String>> {
-        use std::sync::Arc;
-        use tokio::io::{AsyncBufReadExt, BufReader};
-        use tokio::sync::Mutex;
-
-        // 1. store compose file
+    ) -> TappResult<PathBuf> {
         let base_path = Self::get_app_dir(app_id);
         if !base_path.exists() {
             fs::create_dir_all(&base_path).await.map_err(|e| {
@@ -158,8 +154,99 @@ impl DockerComposeManager {
         let compose_path = base_path.join("docker-compose.yml");
         fs::write(&compose_path, compose_content).await?;
 
-        // 2. store mount files to corresponding location
         Self::store_mount_files(&base_path, mount_files).await?;
+        Ok(base_path)
+    }
+
+    /// Pull images and return their digests WITHOUT starting containers.
+    /// Stages the app files, runs `docker compose pull`, then resolves each
+    /// service's image digest. Used to register an app on-chain before it runs;
+    /// the follow-up deploy_compose starts containers from the cached images.
+    pub async fn pull_and_measure(
+        app_id: &str,
+        compose_content: &str,
+        mount_files: &[MountFile],
+    ) -> TappResult<std::collections::BTreeMap<String, String>> {
+        let base_path = Self::stage_app_files(app_id, compose_content, mount_files).await?;
+
+        info!(app_id = %app_id, "📥 Pulling images (measure-only, containers not started)");
+        let output = Command::new("docker")
+            .current_dir(&base_path)
+            .args(["compose", "-f", "docker-compose.yml", "pull"])
+            .output()
+            .await
+            .map_err(|e| DockerError::ContainerOperationFailed {
+                operation: "docker_compose_pull".to_string(),
+                reason: format!("Failed to execute docker compose pull: {}", e),
+            })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            error!(app_id = %app_id, stderr = %stderr, "❌ Docker compose pull failed");
+            return Err(DockerError::ContainerOperationFailed {
+                operation: "docker_compose_pull".to_string(),
+                reason: format!(
+                    "Docker compose pull failed with exit code {:?}\nStderr: {}",
+                    output.status.code(),
+                    stderr
+                ),
+            }
+            .into());
+        }
+
+        // Resolve service -> image digest from the pulled (local) images
+        let mut image_map = std::collections::BTreeMap::new();
+        for (service, image) in Self::compose_service_images(compose_content)? {
+            let digest = Self::get_image_digest(&image).await.unwrap_or_else(|e| {
+                warn!(service = %service, image = %image, error = %e, "Failed to get image digest");
+                String::new()
+            });
+            image_map.insert(service, digest);
+        }
+
+        info!(
+            app_id = %app_id,
+            image_count = image_map.len(),
+            "📦 Measured image digests without starting containers"
+        );
+        Ok(image_map)
+    }
+
+    /// Parse service_name -> image reference from compose content.
+    /// Services without an `image` key (e.g. build-only) are skipped.
+    fn compose_service_images(compose_content: &str) -> TappResult<Vec<(String, String)>> {
+        let compose: serde_yaml::Value =
+            serde_yaml::from_str(compose_content).map_err(|e| TappError::InvalidParameter {
+                field: "compose_content".to_string(),
+                reason: format!("Failed to parse compose file: {}", e),
+            })?;
+
+        let mut result = Vec::new();
+        if let Some(services) = compose.get("services").and_then(|s| s.as_mapping()) {
+            for (name, service) in services {
+                if let (Some(name), Some(image)) = (
+                    name.as_str(),
+                    service.get("image").and_then(|i| i.as_str()),
+                ) {
+                    result.push((name.to_string(), image.to_string()));
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    /// Deploy Docker Compose application
+    pub async fn deploy_compose(
+        app_id: &str,
+        compose_content: &str,
+        mount_files: &[MountFile],
+    ) -> TappResult<std::collections::BTreeMap<String, String>> {
+        use std::sync::Arc;
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        use tokio::sync::Mutex;
+
+        // 1-2. store compose file and mount files
+        let base_path = Self::stage_app_files(app_id, compose_content, mount_files).await?;
 
         // 3. start compose with real-time output
         info!(app_id = %app_id, "🚀 Starting docker compose up");
