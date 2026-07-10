@@ -530,45 +530,6 @@ impl DockerComposeManager {
         Ok(())
     }
 
-    /// Check if a service is running
-    pub async fn is_service_running(app_id: &str, service_name: &str) -> TappResult<bool> {
-        let app_dir = Self::get_app_dir(app_id);
-
-        if !app_dir.exists() {
-            return Ok(false);
-        }
-
-        // Execute: docker compose ps --services --filter "status=running" --format json
-        let output = tokio::process::Command::new("docker")
-            .args(&[
-                "compose",
-                "ps",
-                "--services",
-                "--filter",
-                "status=running",
-                "--format",
-                "json",
-            ])
-            .current_dir(&app_dir)
-            .output()
-            .await
-            .map_err(|e| {
-                TappError::Docker(DockerError::ContainerOperationFailed {
-                    operation: "check_service_status".to_string(),
-                    reason: format!("Failed to execute docker compose ps: {}", e),
-                })
-            })?;
-
-        if !output.status.success() {
-            // If command fails, assume service is not running
-            return Ok(false);
-        }
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        // Check if service_name appears in the output
-        Ok(stdout.contains(service_name))
-    }
-
     /// Get image hash for a specific service
     pub async fn get_service_image(app_id: &str, service_name: &str) -> TappResult<Option<String>> {
         let image_map = Self::get_container_images(app_id).await?;
@@ -885,19 +846,11 @@ impl DockerComposeManager {
             });
         }
 
-        // Check if service is already running
-        let is_running = Self::is_service_running(app_id, service_name).await?;
-        if is_running {
-            warn!(
-                app_id = %app_id,
-                service_name = %service_name,
-                "Service is already running"
-            );
-            return Err(TappError::InvalidParameter {
-                field: "service_name".to_string(),
-                reason: format!("Service {} is already running", service_name),
-            });
-        }
+        // No "already running" pre-check: `docker compose up -d` is idempotent
+        // (running + unchanged config = no-op; with --pull always it recreates on a
+        // new image, and the caller re-measures). A pre-check would also have to
+        // match service names exactly — a substring check once broke restart when a
+        // sibling service shared the prefix, e.g. sandbox vs sandbox-redis (issue #27).
 
         info!(
             app_id = %app_id,
