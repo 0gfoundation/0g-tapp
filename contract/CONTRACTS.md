@@ -46,9 +46,16 @@ TAPP_REGISTRY_CONTRACT=0x95a0BF4148b30F6F8D86870534c51df46Da5511c
 | Contract | Address |
 |----------|---------|
 | TappRegistry Implementation (initial) | `0xaeddc6b6A6b9d4a9513Cc2322bbb78DFF97DA459` |
-| **TappRegistry Implementation (current, getNode resolves inherit)** | `0x6987fD9afe6e2430bF5AD85cfBC8c63487d4e4BD` |
+| TappRegistry Implementation (getNode resolves inherit) | `0x6987fD9afe6e2430bF5AD85cfBC8c63487d4e4BD` |
+| **TappRegistry Implementation (current, v0.1.0 — adds `version()`)** | `0x9Ea52Ef383e8eA3fe7F0890309D3C62b2FC1Ac2B` |
 | UpgradeableBeacon | `0x1Cd7544068AdC525b9Cb21cC13aF25D95a53645E` |
 | **BeaconProxy (stable)** | `0x2Ce80374318B1d7Fb3345724457a182E0ad165c9` |
+
+**Upgrades**
+
+| Date | New Implementation | Upgrade Tx | Notes |
+|------|--------------------|-----------|-------|
+| 2026-07-07 | `0x9Ea52Ef383e8eA3fe7F0890309D3C62b2FC1Ac2B` | `0x8a003a1a05c381f59bf213c19e2340b63094ad3230d84e0f42ac9c71d7f84505` | Add `version()` view (baseline `0.1.0`); storage layout unchanged, source-verified |
 
 e2e exercised on app `0g-kms`: register-onchain (app-level default + first node
 inherit), add-node-onchain (per-node override), update-node-onchain — all verified

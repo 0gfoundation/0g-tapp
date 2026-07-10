@@ -170,6 +170,17 @@ contract TappRegistry {
         lockPeriod     = _lockPeriod;
     }
 
+    // ─── Version ──────────────────────────────────────────────────────────────
+
+    /// @notice Implementation version — see docs/VERSIONING.md.
+    /// @dev The proxy address is stable across upgrades, so callers read this to
+    ///      learn the live implementation's ABI version. Bump on every upgrade:
+    ///      MINOR on an ABI change, PATCH on a logic-only (storage-layout-safe)
+    ///      change.
+    function version() external pure returns (string memory) {
+        return "0.1.0";
+    }
+
     // ─── Admin ────────────────────────────────────────────────────────────────
 
     function setMinStakeAmount(uint256 amount) external onlyAdmin {
@@ -412,17 +423,17 @@ contract TappRegistry {
     function _acknowledgeApp(string calldata appId) internal {
         require(_apps[appId].owner != address(0), "app not found");
 
-        uint256 version = _appAckVersions[appId];
-        uint256 prior   = _acks[msg.sender][appId];
-        if (prior == version + 1) return;
+        uint256 ackVersion = _appAckVersions[appId];
+        uint256 prior      = _acks[msg.sender][appId];
+        if (prior == ackVersion + 1) return;
 
-        // Store version+1 so that version==0 (initial) is distinguishable from "never acked"
+        // Store ackVersion+1 so that ackVersion==0 (initial) is distinguishable from "never acked"
         if (prior == 0) {
             _ackCounts[appId]++;
         }
-        _acks[msg.sender][appId] = version + 1;
+        _acks[msg.sender][appId] = ackVersion + 1;
 
-        emit AppAcknowledged(appId, msg.sender, version);
+        emit AppAcknowledged(appId, msg.sender, ackVersion);
     }
 
     function _revokeAcknowledgement(string calldata appId) internal {
@@ -526,8 +537,8 @@ contract TappRegistry {
 
     /// @notice Returns true if the user has acknowledged the current app version.
     function isAcknowledged(address user, string calldata appId) external view returns (bool) {
-        uint256 version = _appAckVersions[appId];
-        return _acks[user][appId] == version + 1;
+        uint256 ackVersion = _appAckVersions[appId];
+        return _acks[user][appId] == ackVersion + 1;
     }
 
     /// @notice Total number of unique users who have ever acknowledged this app.

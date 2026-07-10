@@ -31,7 +31,7 @@ async fn create_client(
         None
     };
 
-    if let Some(path) = unix_path {
+    let client = if let Some(path) = unix_path {
         let channel = tonic::transport::Endpoint::from_static("http://[::]:50051")
             .connect_with_connector(service_fn(move |_: http::Uri| {
                 let path = path.clone();
@@ -41,9 +41,36 @@ async fn create_client(
                 }
             }))
             .await?;
-        Ok(TappServiceClient::new(channel))
+        TappServiceClient::new(channel)
     } else {
-        Ok(TappServiceClient::connect(server.to_string()).await?)
+        TappServiceClient::connect(server.to_string()).await?
+    };
+
+    // Best-effort interface-version check: warn (never fail) if the server's
+    // gRPC interface looks incompatible with what this CLI was built for.
+    warn_if_incompatible(client.clone()).await;
+
+    Ok(client)
+}
+
+/// gRPC interface version this CLI was built against — the tapp-server
+/// `MAJOR.MINOR` (see `docs/VERSIONING.md`), stamped by `build.rs` from the
+/// workspace root `Cargo.toml`.
+const EXPECTED_SERVER_VERSION: &str = env!("TAPP_EXPECTED_SERVER_VERSION");
+
+/// Read the server version via `GetTappInfo` (a public RPC) and print a warning
+/// to stderr if its interface `MAJOR.MINOR` looks incompatible with this CLI.
+/// Any failure is ignored — the invoked command surfaces real connection errors.
+async fn warn_if_incompatible(mut client: TappServiceClient<tonic::transport::Channel>) {
+    if let Ok(resp) = client
+        .get_tapp_info(Request::new(GetTappInfoRequest {}))
+        .await
+    {
+        if let Some(warning) =
+            tapp_common::compat::interface_warning(&resp.get_ref().version, EXPECTED_SERVER_VERSION)
+        {
+            eprintln!("⚠️  {warning}");
+        }
     }
 }
 

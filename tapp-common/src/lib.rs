@@ -6,6 +6,7 @@ pub mod error;
 pub mod onchain;
 pub mod app_key;
 pub mod verify;
+pub mod compat;
 
 pub mod proto {
     tonic::include_proto!("tapp_service");

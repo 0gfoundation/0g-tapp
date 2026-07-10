@@ -62,6 +62,12 @@ contract TappRegistryTest is Test {
         registry.addNode{value: MIN_STAKE}(APP_ID, node2, TEE_URL_2, hex"", hex"");
     }
 
+    // ─── version ────────────────────────────────────────────────────────────
+
+    function test_Version_ReturnsImplementationVersion() public view {
+        assertEq(registry.version(), "0.1.0");
+    }
+
     // ─── registerApp ──────────────────────────────────────────────────────────
 
     function test_RegisterApp_StoresAppInfo() public {
