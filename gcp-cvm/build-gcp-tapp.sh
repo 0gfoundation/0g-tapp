@@ -45,6 +45,10 @@ export FDE_PACKAGE="${FDE_PACKAGE:-$HERE/cryptpilot-fde_0.7.0_amd64.deb}"
 export ROOTFS_MODE="${ROOTFS_MODE:---rootfs-no-encryption}"
 export PURGE_KERNEL="${PURGE_KERNEL:-}"   # NOTE: convert needs at least one *-generic kernel left in the image; do not purge them all
 export INSTALL_KERNEL=1
+# Stage C (opt-in): if set, publish $OUT to GCP as this image name after the build (raw -> tar.gz ->
+# gsutil -> gcloud images create). Empty = build only. Needs gcloud/gsutil auth; see publish-gcp-image.sh
+# (GCS_BUCKET / GCP_PROJECT / GUEST_OS_FEATURES are passed through to it).
+PUBLISH_AS="${PUBLISH_AS:-}"
 # ====================
 
 IN="${1:?usage: $0 <ubuntu-24.04-base.qcow2> <output.qcow2>}"
@@ -225,7 +229,7 @@ PROVSH
 chmod 0755 /usr/local/sbin/tapp-data-provision.sh
 cat > /etc/systemd/system/tapp-data-provision.service <<'PROVUNIT'
 [Unit]
-Description=Auto-provision /data (carve from boot-disk free space if no tapp-data fs exists)
+Description=Auto-provision /data (format a blank data disk, or adopt an existing one, as tapp-data)
 After=systemd-udev-settle.service
 Wants=systemd-udev-settle.service
 Before=data.mount
@@ -381,3 +385,10 @@ IN_PLACE=1 "$HERE/prepare-gcp-tapp.sh" "$IN" "$OUT"
 echo ""
 echo "[done] final image: $OUT"
 echo "(note: $IN was modified in place; re-download the original base image if you need it again)"
+
+# ---- stage C (opt-in): publish $OUT to GCP as image $PUBLISH_AS ----
+if [ -n "$PUBLISH_AS" ]; then
+  [ -x "$HERE/publish-gcp-image.sh" ] || { echo "PUBLISH_AS set but publish-gcp-image.sh not found/executable in $HERE" >&2; exit 1; }
+  echo "==> [C] publish-gcp-image.sh: $OUT -> GCP image '$PUBLISH_AS'"
+  "$HERE/publish-gcp-image.sh" "$OUT" "$PUBLISH_AS"
+fi

@@ -6,15 +6,23 @@ Build a bootable, measurable, remotely-attestable, security-hardened cryptpilot 
 | File | Description |
 |---|---|
 | `cryptpilot-gcp-boot-fix.md` | **Main doc**: root-cause analysis + fixes + full SOP (§9) + security-hardening audit (§11) + convert issues for Alibaba Cloud (§7) |
-| `build-gcp-tapp.sh` | **One-shot full chain**: bare image → final gcp-tapp (stage A installs app/docker/SGX/DNS + hardening / stage B kernel + convert + ESP) |
+| `build-gcp-tapp.sh` | **One-shot full chain**: base image → final gcp-tapp (Stage A app/docker/SGX/DNS + hardening + /data + Sysbox / Stage B kernel + convert + ESP / opt-in Stage C publish via `PUBLISH_AS=`) |
 | `prepare-gcp-tapp.sh` | Stage B only (when a base already exists): fix A + DNS (guestfish) + nbd reset + convert + fix B |
+| `publish-gcp-image.sh` | **Stage C**: publish a built qcow2 to GCP — `qemu-img` raw → oldgnu sparse `tar.gz` → `gsutil` → `gcloud compute images create` (confidential guest-os-features). Needs gcloud/gsutil auth |
 | `fix-esp-grub.sh` | Sync the ESP grub only (fix B, can be run standalone against an already-converted image) |
 | `test/boot-smoke-test.sh` | **Local boot smoke test**: boots a converted image under QEMU/OVMF (no real GCP CVM needed) and checks the boot chain reaches multi-user / tapp-server |
 | `config_dir/` | cryptpilot convert config (`fde.toml`, `rw_overlay="ram"`) |
 | `cryptpilot-fde_0.7.0_amd64.deb` | FDE **runtime installed into the target image**. **Binary, gitignored**, must be placed locally in this directory (see Prerequisites) |
 
-> The artifact `gcp-tapp.qcow2` (~6G, converted / verity-sealed / hardened) is the **output** of `build-gcp-tapp.sh` and is not committed (gitignored).
+> The artifact `gcp-tapp.qcow2` (~4.5G, converted / verity-sealed / hardened) is the **output** of `build-gcp-tapp.sh` and is not committed (gitignored).
 > The same applies to `cryptpilot-fde_*.deb` and the tapp-server binary: the deb must be placed locally in this directory; tapp-server is pulled by default from GitHub release v0.1.0 (see below).
+
+## Pipeline (stages)
+- **Stage 0 — base prep** *(one-time, reused across builds)*: official Ubuntu 24.04 cloud image → resize to 20 GiB + gVNIC driver → base qcow2. See `cryptpilot-gcp-boot-fix.md` §0. This is the input to Stage A, not part of `build-gcp-tapp.sh`.
+- **Stage A** (`build-gcp-tapp.sh`): provision app / docker / SGX / DNS, security hardening, Sysbox, and the `/data` + `br_netfilter` bakes.
+- **Stage B** (`prepare-gcp-tapp.sh`, invoked by A): install the gcp kernel → fix A → `cryptpilot-convert` → sync ESP (fix B).
+- *(optional)* local boot smoke test (`test/boot-smoke-test.sh`).
+- **Stage C** (`publish-gcp-image.sh`): raw → sparse `tar.gz` → GCS → `gcloud compute images create`. Run standalone, or from `build-gcp-tapp.sh` via `PUBLISH_AS=<name>`.
 
 ## Prerequisites
 - **Conversion host = Anolis / Alibaba Cloud Linux 3 (al8).** `cryptpilot-convert` is only packaged for al8; a plain Ubuntu/macOS host cannot run it.
@@ -46,6 +54,7 @@ KBS_URLS='"http://<kbs-host-1>:9091", "http://<kbs-host-2>:9091"' \
   - `KBS_URLS` — KBS node URLs for `[kbs] node_urls`, comma-separated and quoted as shown.
 - tapp-server is downloaded by default from GitHub v0.1.0 (includes the guest-components `8d71a3b4` fix, RTMR OK); if you have it locally, set `TAPP_SERVER_BIN=<path>`.
 - Storage / Sysbox knobs: `DATA_ROOT` (docker data-root, default `/data/docker`), `CONTAINERD_ROOT` (default `/data/containerd`), `DOCKER_VERSION` (default `5:27.5.1-…noble`; empty = repo default), `ENABLE_SYSBOX` / `SYSBOX_VERSION` (default `0.7.0`).
+- Publish (Stage C, opt-in): `PUBLISH_AS=<gcp-image-name>` publishes the built image to GCP after the build (see [Publish to GCP](#publish-to-gcp-stage-c)); `GCS_BUCKET` / `GCP_PROJECT` / `GUEST_OS_FEATURES` pass through.
 - Other environment variables: `DNS_FALLBACK` `PURGE_KERNEL` `CONFIG_DIR` `FDE_PACKAGE` `ROOTFS_MODE` `IN_PLACE` `INSTALL_KERNEL` `NBD_RESET` (see the top of the script).
 
 ## Persistent data disk (`/data`) — always configured
@@ -85,6 +94,20 @@ Before uploading an image to GCP, sanity-check that it actually boots, locally, 
 It boots the image under QEMU/OVMF (UEFI) in the `qemux/qemu` container — using `/dev/kvm` if present, otherwise TCG software emulation — and scans the serial console for the full chain: grub → gcp kernel → `cryptpilot-fde` (dm-verity + zram + dm-snapshot) → `/sysroot` mount → switch-root → multi-user / `tapp-server.service`. Exit code `0` means the boot was confirmed.
 
 This validates everything except the TDX-specific bits (RTMR extend, remote attestation), which require real hardware — so it is a fast pre-flight check, not a replacement for on-hardware testing. Tunables: `MAX` (timeout seconds), `RAM_SIZE`, `CPU_CORES`.
+
+<a name="publish-to-gcp-stage-c"></a>
+## Publish to GCP (Stage C)
+A qcow2 can't be uploaded to GCP directly — it must become a `disk.raw` inside a sparse `oldgnu` tarball, then a GCP image. `publish-gcp-image.sh` does the four steps (`qemu-img convert` → `tar --format=oldgnu -Szcf` → `gsutil cp` → `gcloud compute images create` with `UEFI_COMPATIBLE,GVNIC,SEV_CAPABLE,TDX_CAPABLE`):
+```bash
+gcloud auth login            # gcloud + gsutil must be authenticated with write access to the bucket/project
+./publish-gcp-image.sh /path/og-tdx-dev.qcow2 og-tdx-dev
+./publish-gcp-image.sh /path/og-tdx.qcow2     og-tdx
+```
+Defaults `GCS_BUCKET=gs://tapp-image`, `GCP_PROJECT=g-devops`, `GUEST_OS_FEATURES=UEFI_COMPATIBLE,GVNIC,SEV_CAPABLE,TDX_CAPABLE` (all overridable). It refuses to clobber an existing image name (delete it, or publish under a new name). Or fold it into the build as an opt-in final stage:
+```bash
+PUBLISH_AS=og-tdx-dev ENABLE_SYSBOX=1 OWNER_ADDRESS=0x... KBS_URLS='...' ./build-gcp-tapp.sh base.qcow2 og-tdx-dev.qcow2
+```
+Create a confidential instance from the published image with `--image=<name> --image-project=g-devops --confidential-compute-type=TDX`.
 
 ## Three core fixes (all required)
 - **Fix A**: before convert, point the `/boot/vmlinuz` symlink at the gcp kernel → the cryptpilot stack goes into the correct initrd (fixes read-only / RTMR / verity).
