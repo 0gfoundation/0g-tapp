@@ -134,6 +134,11 @@ message StartAppRequest {
   string app_id = 2;  // Application identifier for key binding
   repeated MountFile mount_files =
       3;  // Files to mount (mapped by source_path from compose volumes)
+  // Pull images and compute measurements (compose/volumes/image hashes)
+  // WITHOUT starting containers. Used by the CLI to register the app
+  // on-chain before it actually runs; a follow-up StartApp (without this
+  // flag) then starts the containers from the cached images.
+  bool measure_only = 4;
 }
 
 message StartAppResponse {
@@ -163,6 +168,10 @@ message TaskResult {
   string app_id = 1;    // Application identifier (on success)
   string deployer = 2;  // Deployer EVM address (on success)
   string error = 3;     // Error message (on failure)
+  // Measurements, set only for measure_only tasks (see StartAppRequest).
+  string compose_hash = 4;                // Hash of compose file content
+  map<string, string> volumes_hash = 5;   // Map: file_name -> hash
+  map<string, string> image_hash = 6;     // Map: service_name -> image digest
 }
 
 message GetTaskStatusResponse {

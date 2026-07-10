@@ -362,13 +362,20 @@ impl TappService for TappServiceImpl {
         //     &req.key_type
         // };
 
-        let response = self.app_key_service.get_public_key(&req.app_id).await?;
+        // Create-if-missing (same as GetEvidence): allows fetching the signer
+        // address BEFORE the app starts, e.g. for on-chain pre-registration.
+        // The key lives in this process's memory, so the app gets the same key
+        // when it actually starts.
+        let key_pair = self
+            .app_key_service
+            .get_app_key(&req.app_id, "ethereum", req.x25519)
+            .await?;
         Ok(Response::new(GetAppKeyResponse {
             success: true,
             message: format!("Public key for app {}", req.app_id),
-            eth_address: response.0,
-            public_key: response.1,
-            x25519_public_key: response.2.unwrap_or_default(),
+            eth_address: key_pair.eth_address,
+            public_key: key_pair.public_key,
+            x25519_public_key: key_pair.x25519_public_key.unwrap_or_default(),
             key_source: "in-memory".to_string(),
         }))
     }
