@@ -248,6 +248,30 @@ contract_address = "0x..."
 
 Register your app and TEE nodes on the TappRegistry contract using `tapp-cli`. These commands require `--private-key` (the deployer's Ethereum private key) and `--server` (the tapp gRPC endpoint, used both as the gRPC target and as the on-chain `teeUrl`).
 
+### Register during start (recommended)
+
+`start-app --register-onchain` idempotently registers the app BEFORE its
+containers start: the server pulls the images and computes all hashes first
+(measure-only), the CLI submits the transaction, and only after it confirms are
+the containers started. Safe to re-run:
+
+- app not registered on-chain → `registerApp` (this node becomes the first node)
+- registered, but this node's signer not in the node list → `addNode`
+- signer already a node → skip registration, just start
+
+```bash
+tapp-cli -s http://<tapp>:50051 -k 0x<deployer-key> start-app \
+  -f docker-compose.yml --app-id my-app \
+  --register-onchain \
+  --rpc-url https://evmrpc-testnet.0g.ai \
+  --contract 0x<TappRegistry> \
+  --stake-wei 1000000000000000000
+```
+
+Without `--register-onchain`, `start-app` behaves exactly as before (no chain
+interaction). The standalone commands below remain for registering an app that
+is already running:
+
 ```bash
 # Register a new app (fetches hashes and signerAddress from --server automatically)
 tapp-cli -s http://<tapp>:50051 -k 0x<deployer-key> register-onchain \
