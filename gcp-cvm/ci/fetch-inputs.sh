@@ -12,7 +12,14 @@ BASE_IMAGE_URL="${BASE_IMAGE_URL:-}"
 if [ ! -f "$BASE" ]; then
   [ -n "$BASE_IMAGE_URL" ] || { echo "base image $BASE missing and BASE_IMAGE_URL unset (run Stage 0, or point BASE_IMAGE_URL at a cached base)" >&2; exit 1; }
   echo "==> fetching base image: $BASE_IMAGE_URL"
-  case "$BASE_IMAGE_URL" in gs://*) gsutil cp "$BASE_IMAGE_URL" "$BASE" ;; *) curl -fL "$BASE_IMAGE_URL" -o "$BASE" ;; esac
+  # NOTE: always COPY, never symlink — Stage A modifies the input image in place, so a symlink
+  # would corrupt the cached base.
+  case "$BASE_IMAGE_URL" in
+    gs://*)   gsutil cp "$BASE_IMAGE_URL" "$BASE" ;;
+    file://*) cp -f --sparse=always "${BASE_IMAGE_URL#file://}" "$BASE" ;;
+    /*)       cp -f --sparse=always "$BASE_IMAGE_URL" "$BASE" ;;   # absolute local path (persistent runner cache)
+    *)        curl -fL "$BASE_IMAGE_URL" -o "$BASE" ;;
+  esac
 fi
 
 # target-image FDE runtime deb (pinned; from openanolis/cryptpilot release)
