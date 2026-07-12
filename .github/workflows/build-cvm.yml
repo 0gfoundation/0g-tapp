@@ -45,12 +45,15 @@ jobs:
       matrix:
         env: ${{ fromJSON(inputs.env == 'both' && '["dev","prod"]' || format('["{0}"]', inputs.env)) }}
     env:
+      # All fixed config lives in repo/org Actions Variables (Settings → Secrets and variables →
+      # Actions → Variables), editable without touching this file; the `|| 'default'` is a fallback.
       VERSION: ${{ inputs.version }}
       OWNER: ${{ inputs.owner }}
-      KBS_URLS: ${{ vars.TAPP_KBS_URLS }}          # fixed, org/repo variable
-      GCP_PROJECT: g-devops
-      GCS_BUCKET: gs://tapp-image
-      AS_ENDPOINT: 47.237.201.184:50004
+      KBS_URLS: ${{ vars.TAPP_KBS_URLS }}                       # required (no safe default)
+      GCP_PROJECT: ${{ vars.GCP_PROJECT || 'g-devops' }}
+      GCS_BUCKET: ${{ vars.GCS_BUCKET || 'gs://tapp-image' }}
+      AS_ENDPOINT: ${{ vars.AS_ENDPOINT || '47.237.201.184:50004' }}
+      CRYPTPILOT_REF: ${{ vars.CRYPTPILOT_REF || '52a77a2' }}   # fde fork commit (build-cryptpilot-fde.sh)
       LIBGUESTFS_BACKEND: direct
     steps:
       - uses: actions/checkout@v4
