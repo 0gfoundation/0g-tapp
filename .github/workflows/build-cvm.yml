@@ -98,8 +98,15 @@ jobs:
           IMAGE_FAMILY="${{ steps.v.outputs.imgbase }}" \
             ./publish-gcp-image.sh "out-${{ matrix.env }}.qcow2" "$IMG"
 
+      - name: Build the #128-fixed cryptpilot-fde (from pinned fork source)
+        if: ${{ inputs.publish }}
+        id: fde
+        run: echo "bin=$(gcp-cvm/ci/build-cryptpilot-fde.sh)" >> "$GITHUB_OUTPUT"
+
       - name: Reference values — compute, write, register on AS
         if: ${{ inputs.publish }}
+        env:
+          CRYPTPILOT_FDE: ${{ steps.fde.outputs.bin }}
         run: |
           cd gcp-cvm
           # writes verifier/reference-values/<version>/<env>/<owner>.json from show-reference-value
