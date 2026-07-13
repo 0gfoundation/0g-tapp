@@ -3,15 +3,21 @@
 # Register the boot-chain policy on a SHARED Attestation Service.
 # =============================================================================
 # The shared AS's RVPS is not externally writable, so reference values cannot be
-# registered there. Instead we inject a release×env reference set into a copy of the
-# canonical policy.rego and register it under id `0g-tapp-<version>-<env>`.
+# registered there. Instead we inject a release×env×owner reference set into a copy of
+# the canonical policy.rego and register it under id `0g-tapp-<version>-<env>-<owner>`.
 # (For a self-hosted AS with writable RVPS, register the values to RVPS and use the
 #  canonical policy unchanged — see 0g-tapp-verifier.)
 #
+# `owner` is a dimension because OWNER_ADDRESS is baked into /etc/tapp/config.toml, which
+# lives on the verity rootfs; policy.rego folds rootfs integrity into the initrd
+# measurement, so a different owner ⇒ a different measurement.initrd ⇒ a distinct
+# reference set. See verifier/reference-values/README.md.
+#
 # Usage:
-#   ./register-shared-as.sh <version> <env> [as-endpoint]
-#     <version>     e.g. v0.1.0   (→ verifier/reference-values/<version>/<env>.json)
+#   ./register-shared-as.sh <version> <env> <owner> [as-endpoint]
+#     <version>     e.g. v0.1.0   (→ verifier/reference-values/<version>/<env>/<owner>.json)
 #     <env>         dev | prod
+#     <owner>       OWNER_ADDRESS (0x...); normalized to lowercase for the path/id
 #     as-endpoint   default 47.237.201.184:50004
 #
 # Prereqs: grpcurl, python3, base64; run from the repo (paths are relative to it).
@@ -19,13 +25,15 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."   # repo root
 
-VERSION="${1:?usage: register-shared-as.sh <version> <env> [as-endpoint]}"
-ENV="${2:?usage: register-shared-as.sh <version> <env> [as-endpoint]}"
-AS="${3:-47.237.201.184:50004}"
-REF="verifier/reference-values/${VERSION}/${ENV}.json"
+VERSION="${1:?usage: register-shared-as.sh <version> <env> <owner> [as-endpoint]}"
+ENV="${2:?usage: register-shared-as.sh <version> <env> <owner> [as-endpoint]}"
+OWNER="${3:?usage: register-shared-as.sh <version> <env> <owner> [as-endpoint]}"
+OWNER="$(printf '%s' "$OWNER" | tr 'A-Z' 'a-z')"   # normalize (addresses are case-insensitive)
+AS="${4:-47.237.201.184:50004}"
+REF="verifier/reference-values/${VERSION}/${ENV}/${OWNER}.json"
 POLICY="verifier/policy.rego"
 PROTO_DIR="tapp-common/proto"
-POLICY_ID="0g-tapp-${VERSION}-${ENV}"
+POLICY_ID="0g-tapp-${VERSION}-${ENV}-${OWNER}"
 
 [ -f "$REF" ]    || { echo "error: reference file not found: $REF"; exit 1; }
 [ -f "$POLICY" ] || { echo "error: policy not found: $POLICY"; exit 1; }

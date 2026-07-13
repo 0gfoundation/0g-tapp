@@ -6,32 +6,38 @@ a TDX confidential node against a known-good image, consumed by `verifier/policy
 ## Layout
 
 ```
-verifier/reference-values/<tapp-server-version>/<env>.json   # env ∈ {dev, prod}
+verifier/reference-values/<tapp-server-version>/<env>/<owner>.json   # env ∈ {dev, prod}; owner = OWNER_ADDRESS (lowercased)
 ```
 
-- **One set per tapp-server release × environment**, starting at **v0.1.0**. Each release
-  ships a specific image; its boot-chain digests are fixed → one reference set.
-- **dev and prod images differ** → separate `dev.json` / `prod.json` per version.
+- **One set per tapp-server release × environment × owner.** Each release ships a specific
+  image; its boot-chain digests are fixed → one reference set per (version, env, owner).
+- **dev and prod images differ** (HARDEN=0 / HARDEN=1) → separate `dev/` / `prod/` per version.
+- **owner is a dimension**: `OWNER_ADDRESS` is baked into `/etc/tapp/config.toml` on the verity
+  rootfs, and `policy.rego` folds rootfs integrity into the **initrd** measurement, so a
+  different owner ⇒ a different `measurement.initrd.SHA-384` ⇒ a distinct reference set.
 - The policy (`verifier/policy.rego`) is a single, canonical, image-agnostic logic; only
   these values vary. See that file's header for the two verification methods.
 
-## Generating (manual)
+## Generating
 
 Values are produced from the release image with cryptpilot — **must run on an Alinux host**
-(`cryptpilot-convert` / `cryptpilot-fde` are Alinux-only), so this is **not** automated in CI:
+(`cryptpilot-convert` / `cryptpilot-fde` are Alinux-only). `show-reference-value` needs a
+**#128-fixed cryptpilot-fde** (stock 0.7.0 errors `saved_entry not found` on a never-booted
+image); build it from the pinned fork with `gcp-cvm/ci/build-cryptpilot-fde.sh`. The tool emits
+JSON with the `measurement.<component>.SHA-384` keys directly.
+
+Automated on the al8 self-hosted runner (`.github/workflows/build-cvm.yml`); manual equivalent:
 
 ```bash
-cryptpilot-fde show-reference-value --disk <release-image>
-# → kernel / initrd / grub / shim / kernel_cmdline digests
+FDE=$(gcp-cvm/ci/build-cryptpilot-fde.sh)                       # build the fixed binary once
+CRYPTPILOT_FDE=$FDE gcp-cvm/ci/gen-reference-values.sh \
+  <release-image> <version> <env> <owner>                      # writes <version>/<env>/<owner>.json
 ```
-
-Put the output into `verifier/reference-values/<version>/<env>.json` keyed by
-`measurement.<component>.SHA-384` (kernel_cmdline may list multiple allowed values).
 
 ## Using
 
 - **Self-hosted AS** (RVPS writable): register the json to RVPS; the policy reads it via
   `query_reference_value()`. See the `../0g-tapp-verifier/` submodule (`tdx-boot-chain/`).
 - **Shared AS** (RVPS not writable): inject the json into the policy at registration —
-  `verifier/register-shared-as.sh <version> <env> <as-endpoint>` registers it as
-  `0g-tapp-<version>-<env>`.
+  `verifier/register-shared-as.sh <version> <env> <owner> [as-endpoint]` registers it as
+  `0g-tapp-<version>-<env>-<owner>`.
