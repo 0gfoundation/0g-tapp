@@ -14,26 +14,30 @@
 # reference set. See verifier/reference-values/README.md.
 #
 # Usage:
-#   ./register-shared-as.sh <version> <env> <owner> [as-endpoint]
-#     <version>     e.g. v0.1.0   (→ verifier/reference-values/<version>/<env>/<owner>.json)
+#   ./register-shared-as.sh <cloud> <version> <env> <owner> [as-endpoint]
+#     <cloud>       gcp | ali   (→ verifier/reference-values/<cloud>/<version>/<env>/<owner>.json)
+#     <version>     e.g. v0.1.0
 #     <env>         dev | prod
 #     <owner>       OWNER_ADDRESS (0x...); normalized to lowercase for the path/id
 #     as-endpoint   default 47.237.201.184:50004
+#   → registers policy 0g-tapp-<cloud>-<version>-<env>-<owner> (each cloud is a distinct image
+#     with its own boot-chain measurements, so cloud is a real dimension, not just a label)
 #
 # Prereqs: grpcurl, python3, base64; run from the repo (paths are relative to it).
 # =============================================================================
 set -euo pipefail
 cd "$(dirname "$0")/.."   # repo root
 
-VERSION="${1:?usage: register-shared-as.sh <version> <env> <owner> [as-endpoint]}"
-ENV="${2:?usage: register-shared-as.sh <version> <env> <owner> [as-endpoint]}"
-OWNER="${3:?usage: register-shared-as.sh <version> <env> <owner> [as-endpoint]}"
+CLOUD="${1:?usage: register-shared-as.sh <cloud> <version> <env> <owner> [as-endpoint]}"
+VERSION="${2:?usage: register-shared-as.sh <cloud> <version> <env> <owner> [as-endpoint]}"
+ENV="${3:?usage: register-shared-as.sh <cloud> <version> <env> <owner> [as-endpoint]}"
+OWNER="${4:?usage: register-shared-as.sh <cloud> <version> <env> <owner> [as-endpoint]}"
 OWNER="$(printf '%s' "$OWNER" | tr 'A-Z' 'a-z')"   # normalize (addresses are case-insensitive)
-AS="${4:-47.237.201.184:50004}"
-REF="verifier/reference-values/${VERSION}/${ENV}/${OWNER}.json"
+AS="${5:-47.237.201.184:50004}"
+REF="verifier/reference-values/${CLOUD}/${VERSION}/${ENV}/${OWNER}.json"
 POLICY="verifier/policy.rego"
 PROTO_DIR="tapp-common/proto"
-POLICY_ID="0g-tapp-${VERSION}-${ENV}-${OWNER}"
+POLICY_ID="0g-tapp-${CLOUD}-${VERSION}-${ENV}-${OWNER}"
 
 [ -f "$REF" ]    || { echo "error: reference file not found: $REF"; exit 1; }
 [ -f "$POLICY" ] || { echo "error: policy not found: $POLICY"; exit 1; }
