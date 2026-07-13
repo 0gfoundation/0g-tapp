@@ -41,7 +41,7 @@ SYSBOX_VERSION="${SYSBOX_VERSION:-0.7.0}"
 SYSBOX_DEB_URL="${SYSBOX_DEB_URL:-https://downloads.nestybox.com/sysbox/releases/v${SYSBOX_VERSION}/sysbox-ce_${SYSBOX_VERSION}-0.linux_amd64.deb}"
 # passed through to prepare-gcp-tapp.sh (used by convert)
 export CONFIG_DIR="${CONFIG_DIR:-$HERE/config_dir}"
-export FDE_PACKAGE="${FDE_PACKAGE:-$HERE/cryptpilot-fde_0.7.0_amd64.deb}"
+export FDE_PACKAGE="${FDE_PACKAGE:-$HERE/cryptpilot-fde-guest_0.8.0_amd64.deb}"   # 0.8.0 in-image runtime (cryptpilot-fde split into -host/-guest at 0.8.0)
 export ROOTFS_MODE="${ROOTFS_MODE:---rootfs-no-encryption}"
 export PURGE_KERNEL="${PURGE_KERNEL:-}"   # NOTE: convert needs at least one *-generic kernel left in the image; do not purge them all
 export INSTALL_KERNEL=1

@@ -10,9 +10,8 @@
 # (see gcp-cvm/cryptpilot-gcp-boot-fix.md §7.6/§12). The tool already emits JSON with the
 # exact "measurement.*.SHA-384" keys; we just drop its non-"measurement." helper keys.
 #
-# The binary is taken from $CRYPTPILOT_FDE — the pipeline builds it from a pinned fork
-# commit (ci/build-cryptpilot-fde.sh) for transparency rather than shipping a prebuilt blob.
-# MUST run on an Alinux/al8 host.
+# The binary is /usr/bin/cryptpilot-fde-host, set up by ci/setup-toolchain.sh (released 0.8.0 with
+# our #128 build overlaid), overridable via $CRYPTPILOT_FDE. MUST run on an Alinux/al8 host.
 
 set -euo pipefail
 
@@ -21,8 +20,8 @@ VERSION="${2:?usage: $0 <image.qcow2> <version> <env> <owner>}"
 ENV="${3:?usage: $0 <image.qcow2> <version> <env> <owner>}"
 OWNER="$(printf '%s' "${4:?usage: $0 <image.qcow2> <version> <env> <owner>}" | tr 'A-Z' 'a-z')"
 
-FDE="${CRYPTPILOT_FDE:?set CRYPTPILOT_FDE to the #128-fixed cryptpilot-fde-host (build via ci/build-cryptpilot-fde.sh)}"
-[ -x "$FDE" ] || { echo "CRYPTPILOT_FDE not executable: $FDE" >&2; exit 2; }
+FDE="${CRYPTPILOT_FDE:-/usr/bin/cryptpilot-fde-host}"
+[ -x "$FDE" ] || { echo "cryptpilot-fde-host not found at $FDE — run ci/setup-toolchain.sh first" >&2; exit 2; }
 command -v python3 >/dev/null || { echo "python3 required" >&2; exit 2; }
 
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"

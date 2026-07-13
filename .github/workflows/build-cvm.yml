@@ -53,7 +53,7 @@ jobs:
       GCP_PROJECT: ${{ vars.GCP_PROJECT || 'g-devops' }}
       GCS_BUCKET: ${{ vars.GCS_BUCKET || 'gs://tapp-image' }}
       AS_ENDPOINT: ${{ vars.AS_ENDPOINT || '47.237.201.184:50004' }}
-      CRYPTPILOT_REF: ${{ vars.CRYPTPILOT_REF || '64fe4e744574c8e0273dd1e5d54ceae9714748a0' }}   # fde fork commit w/ saved_entry fallback (build-cryptpilot-fde.sh)
+      CRYPTPILOT_REF: ${{ vars.CRYPTPILOT_REF || '57d751259211c0b72fe22c855d95786865c7d84c' }}   # fork feat/0g-gcp-cvm = 0.8.0 + #128 + #130 (ci/setup-toolchain.sh)
       BASE_IMAGE_URL: ${{ vars.BASE_IMAGE_URL }}                # cached Stage-0 base (gs://, file://, or abs path)
       LIBGUESTFS_BACKEND: direct
     steps:
@@ -70,8 +70,14 @@ jobs:
             echo "imgbase=og-tdx-dev" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Fetch build inputs (base image + fde deb)
-        run: gcp-cvm/ci/fetch-inputs.sh "$VERSION"   # → gcp-cvm/base-noble.qcow2 + cryptpilot-fde_*.deb
+      - name: Fetch build inputs (base image + 0.8.0 guest deb)
+        run: gcp-cvm/ci/fetch-inputs.sh "$VERSION"   # → gcp-cvm/base-noble.qcow2 + cryptpilot-fde-guest_0.8.0_amd64.deb
+
+      - name: Set up cryptpilot 0.8.0 toolchain (#128 + #130)
+        # installs released 0.8.0 (crypt/verity/fde-host + dracut) and overlays convert(#130) +
+        # fde-host(#128) built from the pinned fork; idempotent (fast no-op on an already-provisioned
+        # runner). Needed by the build (convert #130) and the reference-value step (fde-host #128).
+        run: gcp-cvm/ci/setup-toolchain.sh
 
       - name: Stage A+B — build the image
         run: |
@@ -104,15 +110,9 @@ jobs:
           IMAGE_FAMILY="${{ steps.v.outputs.imgbase }}" \
             ./publish-gcp-image.sh "out-${{ matrix.env }}.qcow2" "$IMG"
 
-      - name: Build the #128-fixed cryptpilot-fde (from pinned fork source)
-        if: ${{ inputs.publish }}
-        id: fde
-        run: echo "bin=$(gcp-cvm/ci/build-cryptpilot-fde.sh)" >> "$GITHUB_OUTPUT"
-
       - name: Reference values — compute, write, register on AS
         if: ${{ inputs.publish }}
-        env:
-          CRYPTPILOT_FDE: ${{ steps.fde.outputs.bin }}
+        # uses /usr/bin/cryptpilot-fde-host (#128), set up by the toolchain step above
         run: |
           cd gcp-cvm
           # writes verifier/reference-values/<version>/<env>/<owner>.json from show-reference-value

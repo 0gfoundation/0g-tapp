@@ -22,9 +22,11 @@ if [ ! -f "$BASE" ]; then
   esac
 fi
 
-# target-image FDE runtime deb (pinned; from openanolis/cryptpilot release)
-FDE_DEB="${FDE_PACKAGE:-cryptpilot-fde_0.7.0_amd64.deb}"
-FDE_DEB_URL="${FDE_DEB_URL:-https://github.com/openanolis/cryptpilot/releases/download/v0.7.0/cryptpilot-fde_0.7.0_amd64.deb}"
+# target-image FDE runtime deb: the 0.8.0 in-image runtime (cryptpilot-fde split into -host/-guest
+# at 0.8.0; the image gets -guest). Pinned to the released v0.8.0 asset. #128/#130 do NOT touch the
+# runtime, so the released guest deb is used as-is (no fork build needed for the in-image side).
+FDE_DEB="${FDE_PACKAGE:-cryptpilot-fde-guest_0.8.0_amd64.deb}"
+FDE_DEB_URL="${FDE_DEB_URL:-https://github.com/openanolis/cryptpilot/releases/download/v0.8.0/cryptpilot-fde-guest_0.8.0_amd64.deb}"
 [ -f "$FDE_DEB" ] || { echo "==> fetching $FDE_DEB"; curl -fL "$FDE_DEB_URL" -o "$FDE_DEB"; }
 
 echo "[done] base=$BASE fde=$FDE_DEB"

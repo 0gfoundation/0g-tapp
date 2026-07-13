@@ -95,22 +95,13 @@ case "${TMPDIR:-}" in
   ""|/tmp|/var/tmp) : ;;
   *) echo "   (TMPDIR=$TMPDIR is unusual; falling back to /tmp for convert)"; export TMPDIR=/tmp ;;
 esac
-cryptpilot-convert --in "$WORK" --out "$OUT" \
+CRYPTPILOT_CONVERT="${CRYPTPILOT_CONVERT:-cryptpilot-convert}"
+"$CRYPTPILOT_CONVERT" --in "$WORK" --out "$OUT" \
   --config-dir "$CONFIG_DIR" $ROOTFS_MODE --package "$FDE_PACKAGE"
 
-echo "==> [fix B] sync ESP grub.cfg + modules (sda15<-sda16)"
-guestfish --rw -a "$OUT" <<'GF'
-run
-mount /dev/sda16 /
-mount /dev/sda15 /efi
-is-file /grub/grub.cfg
-is-dir  /efi/EFI/ubuntu
-rm-f /efi/EFI/ubuntu/grub.cfg.stale
-mv   /efi/EFI/ubuntu/grub.cfg /efi/EFI/ubuntu/grub.cfg.stale
-cp   /grub/grub.cfg /efi/EFI/ubuntu/grub.cfg
-rm-rf /efi/EFI/ubuntu/x86_64-efi
-cp-a  /grub/x86_64-efi /efi/EFI/ubuntu/x86_64-efi
-GF
+# NOTE: the old "[fix B] sync ESP grub.cfg + modules" step was removed — cryptpilot-convert now does
+# it itself (openanolis/cryptpilot#130: syncs the regenerated grub.cfg + grub modules to the separate
+# ESP grub.cfg on GCP-style images). Requires a convert that carries #130 (0.8.0 + the fork fix).
 
 if [ "$IN_PLACE" != 1 ]; then
   echo "==> cleaning up work copy"
