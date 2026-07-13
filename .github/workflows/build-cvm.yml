@@ -15,7 +15,7 @@
 name: build-cvm
 
 on:
-  # A published tapp-server release auto-builds the DEFAULT deployment (vars.DEFAULT_OWNER_ADDRESS),
+  # A published tapp-server release auto-builds the DEFAULT deployment (vars.OWNER_ADDRESS),
   # both env, and publishes + registers. Custom/per-owner builds use workflow_dispatch below.
   release:
     types: [published]
@@ -30,7 +30,7 @@ on:
         options: [dev, prod, both]
         default: both
       owner:
-        description: "OWNER_ADDRESS (0x...) baked into the image (measured). Blank = DEFAULT_OWNER_ADDRESS."
+        description: "OWNER_ADDRESS (0x...) baked into the image (measured). Blank = vars.OWNER_ADDRESS (default owner)."
         required: false
       publish:
         description: "publish to GCP + register reference values"
@@ -38,7 +38,7 @@ on:
         default: true
 
 concurrency:
-  group: build-cvm-${{ inputs.version || github.event.release.tag_name }}-${{ inputs.owner || vars.DEFAULT_OWNER_ADDRESS }}
+  group: build-cvm-${{ inputs.version || github.event.release.tag_name }}-${{ inputs.owner || vars.OWNER_ADDRESS }}
   cancel-in-progress: false
 
 jobs:
@@ -54,7 +54,7 @@ jobs:
       # Actions → Variables), editable without touching this file; the `|| 'default'` is a fallback.
       # version/owner/publish resolve for BOTH triggers (release event vs dispatch inputs):
       VERSION: ${{ inputs.version || github.event.release.tag_name }}
-      OWNER: ${{ inputs.owner || vars.DEFAULT_OWNER_ADDRESS }}
+      OWNER: ${{ inputs.owner || vars.OWNER_ADDRESS }}
       PUBLISH: ${{ github.event_name == 'release' && 'true' || inputs.publish }}
       KBS_URLS: ${{ vars.TAPP_KBS_URLS }}                       # required (no safe default)
       GCP_PROJECT: ${{ vars.GCP_PROJECT || 'g-devops' }}
