@@ -53,7 +53,7 @@ jobs:
       GCP_PROJECT: ${{ vars.GCP_PROJECT || 'g-devops' }}
       GCS_BUCKET: ${{ vars.GCS_BUCKET || 'gs://tapp-image' }}
       AS_ENDPOINT: ${{ vars.AS_ENDPOINT || '47.237.201.184:50004' }}
-      CRYPTPILOT_REF: ${{ vars.CRYPTPILOT_REF || '52a77a2' }}   # fde fork commit (build-cryptpilot-fde.sh)
+      CRYPTPILOT_REF: ${{ vars.CRYPTPILOT_REF || '64fe4e744574c8e0273dd1e5d54ceae9714748a0' }}   # fde fork commit w/ saved_entry fallback (build-cryptpilot-fde.sh)
       BASE_IMAGE_URL: ${{ vars.BASE_IMAGE_URL }}                # cached Stage-0 base (gs://, file://, or abs path)
       LIBGUESTFS_BACKEND: direct
     steps:

@@ -14,9 +14,11 @@
 set -euo pipefail
 
 REPO_URL="${CRYPTPILOT_REPO_URL:-https://github.com/0gfoundation/cryptpilot.git}"
-# Pinned to the fork commit that produced the verified working -host binary (branch
-# fix/gcp-convert-esp-sync). Bump deliberately; do not track a moving branch.
-REF="${CRYPTPILOT_REF:-52a77a2}"
+# Pinned to the fork commit that carries the show-reference-value fallback fix (branch
+# fix/srv-default-entry) — falls back to the default grub.cfg menuentry when grubenv has no
+# saved_entry, and supports --hash-algo. Bump deliberately; do not track a moving branch.
+# NB: NOT fix/gcp-convert-esp-sync (52a77a2) — that's the convert-side ESP fix and lacks the fallback.
+REF="${CRYPTPILOT_REF:-64fe4e744574c8e0273dd1e5d54ceae9714748a0}"
 OUT_DIR="${1:-$HOME/.cache/cvm-ci/cryptpilot}"
 
 command -v cargo >/dev/null || { echo "cargo/rust required" >&2; exit 2; }
