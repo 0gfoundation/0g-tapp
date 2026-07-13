@@ -1483,9 +1483,11 @@ impl TappService for TappServiceImpl {
             .map_err(|e| Status::internal(format!("Failed to sign KMS request: {}", e)))?;
         let signature_hex = hex::encode(&signature);
 
-        // Call KMS cluster → get ECIES-encrypted app key
+        // Call KMS cluster → get ECIES-encrypted app key. `material` is opaque
+        // derivation material forwarded verbatim (empty = omitted, derives
+        // purely from the app_id namespace as before) — see issue #33.
         let encrypted = kms
-            .get_encrypted_secret(app_id, timestamp, &pubkey_hex, &signature_hex)
+            .get_encrypted_secret(app_id, timestamp, &pubkey_hex, &signature_hex, &req.material)
             .await
             .map_err(|e| Status::unavailable(format!("KMS request failed: {}", e)))?;
 
