@@ -1562,7 +1562,18 @@ pub fn init_tracing(config: &config::LoggingConfig) -> TappResult<()> {
             reason: format!("Cannot create log directory: {}", e),
         })?;
 
-        let file_appender = RollingFileAppender::new(Rotation::DAILY, directory, file_name_prefix);
+        // Keep at most `max_log_files` daily files — without a retention cap the
+        // rotated files accumulate forever, which on RAM-rootfs CVM images means
+        // unbounded RAM growth (issue #23).
+        let file_appender = RollingFileAppender::builder()
+            .rotation(Rotation::DAILY)
+            .filename_prefix(file_name_prefix)
+            .max_log_files(config.max_log_files.max(1))
+            .build(directory)
+            .map_err(|e| error::ConfigError::InvalidValue {
+                field: "logging.file_path".to_string(),
+                reason: format!("Cannot create log appender: {}", e),
+            })?;
 
         let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
         std::mem::forget(_guard);

@@ -30,6 +30,12 @@ pub struct LoggingConfig {
 
     /// Log file path (if None, logs to stdout)
     pub file_path: Option<PathBuf>,
+
+    /// Maximum number of rotated (daily) log files to keep; oldest are deleted.
+    /// Bounds total log growth — without a cap, daily rotation still grows
+    /// unbounded and can exhaust the RAM rootfs on CVM images (issue #23).
+    #[serde(default = "default_max_log_files")]
+    pub max_log_files: usize,
 }
 
 /// Main configuration structure for TAPP service
@@ -218,6 +224,10 @@ fn default_log_format() -> String {
     "json".to_string()
 }
 
+fn default_max_log_files() -> usize {
+    7
+}
+
 impl Default for KbsConfig {
     fn default() -> Self {
         Self {
@@ -268,6 +278,7 @@ impl Default for LoggingConfig {
             level: default_log_level(),
             format: default_log_format(),
             file_path: None,
+            max_log_files: default_max_log_files(),
         }
     }
 }

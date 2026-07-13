@@ -3,7 +3,8 @@
 [logging]
 level = "info"  # Log level: "trace", "debug", "info", "warn", "error"
 format = "json" # Log format: "json" or "pretty"
-# file_path = "/var/log/tapp/app.log"  # Optional: log to file
+# file_path = "/var/log/tapp/app.log"  # Optional: log to file (daily rotation)
+# max_log_files = 7  # Rotated daily files to keep; oldest deleted (default: 7)
 
 [server]
 bind_address = "0.0.0.0:50051"
