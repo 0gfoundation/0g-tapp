@@ -229,13 +229,15 @@ socket_path = "/var/run/docker.sock"
 
 [logging]
 level = "info"
-path = "/var/log/tapp/"
+format = "pretty"              # "json" or "pretty"
+file_path = "/var/log/tapp/"   # daily-rotated files; on RAM-rootfs CVM images use the persistent disk, e.g. /data/log/tapp/
+max_log_files = 7              # rotated daily files to keep; oldest deleted at startup and rotation (default: 7)
 
 # Optional: KMS cluster for hardware-independent app secrets
-[kms]
-cluster_urls = [
-    "http://kms-node-1:8080",
-    "http://kms-node-2:8080",
+[kbs]
+node_urls = [
+    "http://kms-node-1:9091",
+    "http://kms-node-2:9091",
 ]
 
 # Optional: on-chain TappRegistry integration
@@ -363,7 +365,7 @@ tapp-cli -k 0x<owner-key> revoke-invalidator-onchain \
 
 ## KMS Integration
 
-When `[kms]` is configured, apps running inside the TEE can retrieve a hardware-independent, KMS-derived secret via the `GetSecretResource` gRPC call. This call is **local access only** (localhost / same-host Docker network).
+When `[kbs]` is configured, apps running inside the TEE can retrieve a hardware-independent, KMS-derived secret via the `GetSecretResource` gRPC call. This call is **local access only** (localhost / same-host Docker network).
 
 ### Local key retrieval: Unix socket (recommended)
 
@@ -409,3 +411,15 @@ grpcurl -plaintext -d '{"app_id": "my-app"}' host.docker.internal:50051 tapp_ser
 ```
 
 The returned `secret` bytes are the HKDF-derived app key from the KMS cluster, decrypted inside the TEE. The KMS authenticates the request by verifying the TEE node's on-chain registered `signerAddress`.
+
+### Derivation material (per-caller keys)
+
+`GetSecretResourceRequest` takes an optional `material` field — hex-encoded derivation material, opaque to tapp and forwarded verbatim to the KMS `/app-key` endpoint, which binds it into the derived key alongside `app_id`. This lets an app derive many independent keys from the KMS (e.g. AgenticID derives per-agent seal keys with `material = chainId ‖ contractAddress ‖ sealId`) instead of holding one app-wide secret and deriving locally. The KMS DPRF is one-way: per-material keys expose neither each other nor the app-wide key.
+
+```bash
+grpcurl -unix -plaintext \
+  -d '{"app_id": "my-app", "material": "deadbeef01"}' \
+  /run/tapp/tapp.sock tapp_service.TappService/GetSecretResource
+```
+
+Absent/empty `material` derives purely from the `app_id` namespace — byte-identical to the pre-material request, so existing callers and older KMS nodes are unaffected.
