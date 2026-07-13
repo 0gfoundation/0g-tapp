@@ -63,9 +63,6 @@ jobs:
       CRYPTPILOT_REF: ${{ vars.CRYPTPILOT_REF || '57d751259211c0b72fe22c855d95786865c7d84c' }}   # fork feat/0g-gcp-cvm = 0.8.0 + #128 + #130 (ci/setup-toolchain.sh)
       BASE_IMAGE_URL: ${{ vars.BASE_IMAGE_URL }}                # cached Stage-0 base (gs://, file://, or abs path)
       LIBGUESTFS_BACKEND: direct
-      # Keep the SA credential OFF the persistent self-hosted runner: point gcloud/gsutil at a
-      # job-scoped temp config dir (RUNNER_TEMP is wiped per job), so nothing lands in ~/.config/gcloud.
-      CLOUDSDK_CONFIG: ${{ runner.temp }}/gcloud
     steps:
       - uses: actions/checkout@v4   # checks out the dispatched ref (draft branch while testing, dev once merged)
 
@@ -106,6 +103,11 @@ jobs:
       - name: Authenticate to GCP
         if: ${{ env.PUBLISH == 'true' }}
         run: |
+          # Keep the SA credential OFF the persistent self-hosted runner: point gcloud/gsutil at a
+          # job-scoped temp config dir (RUNNER_TEMP is wiped per job), so nothing lands in ~/.config/gcloud.
+          # (RUNNER_TEMP is only known at step runtime — cannot be set in job-level env.)
+          export CLOUDSDK_CONFIG="$RUNNER_TEMP/gcloud"
+          echo "CLOUDSDK_CONFIG=$CLOUDSDK_CONFIG" >> "$GITHUB_ENV"   # inherited by later steps
           mkdir -p "$CLOUDSDK_CONFIG"
           printf '%s' "$GCP_SA_KEY" > "$RUNNER_TEMP/sa.json"
           gcloud auth activate-service-account --key-file="$RUNNER_TEMP/sa.json"
@@ -142,5 +144,7 @@ jobs:
         if: always()
         run: |
           rm -f gcp-cvm/out-${{ matrix.env }}.qcow2 gcp-cvm/base-noble.qcow2 "$RUNNER_TEMP/sa.json"
-          gcloud auth revoke --all 2>/dev/null || true   # drop the activated SA from gcloud
-          rm -rf "$CLOUDSDK_CONFIG"                       # wipe the job-scoped gcloud config dir
+          if [ -n "${CLOUDSDK_CONFIG:-}" ]; then          # only if we authenticated (publish=true)
+            gcloud auth revoke --all 2>/dev/null || true  # drop the activated SA from gcloud
+            rm -rf "$CLOUDSDK_CONFIG"                      # wipe the job-scoped gcloud config dir
+          fi
