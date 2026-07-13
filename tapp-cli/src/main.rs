@@ -237,6 +237,11 @@ enum Commands {
         /// Application ID
         #[arg(short, long)]
         app_id: String,
+
+        /// Optional hex-encoded derivation material, forwarded verbatim to KMS
+        /// (e.g. AgenticID: chainId || contractAddress || sealId)
+        #[arg(short, long, default_value = "")]
+        material: String,
     },
 
     /// Start a specific service within an app
@@ -630,8 +635,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             get_app_secret_key(&cli.server, app_id, json, x25519).await?;
         }
-        Commands::GetSecretResource { app_id } => {
-            get_secret_resource(&cli.server, app_id).await?;
+        Commands::GetSecretResource { app_id, material } => {
+            get_secret_resource(&cli.server, app_id, material).await?;
         }
         Commands::StartService {
             app_id,
@@ -1583,11 +1588,13 @@ async fn get_app_secret_key(
 async fn get_secret_resource(
     server: &str,
     app_id: String,
+    material: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut client = create_client(server).await?;
 
     let request = Request::new(GetSecretResourceRequest {
         app_id: app_id.clone(),
+        material,
     });
 
     let response = match client.get_secret_resource(request).await {
