@@ -1,9 +1,9 @@
 # Build (and optionally publish + register) an og-tdx confidential VM image.
 #
-# DRAFT — requires a self-hosted Alinux/al8 runner (labels: self-hosted, alinux, cvm-builder)
-# with: root, nbd, libguestfs, qemu-img, cryptpilot-convert + a #128-FIXED cryptpilot-fde
-# (the stock 0.7.0 errors "saved_entry not found" on show-reference-value — see gcp-cvm
-# cryptpilot-gcp-boot-fix.md §12), grpcurl, python3, gcloud + gsutil, network to the shared AS.
+# DRAFT — requires a self-hosted Alinux/al8 runner (labels: self-hosted, alinux, cvm-builder) with:
+# root, nbd, libguestfs, qemu-img, git, cargo/rust, cryptsetup-devel, grpcurl, python3, gcloud + gsutil,
+# and network to the shared AS. The cryptpilot 0.8.0 + #128/#130 toolchain is provisioned by
+# ci/setup-toolchain.sh (installs released 0.8.0 + overlays convert #130 / fde-host #128 from the fork).
 #
 # Dimensions (see verifier/reference-values/README.md): version × env × owner.
 #   version = tapp-server release tag (trigger)         → which tapp-server + image name suffix
@@ -15,6 +15,10 @@
 name: build-cvm
 
 on:
+  # A published tapp-server release auto-builds the DEFAULT deployment (vars.DEFAULT_OWNER_ADDRESS),
+  # both env, and publishes + registers. Custom/per-owner builds use workflow_dispatch below.
+  release:
+    types: [published]
   workflow_dispatch:
     inputs:
       version:
@@ -26,15 +30,15 @@ on:
         options: [dev, prod, both]
         default: both
       owner:
-        description: "OWNER_ADDRESS (0x...) — baked into the image, measured"
-        required: true
+        description: "OWNER_ADDRESS (0x...) baked into the image (measured). Blank = DEFAULT_OWNER_ADDRESS."
+        required: false
       publish:
         description: "publish to GCP + register reference values"
         type: boolean
         default: true
 
 concurrency:
-  group: build-cvm-${{ inputs.version }}-${{ inputs.owner }}
+  group: build-cvm-${{ inputs.version || github.event.release.tag_name }}-${{ inputs.owner || vars.DEFAULT_OWNER_ADDRESS }}
   cancel-in-progress: false
 
 jobs:
@@ -43,12 +47,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        env: ${{ fromJSON(inputs.env == 'both' && '["dev","prod"]' || format('["{0}"]', inputs.env)) }}
+        # release (no inputs.env) -> both; dispatch -> the chosen env
+        env: ${{ fromJSON((inputs.env || 'both') == 'both' && '["dev","prod"]' || format('["{0}"]', inputs.env)) }}
     env:
       # All fixed config lives in repo/org Actions Variables (Settings → Secrets and variables →
       # Actions → Variables), editable without touching this file; the `|| 'default'` is a fallback.
-      VERSION: ${{ inputs.version }}
-      OWNER: ${{ inputs.owner }}
+      # version/owner/publish resolve for BOTH triggers (release event vs dispatch inputs):
+      VERSION: ${{ inputs.version || github.event.release.tag_name }}
+      OWNER: ${{ inputs.owner || vars.DEFAULT_OWNER_ADDRESS }}
+      PUBLISH: ${{ github.event_name == 'release' && 'true' || inputs.publish }}
       KBS_URLS: ${{ vars.TAPP_KBS_URLS }}                       # required (no safe default)
       GCP_PROJECT: ${{ vars.GCP_PROJECT || 'g-devops' }}
       GCS_BUCKET: ${{ vars.GCS_BUCKET || 'gs://tapp-image' }}
@@ -94,7 +101,7 @@ jobs:
         run: cd gcp-cvm && ./test/boot-smoke-test.sh "out-${{ matrix.env }}.qcow2"
 
       - name: Authenticate to GCP
-        if: ${{ inputs.publish }}
+        if: ${{ env.PUBLISH == 'true' }}
         run: |
           printf '%s' "$GCP_SA_KEY" > /tmp/sa.json
           gcloud auth activate-service-account --key-file=/tmp/sa.json
@@ -103,7 +110,7 @@ jobs:
           GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
 
       - name: Stage C — publish versioned image (+ family)
-        if: ${{ inputs.publish }}
+        if: ${{ env.PUBLISH == 'true' }}
         run: |
           cd gcp-cvm
           IMG="${{ steps.v.outputs.imgbase }}-${VERSION//./-}"
@@ -111,7 +118,7 @@ jobs:
             ./publish-gcp-image.sh "out-${{ matrix.env }}.qcow2" "$IMG"
 
       - name: Reference values — compute, write, register on AS
-        if: ${{ inputs.publish }}
+        if: ${{ env.PUBLISH == 'true' }}
         # uses /usr/bin/cryptpilot-fde-host (#128), set up by the toolchain step above
         run: |
           cd gcp-cvm
@@ -121,7 +128,7 @@ jobs:
           verifier/register-shared-as.sh "$VERSION" "${{ matrix.env }}" "$OWNER" "$AS_ENDPOINT"
 
       - name: Open PR with the new reference values → dev
-        if: ${{ inputs.publish }}
+        if: ${{ env.PUBLISH == 'true' }}
         run: gcp-cvm/ci/open-refvalues-pr.sh "$VERSION" "${{ matrix.env }}" "$OWNER"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
