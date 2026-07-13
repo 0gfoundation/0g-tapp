@@ -41,6 +41,12 @@ concurrency:
   group: build-cvm-${{ inputs.version || github.event.release.tag_name }}-${{ inputs.owner || vars.OWNER_ADDRESS }}
   cancel-in-progress: false
 
+# The reference-values step pushes a refvalues/* branch and opens a PR into dev with GITHUB_TOKEN;
+# the default token is read-only, so grant the writes it needs (else: "denied to github-actions[bot]" 403).
+permissions:
+  contents: write        # push the refvalues/* branch
+  pull-requests: write   # open the reference-values PR
+
 jobs:
   build:
     runs-on: [self-hosted, alinux, cvm-builder]
