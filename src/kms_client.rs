@@ -19,13 +19,47 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = KmsClient::new(vec![server.uri()]);
+        let client = KmsClient::new(vec![server.uri()], &Default::default());
         let result = client
-            .get_encrypted_secret("myapp", 1234567890, "pubkey_hex", "sig_hex")
+            .get_encrypted_secret("myapp", 1234567890, "pubkey_hex", "sig_hex", "")
             .await
             .unwrap();
 
         assert_eq!(result, vec![0xde, 0xad, 0xbe, 0xef]);
+    }
+
+    #[tokio::test]
+    async fn test_material_forwarded_and_empty_omitted() {
+        use wiremock::matchers::body_partial_json;
+
+        // Server only matches when the body carries the material field verbatim
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/app-key"))
+            .and(body_partial_json(
+                serde_json::json!({ "material": "deadbeef01" }),
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "encrypted_secret": "0xcafe" })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = KmsClient::new(vec![server.uri()], &Default::default());
+
+        // material passed through verbatim -> matches
+        let result = client
+            .get_encrypted_secret("myapp", 1234567890, "pubkey_hex", "sig_hex", "deadbeef01")
+            .await
+            .unwrap();
+        assert_eq!(result, vec![0xca, 0xfe]);
+
+        // empty material -> field omitted from the JSON body -> no match -> error
+        let result = client
+            .get_encrypted_secret("myapp", 1234567890, "pubkey_hex", "sig_hex", "")
+            .await;
+        assert!(result.is_err());
     }
 
     #[tokio::test]
@@ -49,9 +83,9 @@ mod tests {
             .mount(&good_server)
             .await;
 
-        let client = KmsClient::new(vec![bad_server.uri(), good_server.uri()]);
+        let client = KmsClient::new(vec![bad_server.uri(), good_server.uri()], &Default::default());
         let result = client
-            .get_encrypted_secret("myapp", 1234567890, "pubkey_hex", "sig_hex")
+            .get_encrypted_secret("myapp", 1234567890, "pubkey_hex", "sig_hex", "")
             .await
             .unwrap();
 
@@ -67,9 +101,9 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = KmsClient::new(vec![server.uri()]);
+        let client = KmsClient::new(vec![server.uri()], &Default::default());
         let result = client
-            .get_encrypted_secret("myapp", 1234567890, "pubkey_hex", "sig_hex")
+            .get_encrypted_secret("myapp", 1234567890, "pubkey_hex", "sig_hex", "")
             .await;
 
         assert!(result.is_err());
@@ -77,9 +111,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_no_nodes_configured() {
-        let client = KmsClient::new(vec![]);
+        let client = KmsClient::new(vec![], &Default::default());
         let result = client
-            .get_encrypted_secret("myapp", 1234567890, "pubkey_hex", "sig_hex")
+            .get_encrypted_secret("myapp", 1234567890, "pubkey_hex", "sig_hex", "")
             .await;
 
         assert!(result.is_err());
@@ -96,6 +130,12 @@ struct KmsRequest<'a> {
     pubkey: String,
     /// hex-encoded secp256k1 signature over "GetSecretResource:{timestamp}"
     signature: String,
+    /// optional hex-encoded derivation material, opaque — forwarded verbatim to
+    /// KMS /app-key which binds it into the derived key alongside app_id.
+    /// Omitted from the JSON body when empty so the request is byte-identical
+    /// to the pre-material format (KMS then derives purely from app_id).
+    #[serde(skip_serializing_if = "str::is_empty")]
+    material: &'a str,
 }
 
 #[derive(Deserialize)]
@@ -130,12 +170,14 @@ impl KmsClient {
         timestamp: i64,
         pubkey_hex: &str,
         signature_hex: &str,
+        material: &str,
     ) -> Result<Vec<u8>> {
         let req = KmsRequest {
             app_id,
             timestamp,
             pubkey: pubkey_hex.to_string(),
             signature: signature_hex.to_string(),
+            material,
         };
 
         let mut last_err = anyhow!("no KMS nodes configured");
