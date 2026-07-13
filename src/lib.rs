@@ -1504,6 +1504,29 @@ impl TappService for TappServiceImpl {
 }
 
 /// Initialize tracing based on configuration
+/// Delete the oldest `{prefix}.*` daily log files so at most `max_files - 1`
+/// remain (the appender then creates/opens today's file, bringing the total
+/// back to `max_files`). Filenames embed the date (`prefix.yyyy-MM-dd`), so
+/// lexicographic order == chronological order. Best-effort: IO errors are
+/// ignored — logging setup must not fail because a stale file can't be removed.
+fn prune_old_log_files(directory: &std::path::Path, prefix: &str, max_files: usize) {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    let wanted = format!("{}.", prefix);
+    let mut files: Vec<String> = entries
+        .filter_map(|e| e.ok()?.file_name().into_string().ok())
+        .filter(|name| name.starts_with(&wanted))
+        .collect();
+    if files.len() < max_files {
+        return;
+    }
+    files.sort();
+    for name in &files[..files.len() - (max_files - 1)] {
+        let _ = std::fs::remove_file(directory.join(name));
+    }
+}
+
 pub fn init_tracing(config: &config::LoggingConfig) -> TappResult<()> {
     use tracing_subscriber::{
         fmt::{self, format::FmtSpan},
@@ -1562,7 +1585,25 @@ pub fn init_tracing(config: &config::LoggingConfig) -> TappResult<()> {
             reason: format!("Cannot create log directory: {}", e),
         })?;
 
-        let file_appender = RollingFileAppender::new(Rotation::DAILY, directory, file_name_prefix);
+        // Keep at most `max_log_files` daily files — without a retention cap the
+        // rotated files accumulate forever, which on RAM-rootfs CVM images means
+        // unbounded RAM growth (issue #23).
+        //
+        // tracing-appender only prunes inside refresh_writer, i.e. when the date
+        // rolls over WHILE the process is running — files left by previous runs
+        // survive until the first in-process midnight, and a process that never
+        // lives past midnight never prunes at all. Prune at startup ourselves.
+        prune_old_log_files(directory, file_name_prefix, config.max_log_files.max(1));
+
+        let file_appender = RollingFileAppender::builder()
+            .rotation(Rotation::DAILY)
+            .filename_prefix(file_name_prefix)
+            .max_log_files(config.max_log_files.max(1))
+            .build(directory)
+            .map_err(|e| error::ConfigError::InvalidValue {
+                field: "logging.file_path".to_string(),
+                reason: format!("Cannot create log appender: {}", e),
+            })?;
 
         let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
         std::mem::forget(_guard);
@@ -1599,6 +1640,44 @@ pub fn init_tracing(config: &config::LoggingConfig) -> TappResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_prune_old_log_files() {
+        let dir = std::env::temp_dir().join(format!("tapp-prune-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // 10 accumulated daily files + an unrelated file that must survive
+        for d in 1..=10 {
+            std::fs::write(dir.join(format!("app.2026-07-{:02}", d)), "old").unwrap();
+        }
+        std::fs::write(dir.join("other.txt"), "keep").unwrap();
+
+        prune_old_log_files(&dir, "app", 7);
+
+        let mut files: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        files.sort();
+        // newest 6 kept (appender's new file for today makes 7), oldest 4 gone
+        assert_eq!(
+            files,
+            vec![
+                "app.2026-07-05",
+                "app.2026-07-06",
+                "app.2026-07-07",
+                "app.2026-07-08",
+                "app.2026-07-09",
+                "app.2026-07-10",
+                "other.txt"
+            ]
+        );
+
+        // fewer files than the cap -> untouched
+        prune_old_log_files(&dir, "app", 7);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 7);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn test_validate_app_id() {
