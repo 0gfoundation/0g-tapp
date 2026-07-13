@@ -19,7 +19,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = KmsClient::new(vec![server.uri()]);
+        let client = KmsClient::new(vec![server.uri()], &Default::default());
         let result = client
             .get_encrypted_secret("myapp", 1234567890, "pubkey_hex", "sig_hex")
             .await
@@ -49,7 +49,7 @@ mod tests {
             .mount(&good_server)
             .await;
 
-        let client = KmsClient::new(vec![bad_server.uri(), good_server.uri()]);
+        let client = KmsClient::new(vec![bad_server.uri(), good_server.uri()], &Default::default());
         let result = client
             .get_encrypted_secret("myapp", 1234567890, "pubkey_hex", "sig_hex")
             .await
@@ -67,7 +67,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = KmsClient::new(vec![server.uri()]);
+        let client = KmsClient::new(vec![server.uri()], &Default::default());
         let result = client
             .get_encrypted_secret("myapp", 1234567890, "pubkey_hex", "sig_hex")
             .await;
@@ -77,7 +77,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_no_nodes_configured() {
-        let client = KmsClient::new(vec![]);
+        let client = KmsClient::new(vec![], &Default::default());
         let result = client
             .get_encrypted_secret("myapp", 1234567890, "pubkey_hex", "sig_hex")
             .await;

@@ -80,6 +80,9 @@ cat > "$TMPD/tapp-server.service" <<'EOF'
 Description=TAPP gRPC Server - Trusted Application
 After=network.target
 Wants=network.target
+# File logs live on the persistent /data disk (RAM rootfs would grow unbounded,
+# issue #23) — same fail-loud policy as docker/containerd: no /data, no start.
+RequiresMountsFor=/data
 
 [Service]
 Type=simple
@@ -104,7 +107,10 @@ cat > "$TMPD/config.toml" <<EOF
 [logging]
 level = "info"
 format = "pretty"
-file_path = "/var/log/tapp/"
+# On the persistent /data disk, NOT the RAM rootfs (rw_overlay="ram") — file
+# logs on "/" consume RAM and are lost on reboot (issue #23). tapp-server keeps
+# at most `max_log_files` daily files (default 7).
+file_path = "/data/log/tapp/"
 
 [server.permission]
 enabled = true
