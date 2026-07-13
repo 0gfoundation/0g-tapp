@@ -35,6 +35,15 @@ done
 dnf install -y --allowerasing "$ART"/cryptpilot-crypt-0.8.0*.rpm "$ART"/cryptpilot-verity-0.8.0*.rpm \
   "$ART"/cryptpilot-fde-host-0.8.0*.rpm >&2
 
+# grpcurl — needed by verifier/register-shared-as.sh (SetAttestationPolicy on the AS). Not in the
+# al8 repos; install the release binary if missing.
+GRPCURL_VER="${GRPCURL_VER:-1.9.1}"
+command -v grpcurl >/dev/null || {
+  echo "==> installing grpcurl $GRPCURL_VER -> /usr/local/bin" >&2
+  curl -fsSL "https://github.com/fullstorydev/grpcurl/releases/download/v${GRPCURL_VER}/grpcurl_${GRPCURL_VER}_linux_x86_64.tar.gz" \
+    | tar -xz -C /usr/local/bin grpcurl >&2
+}
+
 echo "==> [2/3] build cryptpilot-fde (#128) + get convert (#130) from fork @ ${REF:0:12}" >&2
 command -v cargo >/dev/null || { echo "cargo/rust required" >&2; exit 2; }
 if [ -d "$SRC/.git" ]; then git -C "$SRC" fetch --depth 1 origin "$REF" 2>/dev/null || git -C "$SRC" fetch origin; else git clone "$REPO" "$SRC" >&2; fi
