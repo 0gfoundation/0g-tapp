@@ -94,6 +94,10 @@ jobs:
       uses: softprops/action-gh-release@v1
       if: startsWith(github.ref, 'refs/tags/')
       with:
+        # Create the release with a PAT (not the default GITHUB_TOKEN): releases created by
+        # GITHUB_TOKEN do NOT fire `on: release` in other workflows (anti-recursion), so the
+        # build-cvm auto-trigger would never run. Falls back to GITHUB_TOKEN if the secret is unset.
+        token: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
         files: |
           artifacts/${{ env.BINARY_NAME_SERVER }}
           artifacts/${{ env.BINARY_NAME_CLI }}

@@ -41,6 +41,12 @@ concurrency:
   group: build-cvm-${{ inputs.version || github.event.release.tag_name }}-${{ inputs.owner || vars.OWNER_ADDRESS }}
   cancel-in-progress: false
 
+# The reference-values step pushes a refvalues/* branch and opens a PR into dev with GITHUB_TOKEN;
+# the default token is read-only, so grant the writes it needs (else: "denied to github-actions[bot]" 403).
+permissions:
+  contents: write        # push the refvalues/* branch
+  pull-requests: write   # open the reference-values PR
+
 jobs:
   build:
     runs-on: [self-hosted, alinux, cvm-builder]
@@ -141,7 +147,9 @@ jobs:
         if: ${{ env.PUBLISH == 'true' }}
         run: gcp-cvm/ci/open-refvalues-pr.sh "$CLOUD" "$VERSION" "${{ matrix.env }}" "$OWNER"
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # PAT so `gh pr create` works even if the org disables "Actions create/approve PRs".
+          # git push still uses GITHUB_TOKEN via the permissions block above. Falls back if unset.
+          GH_TOKEN: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
 
       - name: Cleanup build artifacts + revoke GCP credential
         if: always()
