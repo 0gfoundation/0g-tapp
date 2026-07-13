@@ -29,17 +29,37 @@ jobs:
     - name: Install cosign
       uses: sigstore/cosign-installer@v3
 
+    # The toolchain stage (yum + rustup, no project sources) is cached in the
+    # GitHub Actions cache — it only rebuilds when the Dockerfile changes.
+    # Cached separately from the full build so the multi-GB cargo build layer
+    # never gets uploaded to the cache.
+    - name: Build toolchain image (cached)
+      uses: docker/build-push-action@v6
+      with:
+        context: .
+        file: reproducible_build/Dockerfile
+        target: toolchain
+        tags: 0g-tapp-toolchain
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
     - name: Build binaries with Docker
+      uses: docker/build-push-action@v6
+      with:
+        context: .
+        file: reproducible_build/Dockerfile
+        tags: 0g-tapp-builder
+        load: true
+        cache-from: type=gha
+
+    - name: Extract binaries
       run: |
-        # Build the builder image
-        docker build -f reproducible_build/Dockerfile -t 0g-tapp-builder .
-        
         # Create output directory
         mkdir -p artifacts
-        
+
         # Extract binaries from container
         docker run --rm -v $(pwd)/artifacts:/artifacts 0g-tapp-builder
-        
+
         # Verify binaries exist
         ls -lh artifacts/
         file artifacts/*

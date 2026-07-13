@@ -17,9 +17,18 @@
 # Usage:
 #   docker build -f Dockerfile -t 0g-tapp-builder /path/to/0g-tapp
 #   docker run --rm -v $(pwd)/artifacts:/artifacts 0g-tapp-builder
+#
+# Building from inside China? Point rustup at a domestic mirror:
+#   docker build -f Dockerfile -t 0g-tapp-builder \
+#     --build-arg RUSTUP_DIST_SERVER=https://mirrors.ustc.edu.cn/rust-static \
+#     --build-arg RUSTUP_UPDATE_ROOT=https://mirrors.ustc.edu.cn/rust-static/rustup \
+#     /path/to/0g-tapp
 # =============================================================================
 
-FROM alibaba-cloud-linux-3-registry.cn-hangzhou.cr.aliyuncs.com/alinux3/alinux3:latest
+# --- Stage 1: toolchain — OS packages + Rust, no project sources. -----------
+# Kept as a separate stage so CI can cache it: none of these layers depend on
+# the source tree, and mirror choice does not affect the bits installed.
+FROM alibaba-cloud-linux-3-registry.cn-hangzhou.cr.aliyuncs.com/alinux3/alinux3:latest AS toolchain
 
 # Set region for Aliyun services
 ARG REGION=cn-beijing
@@ -43,27 +52,30 @@ RUN yum install -y yum-utils-4.0.21-25.1.al8.noarch && \
     sgxsdk-2.23.100.2-1.al8.x86_64 && \
     yum clean all
 
-# Configure Rust installation with Aliyun mirrors
-#ENV RUSTUP_UPDATE_ROOT=https://mirrors.aliyun.com/rustup/rustup
-#ENV RUSTUP_DIST_SERVER=https://mirrors.aliyun.com/rustup
-ENV RUSTUP_DIST_SERVER=https://mirrors.ustc.edu.cn/rust-static
-ENV RUSTUP_UPDATE_ROOT=https://mirrors.ustc.edu.cn/rust-static/rustup
+# Rust download source: official by default (GitHub runners are US-based and
+# domestic mirrors throttle them); override via --build-arg when building from
+# inside China (see header).
+ARG RUSTUP_DIST_SERVER=https://static.rust-lang.org
+ARG RUSTUP_UPDATE_ROOT=https://static.rust-lang.org/rustup
+ENV RUSTUP_DIST_SERVER=${RUSTUP_DIST_SERVER}
+ENV RUSTUP_UPDATE_ROOT=${RUSTUP_UPDATE_ROOT}
 ENV CARGO_HOME=/usr/local/cargo
 ENV RUSTUP_HOME=/usr/local/rustup
 ENV PATH=/usr/local/cargo/bin:$PATH
 
-# Reproducible build settings
+# Reproducible build settings. Compilation parallelism is deliberately NOT
+# pinned: cargo job count only affects scheduling, not codegen — -j1 and -j4
+# builds of this workspace produce sha256-identical binaries.
 ENV SOURCE_DATE_EPOCH=1609459200
 ENV RUSTFLAGS="-C link-arg=-Wl,--build-id=none --remap-path-prefix=/build=/src"
-ENV CARGO_BUILD_JOBS=1
 
 # Install Rust toolchain (version specified in rust-toolchain.toml: 1.91.0)
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.91.0 && \
     rustc --version && \
     cargo --version
 
-ENV RUSTUP_UPDATE_ROOT=https://mirrors.aliyun.com/rustup/rustup
-ENV RUSTUP_DIST_SERVER=https://mirrors.aliyun.com/rustup
+# --- Stage 2: build — copy sources and compile. ------------------------------
+FROM toolchain AS builder
 
 # Set working directory
 WORKDIR /build
