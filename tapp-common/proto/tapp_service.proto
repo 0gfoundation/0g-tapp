@@ -607,6 +607,11 @@ message ContainerStatus {
 // GetSecretResource Messages
 message GetSecretResourceRequest {
   string app_id = 1;
+  // Optional hex-encoded derivation material, opaque to tapp — forwarded
+  // verbatim to KMS /app-key, which binds it into the derived key alongside
+  // app_id (e.g. AgenticID: chainId || contractAddress || sealId).
+  // Absent/empty derives purely from the app_id namespace, as before.
+  string material = 2;
 }
 
 message GetSecretResourceResponse {
