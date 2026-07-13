@@ -15,17 +15,18 @@
 
 set -euo pipefail
 
-IMG="${1:?usage: $0 <image.qcow2> <version> <env> <owner>}"
-VERSION="${2:?usage: $0 <image.qcow2> <version> <env> <owner>}"
-ENV="${3:?usage: $0 <image.qcow2> <version> <env> <owner>}"
-OWNER="$(printf '%s' "${4:?usage: $0 <image.qcow2> <version> <env> <owner>}" | tr 'A-Z' 'a-z')"
+IMG="${1:?usage: $0 <image.qcow2> <cloud> <version> <env> <owner>}"
+CLOUD="${2:?usage: $0 <image.qcow2> <cloud> <version> <env> <owner>}"
+VERSION="${3:?usage: $0 <image.qcow2> <cloud> <version> <env> <owner>}"
+ENV="${4:?usage: $0 <image.qcow2> <cloud> <version> <env> <owner>}"
+OWNER="$(printf '%s' "${5:?usage: $0 <image.qcow2> <cloud> <version> <env> <owner>}" | tr 'A-Z' 'a-z')"
 
 FDE="${CRYPTPILOT_FDE:-/usr/bin/cryptpilot-fde-host}"
 [ -x "$FDE" ] || { echo "cryptpilot-fde-host not found at $FDE — run ci/setup-toolchain.sh first" >&2; exit 2; }
 command -v python3 >/dev/null || { echo "python3 required" >&2; exit 2; }
 
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
-OUT_DIR="$REPO/verifier/reference-values/${VERSION}/${ENV}"
+OUT_DIR="$REPO/verifier/reference-values/${CLOUD}/${VERSION}/${ENV}"
 OUT="$OUT_DIR/${OWNER}.json"
 RAW="$(mktemp)"; trap 'rm -f "$RAW"' EXIT
 
