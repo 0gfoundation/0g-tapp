@@ -94,6 +94,10 @@ RequiresMountsFor=/data
 Type=simple
 User=root
 Group=root
+# Create /run/tapp (0755, cleaned on stop) so tapp-server can bind its unix_socket_path
+# (/run/tapp/tapp.sock, see config.toml [server]) — app containers bind-mount this dir/socket.
+RuntimeDirectory=tapp
+RuntimeDirectoryMode=0755
 ExecStart=/usr/local/bin/tapp-server
 Restart=always
 RestartSec=10
@@ -117,6 +121,11 @@ format = "pretty"
 # logs on "/" consume RAM and are lost on reboot (issue #23). tapp-server keeps
 # at most `max_log_files` daily files (default 7).
 file_path = "/data/log/tapp/"
+
+[server]
+# Serve the gRPC service on this Unix domain socket in addition to TCP.
+# App containers bind-mount this file and set their tapp socket path to it.
+unix_socket_path = "/run/tapp/tapp.sock"
 
 [server.permission]
 enabled = true
