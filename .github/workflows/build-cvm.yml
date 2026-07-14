@@ -71,7 +71,7 @@ jobs:
       GCP_PROJECT: ${{ vars.GCP_PROJECT || 'g-devops' }}
       GCS_BUCKET: ${{ vars.GCS_BUCKET || 'gs://tapp-image' }}
       AS_ENDPOINT: ${{ vars.AS_ENDPOINT || '47.237.201.184:50004' }}
-      CRYPTPILOT_REF: ${{ vars.CRYPTPILOT_REF || '57d751259211c0b72fe22c855d95786865c7d84c' }}   # fork feat/0g-gcp-cvm = 0.8.0 + #128 + #130 (ci/setup-toolchain.sh)
+      CRYPTPILOT_REF: ${{ vars.CRYPTPILOT_REF || '57d751259211c0b72fe22c855d95786865c7d84c' }}   # fork feat/0g-cvm = 0.8.0 + #128 + #130 (ci/setup-toolchain.sh)
       BASE_IMAGE_URL: ${{ vars.BASE_IMAGE_URL }}                # cached Stage-0 base (gs://, file://, or abs path)
       LIBGUESTFS_BACKEND: direct
     steps:
@@ -89,27 +89,27 @@ jobs:
           fi
 
       - name: Fetch build inputs (base image + 0.8.0 guest deb)
-        run: gcp-cvm/ci/fetch-inputs.sh "$VERSION"   # → gcp-cvm/base-noble.qcow2 + cryptpilot-fde-guest_0.8.0_amd64.deb
+        run: cvm/ci/fetch-inputs.sh "$VERSION"   # → cvm/base-noble.qcow2 + cryptpilot-fde-guest_0.8.0_amd64.deb
 
       - name: Set up cryptpilot 0.8.0 toolchain (#128 + #130)
         # installs released 0.8.0 (crypt/verity/fde-host + dracut) and overlays convert(#130) +
         # fde-host(#128) built from the pinned fork; idempotent (fast no-op on an already-provisioned
         # runner). Needed by the build (convert #130) and the reference-value step (fde-host #128).
-        run: gcp-cvm/ci/setup-toolchain.sh
+        run: cvm/ci/setup-toolchain.sh
 
       - name: Stage A+B — build the image
         run: |
-          cd gcp-cvm
+          cd cvm
           HARDEN=${{ steps.v.outputs.harden }} ENABLE_SYSBOX=1 \
             OWNER_ADDRESS="$OWNER" KBS_URLS="$KBS_URLS" \
             TAPP_SERVER_URL="https://github.com/0gfoundation/0g-tapp/releases/download/${VERSION}/tapp-server" \
-            ./build-gcp-tapp.sh base-noble.qcow2 "out-${{ matrix.env }}.qcow2"
+            ./build-tapp.sh base-noble.qcow2 "out-${{ matrix.env }}.qcow2"
 
       - name: Boot smoke test (advisory for now — TODO make a hard gate)
         # non-blocking until the smoke test is validated on a KVM-capable runner and its
         # serial-console detection is confirmed (this builder has no /dev/kvm → TCG, slow/flaky).
         continue-on-error: true
-        run: cd gcp-cvm && ./test/boot-smoke-test.sh "out-${{ matrix.env }}.qcow2"
+        run: cd cvm && ./test/boot-smoke-test.sh "out-${{ matrix.env }}.qcow2"
 
       - name: Authenticate to GCP
         if: ${{ env.PUBLISH == 'true' }}
@@ -130,7 +130,7 @@ jobs:
       - name: Stage C — publish versioned image (+ family)
         if: ${{ env.PUBLISH == 'true' }}
         run: |
-          cd gcp-cvm
+          cd cvm
           IMG="${{ steps.v.outputs.imgbase }}-${VERSION//./-}"
           IMAGE_FAMILY="${{ steps.v.outputs.imgbase }}" \
             ./publish-gcp-image.sh "out-${{ matrix.env }}.qcow2" "$IMG"
@@ -139,7 +139,7 @@ jobs:
         if: ${{ env.PUBLISH == 'true' }}
         # uses /usr/bin/cryptpilot-fde-host (#128), set up by the toolchain step above
         run: |
-          cd gcp-cvm
+          cd cvm
           # writes verifier/reference-values/<cloud>/<version>/<env>/<owner>.json from show-reference-value
           ci/gen-reference-values.sh "out-${{ matrix.env }}.qcow2" "$CLOUD" "$VERSION" "${{ matrix.env }}" "$OWNER"
           cd ..
@@ -147,7 +147,7 @@ jobs:
 
       - name: Open PR with the new reference values → dev
         if: ${{ env.PUBLISH == 'true' }}
-        run: gcp-cvm/ci/open-refvalues-pr.sh "$CLOUD" "$VERSION" "${{ matrix.env }}" "$OWNER"
+        run: cvm/ci/open-refvalues-pr.sh "$CLOUD" "$VERSION" "${{ matrix.env }}" "$OWNER"
         env:
           # PAT so `gh pr create` works even if the org disables "Actions create/approve PRs".
           # git push still uses GITHUB_TOKEN via the permissions block above. Falls back if unset.
@@ -156,7 +156,7 @@ jobs:
       - name: Cleanup build artifacts + revoke GCP credential
         if: always()
         run: |
-          rm -f gcp-cvm/out-${{ matrix.env }}.qcow2 gcp-cvm/base-noble.qcow2 "$RUNNER_TEMP/sa.json"
+          rm -f cvm/out-${{ matrix.env }}.qcow2 cvm/base-noble.qcow2 "$RUNNER_TEMP/sa.json"
           if [ -n "${CLOUDSDK_CONFIG:-}" ]; then          # only if we authenticated (publish=true)
             gcloud auth revoke --all 2>/dev/null || true  # drop the activated SA from gcloud
             rm -rf "$CLOUDSDK_CONFIG"                      # wipe the job-scoped gcloud config dir

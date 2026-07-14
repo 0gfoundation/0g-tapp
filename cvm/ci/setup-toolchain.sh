@@ -5,7 +5,7 @@
 # Run once per runner (or when CRYPTPILOT_REF bumps). Idempotent-ish. Requires: al8, root, dnf, git,
 # cargo/rust, cryptsetup-devel, gh (authenticated).
 #
-# Why 0.8.0 + a fork build (see gcp-cvm/cryptpilot-gcp-boot-fix.md §12/§14):
+# Why 0.8.0 + a fork build (see cvm/cryptpilot-gcp-boot-fix.md §12/§14):
 #   - #130 (fork) teaches cryptpilot-convert to handle GCP-style images (separate ESP grub.cfg +
 #     vendor kernels) itself, so the build no longer needs the "keep a -generic kernel" + fix-B
 #     ESP-sync workarounds.
@@ -15,12 +15,12 @@
 #   install the released 0.8.0 for the base/runtime/dracut, then overlay convert + fde-host built
 #   from the fork commit that carries both fixes.
 #
-# Prints the 0.8.0 guest deb path (for FDE_PACKAGE / build-gcp-tapp.sh --package) on the last line.
+# Prints the 0.8.0 guest deb path (for FDE_PACKAGE / build-tapp.sh --package) on the last line.
 set -euo pipefail
 
 REL="${CRYPTPILOT_RELEASE:-v0.8.0}"
 REPO="${CRYPTPILOT_REPO_URL:-https://github.com/0gfoundation/cryptpilot.git}"
-# 0.8.0 + #128 + #130 (fork branch feat/0g-gcp-cvm). Bump deliberately; do not track a moving branch.
+# 0.8.0 + #128 + #130 (fork branch feat/0g-cvm). Bump deliberately; do not track a moving branch.
 REF="${CRYPTPILOT_REF:-57d751259211c0b72fe22c855d95786865c7d84c}"
 WORK="${1:-$HOME/.cache/cvm-ci}"; SRC="$WORK/cryptpilot-src"; ART="$WORK/artifacts"
 GH="${GH:-gh}"

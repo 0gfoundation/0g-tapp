@@ -10,7 +10,7 @@
 #
 # Requires: qemu-img, tar, gsutil, gcloud (authenticated: `gcloud auth login`), and write access to
 # the target GCS bucket / project. This step is separate from the image build because it needs cloud
-# credentials and network upload; run it after build-gcp-tapp.sh (or via that script's opt-in Stage C).
+# credentials and network upload; run it after build-tapp.sh (or via that script's opt-in Stage C).
 #
 # Usage:
 #   ./publish-gcp-image.sh /root/og-tdx.qcow2 og-tdx

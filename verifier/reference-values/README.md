@@ -27,14 +27,14 @@ verifier/reference-values/<cloud>/<tapp-server-version>/<env>/<owner>.json   # c
 Values are produced from the release image with cryptpilot — **must run on an Alinux host**
 (`cryptpilot-convert` / `cryptpilot-fde` are Alinux-only). `show-reference-value` needs a
 **#128-fixed cryptpilot-fde** (stock 0.7.0 errors `saved_entry not found` on a never-booted
-image); it's provided by `gcp-cvm/ci/setup-toolchain.sh` (installs released 0.8.0 + overlays the
+image); it's provided by `cvm/ci/setup-toolchain.sh` (installs released 0.8.0 + overlays the
 #128 `cryptpilot-fde-host`). The tool emits JSON with the `measurement.<component>.SHA-384` keys directly.
 
 Automated on the al8 self-hosted runner (`.github/workflows/build-cvm.yml`); manual equivalent:
 
 ```bash
-gcp-cvm/ci/setup-toolchain.sh                                  # provision the 0.8.0 + #128/#130 toolchain once
-gcp-cvm/ci/gen-reference-values.sh \
+cvm/ci/setup-toolchain.sh                                  # provision the 0.8.0 + #128/#130 toolchain once
+cvm/ci/gen-reference-values.sh \
   <release-image> <cloud> <version> <env> <owner>              # writes <cloud>/<version>/<env>/<owner>.json
 ```
 

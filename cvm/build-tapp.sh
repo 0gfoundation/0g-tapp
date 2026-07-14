@@ -1,11 +1,11 @@
 #!/bin/bash
-# build-gcp-tapp.sh <ubuntu-24.04-base.qcow2> <output gcp-tapp.qcow2>
+# build-tapp.sh <ubuntu-24.04-base.qcow2> <output gcp-tapp.qcow2>
 #
 # One-command pipeline that turns a stock Ubuntu 24.04 cloud image into the final
 # cryptpilot tapp image. Two stages:
 #   [A] provision base: tapp-server + service + /etc/tapp/config.toml + libtdx-attest (SGX repo)
 #       + docker + systemd-resolved fallback DNS
-#   [B] reuse prepare-gcp-tapp.sh: install gcp kernel -> fix /boot/vmlinuz symlink -> convert -> sync ESP
+#   [B] reuse prepare-tapp.sh: install gcp kernel -> fix /boot/vmlinuz symlink -> convert -> sync ESP
 #
 # Requires network access on the host/appliance (apt + downloads).
 
@@ -47,7 +47,7 @@ SYSBOX_DEB_URL="${SYSBOX_DEB_URL:-https://downloads.nestybox.com/sysbox/releases
 # Both exported so prepare-*.sh (stage B) inherits them.
 export CLOUD="${CLOUD:-gcp}"
 export BOOT_FORMAT="${BOOT_FORMAT:-$([ "$CLOUD" = gcp ] && echo grub || echo uki)}"
-# passed through to prepare-gcp-tapp.sh (used by convert)
+# passed through to prepare-tapp.sh (used by convert)
 export CONFIG_DIR="${CONFIG_DIR:-$HERE/config_dir}"
 export FDE_PACKAGE="${FDE_PACKAGE:-$HERE/cryptpilot-fde-guest_0.8.0_amd64.deb}"   # 0.8.0 in-image runtime (cryptpilot-fde split into -host/-guest at 0.8.0)
 export ROOTFS_MODE="${ROOTFS_MODE:---rootfs-no-encryption}"
@@ -64,7 +64,7 @@ OUT="${2:?usage: $0 <ubuntu-24.04-base.qcow2> <output.qcow2>}"
 [ -f "$IN" ] || { echo "input image not found: $IN" >&2; exit 1; }
 [ -n "$OWNER_ADDRESS" ] || { echo "OWNER_ADDRESS is required, e.g. OWNER_ADDRESS=0x... $0 ..." >&2; exit 1; }
 [ -n "$KBS_URLS" ] || { echo "KBS_URLS is required, e.g. KBS_URLS='\"http://host1:9091\", \"http://host2:9091\"' $0 ..." >&2; exit 1; }
-[ -f "$HERE/prepare-gcp-tapp.sh" ] || { echo "missing prepare-gcp-tapp.sh (must be in the same directory as this script)" >&2; exit 1; }
+[ -f "$HERE/prepare-tapp.sh" ] || { echo "missing prepare-tapp.sh (must be in the same directory as this script)" >&2; exit 1; }
 [ -d "$CONFIG_DIR" ] || { echo "CONFIG_DIR not found: $CONFIG_DIR" >&2; exit 1; }
 [ -f "$FDE_PACKAGE" ] || { echo "FDE_PACKAGE not found: $FDE_PACKAGE" >&2; exit 1; }
 
@@ -413,8 +413,8 @@ virt-customize -a "$IN" \
   --run "$TMPD/provision-base.sh"
 
 # ---- stage B: kernel + convert + ESP (IN_PLACE operates on the input, reusing the validated script) ----
-echo "==> [B] prepare-gcp-tapp.sh (IN_PLACE): install gcp kernel -> fix A -> convert -> fix B"
-IN_PLACE=1 "$HERE/prepare-gcp-tapp.sh" "$IN" "$OUT"
+echo "==> [B] prepare-tapp.sh (IN_PLACE): install gcp kernel -> fix A -> convert -> fix B"
+IN_PLACE=1 "$HERE/prepare-tapp.sh" "$IN" "$OUT"
 
 echo ""
 echo "[done] final image: $OUT"

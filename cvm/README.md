@@ -6,23 +6,23 @@ Build a bootable, measurable, remotely-attestable, security-hardened cryptpilot 
 | File | Description |
 |---|---|
 | `cryptpilot-gcp-boot-fix.md` | **Main doc**: root-cause analysis + fixes + full SOP (§9) + security-hardening audit (§11) + convert issues for Alibaba Cloud (§7) |
-| `build-gcp-tapp.sh` | **One-shot full chain**: base image → final gcp-tapp (Stage A app/docker/SGX/DNS + hardening + /data + Sysbox / Stage B kernel + convert + ESP / opt-in Stage C publish via `PUBLISH_AS=`) |
-| `prepare-gcp-tapp.sh` | Stage B only (when a base already exists): fix A + DNS (guestfish) + nbd reset + convert + fix B |
+| `build-tapp.sh` | **One-shot full chain**: base image → final gcp-tapp (Stage A app/docker/SGX/DNS + hardening + /data + Sysbox / Stage B kernel + convert + ESP / opt-in Stage C publish via `PUBLISH_AS=`) |
+| `prepare-tapp.sh` | Stage B only (when a base already exists): fix A + DNS (guestfish) + nbd reset + convert + fix B |
 | `publish-gcp-image.sh` | **Stage C**: publish a built qcow2 to GCP — `qemu-img` raw → oldgnu sparse `tar.gz` → `gsutil` → `gcloud compute images create` (confidential guest-os-features). Needs gcloud/gsutil auth |
 | `fix-esp-grub.sh` | Sync the ESP grub only (fix B, can be run standalone against an already-converted image) |
 | `test/boot-smoke-test.sh` | **Local boot smoke test**: boots a converted image under QEMU/OVMF (no real GCP CVM needed) and checks the boot chain reaches multi-user / tapp-server |
 | `config_dir/` | cryptpilot convert config (`fde.toml`, `rw_overlay="ram"`) |
 | `cryptpilot-fde_0.7.0_amd64.deb` | FDE **runtime installed into the target image**. **Binary, gitignored**, must be placed locally in this directory (see Prerequisites) |
 
-> The artifact `gcp-tapp.qcow2` (~4.5G, converted / verity-sealed / hardened) is the **output** of `build-gcp-tapp.sh` and is not committed (gitignored).
+> The artifact `gcp-tapp.qcow2` (~4.5G, converted / verity-sealed / hardened) is the **output** of `build-tapp.sh` and is not committed (gitignored).
 > The same applies to `cryptpilot-fde_*.deb` and the tapp-server binary: the deb must be placed locally in this directory; tapp-server is pulled by default from GitHub release v0.1.0 (see below).
 
 ## Pipeline (stages)
-- **Stage 0 — base prep** *(one-time, reused across builds)*: official Ubuntu 24.04 cloud image → resize to 20 GiB + gVNIC driver → base qcow2. See `cryptpilot-gcp-boot-fix.md` §0. This is the input to Stage A, not part of `build-gcp-tapp.sh`.
-- **Stage A** (`build-gcp-tapp.sh`): provision app / docker / SGX / DNS, security hardening, Sysbox, and the `/data` + `br_netfilter` bakes.
-- **Stage B** (`prepare-gcp-tapp.sh`, invoked by A): install the gcp kernel → fix A → `cryptpilot-convert` → sync ESP (fix B).
+- **Stage 0 — base prep** *(one-time, reused across builds)*: official Ubuntu 24.04 cloud image → resize to 20 GiB + gVNIC driver → base qcow2. See `cryptpilot-gcp-boot-fix.md` §0. This is the input to Stage A, not part of `build-tapp.sh`.
+- **Stage A** (`build-tapp.sh`): provision app / docker / SGX / DNS, security hardening, Sysbox, and the `/data` + `br_netfilter` bakes.
+- **Stage B** (`prepare-tapp.sh`, invoked by A): install the gcp kernel → fix A → `cryptpilot-convert` → sync ESP (fix B).
 - *(optional)* local boot smoke test (`test/boot-smoke-test.sh`).
-- **Stage C** (`publish-gcp-image.sh`): raw → sparse `tar.gz` → GCS → `gcloud compute images create`. Run standalone, or from `build-gcp-tapp.sh` via `PUBLISH_AS=<name>`.
+- **Stage C** (`publish-gcp-image.sh`): raw → sparse `tar.gz` → GCS → `gcloud compute images create`. Run standalone, or from `build-tapp.sh` via `PUBLISH_AS=<name>`.
 
 ## Prerequisites
 - **Conversion host = Anolis / Alibaba Cloud Linux 3 (al8).** `cryptpilot-convert` is only packaged for al8; a plain Ubuntu/macOS host cannot run it.
@@ -47,7 +47,7 @@ See `cryptpilot-gcp-boot-fix.md` §0.1 for details.
 export LIBGUESTFS_BACKEND=direct
 OWNER_ADDRESS=0x<your-owner-address> \
 KBS_URLS='"http://<kbs-host-1>:9091", "http://<kbs-host-2>:9091"' \
-./build-gcp-tapp.sh <bare-ubuntu-24.04.qcow2> gcp-tapp.qcow2
+./build-tapp.sh <bare-ubuntu-24.04.qcow2> gcp-tapp.qcow2
 ```
 - **Required** (no defaults — the build aborts if unset, so no deployment-specific value is ever baked in):
   - `OWNER_ADDRESS` — tapp-server owner address, written to `config.toml` `[server.permission]`.
@@ -76,7 +76,7 @@ The cryptpilot rootfs writable overlay is **RAM-backed (zram) and ephemeral** �
 ## Multi-tenant container isolation — Sysbox (issue #21, opt-in)
 For hostile-multi-tenant workloads (e.g. 0g-sandbox), build with `ENABLE_SYSBOX=1` to install [Sysbox](https://github.com/nestybox/sysbox) and register `sysbox-runc` as a dockerd runtime, so in-container `root` is user-namespace-remapped (a kernel CVE in a sandbox is no longer host-equivalent):
 ```bash
-ENABLE_SYSBOX=1 OWNER_ADDRESS=0x... KBS_URLS='...' ./build-gcp-tapp.sh base.qcow2 gcp-tapp.qcow2
+ENABLE_SYSBOX=1 OWNER_ADDRESS=0x... KBS_URLS='...' ./build-tapp.sh base.qcow2 gcp-tapp.qcow2
 ```
 - Only the runtime registration is gated behind `ENABLE_SYSBOX`; the `/data` storage pinning above happens regardless. Sysbox's own data store is also moved off the RAM root: `sysbox-mgr --data-root` → **`/data/sysbox`** (it holds inner-container images).
 - **Docker is pinned to 27.5.1** (`DOCKER_VERSION`). Docker 28+/29+ emit the Linux *time namespace* in the OCI spec, which `sysbox-runc` rejects (`namespace ... does not exist`); Nestybox supports Docker 20.10–27.x only.
@@ -105,7 +105,7 @@ gcloud auth login            # gcloud + gsutil must be authenticated with write 
 ```
 Defaults `GCS_BUCKET=gs://tapp-image`, `GCP_PROJECT=g-devops`, `GUEST_OS_FEATURES=UEFI_COMPATIBLE,GVNIC,SEV_CAPABLE,TDX_CAPABLE` (all overridable). It refuses to clobber an existing image name (delete it, or publish under a new name). Or fold it into the build as an opt-in final stage:
 ```bash
-PUBLISH_AS=og-tdx-dev ENABLE_SYSBOX=1 OWNER_ADDRESS=0x... KBS_URLS='...' ./build-gcp-tapp.sh base.qcow2 og-tdx-dev.qcow2
+PUBLISH_AS=og-tdx-dev ENABLE_SYSBOX=1 OWNER_ADDRESS=0x... KBS_URLS='...' ./build-tapp.sh base.qcow2 og-tdx-dev.qcow2
 ```
 Create a confidential instance from the published image with `--image=<name> --image-project=g-devops --confidential-compute-type=TDX`.
 

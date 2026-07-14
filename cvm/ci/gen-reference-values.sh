@@ -7,7 +7,7 @@
 #
 # Uses a #128-fixed cryptpilot-fde (0.8.0+), which on a never-booted image (empty grubenv)
 # falls back to the default grub.cfg menuentry instead of erroring "saved_entry not found"
-# (see gcp-cvm/cryptpilot-gcp-boot-fix.md §7.6/§12). The tool already emits JSON with the
+# (see cvm/cryptpilot-gcp-boot-fix.md §7.6/§12). The tool already emits JSON with the
 # exact "measurement.*.SHA-384" keys; we just drop its non-"measurement." helper keys.
 #
 # The binary is /usr/bin/cryptpilot-fde-host, set up by ci/setup-toolchain.sh (released 0.8.0 with

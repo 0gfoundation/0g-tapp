@@ -1,5 +1,5 @@
 #!/bin/bash
-# prepare-gcp-tapp.sh <input-base.qcow2> <output-tapp.qcow2>
+# prepare-tapp.sh <input-base.qcow2> <output-tapp.qcow2>
 #
 # Turn a GCP Ubuntu base image into a working cryptpilot tapp image.
 # Chains four steps, two of which are the key fixes:
