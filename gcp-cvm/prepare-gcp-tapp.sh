@@ -68,9 +68,14 @@ if [ "$CLOUD" = gcp ]; then
     echo "vmlinuz -> $k"
   '
 else
-  # ali (or any non-gcp): keep the base's generic kernel; /boot/vmlinuz already points at it, so no
-  # kernel swap and no fix A. convert will build the cryptpilot initrd for the generic kernel.
-  echo "==> [1/4] CLOUD=$CLOUD: keeping the base generic kernel (no gcp kernel swap, no fix A)"
+  # ali (or any non-gcp): keep the base's generic kernel (Ali ECS boots generic via virtio) — no gcp
+  # kernel swap, no fix A. Install the UKI/systemd-boot prerequisites: Ali's cryptpilot flow uses
+  # `cryptpilot-convert --uki` (systemd-boot / Unified Kernel Image), which needs dracut (initrd) +
+  # systemd-boot-efi (bootloader) present in the image (per the Alibaba confidential-disk guide).
+  echo "==> [1/4] CLOUD=$CLOUD: keep generic kernel; install dracut + systemd-boot-efi for the --uki path"
+  virt-customize -a "$WORK" \
+    --run-command 'apt-get update' \
+    --install dracut,dracut-core,systemd-boot-efi
 fi
 
 if [ -n "$DNS_FALLBACK" ]; then
@@ -107,7 +112,10 @@ case "${TMPDIR:-}" in
   *) echo "   (TMPDIR=$TMPDIR is unusual; falling back to /tmp for convert)"; export TMPDIR=/tmp ;;
 esac
 CRYPTPILOT_CONVERT="${CRYPTPILOT_CONVERT:-cryptpilot-convert}"
-"$CRYPTPILOT_CONVERT" --in "$WORK" --out "$OUT" \
+# Boot format per cloud: ali uses UKI / systemd-boot (`--uki`, the Alibaba confidential-disk flow);
+# gcp uses grub (convert #130 then syncs the regenerated grub.cfg to the ESP). See the CLOUD branch above.
+UKI_FLAG=""; [ "$CLOUD" != gcp ] && UKI_FLAG="--uki"
+"$CRYPTPILOT_CONVERT" --in "$WORK" --out "$OUT" $UKI_FLAG \
   --config-dir "$CONFIG_DIR" $ROOTFS_MODE --package "$FDE_PACKAGE"
 
 # NOTE: the old "[fix B] sync ESP grub.cfg + modules" step was removed — cryptpilot-convert now does

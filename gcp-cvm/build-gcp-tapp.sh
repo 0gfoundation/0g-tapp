@@ -344,8 +344,14 @@ EOF
 else
   # ali (or other) dev variant: the dev build does NOT purge cloud-init (only HARDEN=1 does), and on
   # Alibaba Cloud cloud-init injects the instance SSH key + configures networking from the Ali metadata
-  # service. So no google-guest-agent (that is GCP-only) — just rely on the retained cloud-init.
-  echo "==> [harden] HARDEN=0 $CLOUD: relying on the retained cloud-init for SSH/network injection (no google-guest-agent)"
+  # service (100.100.100.200). So no google-guest-agent (that is GCP-only) — rely on cloud-init, and
+  # PIN its datasource to AliYun: Alibaba recommends pinning rather than relying on ds-identify picking
+  # AliYun out of ~30 candidate datasources, so key/network injection is reliable.
+  echo "==> [harden] HARDEN=0 $CLOUD: pin cloud-init datasource to AliYun for SSH/network injection (no google-guest-agent)"
+  cat >> "$TMPD/provision-base.sh" <<'EOF'
+mkdir -p /etc/cloud/cloud.cfg.d
+printf 'datasource_list: [ AliYun ]\n' > /etc/cloud/cloud.cfg.d/99-aliyun-ds.cfg
+EOF
 fi
 
 # ===== Sysbox (issue #21, Phase 1: container isolation; opt-in) =====
