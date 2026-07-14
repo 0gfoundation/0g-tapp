@@ -146,12 +146,12 @@ apt-get install -y curl gnupg ca-certificates
 install -d -m0755 /etc/apt/keyrings
 # Intel SGX repo (libtdx-attest, a runtime dependency of tapp-server)
 curl -fsSL https://download.01.org/intel-sgx/sgx_repo/ubuntu/intel-sgx-deb.key \
-  | gpg --dearmor -o /etc/apt/keyrings/intel-sgx.gpg
+  | gpg --batch --no-tty --dearmor -o /etc/apt/keyrings/intel-sgx.gpg
 echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/intel-sgx.gpg] https://download.01.org/intel-sgx/sgx_repo/ubuntu noble main" \
   > /etc/apt/sources.list.d/intel-sgx.list
 # Docker official repo
 curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
-  | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+  | gpg --batch --no-tty --dearmor -o /etc/apt/keyrings/docker.gpg
 echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu noble stable" \
   > /etc/apt/sources.list.d/docker.list
 apt-get update
