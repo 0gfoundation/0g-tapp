@@ -327,8 +327,8 @@ network:
 NETEOF
 chmod 600 /etc/netplan/01-dhcp.yaml
 EOF
-else
-  echo "==> [harden] HARDEN=0: dev variant, reinstall google-guest-agent to restore GCP SSH key injection"
+elif [ "$CLOUD" = gcp ]; then
+  echo "==> [harden] HARDEN=0 gcp: reinstall google-guest-agent to restore GCP SSH key injection"
   cat >> "$TMPD/provision-base.sh" <<'EOF'
 # dev variant only: google-guest-agent (from Ubuntu universe) injects the instance
 # SSH public key from metadata into ~ubuntu/.ssh/authorized_keys. It talks to the
@@ -341,6 +341,11 @@ systemctl enable google-guest-agent.service || true
 grep -q 'metadata.google.internal' /etc/hosts || \
   printf '169.254.169.254 metadata.google.internal metadata\n' >> /etc/hosts
 EOF
+else
+  # ali (or other) dev variant: the dev build does NOT purge cloud-init (only HARDEN=1 does), and on
+  # Alibaba Cloud cloud-init injects the instance SSH key + configures networking from the Ali metadata
+  # service. So no google-guest-agent (that is GCP-only) — just rely on the retained cloud-init.
+  echo "==> [harden] HARDEN=0 $CLOUD: relying on the retained cloud-init for SSH/network injection (no google-guest-agent)"
 fi
 
 # ===== Sysbox (issue #21, Phase 1: container isolation; opt-in) =====
