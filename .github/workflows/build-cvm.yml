@@ -62,9 +62,11 @@ jobs:
       VERSION: ${{ inputs.version || github.event.release.tag_name }}
       OWNER: ${{ inputs.owner || vars.OWNER_ADDRESS }}
       PUBLISH: ${{ github.event_name == 'release' && 'true' || inputs.publish }}
-      # cloud dimension: this build kit is GCP-specific (GCP kernel/gVNIC/boot fixes), so each cloud
-      # is a distinct image with its own boot measurements. Fixed to 'gcp'; an Ali pipeline sets 'ali'.
-      CLOUD: gcp
+      # cloud dimension: each cloud is a distinct image (own kernel/boot → own measurements).
+      # NOTE(feat/cvm-multicloud): temporarily FIXED to 'ali' on this branch to test the Ali build path
+      # end-to-end without touching main's inputs/form (per "固定走 aliyun 流程方便测试"). Before merging
+      # to main this becomes an input/matrix dimension; main stays 'gcp'.
+      CLOUD: ali
       KBS_URLS: ${{ vars.TAPP_KBS_URLS }}                       # required (no safe default)
       GCP_PROJECT: ${{ vars.GCP_PROJECT || 'g-devops' }}
       GCS_BUCKET: ${{ vars.GCS_BUCKET || 'gs://tapp-image' }}

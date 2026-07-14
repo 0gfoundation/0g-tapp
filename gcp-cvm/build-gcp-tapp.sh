@@ -39,6 +39,12 @@ CONTAINERD_ROOT="${CONTAINERD_ROOT:-/data/containerd}" # containerd root (image 
 ENABLE_SYSBOX="${ENABLE_SYSBOX:-0}"
 SYSBOX_VERSION="${SYSBOX_VERSION:-0.7.0}"
 SYSBOX_DEB_URL="${SYSBOX_DEB_URL:-https://downloads.nestybox.com/sysbox/releases/v${SYSBOX_VERSION}/sysbox-ce_${SYSBOX_VERSION}-0.linux_amd64.deb}"
+# Target cloud (gcp | ali). Shared build core; cloud-specific bits branch on this:
+#   - stage B (prepare): gcp swaps in linux-image-gcp + fix A; ali keeps the generic kernel.
+#   - stage C (publish): gcp -> publish-gcp-image.sh; ali -> publish-ali-image.sh.
+#   - dev-variant guest agent (below): gcp reinstalls google-guest-agent; ali TODO (aliyun/cloud-init).
+# Exported so prepare-*.sh (stage B) inherits it.
+export CLOUD="${CLOUD:-gcp}"
 # passed through to prepare-gcp-tapp.sh (used by convert)
 export CONFIG_DIR="${CONFIG_DIR:-$HERE/config_dir}"
 export FDE_PACKAGE="${FDE_PACKAGE:-$HERE/cryptpilot-fde-guest_0.8.0_amd64.deb}"   # 0.8.0 in-image runtime (cryptpilot-fde split into -host/-guest at 0.8.0)
@@ -392,9 +398,14 @@ echo ""
 echo "[done] final image: $OUT"
 echo "(note: $IN was modified in place; re-download the original base image if you need it again)"
 
-# ---- stage C (opt-in): publish $OUT to GCP as image $PUBLISH_AS ----
+# ---- stage C (opt-in): publish $OUT as image $PUBLISH_AS on the target cloud ----
 if [ -n "$PUBLISH_AS" ]; then
-  [ -x "$HERE/publish-gcp-image.sh" ] || { echo "PUBLISH_AS set but publish-gcp-image.sh not found/executable in $HERE" >&2; exit 1; }
-  echo "==> [C] publish-gcp-image.sh: $OUT -> GCP image '$PUBLISH_AS'"
-  "$HERE/publish-gcp-image.sh" "$OUT" "$PUBLISH_AS"
+  case "$CLOUD" in
+    gcp) PUBLISHER="$HERE/publish-gcp-image.sh" ;;
+    ali) PUBLISHER="$HERE/publish-ali-image.sh" ;;
+    *)   echo "unknown CLOUD=$CLOUD (expected gcp|ali)" >&2; exit 1 ;;
+  esac
+  [ -x "$PUBLISHER" ] || { echo "PUBLISH_AS set but $(basename "$PUBLISHER") not found/executable in $HERE" >&2; exit 1; }
+  echo "==> [C] $(basename "$PUBLISHER"): $OUT -> $CLOUD image '$PUBLISH_AS'"
+  "$PUBLISHER" "$OUT" "$PUBLISH_AS"
 fi

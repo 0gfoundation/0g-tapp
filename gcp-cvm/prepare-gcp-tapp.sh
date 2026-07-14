@@ -16,6 +16,11 @@
 set -euo pipefail
 
 # ===== Tunables =====
+CLOUD="${CLOUD:-gcp}"                                   # gcp | ali. gcp: swap in linux-image-gcp + point
+                                                       #   /boot/vmlinuz at it (fix A) + verify GCP ESP.
+                                                       #   ali: keep the base's generic kernel (Ali ECS
+                                                       #   boots generic via virtio) — skip kernel swap + fix A.
+                                                       #   convert / DNS / nbd reset are shared either way.
 CONFIG_DIR="${CONFIG_DIR:-./config_dir}"
 FDE_PACKAGE="${FDE_PACKAGE:-cryptpilot-fde_0.7.0_amd64.deb}"
 ROOTFS_MODE="${ROOTFS_MODE:---rootfs-no-encryption}"   # or "--rootfs-passphrase <pass>"
@@ -42,25 +47,31 @@ else
   cp -f "$IN" "$WORK"
 fi
 
-if [ "$INSTALL_KERNEL" = 1 ]; then
-  echo "==> [1/4] installing gcp kernel (virt-customize)"
-  vc_args=(-a "$WORK" --install linux-image-gcp,linux-modules-extra-gcp)
-  [ -n "$PURGE_KERNEL" ] && vc_args+=(--run-command "apt-get autoremove --purge $PURGE_KERNEL -y || true")
-  vc_args+=(--run-command 'update-grub')
-  virt-customize "${vc_args[@]}"
-else
-  echo "==> [1/4] skipping kernel install (INSTALL_KERNEL=0)"
-fi
+if [ "$CLOUD" = gcp ]; then
+  if [ "$INSTALL_KERNEL" = 1 ]; then
+    echo "==> [1/4] installing gcp kernel (virt-customize)"
+    vc_args=(-a "$WORK" --install linux-image-gcp,linux-modules-extra-gcp)
+    [ -n "$PURGE_KERNEL" ] && vc_args+=(--run-command "apt-get autoremove --purge $PURGE_KERNEL -y || true")
+    vc_args+=(--run-command 'update-grub')
+    virt-customize "${vc_args[@]}"
+  else
+    echo "==> [1/4] skipping kernel install (INSTALL_KERNEL=0)"
+  fi
 
-echo "==> [fix A] point /boot/vmlinuz and initrd.img symlinks at the gcp kernel"
-virt-customize -a "$WORK" --run-command '
-  set -e
-  k=$(ls /boot/vmlinuz-*-gcp 2>/dev/null | sort -V | tail -1 | sed "s#/boot/##")
-  [ -n "$k" ] || { echo "ERROR: no gcp kernel (vmlinuz-*-gcp) in the image"; exit 1; }
-  ln -sf "$k" /boot/vmlinuz
-  ln -sf "initrd.img-${k#vmlinuz-}" /boot/initrd.img
-  echo "vmlinuz -> $k"
-'
+  echo "==> [fix A] point /boot/vmlinuz and initrd.img symlinks at the gcp kernel"
+  virt-customize -a "$WORK" --run-command '
+    set -e
+    k=$(ls /boot/vmlinuz-*-gcp 2>/dev/null | sort -V | tail -1 | sed "s#/boot/##")
+    [ -n "$k" ] || { echo "ERROR: no gcp kernel (vmlinuz-*-gcp) in the image"; exit 1; }
+    ln -sf "$k" /boot/vmlinuz
+    ln -sf "initrd.img-${k#vmlinuz-}" /boot/initrd.img
+    echo "vmlinuz -> $k"
+  '
+else
+  # ali (or any non-gcp): keep the base's generic kernel; /boot/vmlinuz already points at it, so no
+  # kernel swap and no fix A. convert will build the cryptpilot initrd for the generic kernel.
+  echo "==> [1/4] CLOUD=$CLOUD: keeping the base generic kernel (no gcp kernel swap, no fix A)"
+fi
 
 if [ -n "$DNS_FALLBACK" ]; then
   echo "==> [fix C] DNS: FallbackDNS (virt-customize) + static /etc/resolv.conf (guestfish)"
@@ -110,10 +121,12 @@ fi
 
 echo ""
 echo "[done] output: $OUT"
-echo "  - verifying the kernel of the ESP default boot entry:"
-guestfish --ro -a "$OUT" <<'GF' 2>/dev/null | grep -m1 -E 'linux[[:space:]]+/vmlinuz' || true
+if [ "$CLOUD" = gcp ]; then
+  echo "  - verifying the kernel of the ESP default boot entry (GCP ESP layout /dev/sda15):"
+  guestfish --ro -a "$OUT" <<'GF' 2>/dev/null | grep -m1 -E 'linux[[:space:]]+/vmlinuz' || true
 run
 mount /dev/sda15 /
 cat /EFI/ubuntu/grub.cfg
 GF
+fi   # ali: ESP layout may differ; skip this GCP-specific verify (convert handles boot). Verify on a real Ali TDX boot.
 echo "  tip: to compute reference values, run cryptpilot-fde show-reference-value --disk $OUT afterwards"
