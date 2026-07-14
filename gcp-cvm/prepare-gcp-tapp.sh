@@ -73,9 +73,12 @@ else
   # `cryptpilot-convert --uki` (systemd-boot / Unified Kernel Image), which needs dracut (initrd) +
   # systemd-boot-efi (bootloader) present in the image (per the Alibaba confidential-disk guide).
   echo "==> [1/4] CLOUD=$CLOUD: keep generic kernel; install dracut + systemd-boot-efi for the --uki path"
+  # dracut-network: the cryptpilot-fde-guest deb (installed during convert) depends on it; pre-install
+  # so the deb install doesn't hit a missing-dep dpkg error mid-convert (convert auto-resolves it, but
+  # cleaner up front).
   virt-customize -a "$WORK" \
     --run-command 'apt-get update' \
-    --install dracut,dracut-core,systemd-boot-efi
+    --install dracut,dracut-core,dracut-network,systemd-boot-efi
 fi
 
 if [ -n "$DNS_FALLBACK" ]; then
