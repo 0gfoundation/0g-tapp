@@ -33,12 +33,22 @@ on:
         description: "OWNER_ADDRESS (0x...) baked into the image (measured). Blank = vars.OWNER_ADDRESS (default owner)."
         required: false
       publish:
-        description: "publish to GCP + register reference values"
+        description: "publish image + register reference values"
         type: boolean
         default: true
+      cloud:
+        description: "target cloud (kernel/guest/publish)"
+        type: choice
+        options: [gcp, ali]
+        default: gcp
+      boot_format:
+        description: "boot format (auto = grub for gcp, uki for ali)"
+        type: choice
+        options: [auto, grub, uki]
+        default: auto
 
 concurrency:
-  group: build-cvm-${{ inputs.version || github.event.release.tag_name }}-${{ inputs.owner || vars.OWNER_ADDRESS }}
+  group: build-cvm-${{ inputs.cloud || 'gcp' }}-${{ inputs.version || github.event.release.tag_name }}-${{ inputs.owner || vars.OWNER_ADDRESS }}
   cancel-in-progress: false
 
 # The reference-values step pushes a refvalues/* branch and opens a PR into dev with GITHUB_TOKEN;
@@ -62,11 +72,11 @@ jobs:
       VERSION: ${{ inputs.version || github.event.release.tag_name }}
       OWNER: ${{ inputs.owner || vars.OWNER_ADDRESS }}
       PUBLISH: ${{ github.event_name == 'release' && 'true' || inputs.publish }}
-      # cloud dimension: each cloud is a distinct image (own kernel/boot → own measurements).
-      # NOTE(feat/cvm-multicloud): temporarily FIXED to 'ali' on this branch to test the Ali build path
-      # end-to-end without touching main's inputs/form (per "固定走 aliyun 流程方便测试"). Before merging
-      # to main this becomes an input/matrix dimension; main stays 'gcp'.
-      CLOUD: ali
+      # cloud/boot-format dimensions (independent; a CVM = one CLOUD × one BOOT_FORMAT = one measurement
+      # chain). release event -> defaults (cloud=gcp, boot_format auto->grub); dispatch -> chosen inputs.
+      CLOUD: ${{ inputs.cloud || 'gcp' }}
+      # boot_format 'auto'/'' -> empty, so build-tapp derives it from cloud (gcp->grub, ali->uki)
+      BOOT_FORMAT: ${{ (inputs.boot_format == 'auto' || inputs.boot_format == '') && '' || inputs.boot_format }}
       KBS_URLS: ${{ vars.TAPP_KBS_URLS }}                       # required (no safe default)
       GCP_PROJECT: ${{ vars.GCP_PROJECT || 'g-devops' }}
       GCS_BUCKET: ${{ vars.GCS_BUCKET || 'gs://tapp-image' }}
@@ -112,7 +122,7 @@ jobs:
         run: cd cvm && ./test/boot-smoke-test.sh "out-${{ matrix.env }}.qcow2"
 
       - name: Authenticate to GCP
-        if: ${{ env.PUBLISH == 'true' }}
+        if: ${{ env.PUBLISH == 'true' && env.CLOUD == 'gcp' }}
         run: |
           # Keep the SA credential OFF the persistent self-hosted runner: point gcloud/gsutil at a
           # job-scoped temp config dir (RUNNER_TEMP is wiped per job), so nothing lands in ~/.config/gcloud.
@@ -127,8 +137,8 @@ jobs:
         env:
           GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
 
-      - name: Stage C — publish versioned image (+ family)
-        if: ${{ env.PUBLISH == 'true' }}
+      - name: Stage C — publish versioned image (+ family)   # gcp only for now; ali publish (OSS + aliyun ecs ImportImage) is TODO
+        if: ${{ env.PUBLISH == 'true' && env.CLOUD == 'gcp' }}
         run: |
           cd cvm
           IMG="${{ steps.v.outputs.imgbase }}-${VERSION//./-}"
