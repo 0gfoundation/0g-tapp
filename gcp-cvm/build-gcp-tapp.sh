@@ -39,12 +39,14 @@ CONTAINERD_ROOT="${CONTAINERD_ROOT:-/data/containerd}" # containerd root (image 
 ENABLE_SYSBOX="${ENABLE_SYSBOX:-0}"
 SYSBOX_VERSION="${SYSBOX_VERSION:-0.7.0}"
 SYSBOX_DEB_URL="${SYSBOX_DEB_URL:-https://downloads.nestybox.com/sysbox/releases/v${SYSBOX_VERSION}/sysbox-ce_${SYSBOX_VERSION}-0.linux_amd64.deb}"
-# Target cloud (gcp | ali). Shared build core; cloud-specific bits branch on this:
-#   - stage B (prepare): gcp swaps in linux-image-gcp + fix A; ali keeps the generic kernel.
-#   - stage C (publish): gcp -> publish-gcp-image.sh; ali -> publish-ali-image.sh.
-#   - dev-variant guest agent (below): gcp reinstalls google-guest-agent; ali TODO (aliyun/cloud-init).
-# Exported so prepare-*.sh (stage B) inherits it.
+# Two independent build dimensions (each image = one of each):
+#   CLOUD       gcp | ali  — kernel/guest/publish. gcp: linux-image-gcp + fix A + google-guest-agent +
+#               publish-gcp-image.sh; ali: generic kernel + cloud-init(AliYun) + publish-ali-image.sh.
+#   BOOT_FORMAT grub | uki — boot format (stage B convert). Defaults by cloud (gcp->grub, ali->uki),
+#               overridable. Determines --uki + UKI prereqs + the reference-value shape (grub 5 / uki 1).
+# Both exported so prepare-*.sh (stage B) inherits them.
 export CLOUD="${CLOUD:-gcp}"
+export BOOT_FORMAT="${BOOT_FORMAT:-$([ "$CLOUD" = gcp ] && echo grub || echo uki)}"
 # passed through to prepare-gcp-tapp.sh (used by convert)
 export CONFIG_DIR="${CONFIG_DIR:-$HERE/config_dir}"
 export FDE_PACKAGE="${FDE_PACKAGE:-$HERE/cryptpilot-fde-guest_0.8.0_amd64.deb}"   # 0.8.0 in-image runtime (cryptpilot-fde split into -host/-guest at 0.8.0)

@@ -16,11 +16,16 @@
 set -euo pipefail
 
 # ===== Tunables =====
-CLOUD="${CLOUD:-gcp}"                                   # gcp | ali. gcp: swap in linux-image-gcp + point
-                                                       #   /boot/vmlinuz at it (fix A) + verify GCP ESP.
-                                                       #   ali: keep the base's generic kernel (Ali ECS
-                                                       #   boots generic via virtio) — skip kernel swap + fix A.
-                                                       #   convert / DNS / nbd reset are shared either way.
+# Two INDEPENDENT dimensions (a CVM is built as exactly one of each; each image = one boot format = one
+# measurement chain):
+#   CLOUD       gcp | ali  — kernel/guest tuning. gcp swaps in linux-image-gcp + points /boot/vmlinuz at
+#               it (fix A); ali (and others) keep the base's generic kernel (Ali ECS boots it via virtio).
+#   BOOT_FORMAT grub | uki — boot format. grub: traditional shim/grub (convert #130 syncs the ESP
+#               grub.cfg); uki: systemd-boot / Unified Kernel Image (convert --uki; needs dracut +
+#               systemd-boot-efi). Reference value differs: grub -> 5 components, uki -> 1 (measurement.uki).
+# Default BOOT_FORMAT by cloud (gcp->grub, ali->uki) but OVERRIDABLE (e.g. a uki image on gcp).
+CLOUD="${CLOUD:-gcp}"
+BOOT_FORMAT="${BOOT_FORMAT:-$([ "$CLOUD" = gcp ] && echo grub || echo uki)}"
 CONFIG_DIR="${CONFIG_DIR:-./config_dir}"
 FDE_PACKAGE="${FDE_PACKAGE:-cryptpilot-fde_0.7.0_amd64.deb}"
 ROOTFS_MODE="${ROOTFS_MODE:---rootfs-no-encryption}"   # or "--rootfs-passphrase <pass>"
@@ -47,6 +52,7 @@ else
   cp -f "$IN" "$WORK"
 fi
 
+# --- [1/4] kernel (CLOUD-specific): gcp swaps in its tuned kernel + fix A; others keep generic ---
 if [ "$CLOUD" = gcp ]; then
   if [ "$INSTALL_KERNEL" = 1 ]; then
     echo "==> [1/4] installing gcp kernel (virt-customize)"
@@ -57,7 +63,6 @@ if [ "$CLOUD" = gcp ]; then
   else
     echo "==> [1/4] skipping kernel install (INSTALL_KERNEL=0)"
   fi
-
   echo "==> [fix A] point /boot/vmlinuz and initrd.img symlinks at the gcp kernel"
   virt-customize -a "$WORK" --run-command '
     set -e
@@ -68,14 +73,15 @@ if [ "$CLOUD" = gcp ]; then
     echo "vmlinuz -> $k"
   '
 else
-  # ali (or any non-gcp): keep the base's generic kernel (Ali ECS boots generic via virtio) — no gcp
-  # kernel swap, no fix A. Install the UKI/systemd-boot prerequisites: Ali's cryptpilot flow uses
-  # `cryptpilot-convert --uki` (systemd-boot / Unified Kernel Image), which needs dracut (initrd) +
-  # systemd-boot-efi (bootloader) present in the image (per the Alibaba confidential-disk guide).
-  echo "==> [1/4] CLOUD=$CLOUD: keep generic kernel; install dracut + systemd-boot-efi for the --uki path"
-  # dracut-network: the cryptpilot-fde-guest deb (installed during convert) depends on it; pre-install
-  # so the deb install doesn't hit a missing-dep dpkg error mid-convert (convert auto-resolves it, but
-  # cleaner up front).
+  echo "==> [1/4] CLOUD=$CLOUD: keeping the base generic kernel (no gcp kernel swap / fix A)"
+fi
+
+# --- [1b/4] boot-format prerequisites (BOOT_FORMAT-specific): UKI needs dracut + systemd-boot ---
+if [ "$BOOT_FORMAT" = uki ]; then
+  # convert --uki builds a Unified Kernel Image via dracut + systemd-boot. dracut-network: the
+  # cryptpilot-fde-guest deb (installed during convert) depends on it; pre-install so the deb install
+  # doesn't hit a missing-dep dpkg error mid-convert (convert auto-resolves it, but cleaner up front).
+  echo "==> [1b/4] BOOT_FORMAT=uki: install dracut + systemd-boot-efi (UKI prerequisites)"
   virt-customize -a "$WORK" \
     --run-command 'apt-get update' \
     --install dracut,dracut-core,dracut-network,systemd-boot-efi
@@ -115,9 +121,9 @@ case "${TMPDIR:-}" in
   *) echo "   (TMPDIR=$TMPDIR is unusual; falling back to /tmp for convert)"; export TMPDIR=/tmp ;;
 esac
 CRYPTPILOT_CONVERT="${CRYPTPILOT_CONVERT:-cryptpilot-convert}"
-# Boot format per cloud: ali uses UKI / systemd-boot (`--uki`, the Alibaba confidential-disk flow);
-# gcp uses grub (convert #130 then syncs the regenerated grub.cfg to the ESP). See the CLOUD branch above.
-UKI_FLAG=""; [ "$CLOUD" != gcp ] && UKI_FLAG="--uki"
+# Boot format is its own dimension (BOOT_FORMAT): uki -> systemd-boot/UKI (--uki); grub -> shim/grub
+# (convert #130 then syncs the regenerated grub.cfg to the ESP). Independent of cloud.
+UKI_FLAG=""; [ "$BOOT_FORMAT" = uki ] && UKI_FLAG="--uki"
 "$CRYPTPILOT_CONVERT" --in "$WORK" --out "$OUT" $UKI_FLAG \
   --config-dir "$CONFIG_DIR" $ROOTFS_MODE --package "$FDE_PACKAGE"
 
@@ -132,12 +138,12 @@ fi
 
 echo ""
 echo "[done] output: $OUT"
-if [ "$CLOUD" = gcp ]; then
-  echo "  - verifying the kernel of the ESP default boot entry (GCP ESP layout /dev/sda15):"
+if [ "$CLOUD" = gcp ] && [ "$BOOT_FORMAT" = grub ]; then
+  echo "  - verifying the kernel of the ESP default boot entry (GCP grub ESP layout /dev/sda15):"
   guestfish --ro -a "$OUT" <<'GF' 2>/dev/null | grep -m1 -E 'linux[[:space:]]+/vmlinuz' || true
 run
 mount /dev/sda15 /
 cat /EFI/ubuntu/grub.cfg
 GF
-fi   # ali: ESP layout may differ; skip this GCP-specific verify (convert handles boot). Verify on a real Ali TDX boot.
+fi   # uki (no grub.cfg) / non-gcp ESP layout: skip this grub-specific verify — verify on a real boot.
 echo "  tip: to compute reference values, run cryptpilot-fde show-reference-value --disk $OUT afterwards"
