@@ -1,28 +1,53 @@
-# GCP TApp Confidential Image (CVM) build kit
+# Multi-cloud TApp Confidential Image (CVM) build kit
 
-Build a bootable, measurable, remotely-attestable, security-hardened cryptpilot TApp confidential image from a bare Ubuntu 24.04 cloud image.
+Build a bootable, measurable, remotely-attestable, security-hardened cryptpilot TApp confidential image from a bare Ubuntu 24.04 cloud image — for **GCP** and **Alibaba Cloud**, from one set of scripts.
+
+## Build dimensions
+One CVM = one point in this grid; each combination has its own image, its own reference values, and its own AS policy.
+
+| Dimension | Values | Set by | Effect |
+|---|---|---|---|
+| **cloud** | `gcp` \| `ali` | `CLOUD` | kernel + guest agent + publish target (see platform table) |
+| **boot_format** | `grub` \| `uki` | `BOOT_FORMAT` (default: gcp→`grub`, ali→`uki`) | boot chain ⇒ **shape of the measurement** (see below) |
+| **env** | `dev` (HARDEN=0) \| `prod` (HARDEN=1) | `HARDEN` | dev keeps cloud-init/SSH for debugging; prod purges it |
+| **owner** | `0x…` address | `OWNER_ADDRESS` | baked into `config.toml` → folded into the **initrd measurement** (an attested dimension) |
+| **version** | tapp-server release tag | `TAPP_SERVER_URL` | which tapp-server binary + image-name suffix |
+
+`cloud` and `boot_format` are **independent axes** — a CVM boots one way (one measurement chain), regardless of cloud. The measurement *shape* is decided by `boot_format`, not cloud:
+- **grub** → 5 components: `measurement.{shim,grub,kernel,initrd,kernel_cmdline}.SHA-384`
+- **uki**  → 1 component:  `measurement.uki.SHA-384` (kernel+initrd+cmdline fused into one signed EFI)
+
+### Platform differences (everything else is shared)
+| | GCP (`gcp`) | Alibaba Cloud (`ali`) |
+|---|---|---|
+| default boot format | grub | uki (systemd-boot) |
+| kernel | `linux-image-gcp` (+ fix A: point `/boot/vmlinuz`) | base **generic** kernel (ECS uses virtio; no swap) |
+| guest / dev SSH inject | `google-guest-agent` | cloud-init pinned to `datasource_list: [ AliYun ]` |
+| convert boot handling | ESP grub.cfg sync (`cryptpilot-convert`, #130) | `cryptpilot-convert --uki` (needs dracut + systemd-boot-efi) |
+| publish | `publish-gcp-image.sh` → GCS + `gcloud compute images create` | `publish-ali-image.sh` → OSS + `aliyun ecs ImportImage` |
 
 ## Directory contents
 | File | Description |
 |---|---|
 | `cryptpilot-gcp-boot-fix.md` | **Main doc**: root-cause analysis + fixes + full SOP (§9) + security-hardening audit (§11) + convert issues for Alibaba Cloud (§7) |
-| `build-tapp.sh` | **One-shot full chain**: base image → final gcp-tapp (Stage A app/docker/SGX/DNS + hardening + /data + Sysbox / Stage B kernel + convert + ESP / opt-in Stage C publish via `PUBLISH_AS=`) |
-| `prepare-tapp.sh` | Stage B only (when a base already exists): fix A + DNS (guestfish) + nbd reset + convert + fix B |
-| `publish-gcp-image.sh` | **Stage C**: publish a built qcow2 to GCP — `qemu-img` raw → oldgnu sparse `tar.gz` → `gsutil` → `gcloud compute images create` (confidential guest-os-features). Needs gcloud/gsutil auth |
-| `fix-esp-grub.sh` | Sync the ESP grub only (fix B, can be run standalone against an already-converted image) |
-| `test/boot-smoke-test.sh` | **Local boot smoke test**: boots a converted image under QEMU/OVMF (no real GCP CVM needed) and checks the boot chain reaches multi-user / tapp-server |
+| `build-tapp.sh` | **One-shot full chain** (cloud-generic, `CLOUD=`): base image → final tapp image (Stage A app/docker/SGX/DNS + hardening + /data + Sysbox / Stage B kernel + convert / opt-in Stage C publish via `PUBLISH_AS=`) |
+| `prepare-tapp.sh` | Stage B only (when a base already exists): fix A (gcp) / generic kernel (ali) + DNS (guestfish) + nbd reset + `cryptpilot-convert` (grub or `--uki`) |
+| `publish-gcp-image.sh` | **Stage C (gcp)**: `qemu-img` raw → oldgnu sparse `tar.gz` → `gsutil` → `gcloud compute images create` (confidential guest-os-features). Needs gcloud/gsutil auth |
+| `publish-ali-image.sh` | **Stage C (ali)**: `ossutil cp` → `aliyun ecs ImportImage` (x86_64/UEFI/QCOW2) → enable NVMe → wait Available. Needs ossutil/aliyun auth |
+| `fix-esp-grub.sh` | Sync the ESP grub only (gcp/grub fix B, standalone against an already-converted image) |
+| `test/boot-smoke-test.sh` | **Local boot smoke test**: boots a converted image under QEMU/OVMF (no real CVM needed) and checks the boot chain (grub *or* UKI) reaches multi-user / tapp-server |
 | `config_dir/` | cryptpilot convert config (`fde.toml`, `rw_overlay="ram"`) |
 | `cryptpilot-fde_0.7.0_amd64.deb` | FDE **runtime installed into the target image**. **Binary, gitignored**, must be placed locally in this directory (see Prerequisites) |
 
-> The artifact `gcp-tapp.qcow2` (~4.5G, converted / verity-sealed / hardened) is the **output** of `build-tapp.sh` and is not committed (gitignored).
-> The same applies to `cryptpilot-fde_*.deb` and the tapp-server binary: the deb must be placed locally in this directory; tapp-server is pulled by default from GitHub release v0.1.0 (see below).
+> The output qcow2 (~4–4.5G, converted / verity-sealed / hardened) is the **output** of `build-tapp.sh` and is not committed (gitignored).
+> The same applies to `cryptpilot-fde_*.deb` and the tapp-server binary: the deb must be placed locally in this directory; tapp-server is pulled by default from a GitHub release (see below).
 
 ## Pipeline (stages)
-- **Stage 0 — base prep** *(one-time, reused across builds)*: official Ubuntu 24.04 cloud image → resize to 20 GiB + gVNIC driver → base qcow2. See `cryptpilot-gcp-boot-fix.md` §0. This is the input to Stage A, not part of `build-tapp.sh`.
+- **Stage 0 — base prep** *(one-time, reused across builds & both clouds)*: official Ubuntu 24.04 cloud image → resize to 20 GiB → base qcow2. See `cryptpilot-gcp-boot-fix.md` §0. The base is **cloud-neutral** (generic kernel only). Input to Stage A, not part of `build-tapp.sh`.
 - **Stage A** (`build-tapp.sh`): provision app / docker / SGX / DNS, security hardening, Sysbox, and the `/data` + `br_netfilter` bakes.
-- **Stage B** (`prepare-tapp.sh`, invoked by A): install the gcp kernel → fix A → `cryptpilot-convert` → sync ESP (fix B).
+- **Stage B** (`prepare-tapp.sh`, invoked by A): `CLOUD=gcp` → install the gcp kernel + fix A; `CLOUD=ali` → keep the generic kernel. Then `cryptpilot-convert` (grub, syncing the ESP) or `cryptpilot-convert --uki` per `BOOT_FORMAT`.
 - *(optional)* local boot smoke test (`test/boot-smoke-test.sh`).
-- **Stage C** (`publish-gcp-image.sh`): raw → sparse `tar.gz` → GCS → `gcloud compute images create`. Run standalone, or from `build-tapp.sh` via `PUBLISH_AS=<name>`.
+- **Stage C** (`publish-gcp-image.sh` / `publish-ali-image.sh` by `CLOUD`): publish the built qcow2 to the cloud. Run standalone, or from `build-tapp.sh` via `PUBLISH_AS=<name>`.
 
 ## Prerequisites
 - **Conversion host = Anolis / Alibaba Cloud Linux 3 (al8).** `cryptpilot-convert` is only packaged for al8; a plain Ubuntu/macOS host cannot run it.
@@ -45,9 +70,10 @@ See `cryptpilot-gcp-boot-fix.md` §0.1 for details.
 ## One-shot build
 ```bash
 export LIBGUESTFS_BACKEND=direct
+CLOUD=gcp \                       # or CLOUD=ali (default gcp; picks kernel/guest/boot-format/publish)
 OWNER_ADDRESS=0x<your-owner-address> \
 KBS_URLS='"http://<kbs-host-1>:9091", "http://<kbs-host-2>:9091"' \
-./build-tapp.sh <bare-ubuntu-24.04.qcow2> gcp-tapp.qcow2
+./build-tapp.sh <bare-ubuntu-24.04.qcow2> tapp.qcow2
 ```
 - **Required** (no defaults — the build aborts if unset, so no deployment-specific value is ever baked in):
   - `OWNER_ADDRESS` — tapp-server owner address, written to `config.toml` `[server.permission]`.
@@ -108,6 +134,14 @@ Defaults `GCS_BUCKET=gs://tapp-image`, `GCP_PROJECT=g-devops`, `GUEST_OS_FEATURE
 PUBLISH_AS=og-tdx-dev ENABLE_SYSBOX=1 OWNER_ADDRESS=0x... KBS_URLS='...' ./build-tapp.sh base.qcow2 og-tdx-dev.qcow2
 ```
 Create a confidential instance from the published image with `--image=<name> --image-project=g-devops --confidential-compute-type=TDX`.
+
+## Publish to Alibaba Cloud (Stage C, `CLOUD=ali`)
+A qcow2 can't be registered directly — it goes through OSS. `publish-ali-image.sh` does four steps (`ossutil cp` → `aliyun ecs ImportImage` → enable NVMe → wait `Available`), pinning the four params that are easy to get wrong per the Ali confidential-disk guide: **Architecture=x86_64, BootMode=UEFI, Format=QCOW2, and NVMe support enabled *after* import**:
+```bash
+# ossutil + aliyun both authenticated (AK/SK env, or an instance RAM role on an Ali ECS build host)
+ALIYUN_REGION=cn-beijing ./publish-ali-image.sh /path/og-tdx-ali-dev.qcow2 og-tdx-ali-dev
+```
+Defaults `OSS_BUCKET=0g-confidential-disk` (`ALIYUN_REGION` required, no default). It refuses to clobber an existing image name. In CI the al8 build runner is itself an Ali ECS instance, so it authenticates via its **instance RAM role** (no AK/SK secret). Create a confidential (TDX) instance from the image; assign a public IPv4 (for Trustee attestation) and use **key-pair** auth (passwords are unsupported on confidential instances).
 
 ## Three core fixes (all required)
 - **Fix A**: before convert, point the `/boot/vmlinuz` symlink at the gcp kernel → the cryptpilot stack goes into the correct initrd (fixes read-only / RTMR / verity).
