@@ -1,5 +1,5 @@
 #!/bin/bash
-# prepare-gcp-tapp.sh <input-base.qcow2> <output-tapp.qcow2>
+# prepare-tapp.sh <input-base.qcow2> <output-tapp.qcow2>
 #
 # Turn a GCP Ubuntu base image into a working cryptpilot tapp image.
 # Chains four steps, two of which are the key fixes:
@@ -16,6 +16,16 @@
 set -euo pipefail
 
 # ===== Tunables =====
+# Two INDEPENDENT dimensions (a CVM is built as exactly one of each; each image = one boot format = one
+# measurement chain):
+#   CLOUD       gcp | ali  — kernel/guest tuning. gcp swaps in linux-image-gcp + points /boot/vmlinuz at
+#               it (fix A); ali (and others) keep the base's generic kernel (Ali ECS boots it via virtio).
+#   BOOT_FORMAT grub | uki — boot format. grub: traditional shim/grub (convert #130 syncs the ESP
+#               grub.cfg); uki: systemd-boot / Unified Kernel Image (convert --uki; needs dracut +
+#               systemd-boot-efi). Reference value differs: grub -> 5 components, uki -> 1 (measurement.uki).
+# Default BOOT_FORMAT by cloud (gcp->grub, ali->uki) but OVERRIDABLE (e.g. a uki image on gcp).
+CLOUD="${CLOUD:-gcp}"
+BOOT_FORMAT="${BOOT_FORMAT:-$([ "$CLOUD" = gcp ] && echo grub || echo uki)}"
 CONFIG_DIR="${CONFIG_DIR:-./config_dir}"
 FDE_PACKAGE="${FDE_PACKAGE:-cryptpilot-fde_0.7.0_amd64.deb}"
 ROOTFS_MODE="${ROOTFS_MODE:---rootfs-no-encryption}"   # or "--rootfs-passphrase <pass>"
@@ -42,25 +52,40 @@ else
   cp -f "$IN" "$WORK"
 fi
 
-if [ "$INSTALL_KERNEL" = 1 ]; then
-  echo "==> [1/4] installing gcp kernel (virt-customize)"
-  vc_args=(-a "$WORK" --install linux-image-gcp,linux-modules-extra-gcp)
-  [ -n "$PURGE_KERNEL" ] && vc_args+=(--run-command "apt-get autoremove --purge $PURGE_KERNEL -y || true")
-  vc_args+=(--run-command 'update-grub')
-  virt-customize "${vc_args[@]}"
+# --- [1/4] kernel (CLOUD-specific): gcp swaps in its tuned kernel + fix A; others keep generic ---
+if [ "$CLOUD" = gcp ]; then
+  if [ "$INSTALL_KERNEL" = 1 ]; then
+    echo "==> [1/4] installing gcp kernel (virt-customize)"
+    vc_args=(-a "$WORK" --install linux-image-gcp,linux-modules-extra-gcp)
+    [ -n "$PURGE_KERNEL" ] && vc_args+=(--run-command "apt-get autoremove --purge $PURGE_KERNEL -y || true")
+    vc_args+=(--run-command 'update-grub')
+    virt-customize "${vc_args[@]}"
+  else
+    echo "==> [1/4] skipping kernel install (INSTALL_KERNEL=0)"
+  fi
+  echo "==> [fix A] point /boot/vmlinuz and initrd.img symlinks at the gcp kernel"
+  virt-customize -a "$WORK" --run-command '
+    set -e
+    k=$(ls /boot/vmlinuz-*-gcp 2>/dev/null | sort -V | tail -1 | sed "s#/boot/##")
+    [ -n "$k" ] || { echo "ERROR: no gcp kernel (vmlinuz-*-gcp) in the image"; exit 1; }
+    ln -sf "$k" /boot/vmlinuz
+    ln -sf "initrd.img-${k#vmlinuz-}" /boot/initrd.img
+    echo "vmlinuz -> $k"
+  '
 else
-  echo "==> [1/4] skipping kernel install (INSTALL_KERNEL=0)"
+  echo "==> [1/4] CLOUD=$CLOUD: keeping the base generic kernel (no gcp kernel swap / fix A)"
 fi
 
-echo "==> [fix A] point /boot/vmlinuz and initrd.img symlinks at the gcp kernel"
-virt-customize -a "$WORK" --run-command '
-  set -e
-  k=$(ls /boot/vmlinuz-*-gcp 2>/dev/null | sort -V | tail -1 | sed "s#/boot/##")
-  [ -n "$k" ] || { echo "ERROR: no gcp kernel (vmlinuz-*-gcp) in the image"; exit 1; }
-  ln -sf "$k" /boot/vmlinuz
-  ln -sf "initrd.img-${k#vmlinuz-}" /boot/initrd.img
-  echo "vmlinuz -> $k"
-'
+# --- [1b/4] boot-format prerequisites (BOOT_FORMAT-specific): UKI needs dracut + systemd-boot ---
+if [ "$BOOT_FORMAT" = uki ]; then
+  # convert --uki builds a Unified Kernel Image via dracut + systemd-boot. dracut-network: the
+  # cryptpilot-fde-guest deb (installed during convert) depends on it; pre-install so the deb install
+  # doesn't hit a missing-dep dpkg error mid-convert (convert auto-resolves it, but cleaner up front).
+  echo "==> [1b/4] BOOT_FORMAT=uki: install dracut + systemd-boot-efi (UKI prerequisites)"
+  virt-customize -a "$WORK" \
+    --run-command 'apt-get update' \
+    --install dracut,dracut-core,dracut-network,systemd-boot-efi
+fi
 
 if [ -n "$DNS_FALLBACK" ]; then
   echo "==> [fix C] DNS: FallbackDNS (virt-customize) + static /etc/resolv.conf (guestfish)"
@@ -96,7 +121,10 @@ case "${TMPDIR:-}" in
   *) echo "   (TMPDIR=$TMPDIR is unusual; falling back to /tmp for convert)"; export TMPDIR=/tmp ;;
 esac
 CRYPTPILOT_CONVERT="${CRYPTPILOT_CONVERT:-cryptpilot-convert}"
-"$CRYPTPILOT_CONVERT" --in "$WORK" --out "$OUT" \
+# Boot format is its own dimension (BOOT_FORMAT): uki -> systemd-boot/UKI (--uki); grub -> shim/grub
+# (convert #130 then syncs the regenerated grub.cfg to the ESP). Independent of cloud.
+UKI_FLAG=""; [ "$BOOT_FORMAT" = uki ] && UKI_FLAG="--uki"
+"$CRYPTPILOT_CONVERT" --in "$WORK" --out "$OUT" $UKI_FLAG \
   --config-dir "$CONFIG_DIR" $ROOTFS_MODE --package "$FDE_PACKAGE"
 
 # NOTE: the old "[fix B] sync ESP grub.cfg + modules" step was removed — cryptpilot-convert now does
@@ -110,10 +138,12 @@ fi
 
 echo ""
 echo "[done] output: $OUT"
-echo "  - verifying the kernel of the ESP default boot entry:"
-guestfish --ro -a "$OUT" <<'GF' 2>/dev/null | grep -m1 -E 'linux[[:space:]]+/vmlinuz' || true
+if [ "$CLOUD" = gcp ] && [ "$BOOT_FORMAT" = grub ]; then
+  echo "  - verifying the kernel of the ESP default boot entry (GCP grub ESP layout /dev/sda15):"
+  guestfish --ro -a "$OUT" <<'GF' 2>/dev/null | grep -m1 -E 'linux[[:space:]]+/vmlinuz' || true
 run
 mount /dev/sda15 /
 cat /EFI/ubuntu/grub.cfg
 GF
+fi   # uki (no grub.cfg) / non-gcp ESP layout: skip this grub-specific verify — verify on a real boot.
 echo "  tip: to compute reference values, run cryptpilot-fde show-reference-value --disk $OUT afterwards"

@@ -7,7 +7,7 @@
 #
 # Uses a #128-fixed cryptpilot-fde (0.8.0+), which on a never-booted image (empty grubenv)
 # falls back to the default grub.cfg menuentry instead of erroring "saved_entry not found"
-# (see gcp-cvm/cryptpilot-gcp-boot-fix.md §7.6/§12). The tool already emits JSON with the
+# (see cvm/cryptpilot-gcp-boot-fix.md §7.6/§12). The tool already emits JSON with the
 # exact "measurement.*.SHA-384" keys; we just drop its non-"measurement." helper keys.
 #
 # The binary is /usr/bin/cryptpilot-fde-host, set up by ci/setup-toolchain.sh (released 0.8.0 with
@@ -37,25 +37,17 @@ echo "==> $FDE show-reference-value --disk $IMG"
 
 mkdir -p "$OUT_DIR"
 # keep only the five measurement.<component>.SHA-384 keys (drop the raw "kernel_cmdline" echo etc.);
-# require every one to be a non-empty array, else fail loudly (never emit a half-populated file).
+# Keep exactly the measurement components the tool emits for THIS image — the set is a property of the
+# boot FORMAT, not the cloud: grub -> shim/grub/kernel/initrd/kernel_cmdline (5); UKI -> one
+# measurement.uki (kernel+initrd+cmdline fused into one signed EFI). show-reference-value is
+# authoritative, so we just capture its non-empty measurement.*.SHA-384 keys (require ≥1, else fail).
 python3 - "$RAW" "$OUT" <<'PY'
 import sys, json
 data = json.load(open(sys.argv[1]))
-KEYS = [
-    "measurement.shim.SHA-384",
-    "measurement.grub.SHA-384",
-    "measurement.kernel.SHA-384",
-    "measurement.initrd.SHA-384",
-    "measurement.kernel_cmdline.SHA-384",
-]
-out, missing = {}, []
-for k in KEYS:
-    v = data.get(k)
-    if not (isinstance(v, list) and v):
-        missing.append(k)
-    out[k] = v
-if missing:
-    sys.stderr.write("ERROR: empty/missing reference components: %s\n" % ", ".join(missing))
+out = {k: v for k, v in data.items()
+       if k.startswith("measurement.") and k.endswith(".SHA-384") and isinstance(v, list) and v}
+if not out:
+    sys.stderr.write("ERROR: no non-empty measurement.*.SHA-384 in show-reference-value output\n")
     sys.stderr.write("---- raw ----\n" + json.dumps(data, indent=2) + "\n")
     sys.exit(1)
 json.dump(out, open(sys.argv[2], "w"), indent=2)
