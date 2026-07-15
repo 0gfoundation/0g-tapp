@@ -21,6 +21,11 @@ set -euo pipefail
 IMG="${1:?usage: $0 <image.qcow2> <gcp-image-name>}"
 NAME="${2:?usage: $0 <image.qcow2> <gcp-image-name>}"
 [ -f "$IMG" ] || { echo "image not found: $IMG" >&2; exit 1; }
+# GCP image names: ^[a-z]([-a-z0-9]*[a-z0-9])?$, max 63 chars. The name now carries the owner address
+# (~42 chars), so a long version tag could overflow — fail early with a clear message rather than a
+# cryptic gcloud error.
+[ "${#NAME}" -le 63 ] || { echo "image name '$NAME' is ${#NAME} chars (GCP max 63) — shorten the version tag" >&2; exit 1; }
+printf '%s' "$NAME" | grep -Eq '^[a-z]([-a-z0-9]*[a-z0-9])?$' || { echo "image name '$NAME' is not a valid GCP name (^[a-z][-a-z0-9]*[a-z0-9]?$)" >&2; exit 1; }
 
 # ===== Tunables =====
 GCS_BUCKET="${GCS_BUCKET:-gs://tapp-image}"
