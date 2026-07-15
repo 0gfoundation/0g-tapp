@@ -129,8 +129,13 @@ jobs:
         if: ${{ env.PUBLISH == 'true' }}
         run: |
           cd gcp-cvm
-          IMG="${{ steps.v.outputs.imgbase }}-${VERSION//./-}"
-          IMAGE_FAMILY="${{ steps.v.outputs.imgbase }}" \
+          # owner is a MEASURED dimension → include it in the image name + family, else different owners
+          # (same version×env) collide on the GCP image name (publish refuses an existing name).
+          # lowercased for GCP naming rules ([a-z][-a-z0-9]*, max 63 chars):
+          #   og-tdx-dev-<ver>-0x<40hex> ≈ 60 chars, within budget for normal version tags.
+          OWNER_TAG="$(printf '%s' "$OWNER" | tr 'A-Z' 'a-z')"
+          IMG="${{ steps.v.outputs.imgbase }}-${VERSION//./-}-${OWNER_TAG}"
+          IMAGE_FAMILY="${{ steps.v.outputs.imgbase }}-${OWNER_TAG}" \
             ./publish-gcp-image.sh "out-${{ matrix.env }}.qcow2" "$IMG"
 
       - name: Reference values — compute, write, register on AS
