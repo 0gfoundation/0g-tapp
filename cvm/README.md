@@ -8,7 +8,7 @@ One CVM = one point in this grid; each combination has its own image, its own re
 | Dimension | Values | Set by | Effect |
 |---|---|---|---|
 | **cloud** | `gcp` \| `ali` | `CLOUD` | kernel + guest agent + publish target (see platform table) |
-| **boot_format** | `grub` \| `uki` | `BOOT_FORMAT` (default: gcp→`grub`, ali→`uki`) | boot chain ⇒ **shape of the measurement** (see below) |
+| **boot_format** | `grub` \| `uki` | `BOOT_FORMAT` (default `grub` for any cloud; `uki` is opt-in) | boot chain ⇒ **shape of the measurement** (see below) |
 | **env** | `dev` (HARDEN=0) \| `prod` (HARDEN=1) | `HARDEN` | dev keeps cloud-init/SSH for debugging; prod purges it |
 | **owner** | `0x…` address | `OWNER_ADDRESS` | baked into `config.toml` → folded into the **initrd measurement** (an attested dimension) |
 | **version** | tapp-server release tag | `TAPP_SERVER_URL` | which tapp-server binary + image-name suffix |
@@ -20,10 +20,10 @@ One CVM = one point in this grid; each combination has its own image, its own re
 ### Platform differences (everything else is shared)
 | | GCP (`gcp`) | Alibaba Cloud (`ali`) |
 |---|---|---|
-| default boot format | grub | uki (systemd-boot) |
+| default boot format | grub | grub (`uki` opt-in via `BOOT_FORMAT=uki`) |
 | kernel | `linux-image-gcp` (+ fix A: point `/boot/vmlinuz`) | base **generic** kernel (ECS uses virtio; no swap) |
 | guest / dev SSH inject | `google-guest-agent` | cloud-init pinned to `datasource_list: [ AliYun ]` |
-| convert boot handling | ESP grub.cfg sync (`cryptpilot-convert`, #130) | `cryptpilot-convert --uki` (needs dracut + systemd-boot-efi) |
+| convert boot handling | grub → ESP grub.cfg sync (`cryptpilot-convert`, #130) | grub → ESP sync; `uki` → `cryptpilot-convert --uki` (dracut + systemd-boot-efi) |
 | publish | `publish-gcp-image.sh` → GCS + `gcloud compute images create` | `publish-ali-image.sh` → OSS + `aliyun ecs ImportImage` |
 
 ## Directory contents

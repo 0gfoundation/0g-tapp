@@ -42,11 +42,11 @@ SYSBOX_DEB_URL="${SYSBOX_DEB_URL:-https://downloads.nestybox.com/sysbox/releases
 # Two independent build dimensions (each image = one of each):
 #   CLOUD       gcp | ali  — kernel/guest/publish. gcp: linux-image-gcp + fix A + google-guest-agent +
 #               publish-gcp-image.sh; ali: generic kernel + cloud-init(AliYun) + publish-ali-image.sh.
-#   BOOT_FORMAT grub | uki — boot format (stage B convert). Defaults by cloud (gcp->grub, ali->uki),
-#               overridable. Determines --uki + UKI prereqs + the reference-value shape (grub 5 / uki 1).
+#   BOOT_FORMAT grub | uki — boot format (stage B convert). Defaults to grub for any cloud;
+#               set uki explicitly. Determines --uki + UKI prereqs + the reference-value shape (grub 5 / uki 1).
 # Both exported so prepare-*.sh (stage B) inherits them.
 export CLOUD="${CLOUD:-gcp}"
-export BOOT_FORMAT="${BOOT_FORMAT:-$([ "$CLOUD" = gcp ] && echo grub || echo uki)}"
+export BOOT_FORMAT="${BOOT_FORMAT:-grub}"
 # passed through to prepare-tapp.sh (used by convert)
 export CONFIG_DIR="${CONFIG_DIR:-$HERE/config_dir}"
 export FDE_PACKAGE="${FDE_PACKAGE:-$HERE/cryptpilot-fde-guest_0.8.0_amd64.deb}"   # 0.8.0 in-image runtime (cryptpilot-fde split into -host/-guest at 0.8.0)
