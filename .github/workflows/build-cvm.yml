@@ -5,8 +5,8 @@
 # and network to the shared AS. The cryptpilot 0.8.0 + #128/#130 toolchain is provisioned by
 # ci/setup-toolchain.sh (installs released 0.8.0 + overlays convert #130 / fde-host #128 from the fork).
 #
-# Dimensions (see verifier/reference-values/README.md): version × env × owner.
-#   version = tapp-server release tag (trigger)         → which tapp-server + image name suffix
+# Dimensions (see verifier/reference-values/README.md): cloud × boot_format × env × owner × version.
+#   version = tapp-server release tag                   → which tapp-server + image name suffix
 #   env     = dev (HARDEN=0) | prod (HARDEN=1)          → image variant (og-tdx-dev / og-tdx)
 #   owner   = OWNER_ADDRESS, baked into config.toml     → folded into the initrd measurement,
 #             so it IS an attested dimension (per-owner reference values).
@@ -15,10 +15,8 @@
 name: build-cvm
 
 on:
-  # A published tapp-server release auto-builds the DEFAULT deployment (vars.OWNER_ADDRESS),
-  # both env, and publishes + registers. Custom/per-owner builds use workflow_dispatch below.
-  release:
-    types: [published]
+  # Manual entry point: build a chosen cloud × boot_format × env × owner at a given tapp-server
+  # release version, optionally publishing the image + registering reference values.
   workflow_dispatch:
     inputs:
       version:
@@ -48,7 +46,7 @@ on:
         default: auto
 
 concurrency:
-  group: build-cvm-${{ inputs.cloud || 'gcp' }}-${{ inputs.version || github.event.release.tag_name }}-${{ inputs.owner || vars.OWNER_ADDRESS }}
+  group: build-cvm-${{ inputs.cloud || 'gcp' }}-${{ inputs.version }}-${{ inputs.owner || vars.OWNER_ADDRESS }}
   cancel-in-progress: false
 
 # The reference-values step pushes a refvalues/* branch and opens a PR into dev with GITHUB_TOKEN;
@@ -63,17 +61,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # release (no inputs.env) -> both; dispatch -> the chosen env
-        env: ${{ fromJSON((inputs.env || 'both') == 'both' && '["dev","prod"]' || format('["{0}"]', inputs.env)) }}
+        # env=both -> [dev, prod]; otherwise the single chosen env
+        env: ${{ fromJSON(inputs.env == 'both' && '["dev","prod"]' || format('["{0}"]', inputs.env)) }}
     env:
       # All fixed config lives in repo/org Actions Variables (Settings → Secrets and variables →
       # Actions → Variables), editable without touching this file; the `|| 'default'` is a fallback.
-      # version/owner/publish resolve for BOTH triggers (release event vs dispatch inputs):
-      VERSION: ${{ inputs.version || github.event.release.tag_name }}
+      VERSION: ${{ inputs.version }}
       OWNER: ${{ inputs.owner || vars.OWNER_ADDRESS }}
-      PUBLISH: ${{ github.event_name == 'release' && 'true' || inputs.publish }}
+      PUBLISH: ${{ inputs.publish }}
       # cloud/boot-format dimensions (independent; a CVM = one CLOUD × one BOOT_FORMAT = one measurement
-      # chain). release event -> defaults (cloud=gcp, boot_format auto->grub); dispatch -> chosen inputs.
+      # chain). cloud defaults to gcp; boot_format auto -> grub for gcp / uki for ali.
       CLOUD: ${{ inputs.cloud || 'gcp' }}
       # boot_format 'auto'/'' -> empty, so build-tapp derives it from cloud (gcp->grub, ali->uki)
       BOOT_FORMAT: ${{ (inputs.boot_format == 'auto' || inputs.boot_format == '') && '' || inputs.boot_format }}
