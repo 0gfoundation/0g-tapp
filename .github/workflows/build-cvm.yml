@@ -40,10 +40,10 @@ on:
         options: [gcp, ali]
         default: gcp
       boot_format:
-        description: "boot format (auto = grub; choose uki explicitly)"
+        description: "boot format (grub default; uki = one signed EFI, kernel+initrd+cmdline fused)"
         type: choice
-        options: [auto, grub, uki]
-        default: auto
+        options: [grub, uki]
+        default: grub
 
 concurrency:
   group: build-cvm-${{ inputs.cloud || 'gcp' }}-${{ inputs.version }}-${{ inputs.owner || vars.OWNER_ADDRESS }}
@@ -70,10 +70,9 @@ jobs:
       OWNER: ${{ inputs.owner || vars.OWNER_ADDRESS }}
       PUBLISH: ${{ inputs.publish }}
       # cloud/boot-format dimensions (independent; a CVM = one CLOUD × one BOOT_FORMAT = one measurement
-      # chain). cloud defaults to gcp; boot_format auto -> grub (uki is opt-in, any cloud).
+      # chain). cloud defaults to gcp; boot_format defaults to grub (uki is opt-in, any cloud).
       CLOUD: ${{ inputs.cloud || 'gcp' }}
-      # boot_format 'auto'/'' -> empty, so build-tapp applies its default (grub)
-      BOOT_FORMAT: ${{ (inputs.boot_format == 'auto' || inputs.boot_format == '') && '' || inputs.boot_format }}
+      BOOT_FORMAT: ${{ inputs.boot_format }}
       KBS_URLS: ${{ vars.TAPP_KBS_URLS }}                       # required (no safe default)
       GCP_PROJECT: ${{ vars.GCP_PROJECT || 'g-devops' }}
       GCS_BUCKET: ${{ vars.GCS_BUCKET || 'gs://tapp-image' }}
