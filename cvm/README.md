@@ -17,6 +17,11 @@ One CVM = one point in this grid; each combination has its own image, its own re
 - **grub** → 5 components: `measurement.{shim,grub,kernel,initrd,kernel_cmdline}.SHA-384`
 - **uki**  → 1 component:  `measurement.uki.SHA-384` (kernel+initrd+cmdline fused into one signed EFI)
 
+Because they yield different images/measurements, **`boot_format` (like `cloud`, `env`, `owner`, `version`) is part of the identifiers**, so a grub and a uki build never clobber each other:
+- image name: `<imgbase>-<boot_format>-<version>-<owner>` (e.g. `og-tdx-dev-grub-v0-2-0-<40hex>`; owner has `0x` stripped + lowercased to fit GCP's 63-char limit)
+- reference value: `verifier/reference-values/<cloud>/<boot_format>/<version>/<env>/<owner>.json`
+- AS policy id: `0g-tapp-<cloud>-<boot_format>-<version>-<env>-<owner>`
+
 ### Platform differences (everything else is shared)
 | | GCP (`gcp`) | Alibaba Cloud (`ali`) |
 |---|---|---|

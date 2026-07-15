@@ -50,7 +50,7 @@ on:
         default: false
 
 concurrency:
-  group: build-cvm-${{ inputs.cloud || 'gcp' }}-${{ inputs.version }}-${{ inputs.owner || vars.OWNER_ADDRESS }}
+  group: build-cvm-${{ inputs.cloud || 'gcp' }}-${{ inputs.boot_format }}-${{ inputs.version }}-${{ inputs.owner || vars.OWNER_ADDRESS }}
   cancel-in-progress: false
 
 # The reference-values step pushes a refvalues/* branch and opens a PR into dev with GITHUB_TOKEN;
@@ -154,11 +154,11 @@ jobs:
         if: ${{ env.PUBLISH == 'true' && env.CLOUD == 'gcp' }}
         run: |
           cd cvm
-          # owner is a MEASURED dimension → in the name + family (else different owners collide on the
-          # GCP image name); lowercased for GCP naming rules ([a-z][-a-z0-9]*, max 63; ~60 chars here).
-          OWNER_TAG="$(printf '%s' "$OWNER" | tr 'A-Z' 'a-z')"
-          IMG="${{ steps.v.outputs.imgbase }}-${VERSION//./-}-${OWNER_TAG}"
-          IMAGE_FAMILY="${{ steps.v.outputs.imgbase }}-${OWNER_TAG}" \
+          # owner + boot_format are MEASURED dimensions → both in the name + family. owner: strip 0x +
+          # lowercase (GCP names [a-z][-a-z0-9]*, max 63; og-tdx-dev-grub-<ver>-<40hex> = 63).
+          OWNER_TAG="$(printf '%s' "$OWNER" | sed 's/^0[xX]//' | tr 'A-Z' 'a-z')"
+          IMG="${{ steps.v.outputs.imgbase }}-${BOOT_FORMAT}-${VERSION//./-}-${OWNER_TAG}"
+          IMAGE_FAMILY="${{ steps.v.outputs.imgbase }}-${BOOT_FORMAT}-${OWNER_TAG}" \
           OVERWRITE=${{ inputs.overwrite && '1' || '0' }} \
             ./publish-gcp-image.sh "out-${{ matrix.env }}.qcow2" "$IMG"
 
@@ -166,9 +166,9 @@ jobs:
         if: ${{ env.PUBLISH == 'true' && env.CLOUD == 'ali' }}
         run: |
           cd cvm
-          # ali image name includes the owner (measured dimension); Ali image names allow it (<=128 chars)
-          OWNER_TAG="$(printf '%s' "$OWNER" | tr 'A-Z' 'a-z')"
-          IMG="${{ steps.v.outputs.imgbase }}-${VERSION//./-}-${OWNER_TAG}"
+          # owner + boot_format in the name (measured dimensions). owner: strip 0x + lowercase.
+          OWNER_TAG="$(printf '%s' "$OWNER" | sed 's/^0[xX]//' | tr 'A-Z' 'a-z')"
+          IMG="${{ steps.v.outputs.imgbase }}-${BOOT_FORMAT}-${VERSION//./-}-${OWNER_TAG}"
           ALIYUN_REGION="$ALIYUN_REGION" OSS_BUCKET="$OSS_BUCKET" \
           OVERWRITE=${{ inputs.overwrite && '1' || '0' }} \
             ./publish-ali-image.sh "out-${{ matrix.env }}.qcow2" "$IMG"
@@ -178,14 +178,14 @@ jobs:
         # uses /usr/bin/cryptpilot-fde-host (#128), set up by the toolchain step above
         run: |
           cd cvm
-          # writes verifier/reference-values/<cloud>/<version>/<env>/<owner>.json from show-reference-value
-          ci/gen-reference-values.sh "out-${{ matrix.env }}.qcow2" "$CLOUD" "$VERSION" "${{ matrix.env }}" "$OWNER"
+          # writes verifier/reference-values/<cloud>/<boot_format>/<version>/<env>/<owner>.json
+          ci/gen-reference-values.sh "out-${{ matrix.env }}.qcow2" "$CLOUD" "$BOOT_FORMAT" "$VERSION" "${{ matrix.env }}" "$OWNER"
           cd ..
-          verifier/register-shared-as.sh "$CLOUD" "$VERSION" "${{ matrix.env }}" "$OWNER" "$AS_ENDPOINT"
+          verifier/register-shared-as.sh "$CLOUD" "$BOOT_FORMAT" "$VERSION" "${{ matrix.env }}" "$OWNER" "$AS_ENDPOINT"
 
       - name: Open PR with the new reference values → dev
         if: ${{ env.PUBLISH == 'true' }}
-        run: cvm/ci/open-refvalues-pr.sh "$CLOUD" "$VERSION" "${{ matrix.env }}" "$OWNER"
+        run: cvm/ci/open-refvalues-pr.sh "$CLOUD" "$BOOT_FORMAT" "$VERSION" "${{ matrix.env }}" "$OWNER"
         env:
           # PAT so `gh pr create` works even if the org disables "Actions create/approve PRs".
           # git push still uses GITHUB_TOKEN via the permissions block above. Falls back if unset.
