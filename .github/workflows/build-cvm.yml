@@ -80,6 +80,11 @@ jobs:
       KBS_URLS: ${{ vars.TAPP_KBS_URLS }}                       # required (no safe default)
       GCP_PROJECT: ${{ vars.GCP_PROJECT || 'g-devops' }}
       GCS_BUCKET: ${{ vars.GCS_BUCKET || 'gs://tapp-image' }}
+      # Ali publish (CLOUD=ali): the al8 build runner is itself an Ali ECS instance, so aliyun/ossutil
+      # authenticate via its instance RAM role — no AK/SK secret needed.
+      ALIYUN_REGION: ${{ vars.ALIYUN_REGION || 'ap-southeast-1' }}
+      ALIYUN_ECS_ROLE: ${{ vars.ALIYUN_ECS_ROLE || '0g-confidential-disk-oss' }}
+      OSS_BUCKET: ${{ vars.OSS_BUCKET || '0g-confidential-disk' }}
       AS_ENDPOINT: ${{ vars.AS_ENDPOINT || '47.237.201.184:50004' }}
       CRYPTPILOT_REF: ${{ vars.CRYPTPILOT_REF || '57d751259211c0b72fe22c855d95786865c7d84c' }}   # fork feat/0g-cvm = 0.8.0 + #128 + #130 (ci/setup-toolchain.sh)
       BASE_IMAGE_URL: ${{ vars.BASE_IMAGE_URL }}                # cached Stage-0 base (gs://, file://, or abs path)
@@ -137,13 +142,31 @@ jobs:
         env:
           GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
 
-      - name: Stage C — publish versioned image (+ family)   # gcp only for now; ali publish (OSS + aliyun ecs ImportImage) is TODO
+      - name: Authenticate to Ali
+        if: ${{ env.PUBLISH == 'true' && env.CLOUD == 'ali' }}
+        run: |
+          # The al8 runner is an Ali ECS instance; aliyun/ossutil authenticate via its instance RAM role
+          # (no AK/SK secret). ossutil is already configured on the runner; point aliyun at the role too.
+          aliyun configure set --profile default --mode EcsRamRole \
+            --ram-role-name "$ALIYUN_ECS_ROLE" --region "$ALIYUN_REGION"
+
+      - name: Stage C — publish versioned image (gcp)
         if: ${{ env.PUBLISH == 'true' && env.CLOUD == 'gcp' }}
         run: |
           cd cvm
           IMG="${{ steps.v.outputs.imgbase }}-${VERSION//./-}"
           IMAGE_FAMILY="${{ steps.v.outputs.imgbase }}" \
             ./publish-gcp-image.sh "out-${{ matrix.env }}.qcow2" "$IMG"
+
+      - name: Stage C — publish versioned image (ali)
+        if: ${{ env.PUBLISH == 'true' && env.CLOUD == 'ali' }}
+        run: |
+          cd cvm
+          # ali image name includes the owner (measured dimension); Ali image names allow it (<=128 chars)
+          OWNER_TAG="$(printf '%s' "$OWNER" | tr 'A-Z' 'a-z')"
+          IMG="${{ steps.v.outputs.imgbase }}-${VERSION//./-}-${OWNER_TAG}"
+          ALIYUN_REGION="$ALIYUN_REGION" OSS_BUCKET="$OSS_BUCKET" \
+            ./publish-ali-image.sh "out-${{ matrix.env }}.qcow2" "$IMG"
 
       - name: Reference values — compute, write, register on AS
         if: ${{ env.PUBLISH == 'true' }}
