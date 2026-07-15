@@ -23,9 +23,9 @@ set -euo pipefail
 #   BOOT_FORMAT grub | uki — boot format. grub: traditional shim/grub (convert #130 syncs the ESP
 #               grub.cfg); uki: systemd-boot / Unified Kernel Image (convert --uki; needs dracut +
 #               systemd-boot-efi). Reference value differs: grub -> 5 components, uki -> 1 (measurement.uki).
-# Default BOOT_FORMAT by cloud (gcp->grub, ali->uki) but OVERRIDABLE (e.g. a uki image on gcp).
+# Default BOOT_FORMAT = grub for any cloud; set uki explicitly (e.g. a uki image on ali).
 CLOUD="${CLOUD:-gcp}"
-BOOT_FORMAT="${BOOT_FORMAT:-$([ "$CLOUD" = gcp ] && echo grub || echo uki)}"
+BOOT_FORMAT="${BOOT_FORMAT:-grub}"
 CONFIG_DIR="${CONFIG_DIR:-./config_dir}"
 FDE_PACKAGE="${FDE_PACKAGE:-cryptpilot-fde_0.7.0_amd64.deb}"
 ROOTFS_MODE="${ROOTFS_MODE:---rootfs-no-encryption}"   # or "--rootfs-passphrase <pass>"

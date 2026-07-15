@@ -40,7 +40,7 @@ on:
         options: [gcp, ali]
         default: gcp
       boot_format:
-        description: "boot format (auto = grub for gcp, uki for ali)"
+        description: "boot format (auto = grub; choose uki explicitly)"
         type: choice
         options: [auto, grub, uki]
         default: auto
@@ -70,9 +70,9 @@ jobs:
       OWNER: ${{ inputs.owner || vars.OWNER_ADDRESS }}
       PUBLISH: ${{ inputs.publish }}
       # cloud/boot-format dimensions (independent; a CVM = one CLOUD × one BOOT_FORMAT = one measurement
-      # chain). cloud defaults to gcp; boot_format auto -> grub for gcp / uki for ali.
+      # chain). cloud defaults to gcp; boot_format auto -> grub (uki is opt-in, any cloud).
       CLOUD: ${{ inputs.cloud || 'gcp' }}
-      # boot_format 'auto'/'' -> empty, so build-tapp derives it from cloud (gcp->grub, ali->uki)
+      # boot_format 'auto'/'' -> empty, so build-tapp applies its default (grub)
       BOOT_FORMAT: ${{ (inputs.boot_format == 'auto' || inputs.boot_format == '') && '' || inputs.boot_format }}
       KBS_URLS: ${{ vars.TAPP_KBS_URLS }}                       # required (no safe default)
       GCP_PROJECT: ${{ vars.GCP_PROJECT || 'g-devops' }}
