@@ -33,6 +33,7 @@ GCP_PROJECT="${GCP_PROJECT:-g-devops}"
 GUEST_OS_FEATURES="${GUEST_OS_FEATURES:-UEFI_COMPATIBLE,GVNIC,SEV_CAPABLE,TDX_CAPABLE}"
 WORKDIR="${WORKDIR:-$(cd "$(dirname "$IMG")" && pwd)}"   # where disk.raw / tarball are staged
 KEEP_TARBALL="${KEEP_TARBALL:-0}"                         # 1 = keep the local .tar.gz after upload
+OVERWRITE="${OVERWRITE:-0}"                              # 1 = if the image name exists, delete then recreate
 # ====================
 
 for t in qemu-img tar gsutil gcloud; do command -v "$t" >/dev/null || { echo "missing tool: $t" >&2; exit 1; }; done
@@ -40,12 +41,19 @@ for t in qemu-img tar gsutil gcloud; do command -v "$t" >/dev/null || { echo "mi
 RAW="$WORKDIR/disk.raw"
 TAR="$WORKDIR/$NAME.tar.gz"
 
-# refuse to clobber an existing image name (gcloud would error anyway; give a clearer hint up front)
+# An existing image name is immutable by default (a published version image may back running
+# instances; silently replacing it would change its measurements and break their attestation).
+# OVERWRITE=1 opts into delete-then-recreate for deliberate re-runs of the same version.
 if gcloud compute images describe "$NAME" --project="$GCP_PROJECT" >/dev/null 2>&1; then
-  echo "GCP image '$NAME' already exists in project $GCP_PROJECT." >&2
-  echo "  delete it first:  gcloud compute images delete $NAME --project=$GCP_PROJECT" >&2
-  echo "  or publish under a new name (e.g. ${NAME}-$(date +%Y%m%d) — pass a different <gcp-image-name>)." >&2
-  exit 1
+  if [ "$OVERWRITE" = 1 ]; then
+    echo "==> image '$NAME' already exists; OVERWRITE=1 → deleting it first"
+    gcloud compute images delete "$NAME" --project="$GCP_PROJECT" --quiet
+  else
+    echo "GCP image '$NAME' already exists in project $GCP_PROJECT." >&2
+    echo "  re-run with OVERWRITE=1 to replace it, delete it manually, or publish under a new name." >&2
+    echo "  delete:  gcloud compute images delete $NAME --project=$GCP_PROJECT" >&2
+    exit 1
+  fi
 fi
 
 cleanup() { rm -f "$RAW"; [ "$KEEP_TARBALL" = 1 ] || rm -f "$TAR"; }

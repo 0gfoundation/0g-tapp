@@ -34,16 +34,25 @@ OSS_ENDPOINT="${OSS_ENDPOINT:-oss-${ALIYUN_REGION}.aliyuncs.com}"
 PLATFORM="${PLATFORM:-Ubuntu}"
 KEEP_OSS_OBJECT="${KEEP_OSS_OBJECT:-0}"                   # 1 = keep the uploaded qcow2 in OSS after import
 POLL_MAX="${POLL_MAX:-1800}"                              # max seconds to wait for the image to become Available
+OVERWRITE="${OVERWRITE:-0}"                              # 1 = if the image name exists, delete then recreate
 # ====================
 
 for t in ossutil aliyun python3; do command -v "$t" >/dev/null || { echo "missing tool: $t" >&2; exit 1; }; done
 
-# refuse to clobber an existing image name (give a clear hint up front)
-if aliyun ecs DescribeImages --RegionId "$ALIYUN_REGION" --ImageName "$NAME" 2>/dev/null \
-     | python3 -c 'import sys,json; sys.exit(0 if json.load(sys.stdin).get("TotalCount",0)>0 else 1)'; then
-  echo "Ali image '$NAME' already exists in region $ALIYUN_REGION." >&2
-  echo "  delete it first, or publish under a new name (a different <ali-image-name>)." >&2
-  exit 1
+# An existing image name is immutable by default (a published version image may back running
+# instances; silently replacing it would change its measurements and break their attestation).
+# OVERWRITE=1 opts into delete-then-recreate for deliberate re-runs of the same version.
+EXIST_ID="$(aliyun ecs DescribeImages --RegionId "$ALIYUN_REGION" --ImageName "$NAME" 2>/dev/null \
+  | python3 -c 'import sys,json; im=json.load(sys.stdin).get("Images",{}).get("Image",[]); print(im[0]["ImageId"] if im else "")')"
+if [ -n "$EXIST_ID" ]; then
+  if [ "$OVERWRITE" = 1 ]; then
+    echo "==> image '$NAME' already exists ($EXIST_ID); OVERWRITE=1 → deleting it first"
+    aliyun ecs DeleteImage --RegionId "$ALIYUN_REGION" --ImageId "$EXIST_ID" --Force true >/dev/null
+  else
+    echo "Ali image '$NAME' already exists in region $ALIYUN_REGION ($EXIST_ID)." >&2
+    echo "  re-run with OVERWRITE=1 to replace it, delete it manually, or publish under a new name." >&2
+    exit 1
+  fi
 fi
 
 echo "==> [C1] ossutil cp -> oss://$OSS_BUCKET/$OSS_OBJECT"
