@@ -65,11 +65,13 @@ echo "    ImageId=$IMAGE_ID"
 
 echo "==> [C3] enable NVMe support (ModifyImageAttribute Features.NvmeSupport=supported)"
 # The confidential instance exposes disks over NVMe; the imported image must advertise NVMe support.
-# Set it right after ImportImage is kicked off (the import task itself is async).
+# --force: the aliyun CLI's built-in schema for ModifyImageAttribute doesn't expose the Features.NvmeSupport
+# sub-field as a flag (rejects both `--Features.NvmeSupport` and JSON `--Features`), so --force skips
+# client-side validation and sends it in the flat form the server requires. Verified working.
 aliyun ecs ModifyImageAttribute \
   --RegionId "$ALIYUN_REGION" \
   --ImageId "$IMAGE_ID" \
-  --Features.NvmeSupport supported >/dev/null
+  --Features.NvmeSupport supported --force >/dev/null
 
 echo "==> [C4] wait for image $IMAGE_ID to become Available (import task runs async; up to ${POLL_MAX}s)"
 t=0
