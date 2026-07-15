@@ -52,20 +52,28 @@ INJECTED=$(python3 - "$POLICY" "$REF" <<'PY'
 import sys, json, re
 policy = open(sys.argv[1]).read()
 ref = json.load(open(sys.argv[2]))
+# grub uses 5 components, uki uses 1 — inject a literal set per rule (empty set() when
+# the key is absent), so whichever format the image is, only its boot_chain_ok branch
+# in policy.rego has non-empty reference sets and fires. Require ≥1 value overall.
 keymap = {
     "ref_shim": "measurement.shim.SHA-384",
     "ref_grub": "measurement.grub.SHA-384",
     "ref_kernel": "measurement.kernel.SHA-384",
     "ref_initrd": "measurement.initrd.SHA-384",
     "ref_kernel_cmdline": "measurement.kernel_cmdline.SHA-384",
+    "ref_uki": "measurement.uki.SHA-384",
 }
+nonempty = 0
 for rule, key in keymap.items():
     vals = [v for v in ref.get(key, []) if isinstance(v, str) and v]
-    if not vals:
-        sys.stderr.write(f"error: {key} empty in reference file\n"); sys.exit(1)
-    literal = "{" + ", ".join('"%s"' % v for v in vals) + "}"
+    nonempty += len(vals)
+    literal = ("{" + ", ".join('"%s"' % v for v in vals) + "}") if vals else "set()"
     # replace the rule's RHS (the qrv(...) set comprehension) with the literal set
-    policy = re.sub(rule + r" := \{x \| some x in qrv\([^)]*\)\}", f"{rule} := {literal}", policy, count=1)
+    policy, n = re.subn(rule + r" := \{x \| some x in qrv\([^)]*\)\}", f"{rule} := {literal}", policy, count=1)
+    if n != 1:
+        sys.stderr.write(f"error: could not inject {rule} (policy.rego rule/regex mismatch)\n"); sys.exit(1)
+if nonempty == 0:
+    sys.stderr.write("error: reference file has no measurement.*.SHA-384 values\n"); sys.exit(1)
 sys.stdout.write(policy)
 PY
 )

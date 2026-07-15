@@ -5,10 +5,14 @@ import rego.v1
 # =============================================================================
 # 0g-tapp boot-chain verification policy (canonical, tapp-level)
 # =============================================================================
-# Verifies a TDX confidential VM boot chain (shim / grub / kernel / initrd /
-# kernel_cmdline) against an image's reference values. These measurements come from
-# the TDX evidence's uefi_event_logs (RTMR0-2). rootfs integrity is folded into the
-# initrd, so it is not checked separately.
+# Verifies a TDX confidential VM boot chain against an image's reference values.
+# Two boot formats, one policy:
+#   * grub → shim / grub / kernel / initrd / kernel_cmdline (5 components)
+#   * uki  → a single signed EFI (kernel+initrd+cmdline fused) → measurement.uki
+# The measurements come from the TDX evidence's uefi_event_logs (RTMR0-2). rootfs
+# integrity is folded into the initrd (grub) / uki, so it is not checked separately.
+# boot_chain_ok has one rule per format; only the format whose reference values are
+# present fires (the other's ref sets are empty), so an image verifies as exactly one.
 #
 # ONE canonical policy — image-/version-/env-agnostic. What differs per
 # release × {dev,prod} is the REFERENCE VALUES, NOT this logic. The values are NOT
@@ -50,6 +54,9 @@ ref_initrd := {x | some x in qrv("measurement.initrd.SHA-384")}
 # kernel_cmdline may have several allowed values (grub path spellings); OR-match.
 ref_kernel_cmdline := {x | some x in qrv("measurement.kernel_cmdline.SHA-384")}
 
+# uki path: a single measurement covering the whole unified kernel image.
+ref_uki := {x | some x in qrv("measurement.uki.SHA-384")}
+
 # --- Extract component digests from uefi_event_logs ------------------------
 # Digests of EV_EFI_BOOT_SERVICES_APPLICATION events whose device_paths contain `needle`.
 bsa_digests(needle) := {d |
@@ -68,18 +75,34 @@ ipl_digests(prefix) := {d |
 	d := e.digests[_].digest
 }
 
+# All boot-services-application digests (any device path). The UKI is loaded as one
+# such event; we match its (specific, known) reference digest against this set rather
+# than pinning a device-path spelling — an attacker still needs our exact UKI digest.
+all_bsa_digests := {d |
+	some e in input.tdx.uefi_event_logs
+	e.type_name == "EV_EFI_BOOT_SERVICES_APPLICATION"
+	d := e.digests[_].digest
+}
+
 # Non-empty intersection = a measured digest matched a reference value.
 hit(measured, reference) if {
 	some m in measured
 	m in reference
 }
 
+# grub boot chain: all five components must match.
 boot_chain_ok if {
 	hit(bsa_digests("shimx64.efi"), ref_shim)
 	hit(bsa_digests("grubx64.efi"), ref_grub)
 	hit(ipl_digests("/vmlinuz"), ref_kernel)
 	hit(ipl_digests("/initrd"), ref_initrd)
 	hit(ipl_digests("kernel_cmdline:"), ref_kernel_cmdline)
+}
+
+# uki boot chain: the single UKI measurement must match. Fires only for UKI images
+# (ref_uki populated); for grub images ref_uki is empty so this rule is inert.
+boot_chain_ok if {
+	hit(all_bsa_digests, ref_uki)
 }
 
 # --- AR4SI trust claims ----------------------------------------------------
