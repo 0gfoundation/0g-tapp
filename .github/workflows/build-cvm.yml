@@ -170,16 +170,15 @@ jobs:
       - name: Stage A+B — build the image
         run: |
           cd cvm
-          # canonical: no OWNER_ADDRESS → owner-agnostic image, one refval set for all owners.
-          # custom:    OWNER_ADDRESS baked in → per-owner initrd measurement + per-owner refval set.
-          EXTRA=""
-          [ "$BUILD_MODE" = "custom" ] && EXTRA="OWNER_ADDRESS=$OWNER"
-          # KBS_URLS may be empty in canonical mode (supplied at runtime via ClaimConfig
-          # --kbs-urls); custom mode requires it — build-tapp.sh enforces per mode.
-          # NOTE: must stay an inline quoted assignment — the value contains spaces/quotes.
+          # BUILD_MODE and KBS_URLS are inherited from the job env (empty KBS_URLS is fine
+          # in canonical mode — supplied at runtime via ClaimConfig --kbs-urls).
+          # custom mode: map the workflow's OWNER to build-tapp.sh's OWNER_ADDRESS.
+          # NOTE: no $VAR expansion inside the assignment-prefix list — bash decides what is
+          # an assignment BEFORE expansion, so a variable there (even empty) turns every
+          # later VAR=val into the command name ("KBS_URLS=...: command not found").
+          [ "$BUILD_MODE" = "custom" ] && export OWNER_ADDRESS="$OWNER"
           HARDEN=${{ steps.v.outputs.harden }} ENABLE_SYSBOX=1 \
-            BUILD_MODE="$BUILD_MODE" $EXTRA \
-            KBS_URLS="$KBS_URLS" DISK_SIZE="${{ inputs.disk_size || '20G' }}" \
+            DISK_SIZE="${{ inputs.disk_size || '20G' }}" \
             TAPP_SERVER_URL="https://github.com/0gfoundation/0g-tapp/releases/download/${VERSION}/tapp-server" \
             ./build-tapp.sh base-noble.qcow2 "out-${{ matrix.env }}.qcow2"
 
