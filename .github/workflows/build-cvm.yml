@@ -128,11 +128,10 @@ jobs:
             TAPP_SERVER_URL="https://github.com/0gfoundation/0g-tapp/releases/download/${VERSION}/tapp-server" \
             ./build-tapp.sh base-noble.qcow2 "out-${{ matrix.env }}.qcow2"
 
-      - name: Boot smoke test (advisory for now — TODO make a hard gate)
-        # non-blocking until the smoke test is validated on a KVM-capable runner and its
-        # serial-console detection is confirmed (this builder has no /dev/kvm → TCG, slow/flaky).
-        continue-on-error: true
-        run: cd cvm && ./test/boot-smoke-test.sh "out-${{ matrix.env }}.qcow2"
+      # Boot smoke test intentionally NOT run here: this builder has no /dev/kvm, so under TCG the
+      # 600s window is truncated before multi-user (false negatives) and it never gated (advisory).
+      # cvm/test/boot-smoke-test.sh is kept for local / KVM-capable runs; make it a hard gate once a
+      # KVM runner is available. Real boot + attestation validation is done on actual TDX hardware.
 
       - name: Authenticate to GCP
         if: ${{ env.PUBLISH == 'true' && env.CLOUD == 'gcp' }}
