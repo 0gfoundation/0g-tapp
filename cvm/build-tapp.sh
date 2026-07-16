@@ -137,6 +137,11 @@ Group=root
 # (/run/tapp/tapp.sock, see config.toml [server]) — app containers bind-mount this dir/socket.
 RuntimeDirectory=tapp
 RuntimeDirectoryMode=0755
+# Preserve /run/tapp across process restarts: the claimed_owner file must
+# survive `systemctl restart` (process restart) but be cleared on VM reboot
+# (tmpfs lifetime = same as RTMR lifetime). Without this, systemd removes
+# /run/tapp on every stop, wiping the claim and allowing re-claim on restart.
+RuntimeDirectoryPreserve=yes
 ExecStart=/usr/local/bin/tapp-server
 Restart=always
 RestartSec=10
