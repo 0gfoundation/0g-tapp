@@ -20,6 +20,6 @@ contract/internal/
 
 
 # GCP CVM 构建：大文件/二进制不入库（本地保留）
-gcp-cvm/*.qcow2
-gcp-cvm/*.deb
-gcp-cvm/disk.raw
+cvm/*.qcow2
+cvm/*.deb
+cvm/disk.raw

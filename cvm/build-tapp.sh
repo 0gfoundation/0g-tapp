@@ -1,11 +1,11 @@
 #!/bin/bash
-# build-gcp-tapp.sh <ubuntu-24.04-base.qcow2> <output gcp-tapp.qcow2>
+# build-tapp.sh <ubuntu-24.04-base.qcow2> <output gcp-tapp.qcow2>
 #
 # One-command pipeline that turns a stock Ubuntu 24.04 cloud image into the final
 # cryptpilot tapp image. Two stages:
 #   [A] provision base: tapp-server + service + /etc/tapp/config.toml + libtdx-attest (SGX repo)
 #       + docker + systemd-resolved fallback DNS
-#   [B] reuse prepare-gcp-tapp.sh: install gcp kernel -> fix /boot/vmlinuz symlink -> convert -> sync ESP
+#   [B] reuse prepare-tapp.sh: install gcp kernel -> fix /boot/vmlinuz symlink -> convert -> sync ESP
 #
 # Requires network access on the host/appliance (apt + downloads).
 
@@ -39,9 +39,21 @@ CONTAINERD_ROOT="${CONTAINERD_ROOT:-/data/containerd}" # containerd root (image 
 ENABLE_SYSBOX="${ENABLE_SYSBOX:-0}"
 SYSBOX_VERSION="${SYSBOX_VERSION:-0.7.0}"
 SYSBOX_DEB_URL="${SYSBOX_DEB_URL:-https://downloads.nestybox.com/sysbox/releases/v${SYSBOX_VERSION}/sysbox-ce_${SYSBOX_VERSION}-0.linux_amd64.deb}"
-# passed through to prepare-gcp-tapp.sh (used by convert)
+# Two independent build dimensions (each image = one of each):
+#   CLOUD       gcp | ali  — kernel/guest/publish. gcp: linux-image-gcp + fix A + google-guest-agent +
+#               publish-gcp-image.sh; ali: generic kernel + cloud-init(AliYun) + publish-ali-image.sh.
+#   BOOT_FORMAT grub | uki — boot format (stage B convert). Defaults to grub for any cloud;
+#               set uki explicitly. Determines --uki + UKI prereqs + the reference-value shape (grub 5 / uki 1).
+# Both exported so prepare-*.sh (stage B) inherits them.
+export CLOUD="${CLOUD:-gcp}"
+export BOOT_FORMAT="${BOOT_FORMAT:-grub}"
+# Boot-disk size of the produced image (the read-only verity rootfs sizes to this). Default 20G =
+# the cached base. A larger value grows the working copy (qemu-img resize + growpart + resize2fs)
+# up front, before the build; shrinking below the current size is unsupported (ignored).
+DISK_SIZE="${DISK_SIZE:-20G}"
+# passed through to prepare-tapp.sh (used by convert)
 export CONFIG_DIR="${CONFIG_DIR:-$HERE/config_dir}"
-export FDE_PACKAGE="${FDE_PACKAGE:-$HERE/cryptpilot-fde_0.7.0_amd64.deb}"
+export FDE_PACKAGE="${FDE_PACKAGE:-$HERE/cryptpilot-fde-guest_0.8.0_amd64.deb}"   # 0.8.0 in-image runtime (cryptpilot-fde split into -host/-guest at 0.8.0)
 export ROOTFS_MODE="${ROOTFS_MODE:---rootfs-no-encryption}"
 export PURGE_KERNEL="${PURGE_KERNEL:-}"   # NOTE: convert needs at least one *-generic kernel left in the image; do not purge them all
 export INSTALL_KERNEL=1
@@ -56,9 +68,24 @@ OUT="${2:?usage: $0 <ubuntu-24.04-base.qcow2> <output.qcow2>}"
 [ -f "$IN" ] || { echo "input image not found: $IN" >&2; exit 1; }
 [ -n "$OWNER_ADDRESS" ] || { echo "OWNER_ADDRESS is required, e.g. OWNER_ADDRESS=0x... $0 ..." >&2; exit 1; }
 [ -n "$KBS_URLS" ] || { echo "KBS_URLS is required, e.g. KBS_URLS='\"http://host1:9091\", \"http://host2:9091\"' $0 ..." >&2; exit 1; }
-[ -f "$HERE/prepare-gcp-tapp.sh" ] || { echo "missing prepare-gcp-tapp.sh (must be in the same directory as this script)" >&2; exit 1; }
+[ -f "$HERE/prepare-tapp.sh" ] || { echo "missing prepare-tapp.sh (must be in the same directory as this script)" >&2; exit 1; }
 [ -d "$CONFIG_DIR" ] || { echo "CONFIG_DIR not found: $CONFIG_DIR" >&2; exit 1; }
 [ -f "$FDE_PACKAGE" ] || { echo "FDE_PACKAGE not found: $FDE_PACKAGE" >&2; exit 1; }
+
+# ---- resize the working image up front (before Stage A / convert) ----
+# The final image's read-only verity rootfs is sized from the disk here, so grow the disk + rootfs
+# partition (sda1) + filesystem now. Preserve partition numbering (growpart, NOT virt-resize --expand,
+# which renumbers sda1->sda4 and breaks the sda1=rootfs / sda16=/boot assumptions). Only grows: a
+# DISK_SIZE at or below the current size is a no-op (shrinking a populated fs is unsafe).
+CUR_BYTES="$(qemu-img info --output=json "$IN" | python3 -c 'import sys,json; print(json.load(sys.stdin)["virtual-size"])')"
+WANT_BYTES="$(numfmt --from=iec "$DISK_SIZE")"
+if [ "$WANT_BYTES" -gt "$CUR_BYTES" ]; then
+  echo "==> resize disk -> $DISK_SIZE (grow sda1 + fs; was $(numfmt --to=iec "$CUR_BYTES"))"
+  qemu-img resize "$IN" "$DISK_SIZE"
+  virt-customize -a "$IN" --run-command 'growpart /dev/sda 1 && resize2fs /dev/sda1'
+elif [ "$WANT_BYTES" -lt "$CUR_BYTES" ]; then
+  echo "==> DISK_SIZE=$DISK_SIZE is below the current $(numfmt --to=iec "$CUR_BYTES"); shrinking unsupported — keeping current size" >&2
+fi
 
 TMPD="$(mktemp -d)"
 trap 'rm -rf "$TMPD"' EXIT
@@ -88,6 +115,10 @@ RequiresMountsFor=/data
 Type=simple
 User=root
 Group=root
+# Create /run/tapp (0755, cleaned on stop) so tapp-server can bind its unix_socket_path
+# (/run/tapp/tapp.sock, see config.toml [server]) — app containers bind-mount this dir/socket.
+RuntimeDirectory=tapp
+RuntimeDirectoryMode=0755
 ExecStart=/usr/local/bin/tapp-server
 Restart=always
 RestartSec=10
@@ -111,6 +142,11 @@ format = "pretty"
 # logs on "/" consume RAM and are lost on reboot (issue #23). tapp-server keeps
 # at most `max_log_files` daily files (default 7).
 file_path = "/data/log/tapp/"
+
+[server]
+# Serve the gRPC service on this Unix domain socket in addition to TCP.
+# App containers bind-mount this file and set their tapp socket path to it.
+unix_socket_path = "/run/tapp/tapp.sock"
 
 [server.permission]
 enabled = true
@@ -140,12 +176,12 @@ apt-get install -y curl gnupg ca-certificates
 install -d -m0755 /etc/apt/keyrings
 # Intel SGX repo (libtdx-attest, a runtime dependency of tapp-server)
 curl -fsSL https://download.01.org/intel-sgx/sgx_repo/ubuntu/intel-sgx-deb.key \
-  | gpg --dearmor -o /etc/apt/keyrings/intel-sgx.gpg
+  | gpg --batch --no-tty --dearmor -o /etc/apt/keyrings/intel-sgx.gpg
 echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/intel-sgx.gpg] https://download.01.org/intel-sgx/sgx_repo/ubuntu noble main" \
   > /etc/apt/sources.list.d/intel-sgx.list
 # Docker official repo
 curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
-  | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+  | gpg --batch --no-tty --dearmor -o /etc/apt/keyrings/docker.gpg
 echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu noble stable" \
   > /etc/apt/sources.list.d/docker.list
 apt-get update
@@ -321,8 +357,8 @@ network:
 NETEOF
 chmod 600 /etc/netplan/01-dhcp.yaml
 EOF
-else
-  echo "==> [harden] HARDEN=0: dev variant, reinstall google-guest-agent to restore GCP SSH key injection"
+elif [ "$CLOUD" = gcp ]; then
+  echo "==> [harden] HARDEN=0 gcp: reinstall google-guest-agent to restore GCP SSH key injection"
   cat >> "$TMPD/provision-base.sh" <<'EOF'
 # dev variant only: google-guest-agent (from Ubuntu universe) injects the instance
 # SSH public key from metadata into ~ubuntu/.ssh/authorized_keys. It talks to the
@@ -334,6 +370,17 @@ apt-get install -y google-guest-agent
 systemctl enable google-guest-agent.service || true
 grep -q 'metadata.google.internal' /etc/hosts || \
   printf '169.254.169.254 metadata.google.internal metadata\n' >> /etc/hosts
+EOF
+else
+  # ali (or other) dev variant: the dev build does NOT purge cloud-init (only HARDEN=1 does), and on
+  # Alibaba Cloud cloud-init injects the instance SSH key + configures networking from the Ali metadata
+  # service (100.100.100.200). So no google-guest-agent (that is GCP-only) — rely on cloud-init, and
+  # PIN its datasource to AliYun: Alibaba recommends pinning rather than relying on ds-identify picking
+  # AliYun out of ~30 candidate datasources, so key/network injection is reliable.
+  echo "==> [harden] HARDEN=0 $CLOUD: pin cloud-init datasource to AliYun for SSH/network injection (no google-guest-agent)"
+  cat >> "$TMPD/provision-base.sh" <<'EOF'
+mkdir -p /etc/cloud/cloud.cfg.d
+printf 'datasource_list: [ AliYun ]\n' > /etc/cloud/cloud.cfg.d/99-aliyun-ds.cfg
 EOF
 fi
 
@@ -385,16 +432,21 @@ virt-customize -a "$IN" \
   --run "$TMPD/provision-base.sh"
 
 # ---- stage B: kernel + convert + ESP (IN_PLACE operates on the input, reusing the validated script) ----
-echo "==> [B] prepare-gcp-tapp.sh (IN_PLACE): install gcp kernel -> fix A -> convert -> fix B"
-IN_PLACE=1 "$HERE/prepare-gcp-tapp.sh" "$IN" "$OUT"
+echo "==> [B] prepare-tapp.sh (IN_PLACE): install gcp kernel -> fix A -> convert -> fix B"
+IN_PLACE=1 "$HERE/prepare-tapp.sh" "$IN" "$OUT"
 
 echo ""
 echo "[done] final image: $OUT"
 echo "(note: $IN was modified in place; re-download the original base image if you need it again)"
 
-# ---- stage C (opt-in): publish $OUT to GCP as image $PUBLISH_AS ----
+# ---- stage C (opt-in): publish $OUT as image $PUBLISH_AS on the target cloud ----
 if [ -n "$PUBLISH_AS" ]; then
-  [ -x "$HERE/publish-gcp-image.sh" ] || { echo "PUBLISH_AS set but publish-gcp-image.sh not found/executable in $HERE" >&2; exit 1; }
-  echo "==> [C] publish-gcp-image.sh: $OUT -> GCP image '$PUBLISH_AS'"
-  "$HERE/publish-gcp-image.sh" "$OUT" "$PUBLISH_AS"
+  case "$CLOUD" in
+    gcp) PUBLISHER="$HERE/publish-gcp-image.sh" ;;
+    ali) PUBLISHER="$HERE/publish-ali-image.sh" ;;
+    *)   echo "unknown CLOUD=$CLOUD (expected gcp|ali)" >&2; exit 1 ;;
+  esac
+  [ -x "$PUBLISHER" ] || { echo "PUBLISH_AS set but $(basename "$PUBLISHER") not found/executable in $HERE" >&2; exit 1; }
+  echo "==> [C] $(basename "$PUBLISHER"): $OUT -> $CLOUD image '$PUBLISH_AS'"
+  "$PUBLISHER" "$OUT" "$PUBLISH_AS"
 fi
