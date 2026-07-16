@@ -32,9 +32,9 @@ export LIBGUESTFS_BACKEND=direct                       # required for libguestfs
 
 Run the build as **root** (libguestfs direct backend + nbd + chroot in convert).
 
-Materials to place in `gcp-cvm/` (gitignored binaries, not committed):
+Materials to place in `cvm/` (gitignored binaries, not committed):
 - `cryptpilot-fde_0.7.0_amd64.deb` — the FDE **runtime installed into the target Ubuntu image** (passed via `--package`). From the same [v0.7.0 release](https://github.com/openanolis/cryptpilot/releases/tag/v0.7.0). Note this is the `.deb` for the *target image*, distinct from the `.al8.rpm` for the *host* above.
-- `tapp-server` — pulled automatically from the 0g-tapp v0.1.0 release by `build-gcp-tapp.sh`, or supply a local one via `TAPP_SERVER_BIN=<path>`.
+- `tapp-server` — pulled automatically from the 0g-tapp v0.1.0 release by `build-tapp.sh`, or supply a local one via `TAPP_SERVER_BIN=<path>`.
 
 ### 0.2 Base Ubuntu image
 
@@ -71,7 +71,7 @@ sudo lsmod | grep -i gve
 
 > Note on SSH access — the stock Ubuntu cloud image relies on `google-guest-agent` to inject the instance's SSH public key (from the metadata server, via the `169.254.169.254` IP — independent of DNS) into `~ubuntu/.ssh/authorized_keys`. Because the build pins `/etc/resolv.conf` to public DNS (fix C, §9), `metadata.google.internal` no longer resolves, so a `169.254.169.254 metadata.google.internal` line in `/etc/hosts` is also needed for the agent to reach the metadata server by name. The build handles this **only for the dev variant** (`HARDEN=0`): it (re)installs `google-guest-agent` and adds the `/etc/hosts` line. The hardened variant intentionally omits both — `google-guest-agent` is exactly the kind of component that can push changes into the instance from outside, so the hardened image is not SSH-reachable by design.
 
-The full build (`gcp-cvm/build-gcp-tapp.sh`, §9) then takes this base image and adds the application, Docker, the gcp kernel, runs `cryptpilot-convert`, syncs the ESP, and (for the hardened variant) removes back-door software.
+The full build (`cvm/build-tapp.sh`, §9) then takes this base image and adds the application, Docker, the gcp kernel, runs `cryptpilot-convert`, syncs the ESP, and (for the hardened variant) removes back-door software.
 
 ## 1. Environment
 
@@ -323,13 +323,13 @@ This integrates all the fixes above into one reproducible pipeline, in two stage
 ### One-shot scripts
 
 The repository provides three scripts:
-- **`build-gcp-tapp.sh <bare-ubuntu.qcow2> <out.qcow2>`** — chains the full stage A + stage B flow;
-- **`prepare-gcp-tapp.sh <base.qcow2> <out.qcow2>`** — stage B only (use when a base already exists); includes fix A, DNS (guestfish), nbd reset, convert, fix B;
+- **`build-tapp.sh <bare-ubuntu.qcow2> <out.qcow2>`** — chains the full stage A + stage B flow;
+- **`prepare-tapp.sh <base.qcow2> <out.qcow2>`** — stage B only (use when a base already exists); includes fix A, DNS (guestfish), nbd reset, convert, fix B;
 - **`fix-esp-grub.sh <img.qcow2>`** — sync the ESP only (fix B).
 
 ```bash
 # bare Ubuntu 24.04 → final gcp-tapp.qcow2 (one command)
-./build-gcp-tapp.sh ubuntu-24.04.qcow2 gcp-tapp.qcow2
+./build-tapp.sh ubuntu-24.04.qcow2 gcp-tapp.qcow2
 ```
 Key environment variables: `TAPP_SERVER_BIN` (local tapp-server; if empty, downloads v0.1.0), `DNS_FALLBACK`, `PURGE_KERNEL`, `CONFIG_DIR`, `FDE_PACKAGE`, `ROOTFS_MODE`, `IN_PLACE` (1 = modify the input directly without copying), `INSTALL_KERNEL`, `NBD_RESET`.
 
@@ -409,7 +409,7 @@ network:
 ```
 (DNS still relies on the static `/etc/resolv.conf` from §9.)
 
-The hardening above is integrated at the end of stage A in `build-gcp-tapp.sh` (`apt-get purge` + `systemctl mask` + netplan replacement), and is sealed into the verity measurement layer together with convert.
+The hardening above is integrated at the end of stage A in `build-tapp.sh` (`apt-get purge` + `systemctl mask` + netplan replacement), and is sealed into the verity measurement layer together with convert.
 
 ## 12. Extracting reference values: `show-reference-value` (requires the saved_entry fix)
 
@@ -449,7 +449,7 @@ cryptpilot-fde show-reference-value --disk gcp-tapp.qcow2 --hash-algo sha384
 
 ## 13. Persistent `/data` disk (container storage off the RAM rootfs) + Sysbox
 
-The rootfs writable overlay is `rw_overlay = "ram"` (zram) — **anything written to `/` at runtime lives in RAM and is lost on reboot**, and is bounded by instance memory. So all persistent container state must live on a separate **`/data`** disk. `build-gcp-tapp.sh` bakes this in **unconditionally** (not tied to `ENABLE_SYSBOX`); see the gcp-cvm README for the deploy model. The non-obvious gotchas that cost real debugging:
+The rootfs writable overlay is `rw_overlay = "ram"` (zram) — **anything written to `/` at runtime lives in RAM and is lost on reboot**, and is bounded by instance memory. So all persistent container state must live on a separate **`/data`** disk. `build-tapp.sh` bakes this in **unconditionally** (not tied to `ENABLE_SYSBOX`); see the cvm README for the deploy model. The non-obvious gotchas that cost real debugging:
 
 - **fstab `/data` MUST use `nofail`.** A plain `LABEL=tapp-data /data ext4 defaults 0 2` will, when the data disk is missing or not yet labelled, fail `local-fs.target` → the whole system drops into **emergency mode → no network, no SSH** (verified: a fresh instance with a blank data disk was unreachable; serial console showed `Timed out waiting for device .../tapp-data` → `emergency.target`). Use `defaults,nofail,x-systemd.device-timeout=60s,x-systemd.requires=tapp-data-provision.service`. With `nofail`, a missing `/data` only makes docker/containerd fail-loud (`RequiresMountsFor=/data`), the OS still boots and is reachable.
 - **First-boot auto-provision race.** `tapp-data-provision.service` prepares the single non-boot disk before `data.mount` — a **blank** disk is `mkfs.ext4 -L tapp-data`'d; a disk that **already has an ext4 filesystem** (e.g. a migrated chain-data disk) is **adopted** via `e2label tapp-data` (never reformatted, data preserved). The by-label `.device` unit's timeout must comfortably exceed that prep or the mount is abandoned before the label appears (a 10s timeout lost the race on first boot; **60s** is safe — mkfs took ~4s, e2label is instant). A *second* boot always worked because the disk was already labelled; the bug only bit the first boot. Guarded: real disks only, never the boot disk, never a partitioned disk; refuses to guess with 0 or >1 candidates.
@@ -462,7 +462,7 @@ The rootfs writable overlay is `rw_overlay = "ram"` (zram) — **anything writte
 
 ## 14. Stage C: publish the image to GCP
 
-A built qcow2 (§9 output) cannot be uploaded to GCP directly — GCP wants a raw disk named exactly `disk.raw` inside a **sparse `oldgnu`-format tarball**, imported as an image with the confidential guest-os-features. `gcp-cvm/publish-gcp-image.sh <image.qcow2> <gcp-image-name>` runs the four steps:
+A built qcow2 (§9 output) cannot be uploaded to GCP directly — GCP wants a raw disk named exactly `disk.raw` inside a **sparse `oldgnu`-format tarball**, imported as an image with the confidential guest-os-features. `cvm/publish-gcp-image.sh <image.qcow2> <gcp-image-name>` runs the four steps:
 
 ```bash
 # [C1] qcow2 -> raw
@@ -478,7 +478,7 @@ gcloud compute images create og-tdx --project=g-devops \
 ```
 
 Notes:
-- **Auth**: needs `gcloud auth login` and write access to the bucket/project. This is why Stage C is separate from the build (which needs no cloud creds) — run it after §9, or fold it in with `PUBLISH_AS=<name>` on `build-gcp-tapp.sh`.
+- **Auth**: needs `gcloud auth login` and write access to the bucket/project. This is why Stage C is separate from the build (which needs no cloud creds) — run it after §9, or fold it in with `PUBLISH_AS=<name>` on `build-tapp.sh`.
 - **`--format=oldgnu -S`**: GCP's importer requires the GNU-old tar format; `-S` keeps the (mostly-empty) 20 GiB raw sparse so the tarball stays small (~few GB).
 - **`-C <dir> disk.raw`**: the archive member must be the bare name `disk.raw`, not a path.
 - **Guest-OS features**: `UEFI_COMPATIBLE` (cryptpilot boots via UEFI/ESP), `GVNIC` (network driver), `SEV_CAPABLE`+`TDX_CAPABLE` (usable as an AMD-SEV or Intel-TDX confidential VM).

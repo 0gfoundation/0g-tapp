@@ -1,0 +1,274 @@
+# Build (and optionally publish + register) an og-tdx confidential VM image.
+#
+# DRAFT — requires a self-hosted Alinux/al8 runner (labels: self-hosted, alinux, cvm-builder) with:
+# root, nbd, libguestfs, qemu-img, git, cargo/rust, cryptsetup-devel, grpcurl, python3, gcloud + gsutil,
+# and network to the shared AS. The cryptpilot 0.8.0 + #128/#130 toolchain is provisioned by
+# ci/setup-toolchain.sh (installs released 0.8.0 + overlays convert #130 / fde-host #128 from the fork).
+#
+# Build modes:
+#   canonical (default): owner-agnostic image — owner/chain/kbs set at runtime via ClaimConfig
+#                        RPC (measured event). One image + one reference set for every owner.
+#                        Identifiers: image og-tdx-dev-grub-<ver>, refval <env>.json
+#   custom:              owner baked into config.toml → folded into the initrd measurement.
+#                        Per-owner image + per-owner reference set (legacy mode).
+#                        Identifiers: image og-tdx-dev-grub-<ver>-<owner>, refval .../<owner>.json
+#
+# Dimensions: cloud × boot_format × env × version (× owner only in custom mode).
+# KBS/KMS is fixed (vars.TAPP_KBS_URLS), not per-build.
+
+name: build-cvm
+
+on:
+  # Manual entry point: build a chosen cloud × boot_format × env at a given tapp-server
+  # release version, optionally publishing the image + registering reference values.
+  workflow_dispatch:
+    inputs:
+      build_mode:
+        description: "canonical = owner-agnostic image (one refval set for all owners); custom = owner baked in (per-owner refval set, requires owner input)"
+        type: choice
+        options: [canonical, custom]
+        default: canonical
+      owner:
+        description: "[custom mode only] OWNER_ADDRESS (0x...) baked into the image. Ignored in canonical mode."
+        required: false
+        default: ""
+      image_name:
+        description: "override the published image name. Blank = auto name."
+        required: false
+        default: ""
+      version:
+        description: "tapp-server release tag (e.g. v0.1.0)"
+        required: true
+      env:
+        description: "image variant"
+        type: choice
+        options: [dev, prod, both]
+        default: both
+      publish:
+        description: "publish image + register reference values"
+        type: boolean
+        default: true
+      cloud:
+        description: "target cloud (kernel/guest/publish)"
+        type: choice
+        options: [gcp, ali]
+        default: gcp
+      boot_format:
+        description: "boot format (grub default; uki = one signed EFI, kernel+initrd+cmdline fused)"
+        type: choice
+        options: [grub, uki]
+        default: grub
+      overwrite:
+        description: "replace an existing image of the same name (delete + recreate). Off = fail if it exists."
+        type: boolean
+        default: false
+      disk_size:
+        description: "boot-disk size of the image (e.g. 20G, 40G). Only grows; the verity rootfs sizes to it."
+        required: false
+        default: "20G"
+
+concurrency:
+  group: build-cvm-${{ inputs.cloud || 'gcp' }}-${{ inputs.boot_format }}-${{ inputs.build_mode || 'canonical' }}-${{ inputs.version }}-${{ inputs.owner }}
+  cancel-in-progress: false
+
+# The reference-values step pushes a refvalues/* branch and opens a PR into dev with GITHUB_TOKEN;
+# the default token is read-only, so grant the writes it needs (else: "denied to github-actions[bot]" 403).
+permissions:
+  contents: write        # push the refvalues/* branch
+  pull-requests: write   # open the reference-values PR
+
+jobs:
+  build:
+    runs-on: [self-hosted, alinux, cvm-builder]
+    strategy:
+      fail-fast: false
+      matrix:
+        # env=both -> [dev, prod]; otherwise the single chosen env
+        env: ${{ fromJSON(inputs.env == 'both' && '["dev","prod"]' || format('["{0}"]', inputs.env)) }}
+    env:
+      # All fixed config lives in repo/org Actions Variables (Settings → Secrets and variables →
+      # Actions → Variables), editable without touching this file; the `|| 'default'` is a fallback.
+      VERSION: ${{ inputs.version }}
+      PUBLISH: ${{ inputs.publish }}
+      BUILD_MODE: ${{ inputs.build_mode || 'canonical' }}
+      # OWNER is only meaningful in custom mode; empty otherwise so no step can
+      # accidentally use it (canonical images must not know any owner).
+      OWNER: ${{ inputs.build_mode == 'custom' && inputs.owner || '' }}
+      # cloud/boot-format dimensions (independent; a CVM = one CLOUD × one BOOT_FORMAT = one measurement
+      # chain). cloud defaults to gcp; boot_format defaults to grub (uki is opt-in, any cloud).
+      CLOUD: ${{ inputs.cloud || 'gcp' }}
+      BOOT_FORMAT: ${{ inputs.boot_format }}
+      KBS_URLS: ${{ vars.TAPP_KBS_URLS }}                       # required (no safe default)
+      GCP_PROJECT: ${{ vars.GCP_PROJECT || 'g-devops' }}
+      GCS_BUCKET: ${{ vars.GCS_BUCKET || 'gs://tapp-image' }}
+      # Ali publish (CLOUD=ali): the al8 build runner is itself an Ali ECS instance, so aliyun/ossutil
+      # authenticate via its instance RAM role — no AK/SK secret needed.
+      ALIYUN_REGION: ${{ vars.ALIYUN_REGION || 'ap-southeast-1' }}
+      ALIYUN_ECS_ROLE: ${{ vars.ALIYUN_ECS_ROLE || '0g-confidential-disk-oss' }}
+      OSS_BUCKET: ${{ vars.OSS_BUCKET || '0g-confidential-disk' }}
+      AS_ENDPOINT: ${{ vars.AS_ENDPOINT || '47.237.201.184:50004' }}
+      CRYPTPILOT_REF: ${{ vars.CRYPTPILOT_REF || '57d751259211c0b72fe22c855d95786865c7d84c' }}   # fork feat/0g-cvm = 0.8.0 + #128 + #130 (ci/setup-toolchain.sh)
+      BASE_IMAGE_URL: ${{ vars.BASE_IMAGE_URL }}                # cached Stage-0 base (gs://, file://, or abs path)
+      LIBGUESTFS_BACKEND: direct
+    steps:
+      - uses: actions/checkout@v4   # checks out the dispatched ref (draft branch while testing, dev once merged)
+
+      - name: Validate inputs (fail fast, before any expensive step)
+        run: |
+          FAIL=0
+          if [ "$BUILD_MODE" = "canonical" ]; then
+            # ClaimConfig RPC (required for canonical mode) was introduced in tapp-server v0.3.0.
+            # A canonical image built from an older binary boots unclaimed and can never be claimed.
+            VER="${VERSION#v}"
+            MAJOR="$(echo "$VER" | cut -d. -f1)"
+            MINOR="$(echo "$VER" | cut -d. -f2)"
+            if [ "$MAJOR" -eq 0 ] && [ "$MINOR" -lt 3 ]; then
+              echo "error: canonical mode requires tapp-server >= v0.3.0 (ClaimConfig RPC); got $VERSION — use build_mode=custom." >&2
+              FAIL=1
+            fi
+          else
+            # custom mode: an explicit, well-formed owner is mandatory (no vars fallback —
+            # a silently-defaulted owner baked into a measured image is how mistakes ship).
+            if ! printf '%s' "$OWNER" | grep -qE '^0[xX][0-9a-fA-F]{40}$'; then
+              echo "error: build_mode=custom requires owner as a full 0x-prefixed 40-hex address; got '${OWNER:-<empty>}'." >&2
+              FAIL=1
+            fi
+          fi
+          # env=both runs two matrix jobs; a fixed image_name would make them clobber each other.
+          if [ -n "${{ inputs.image_name }}" ] && [ "${{ inputs.env }}" = "both" ]; then
+            echo "error: image_name requires a single env (dev or prod), not both." >&2
+            FAIL=1
+          fi
+          # The tapp-server release asset must exist (otherwise the build dies mid-way).
+          URL="https://github.com/0gfoundation/0g-tapp/releases/download/${VERSION}/tapp-server"
+          if ! curl -sfIL --max-time 30 "$URL" >/dev/null; then
+            echo "error: release binary not found: $URL (is the tag published with a tapp-server asset?)" >&2
+            FAIL=1
+          fi
+          exit $FAIL
+
+      - name: Resolve variant (env → HARDEN + image base)
+        id: v
+        run: |
+          if [ "${{ matrix.env }}" = prod ]; then
+            echo "harden=1"       >> "$GITHUB_OUTPUT"
+            echo "imgbase=og-tdx"  >> "$GITHUB_OUTPUT"
+          else
+            echo "harden=0"           >> "$GITHUB_OUTPUT"
+            echo "imgbase=og-tdx-dev" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Fetch build inputs (base image + 0.8.0 guest deb)
+        run: cvm/ci/fetch-inputs.sh "$VERSION"   # → cvm/base-noble.qcow2 + cryptpilot-fde-guest_0.8.0_amd64.deb
+
+      - name: Set up cryptpilot 0.8.0 toolchain (#128 + #130)
+        # installs released 0.8.0 (crypt/verity/fde-host + dracut) and overlays convert(#130) +
+        # fde-host(#128) built from the pinned fork; idempotent (fast no-op on an already-provisioned
+        # runner). Needed by the build (convert #130) and the reference-value step (fde-host #128).
+        run: cvm/ci/setup-toolchain.sh
+
+      - name: Stage A+B — build the image
+        run: |
+          cd cvm
+          # BUILD_MODE and KBS_URLS are inherited from the job env (empty KBS_URLS is fine
+          # in canonical mode — supplied at runtime via ClaimConfig --kbs-urls).
+          # custom mode: map the workflow's OWNER to build-tapp.sh's OWNER_ADDRESS.
+          # NOTE: no $VAR expansion inside the assignment-prefix list — bash decides what is
+          # an assignment BEFORE expansion, so a variable there (even empty) turns every
+          # later VAR=val into the command name ("KBS_URLS=...: command not found").
+          [ "$BUILD_MODE" = "custom" ] && export OWNER_ADDRESS="$OWNER"
+          HARDEN=${{ steps.v.outputs.harden }} ENABLE_SYSBOX=1 \
+            DISK_SIZE="${{ inputs.disk_size || '20G' }}" \
+            TAPP_SERVER_URL="https://github.com/0gfoundation/0g-tapp/releases/download/${VERSION}/tapp-server" \
+            ./build-tapp.sh base-noble.qcow2 "out-${{ matrix.env }}.qcow2"
+
+      # Boot smoke test intentionally NOT run here: this builder has no /dev/kvm, so under TCG the
+      # 600s window is truncated before multi-user (false negatives) and it never gated (advisory).
+      # cvm/test/boot-smoke-test.sh is kept for local / KVM-capable runs; make it a hard gate once a
+      # KVM runner is available. Real boot + attestation validation is done on actual TDX hardware.
+
+      - name: Authenticate to GCP
+        if: ${{ env.PUBLISH == 'true' && env.CLOUD == 'gcp' }}
+        run: |
+          # Keep the SA credential OFF the persistent self-hosted runner: point gcloud/gsutil at a
+          # job-scoped temp config dir (RUNNER_TEMP is wiped per job), so nothing lands in ~/.config/gcloud.
+          # (RUNNER_TEMP is only known at step runtime — cannot be set in job-level env.)
+          export CLOUDSDK_CONFIG="$RUNNER_TEMP/gcloud"
+          echo "CLOUDSDK_CONFIG=$CLOUDSDK_CONFIG" >> "$GITHUB_ENV"   # inherited by later steps
+          mkdir -p "$CLOUDSDK_CONFIG"
+          printf '%s' "$GCP_SA_KEY" > "$RUNNER_TEMP/sa.json"
+          gcloud auth activate-service-account --key-file="$RUNNER_TEMP/sa.json"
+          gcloud config set project "$GCP_PROJECT"
+          rm -f "$RUNNER_TEMP/sa.json"   # key now only in gcloud's job-scoped CLOUDSDK_CONFIG
+        env:
+          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Authenticate to Ali
+        if: ${{ env.PUBLISH == 'true' && env.CLOUD == 'ali' }}
+        run: |
+          # The al8 runner is an Ali ECS instance; aliyun/ossutil authenticate via its instance RAM role
+          # (no AK/SK secret). ossutil is already configured on the runner; point aliyun at the role too.
+          aliyun configure set --profile default --mode EcsRamRole \
+            --ram-role-name "$ALIYUN_ECS_ROLE" --region "$ALIYUN_REGION"
+
+      - name: Resolve image name and owner tag
+        id: names
+        run: |
+          # canonical: no owner tag in name; refvals at <env>.json (no owner subdir)
+          # custom:    owner tag in name; refvals at <env>/<owner>.json
+          if [ "$BUILD_MODE" = "custom" ]; then
+            OWNER_TAG="$(printf '%s' "$OWNER" | sed 's/^0[xX]//' | tr 'A-Z' 'a-z')"
+            echo "img_suffix=-${OWNER_TAG}"    >> "$GITHUB_OUTPUT"
+            echo "family_suffix=-${OWNER_TAG}" >> "$GITHUB_OUTPUT"
+          else
+            echo "img_suffix="     >> "$GITHUB_OUTPUT"
+            echo "family_suffix="  >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Stage C — publish versioned image (gcp)
+        if: ${{ env.PUBLISH == 'true' && env.CLOUD == 'gcp' }}
+        run: |
+          cd cvm
+          IMG="${{ inputs.image_name }}"
+          [ -n "$IMG" ] || IMG="${{ steps.v.outputs.imgbase }}-${BOOT_FORMAT}-${VERSION//./-}${{ steps.names.outputs.img_suffix }}"
+          IMAGE_FAMILY="${{ steps.v.outputs.imgbase }}-${BOOT_FORMAT}${{ steps.names.outputs.family_suffix }}" \
+          OVERWRITE=${{ inputs.overwrite && '1' || '0' }} \
+            ./publish-gcp-image.sh "out-${{ matrix.env }}.qcow2" "$IMG"
+
+      - name: Stage C — publish versioned image (ali)
+        if: ${{ env.PUBLISH == 'true' && env.CLOUD == 'ali' }}
+        run: |
+          cd cvm
+          IMG="${{ inputs.image_name }}"
+          [ -n "$IMG" ] || IMG="${{ steps.v.outputs.imgbase }}-${BOOT_FORMAT}-${VERSION//./-}${{ steps.names.outputs.img_suffix }}"
+          ALIYUN_REGION="$ALIYUN_REGION" OSS_BUCKET="$OSS_BUCKET" \
+          OVERWRITE=${{ inputs.overwrite && '1' || '0' }} \
+            ./publish-ali-image.sh "out-${{ matrix.env }}.qcow2" "$IMG"
+
+      - name: Reference values — compute, write, register on AS
+        if: ${{ env.PUBLISH == 'true' }}
+        run: |
+          # canonical: $OWNER is empty and the unquoted expansion vanishes → the scripts
+          # see no owner arg and use the <env>.json path / no-owner policy id.
+          # custom: $OWNER is the full 0x address (scripts strip/lowercase themselves).
+          cd cvm
+          ci/gen-reference-values.sh "out-${{ matrix.env }}.qcow2" "$CLOUD" "$BOOT_FORMAT" "$VERSION" "${{ matrix.env }}" $OWNER
+          cd ..
+          verifier/register-shared-as.sh "$CLOUD" "$BOOT_FORMAT" "$VERSION" "${{ matrix.env }}" $OWNER "$AS_ENDPOINT"
+
+      - name: Open PR with the new reference values → dev
+        if: ${{ env.PUBLISH == 'true' }}
+        run: cvm/ci/open-refvalues-pr.sh "$CLOUD" "$BOOT_FORMAT" "$VERSION" "${{ matrix.env }}" $OWNER
+        env:
+          # PAT so `gh pr create` works even if the org disables "Actions create/approve PRs".
+          # git push still uses GITHUB_TOKEN via the permissions block above. Falls back if unset.
+          GH_TOKEN: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
+
+      - name: Cleanup build artifacts + revoke GCP credential
+        if: always()
+        run: |
+          rm -f cvm/out-${{ matrix.env }}.qcow2 cvm/base-noble.qcow2 "$RUNNER_TEMP/sa.json"
+          if [ -n "${CLOUDSDK_CONFIG:-}" ]; then          # only if we authenticated (publish=true)
+            gcloud auth revoke --all 2>/dev/null || true  # drop the activated SA from gcloud
+            rm -rf "$CLOUDSDK_CONFIG"                      # wipe the job-scoped gcloud config dir
+          fi

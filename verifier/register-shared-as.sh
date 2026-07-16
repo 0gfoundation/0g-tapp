@@ -3,29 +3,49 @@
 # Register the boot-chain policy on a SHARED Attestation Service.
 # =============================================================================
 # The shared AS's RVPS is not externally writable, so reference values cannot be
-# registered there. Instead we inject a release×env reference set into a copy of the
-# canonical policy.rego and register it under id `0g-tapp-<version>-<env>`.
-# (For a self-hosted AS with writable RVPS, register the values to RVPS and use the
-#  canonical policy unchanged — see 0g-tapp-verifier.)
+# registered there. Instead we inject a reference set into a copy of the canonical
+# policy.rego and register it under a version-scoped policy id.
+#
+# Two modes (matching build modes):
+#   canonical (owner omitted): one policy for all owners; reads <env>.json
+#     → policy id: 0g-tapp-<cloud>-<boot_format>-<version>-<env>
+#   custom    (owner given):   per-owner policy; reads <env>/<owner>.json
+#     → policy id: 0g-tapp-<cloud>-<boot_format>-<version>-<env>-<owner>
 #
 # Usage:
-#   ./register-shared-as.sh <version> <env> [as-endpoint]
-#     <version>     e.g. v0.1.0   (→ verifier/reference-values/<version>/<env>.json)
-#     <env>         dev | prod
-#     as-endpoint   default 47.237.201.184:50004
+#   ./register-shared-as.sh <cloud> <boot_format> <version> <env> [owner] [as-endpoint]
+#     owner       optional: OWNER_ADDRESS (0x...); omit for canonical mode
+#     as-endpoint default 47.237.201.184:50004
 #
 # Prereqs: grpcurl, python3, base64; run from the repo (paths are relative to it).
 # =============================================================================
 set -euo pipefail
 cd "$(dirname "$0")/.."   # repo root
 
-VERSION="${1:?usage: register-shared-as.sh <version> <env> [as-endpoint]}"
-ENV="${2:?usage: register-shared-as.sh <version> <env> [as-endpoint]}"
-AS="${3:-47.237.201.184:50004}"
-REF="verifier/reference-values/${VERSION}/${ENV}.json"
+U="usage: register-shared-as.sh <cloud> <boot_format> <version> <env> [owner] [as-endpoint]"
+CLOUD="${1:?$U}"
+BOOT_FORMAT="${2:?$U}"
+VERSION="${3:?$U}"
+ENV="${4:?$U}"
+# Detect whether arg 5 looks like an owner address or an AS endpoint
+_ARG5="${5:-}"
+if printf '%s' "$_ARG5" | grep -qE '^(0[xX])?[0-9a-fA-F]{40}$'; then
+  OWNER="$(printf '%s' "$_ARG5" | sed 's/^0[xX]//' | tr 'A-Z' 'a-z')"
+  AS="${6:-47.237.201.184:50004}"
+else
+  OWNER=""
+  AS="${_ARG5:-47.237.201.184:50004}"
+fi
+
+if [ -n "$OWNER" ]; then
+  REF="verifier/reference-values/${CLOUD}/${BOOT_FORMAT}/${VERSION}/${ENV}/${OWNER}.json"
+  POLICY_ID="0g-tapp-${CLOUD}-${BOOT_FORMAT}-${VERSION}-${ENV}-${OWNER}"
+else
+  REF="verifier/reference-values/${CLOUD}/${BOOT_FORMAT}/${VERSION}/${ENV}.json"
+  POLICY_ID="0g-tapp-${CLOUD}-${BOOT_FORMAT}-${VERSION}-${ENV}"
+fi
 POLICY="verifier/policy.rego"
 PROTO_DIR="tapp-common/proto"
-POLICY_ID="0g-tapp-${VERSION}-${ENV}"
 
 [ -f "$REF" ]    || { echo "error: reference file not found: $REF"; exit 1; }
 [ -f "$POLICY" ] || { echo "error: policy not found: $POLICY"; exit 1; }
@@ -40,20 +60,28 @@ INJECTED=$(python3 - "$POLICY" "$REF" <<'PY'
 import sys, json, re
 policy = open(sys.argv[1]).read()
 ref = json.load(open(sys.argv[2]))
+# grub uses 5 components, uki uses 1 — inject a literal set per rule (empty set() when
+# the key is absent), so whichever format the image is, only its boot_chain_ok branch
+# in policy.rego has non-empty reference sets and fires. Require ≥1 value overall.
 keymap = {
     "ref_shim": "measurement.shim.SHA-384",
     "ref_grub": "measurement.grub.SHA-384",
     "ref_kernel": "measurement.kernel.SHA-384",
     "ref_initrd": "measurement.initrd.SHA-384",
     "ref_kernel_cmdline": "measurement.kernel_cmdline.SHA-384",
+    "ref_uki": "measurement.uki.SHA-384",
 }
+nonempty = 0
 for rule, key in keymap.items():
     vals = [v for v in ref.get(key, []) if isinstance(v, str) and v]
-    if not vals:
-        sys.stderr.write(f"error: {key} empty in reference file\n"); sys.exit(1)
-    literal = "{" + ", ".join('"%s"' % v for v in vals) + "}"
+    nonempty += len(vals)
+    literal = ("{" + ", ".join('"%s"' % v for v in vals) + "}") if vals else "set()"
     # replace the rule's RHS (the qrv(...) set comprehension) with the literal set
-    policy = re.sub(rule + r" := \{x \| some x in qrv\([^)]*\)\}", f"{rule} := {literal}", policy, count=1)
+    policy, n = re.subn(rule + r" := \{x \| some x in qrv\([^)]*\)\}", f"{rule} := {literal}", policy, count=1)
+    if n != 1:
+        sys.stderr.write(f"error: could not inject {rule} (policy.rego rule/regex mismatch)\n"); sys.exit(1)
+if nonempty == 0:
+    sys.stderr.write("error: reference file has no measurement.*.SHA-384 values\n"); sys.exit(1)
 sys.stdout.write(policy)
 PY
 )

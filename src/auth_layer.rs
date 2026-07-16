@@ -28,6 +28,8 @@ impl AuthLayer {
         } else {
             (None, false)
         };
+        // NOTE: main.rs always uses with_permission_manager; this path only
+        // serves tests and keeps the claim/persistence wiring out of the layer.
 
         Self {
             permission_manager,
@@ -194,9 +196,10 @@ pub struct SignerAddress(pub String);
 /// Method permission requirements
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum MethodPermission {
-    Public,    // No auth required
-    OwnerOnly, // Only tapp owner
-    Whitelist, // Owner or whitelisted users
+    Public,        // No auth required
+    Authenticated, // Any valid signature (permission decided in the handler)
+    OwnerOnly,     // Only tapp owner
+    Whitelist,     // Owner or whitelisted users
 }
 
 /// Get permission requirement for a method
@@ -207,6 +210,11 @@ fn get_method_permission(method_name: &str) -> MethodPermission {
         | "GetServiceStatus" | "GetAppSecretKey" | "GetTappInfo" | "GetSecretResource" => {
             MethodPermission::Public
         }
+
+        // Signature required, but no permission level: while the tapp is
+        // unclaimed anybody may claim (first-come-first-served); once claimed
+        // the handler rejects with ALREADY_EXISTS.
+        "ClaimConfig" => MethodPermission::Authenticated,
 
         // Owner-only methods
         "StartApp"
@@ -234,6 +242,7 @@ fn get_method_permission(method_name: &str) -> MethodPermission {
 fn is_authorized(required: &MethodPermission, actual: &Permission) -> bool {
     match required {
         MethodPermission::Public => true,
+        MethodPermission::Authenticated => true, // signature already validated
         MethodPermission::OwnerOnly => *actual == Permission::Owner,
         MethodPermission::Whitelist => {
             *actual == Permission::Owner || *actual == Permission::Whitelist

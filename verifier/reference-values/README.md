@@ -6,32 +6,52 @@ a TDX confidential node against a known-good image, consumed by `verifier/policy
 ## Layout
 
 ```
-verifier/reference-values/<tapp-server-version>/<env>.json   # env ∈ {dev, prod}
+canonical: verifier/reference-values/<cloud>/<boot_format>/<version>/<env>.json
+custom:    verifier/reference-values/<cloud>/<boot_format>/<version>/<env>/<owner>.json
+#   cloud ∈ {gcp, ali}; boot_format ∈ {grub, uki}; env ∈ {dev, prod}
+#   owner (custom mode only): 0x-stripped, lowercased OWNER_ADDRESS
 ```
 
-- **One set per tapp-server release × environment**, starting at **v0.1.0**. Each release
-  ships a specific image; its boot-chain digests are fixed → one reference set.
-- **dev and prod images differ** → separate `dev.json` / `prod.json` per version.
+- **One set per cloud × boot_format × tapp-server release × environment × owner.** Each combination
+  ships a specific image; its boot-chain digests are fixed → one reference set per combination.
+- **cloud is a dimension**: each cloud builds its **own** image (e.g. GCP uses `linux-image-gcp` +
+  gVNIC + GCP-specific boot fixes; Alibaba Cloud uses its own kernel/drivers), so the boot-chain
+  digests genuinely differ per cloud ⇒ distinct reference sets and distinct AS policies.
+- **boot_format is a dimension**: the boot chain differs by format → the **measurement shape** differs
+  (grub → 5 components `shim/grub/kernel/initrd/kernel_cmdline`; uki → 1 `measurement.uki`). Without it,
+  a grub and a uki image for the same cloud/version/env/owner would collide on the path + AS policy id.
+- **dev and prod images differ** (HARDEN=0 / HARDEN=1) → separate `dev/` / `prod/` per version.
+- **owner is a dimension only in custom builds**. Canonical images (the default,
+  `BUILD_MODE=canonical`) are owner-agnostic: owner/chain/kbs are claimed at runtime via the
+  ClaimConfig RPC and land in the **runtime measurement event log** (a `claim_config` event,
+  like `start_app`), NOT in the boot-chain digests — one image ⇒ one reference set at
+  `<env>.json`, no owner path segment at all. Verifiers get the owner from the claim_config
+  event in the evidence and reconcile it against the on-chain registration.
+  Custom builds bake `OWNER_ADDRESS` into `/etc/tapp/config.toml`, folding the owner into
+  `measurement.initrd.SHA-384` → per-owner reference sets at `<env>/<owner>.json`.
 - The policy (`verifier/policy.rego`) is a single, canonical, image-agnostic logic; only
   these values vary. See that file's header for the two verification methods.
 
-## Generating (manual)
+## Generating
 
 Values are produced from the release image with cryptpilot — **must run on an Alinux host**
-(`cryptpilot-convert` / `cryptpilot-fde` are Alinux-only), so this is **not** automated in CI:
+(`cryptpilot-convert` / `cryptpilot-fde` are Alinux-only). `show-reference-value` needs a
+**#128-fixed cryptpilot-fde** (stock 0.7.0 errors `saved_entry not found` on a never-booted
+image); it's provided by `cvm/ci/setup-toolchain.sh` (installs released 0.8.0 + overlays the
+#128 `cryptpilot-fde-host`). The tool emits JSON with the `measurement.<component>.SHA-384` keys directly.
+
+Automated on the al8 self-hosted runner (`.github/workflows/build-cvm.yml`); manual equivalent:
 
 ```bash
-cryptpilot-fde show-reference-value --disk <release-image>
-# → kernel / initrd / grub / shim / kernel_cmdline digests
+cvm/ci/setup-toolchain.sh                                  # provision the 0.8.0 + #128/#130 toolchain once
+cvm/ci/gen-reference-values.sh \
+  <release-image> <cloud> <boot_format> <version> <env> <owner>   # writes <cloud>/<boot_format>/<version>/<env>/<owner>.json
 ```
-
-Put the output into `verifier/reference-values/<version>/<env>.json` keyed by
-`measurement.<component>.SHA-384` (kernel_cmdline may list multiple allowed values).
 
 ## Using
 
 - **Self-hosted AS** (RVPS writable): register the json to RVPS; the policy reads it via
   `query_reference_value()`. See the `../0g-tapp-verifier/` submodule (`tdx-boot-chain/`).
 - **Shared AS** (RVPS not writable): inject the json into the policy at registration —
-  `verifier/register-shared-as.sh <version> <env> <as-endpoint>` registers it as
-  `0g-tapp-<version>-<env>`.
+  `verifier/register-shared-as.sh <cloud> <boot_format> <version> <env> <owner> [as-endpoint]` registers it as
+  `0g-tapp-<cloud>-<boot_format>-<version>-<env>-<owner>`.
