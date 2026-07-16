@@ -93,6 +93,14 @@ service TappService {
   // tapp signs the KMS request with its in-memory key, decrypts the response, and returns plaintext.
   rpc GetSecretResource(GetSecretResourceRequest)
       returns (GetSecretResourceResponse);
+
+  // Claim ownership of an unclaimed tapp (first-come-first-served).
+  // The signer of the request becomes the tapp owner. Succeeds exactly once;
+  // the claim is extended into the runtime measurement (RTMR) so verifiers
+  // see the owner in the attestation evidence instead of baked-in golden
+  // values. Fails with ALREADY_EXISTS once an owner is set (from a previous
+  // claim or from config).
+  rpc ClaimOwner(ClaimOwnerRequest) returns (ClaimOwnerResponse);
 }
 
 enum LogLevel {
@@ -618,4 +626,17 @@ message GetSecretResourceResponse {
   bool success = 1;
   string message = 2;
   bytes secret = 3;  // plaintext KMS-derived app key
+}
+
+// Claim Owner Messages
+message ClaimOwnerRequest {
+  // No parameters — the owner is the EVM address recovered from the
+  // request signature (x-signature / x-timestamp metadata).
+}
+
+message ClaimOwnerResponse {
+  bool success = 1;
+  string message = 2;
+  string owner_address = 3;  // The claimed owner address (normalized)
+  int64 timestamp = 4;       // Claim timestamp
 }

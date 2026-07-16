@@ -23,8 +23,18 @@ tls_enabled = false
 # Permission-based Authentication Configuration
 [server.permission]
 enabled = true
-owner_address = "0xYourOwnerAddressHere"
-initial_whitelist = ["0xYourWhitelistAddressHere"]
+# Owner is OPTIONAL: leave it unset and the tapp boots UNCLAIMED — the first
+# valid signer of `tapp-cli claim-owner` becomes the owner, and the claim is
+# extended into the runtime measurement (keeps the CVM image owner-independent).
+# Setting it here is the legacy baked-in mode and still works:
+# owner_address = "0xYourOwnerAddressHere"
+#
+# Where the claimed owner is persisted so a tapp-server restart within the
+# same boot cannot reopen the claim (tmpfs: cleared on reboot, like the RTMRs):
+# owner_state_path = "/run/tapp/claimed_owner"
+#
+# initial_whitelist was removed in 0.3 — use `tapp-cli add-to-whitelist`
+# after claiming; every change is a measured runtime event.
 
 [boot]
 # aa_config_path = "/etc/tapp/attestation-agent.toml"

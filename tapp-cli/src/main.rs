@@ -1,7 +1,8 @@
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use tapp_common::proto::{
-    tapp_service_client::TappServiceClient, AddToWhitelistRequest, DockerLoginRequest,
+    tapp_service_client::TappServiceClient, AddToWhitelistRequest, ClaimOwnerRequest,
+    DockerLoginRequest,
     DockerLogoutRequest, GetAppContainerStatusRequest, GetAppInfoRequest, GetAppKeyRequest,
     GetAppLogsRequest, GetAppSecretKeyRequest, GetEvidenceRequest, GetSecretResourceRequest,
     GetServiceLogsRequest, GetServiceStatusRequest, GetTappInfoRequest, GetTaskStatusRequest,
@@ -271,6 +272,13 @@ enum Commands {
     },
 
     /// Add address to whitelist (owner only)
+    /// Claim ownership of an unclaimed tapp (first-come-first-served)
+    ///
+    /// The signer (your private key's address) becomes the tapp owner.
+    /// Succeeds exactly once per boot; the claim is extended into the
+    /// runtime measurement so verifiers see it in the attestation evidence.
+    ClaimOwner,
+
     AddToWhitelist {
         /// EVM address to add
         #[arg(short, long)]
@@ -652,6 +660,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             let private_key = require_private_key(&cli.private_key)?;
             stop_service(&cli.server, app_id, service_name, private_key).await?;
+        }
+        Commands::ClaimOwner => {
+            let private_key = require_private_key(&cli.private_key)?;
+            claim_owner(&cli.server, private_key).await?;
         }
         Commands::AddToWhitelist { address } => {
             let private_key = require_private_key(&cli.private_key)?;
@@ -1689,6 +1701,74 @@ async fn stop_service(
         println!("  Service: {}", service_name);
     } else {
         eprintln!("✗ {}", result.message);
+        std::process::exit(1);
+    }
+
+    Ok(())
+}
+
+async fn claim_owner(
+    server: &str,
+    private_key: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use ethers::signers::Signer;
+
+    // Derive our own address up front so the result can be verified end-to-end
+    let key_bytes = hex::decode(private_key.trim_start_matches("0x"))
+        .map_err(|e| format!("Invalid private key: {}", e))?;
+    let wallet = ethers::signers::LocalWallet::from_bytes(&key_bytes)
+        .map_err(|e| format!("Invalid private key: {}", e))?;
+    let my_address = format!("0x{:x}", wallet.address());
+
+    let mut client = create_client(server).await?;
+
+    let mut request = Request::new(ClaimOwnerRequest {});
+    add_signature_metadata(&mut request, &private_key, "ClaimOwner")?;
+
+    let result = match client.claim_owner(request).await {
+        Ok(response) => response.into_inner(),
+        Err(status) if status.code() == tonic::Code::AlreadyExists => {
+            eprintln!("✗ {}", status.message());
+            std::process::exit(1);
+        }
+        Err(e) => return Err(e.into()),
+    };
+
+    if !result.success {
+        eprintln!("✗ {}", result.message);
+        std::process::exit(1);
+    }
+
+    println!("✓ Tapp ownership claimed");
+    println!("  Owner: {}", result.owner_address);
+
+    if result.owner_address != my_address {
+        eprintln!(
+            "⚠️  Server reported owner {} but this key is {} — investigate!",
+            result.owner_address, my_address
+        );
+        std::process::exit(1);
+    }
+
+    // Close the loop: re-read the server's live owner state
+    let info = client
+        .get_tapp_info(Request::new(GetTappInfoRequest {}))
+        .await?
+        .into_inner();
+    let live_owner = info
+        .config
+        .as_ref()
+        .and_then(|c| c.server.as_ref())
+        .map(|s| s.owner_address.clone())
+        .unwrap_or_default();
+
+    if live_owner == my_address {
+        println!("  Verified: server now reports this address as owner");
+    } else {
+        eprintln!(
+            "⚠️  Verification failed: server reports owner '{}' (expected {})",
+            live_owner, my_address
+        );
         std::process::exit(1);
     }
 

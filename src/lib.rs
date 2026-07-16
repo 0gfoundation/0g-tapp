@@ -169,6 +169,75 @@ impl TappServiceImpl {
     }
 }
 
+/// Establish the tapp owner at startup and return it (None = boots unclaimed,
+/// awaiting the ClaimOwner RPC). Sources, in order of resolution:
+///
+/// - config `owner_address` (legacy baked-in mode) — measured as a
+///   `claim_owner` event the first time it takes effect in a boot;
+/// - the owner persisted by a previous tapp-server process of the SAME boot
+///   (restored silently: its claim_owner event is already in this boot's
+///   runtime event log);
+/// - neither → unclaimed.
+///
+/// A config/persisted mismatch is a hard error: it means the state file was
+/// tampered with or the config changed mid-boot — refuse to guess.
+pub async fn establish_owner_at_startup(
+    pm: &Arc<permission::PermissionManager>,
+    measurement_service: &Arc<measurement_service::MeasurementService>,
+    config_owner: Option<&str>,
+) -> Result<Option<String>, String> {
+    let config_owner =
+        config_owner.map(permission::PermissionManager::normalize_address);
+    let persisted = pm.load_persisted_owner();
+
+    let (owner, needs_measurement) = match (config_owner, persisted) {
+        (Some(c), Some(p)) => {
+            if c != p {
+                return Err(format!(
+                    "Owner mismatch: config says {} but this boot already claimed {}",
+                    c, p
+                ));
+            }
+            (Some(c), false) // measured earlier this boot
+        }
+        (Some(c), None) => (Some(c), true),
+        (None, Some(p)) => (Some(p), false),
+        (None, None) => (None, false),
+    };
+
+    if let Some(owner) = &owner {
+        pm.set_owner(owner).await;
+
+        if needs_measurement {
+            let measurement_data = serde_json::json!({
+                "operation": measurement_service::OPERATION_NAME_CLAIM_OWNER,
+                "address": owner,
+                "timestamp": utils::current_timestamp()
+            })
+            .to_string();
+
+            // Best-effort, like start_app: on a real TEE node this succeeds;
+            // on dev machines without runtime measurement support we log and
+            // keep the legacy (unmeasured, baked-in) semantics.
+            if let Err(e) = measurement_service
+                .extend_measurement(
+                    measurement_service::OPERATION_NAME_CLAIM_OWNER,
+                    &measurement_data,
+                )
+                .await
+            {
+                error!(error = %e, "Failed to extend claim_owner measurement at startup");
+            }
+
+            if let Err(e) = pm.persist_owner().await {
+                tracing::warn!(error = %e, "Failed to persist owner at startup");
+            }
+        }
+    }
+
+    Ok(owner)
+}
+
 #[tonic::async_trait]
 impl TappService for TappServiceImpl {
     /// Get attestation evidence from TEE platform
@@ -625,6 +694,13 @@ impl TappService for TappServiceImpl {
                 .unwrap_or_default(),
         };
 
+        // Live owner state (empty = unclaimed) rather than the static config —
+        // with runtime claiming the config may not carry an owner at all.
+        let owner_address = match &self.permission_manager {
+            Some(pm) => pm.owner_address().await.unwrap_or_default(),
+            None => String::new(),
+        };
+
         // Build server config
         let server_config = ServerConfigInfo {
             bind_address: self.config.server.bind_address.clone(),
@@ -639,13 +715,7 @@ impl TappService for TappServiceImpl {
                 .as_ref()
                 .map(|p| p.enabled)
                 .unwrap_or(false),
-            owner_address: self
-                .config
-                .server
-                .permission
-                .as_ref()
-                .map(|p| p.owner_address.clone())
-                .unwrap_or_default(),
+            owner_address,
         };
 
         // Build boot config
@@ -877,6 +947,71 @@ impl TappService for TappServiceImpl {
     // Permission Management Methods
     // ============================================================================
 
+    async fn claim_owner(
+        &self,
+        request: Request<ClaimOwnerRequest>,
+    ) -> Result<Response<ClaimOwnerResponse>, Status> {
+        info!("Calling ClaimOwner");
+
+        // The claimer is whoever signed the request (validated by AuthLayer)
+        let signer = auth_layer::get_signer_address(&request)
+            .ok_or_else(|| Status::unauthenticated("Signer address not found"))?;
+
+        let pm = self
+            .permission_manager
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("Permission management not enabled"))?;
+
+        // First-come-first-served, exactly once
+        let owner = pm.claim_owner(&signer).await.map_err(|current| {
+            Status::already_exists(format!("Tapp already owned by {}", current))
+        })?;
+
+        // Extend runtime measurement — the claim only counts if it is measured.
+        // On failure the claim is rolled back so the tapp stays claimable.
+        let timestamp = utils::current_timestamp();
+        let measurement_data = serde_json::json!({
+            "operation": measurement_service::OPERATION_NAME_CLAIM_OWNER,
+            "address": owner,
+            "timestamp": timestamp
+        })
+        .to_string();
+
+        if let Err(e) = self
+            .measurement_service
+            .extend_measurement(
+                measurement_service::OPERATION_NAME_CLAIM_OWNER,
+                &measurement_data,
+            )
+            .await
+        {
+            pm.rollback_claim().await;
+            return Err(Status::internal(format!(
+                "Failed to extend measurement for claim: {}",
+                e
+            )));
+        }
+
+        // Persist so a process restart within this boot cannot reopen the
+        // claim. Best-effort: the measurement (above) is the source of truth.
+        if let Err(e) = pm.persist_owner().await {
+            tracing::warn!(error = %e, "Failed to persist claimed owner");
+        }
+
+        info!(
+            owner = %owner,
+            event = "OWNER_CLAIMED",
+            "Tapp ownership claimed and measurement extended"
+        );
+
+        Ok(Response::new(ClaimOwnerResponse {
+            success: true,
+            message: format!("Tapp ownership claimed by {}", owner),
+            owner_address: owner,
+            timestamp,
+        }))
+    }
+
     async fn add_to_whitelist(
         &self,
         request: Request<AddToWhitelistRequest>,
@@ -1007,7 +1142,7 @@ impl TappService for TappServiceImpl {
 
         // Check if user can view this app's ownership
         // Owner can view all, others can only view if they can manage the app
-        if !pm.can_manage_app(&req.app_id, &signer).await && signer != pm.get_tapp_owner_address() {
+        if !pm.can_manage_app(&req.app_id, &signer).await && !pm.is_owner(&signer).await {
             return Err(Status::permission_denied(
                 "You don't have permission to view this app's ownership",
             ));
@@ -1087,10 +1222,13 @@ impl TappService for TappServiceImpl {
 
         // Determine recipient
         let recipient = if req.recipient.is_empty() {
-            self.permission_manager
-                .as_ref()
-                .map(|pm| pm.get_tapp_owner_address().to_string())
-                .ok_or_else(|| Status::internal("TAPP owner not configured"))?
+            match self.permission_manager.as_ref() {
+                Some(pm) => pm
+                    .owner_address()
+                    .await
+                    .ok_or_else(|| Status::failed_precondition("TAPP owner not claimed"))?,
+                None => return Err(Status::internal("TAPP owner not configured")),
+            }
         } else {
             req.recipient.clone()
         };

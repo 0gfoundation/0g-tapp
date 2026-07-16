@@ -70,26 +70,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .bind
         .unwrap_or_else(|| config.server.bind_address.clone());
 
-    // Step 5: Initialize PermissionManager if configured
+    // Step 5: Initialize PermissionManager if configured. The owner is NOT
+    // set here — it is established after the MeasurementService is up (Step
+    // 6.5), so the claim can be extended into the runtime measurement.
     let permission_manager = if let Some(ref perm_config) = config.server.permission {
         if perm_config.enabled {
             info!("🔐 Permission-based authentication enabled");
-            info!("   Tapp owner: {}", perm_config.owner_address);
-
-            let pm = Arc::new(PermissionManager::new(perm_config.owner_address.clone()));
-
-            // Initialize whitelist with addresses from config
-            if !perm_config.initial_whitelist.is_empty() {
-                info!(
-                    "   Initializing whitelist with {} address(es)",
-                    perm_config.initial_whitelist.len()
-                );
-                for addr in &perm_config.initial_whitelist {
-                    pm.add_to_whitelist(addr.clone()).await.ok();
-                    info!("      - {}", addr);
-                }
-            }
-
+            let pm = Arc::new(
+                PermissionManager::new(None)
+                    .with_owner_state_path(perm_config.owner_state_path.clone()),
+            );
             Some(pm)
         } else {
             info!("🔓 Permission-based authentication disabled");
@@ -119,6 +109,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "✓ Detected TEE type: {:?}",
         measurement_service.get_tee_type().await
     );
+
+    // Step 6.5: Establish the tapp owner (config / persisted claim / unclaimed)
+    if let Some(ref pm) = permission_manager {
+        let config_owner = config
+            .server
+            .permission
+            .as_ref()
+            .and_then(|p| p.owner_address.as_deref());
+
+        match tapp_server::establish_owner_at_startup(pm, &measurement_service, config_owner).await
+        {
+            Ok(Some(owner)) => info!("   Tapp owner: {}", owner),
+            Ok(None) => info!(
+                "   Tapp owner: ⏳ UNCLAIMED — first valid signer of the \
+                 ClaimOwner RPC becomes the owner (tapp-cli claim-owner)"
+            ),
+            Err(e) => {
+                error!("✗ Failed to establish tapp owner: {}", e);
+                std::process::exit(1);
+            }
+        }
+    }
 
     // Step 7: Initialize service with PermissionManager and MeasurementService
     let service = match TappServiceImpl::new(

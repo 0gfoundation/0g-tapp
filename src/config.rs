@@ -117,14 +117,22 @@ pub struct PermissionConfig {
     #[serde(default)]
     pub enabled: bool,
 
-    /// Tapp owner EVM address (has full control)
+    /// Tapp owner EVM address (has full control).
     /// Example: "0x70997970C51812dc3A010C7d01b50e0d17dc79C8"
-    pub owner_address: String,
-
-    /// Initial whitelist of EVM addresses allowed to start apps
-    /// Example: ["0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"]
+    ///
+    /// OPTIONAL since 0.3: when absent, the tapp boots UNCLAIMED — the first
+    /// valid signer of the ClaimOwner RPC becomes the owner, and the claim is
+    /// extended into the runtime measurement. This keeps the CVM image (and
+    /// its golden reference values) owner-independent. Setting it here is the
+    /// legacy baked-in mode and still works.
     #[serde(default)]
-    pub initial_whitelist: Vec<String>,
+    pub owner_address: Option<String>,
+
+    /// Where the claimed owner is persisted so a tapp-server restart within
+    /// the same boot cannot reopen the claim. tmpfs by design: cleared on VM
+    /// reboot, matching the RTMR lifetime (reboot = re-claim, re-measured).
+    #[serde(default = "default_owner_state_path")]
+    pub owner_state_path: PathBuf,
 }
 
 /// On-chain configuration
@@ -226,6 +234,10 @@ fn default_log_format() -> String {
 
 fn default_max_log_files() -> usize {
     7
+}
+
+fn default_owner_state_path() -> PathBuf {
+    PathBuf::from("/run/tapp/claimed_owner")
 }
 
 impl Default for KbsConfig {
