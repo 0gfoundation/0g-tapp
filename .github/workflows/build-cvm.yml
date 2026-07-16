@@ -8,7 +8,7 @@
 # Build modes:
 #   canonical (default): owner-agnostic image — owner/chain/kbs set at runtime via ClaimConfig
 #                        RPC (measured event). One image + one reference set for every owner.
-#                        Identifiers: image og-tdx-dev-grub-<ver>, refval .../any.json
+#                        Identifiers: image og-tdx-dev-grub-<ver>, refval <env>.json
 #   custom:              owner baked into config.toml → folded into the initrd measurement.
 #                        Per-owner image + per-owner reference set (legacy mode).
 #                        Identifiers: image og-tdx-dev-grub-<ver>-<owner>, refval .../<owner>.json
@@ -173,18 +173,18 @@ jobs:
           aliyun configure set --profile default --mode EcsRamRole \
             --ram-role-name "$ALIYUN_ECS_ROLE" --region "$ALIYUN_REGION"
 
-      - name: Resolve image name and owner slot
+      - name: Resolve image name and owner tag
         id: names
         run: |
-          # canonical: no owner tag in name; refvals under `any`
-          # custom:    owner tag in name; refvals under the lowercased 0x-stripped owner address
+          # canonical: no owner tag in name; refvals at <env>.json (no owner subdir)
+          # custom:    owner tag in name; refvals at <env>/<owner>.json
           if [ "$BUILD_MODE" = "custom" ] && [ -n "$OWNER" ]; then
             OWNER_TAG="$(printf '%s' "$OWNER" | sed 's/^0[xX]//' | tr 'A-Z' 'a-z')"
-            echo "owner_slot=$OWNER_TAG"  >> "$GITHUB_OUTPUT"
-            echo "img_suffix=-${OWNER_TAG}" >> "$GITHUB_OUTPUT"
+            echo "owner_tag=${OWNER_TAG}"    >> "$GITHUB_OUTPUT"
+            echo "img_suffix=-${OWNER_TAG}"  >> "$GITHUB_OUTPUT"
             echo "family_suffix=-${OWNER_TAG}" >> "$GITHUB_OUTPUT"
           else
-            echo "owner_slot=any"  >> "$GITHUB_OUTPUT"
+            echo "owner_tag="      >> "$GITHUB_OUTPUT"
             echo "img_suffix="     >> "$GITHUB_OUTPUT"
             echo "family_suffix="  >> "$GITHUB_OUTPUT"
           fi
@@ -212,15 +212,18 @@ jobs:
       - name: Reference values — compute, write, register on AS
         if: ${{ env.PUBLISH == 'true' }}
         run: |
+          OWNER_TAG="${{ steps.names.outputs.owner_tag }}"
           cd cvm
-          OWNER_SLOT="${{ steps.names.outputs.owner_slot }}"
-          ci/gen-reference-values.sh "out-${{ matrix.env }}.qcow2" "$CLOUD" "$BOOT_FORMAT" "$VERSION" "${{ matrix.env }}" "$OWNER_SLOT"
+          # canonical: no owner arg → writes <env>.json; custom: owner arg → writes <env>/<owner>.json
+          ci/gen-reference-values.sh "out-${{ matrix.env }}.qcow2" "$CLOUD" "$BOOT_FORMAT" "$VERSION" "${{ matrix.env }}" $OWNER_TAG
           cd ..
-          verifier/register-shared-as.sh "$CLOUD" "$BOOT_FORMAT" "$VERSION" "${{ matrix.env }}" "$OWNER_SLOT" "$AS_ENDPOINT"
+          verifier/register-shared-as.sh "$CLOUD" "$BOOT_FORMAT" "$VERSION" "${{ matrix.env }}" $OWNER_TAG "$AS_ENDPOINT"
 
       - name: Open PR with the new reference values → dev
         if: ${{ env.PUBLISH == 'true' }}
-        run: cvm/ci/open-refvalues-pr.sh "$CLOUD" "$BOOT_FORMAT" "$VERSION" "${{ matrix.env }}" "${{ steps.names.outputs.owner_slot }}"
+        run: |
+          OWNER_TAG="${{ steps.names.outputs.owner_tag }}"
+          cvm/ci/open-refvalues-pr.sh "$CLOUD" "$BOOT_FORMAT" "$VERSION" "${{ matrix.env }}" $OWNER_TAG
         env:
           # PAT so `gh pr create` works even if the org disables "Actions create/approve PRs".
           # git push still uses GITHUB_TOKEN via the permissions block above. Falls back if unset.
