@@ -88,6 +88,24 @@ KBS_URLS='"http://<kbs-host-1>:9091", "http://<kbs-host-2>:9091"' \
 - Publish (Stage C, opt-in): `PUBLISH_AS=<gcp-image-name>` publishes the built image to GCP after the build (see [Publish to GCP](#publish-to-gcp-stage-c)); `GCS_BUCKET` / `GCP_PROJECT` / `GUEST_OS_FEATURES` pass through.
 - Other environment variables: `DNS_FALLBACK` `PURGE_KERNEL` `CONFIG_DIR` `FDE_PACKAGE` `ROOTFS_MODE` `IN_PLACE` `INSTALL_KERNEL` `NBD_RESET` (see the top of the script).
 
+## Root filesystem size (`/`) — read-only base + writable overlay
+`/` is **assembled at boot** by `cryptpilot-fde` (not a fixed partition), stacking two parts:
+- **read-only base** — your image's actual content, sealed under dm-verity. `cryptpilot-convert` shrinks the rootfs to the real data size (~4 GiB for a bare build), so this part is **fixed by what you bake in**, independent of the disk size (growing the input disk does *not* grow it).
+- **writable overlay** — a copy-on-write layer on top. Where it lives is set by **`rw_overlay`** in `config_dir/fde.toml` (cryptpilot's `delta_location`):
+
+| `rw_overlay` | overlay backed by | survives reboot? | size |
+|---|---|---|---|
+| `ram` *(what we ship)* | memory (a `zram` device) | no (wiped) | `= MemTotal` (≈ instance RAM, minus kernel reserve) |
+| `disk` *(cryptpilot default)* | boot-disk leftover (LVM delta LV, LUKS2) | no (wiped each boot) | = leftover disk |
+| `disk-persist` | same, but retained | **yes** | = leftover disk |
+
+Apparent `/` size (`df`) = **read-only base + overlay size**. Under our `rw_overlay = "ram"`:
+- `/` ≈ (baked data ~4 GiB) + (total RAM). **Measured: a 16 GiB-RAM instance → ~18.7 GiB `/`** (≈4 + ~14.7); a 64 GiB-RAM instance → ~66 GiB.
+- **The boot disk does not affect `/`** — nothing reads it for the root. A bigger boot disk is wasted; keep it ≈ the image size.
+- That writable space **is RAM**: bytes written to `/` consume (compressed) memory shared with the workload, and are **lost on reboot**. It's a ceiling competing with app memory, not free disk.
+
+**To make `/` bigger:** add instance **memory** (simplest — `/` grows automatically, no config change); or switch `rw_overlay` to **`disk`** so `/` is backed by the boot-disk leftover (boot-disk size then matters), still wiped each boot (stateless preserved), overlay key can be ephemeral. Use **`disk-persist`** only if `/` must survive reboots — that needs a real KBS key for the delta volume (not the placeholder currently in `fde.toml`). Persistent app data does not depend on any of this — it goes to the separate `/data` disk (below).
+
 ## Persistent data disk (`/data`) — always configured
 The cryptpilot rootfs writable overlay is **RAM-backed (zram) and ephemeral** — anything written to `/` lives in RAM and is lost on reboot. So all persistent container state is pinned off the root onto a separate **`/data`** disk. This is **unconditional** (independent of Sysbox); every image does it:
 
