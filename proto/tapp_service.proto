@@ -346,12 +346,18 @@ message KbsConfigInfo {
   RetryConfigInfo retry = 4;
 }
 
+message ChainConfigInfo {
+  string rpc_url = 1;
+  string contract_address = 2;
+}
+
 message TappConfigInfo {
   LoggingConfigInfo logging = 1;
   ServerConfigInfo server = 2;
   BootConfigInfo boot = 3;
-  KbsConfigInfo kbs = 4;  // Null if KBS is not configured
+  KbsConfigInfo kbs = 4;   // Null if KBS is not configured
   bool kbs_enabled = 5;
+  ChainConfigInfo chain = 6;  // Null if chain is not configured
 }
 
 message GetTappInfoResponse {

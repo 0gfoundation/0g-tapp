@@ -2031,6 +2031,21 @@ async fn get_tapp_info(server: &str) -> Result<(), Box<dyn std::error::Error>> {
             println!("\nBoot:");
             println!("  AA Config Path: {}", boot_config.aa_config_path);
         }
+
+        if let Some(chain) = config.chain {
+            println!("\nChain:");
+            println!("  RPC URL: {}", chain.rpc_url);
+            println!("  Contract: {}", chain.contract_address);
+        }
+
+        if config.kbs_enabled {
+            if let Some(kbs) = config.kbs {
+                println!("\nKBS:");
+                for url in &kbs.node_urls {
+                    println!("  {}", url);
+                }
+            }
+        }
     }
 
     Ok(())

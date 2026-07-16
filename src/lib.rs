@@ -41,6 +41,15 @@ pub use proto::{
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const NAME: &str = env!("CARGO_PKG_NAME");
 
+/// Runtime configuration set via ClaimConfig (owner/chain/kbs).
+/// Separate from the static TappConfig so get-tapp-info can show live values.
+#[derive(Debug, Clone, Default)]
+pub struct ClaimedRuntimeConfig {
+    pub chain_rpc_url: String,
+    pub chain_contract_address: String,
+    pub kbs_node_urls: Vec<String>,
+}
+
 pub struct TappServiceImpl {
     pub config: TappConfig,
     pub boot_service: Arc<BootService>,
@@ -52,6 +61,8 @@ pub struct TappServiceImpl {
     pub logs_service: service_monitor::logs::LogsService,
     pub permission_manager: Option<Arc<permission::PermissionManager>>,
     pub measurement_service: Arc<measurement_service::MeasurementService>,
+    /// Runtime config set by ClaimConfig or establish_owner_at_startup.
+    pub claimed_runtime_config: Arc<tokio::sync::RwLock<ClaimedRuntimeConfig>>,
 }
 
 impl TappServiceImpl {
@@ -158,6 +169,13 @@ impl TappServiceImpl {
             kms_client::KmsClient::new(kbs.node_urls.clone(), &kbs.retry)
         })));
 
+        // Initialize runtime config from static config (pre-baked values visible immediately)
+        let claimed_runtime_config = Arc::new(tokio::sync::RwLock::new(ClaimedRuntimeConfig {
+            chain_rpc_url: config.chain.as_ref().map(|c| c.rpc_url.clone()).unwrap_or_default(),
+            chain_contract_address: config.chain.as_ref().map(|c| c.contract_address.clone()).unwrap_or_default(),
+            kbs_node_urls: config.kbs.as_ref().map(|k| k.node_urls.clone()).unwrap_or_default(),
+        }));
+
         info!("All TAPP service components initialized successfully");
 
         Ok(Self {
@@ -168,6 +186,7 @@ impl TappServiceImpl {
             logs_service,
             permission_manager,
             measurement_service,
+            claimed_runtime_config,
             config,
         })
     }
@@ -736,22 +755,56 @@ impl TappService for TappServiceImpl {
                 .unwrap_or_default(),
         };
 
-        // Build KBS config if available
-        let kbs_enabled = self.config.kbs.is_some();
-        let kbs_config = self.config.kbs.as_ref().map(|kbs| {
-            let retry_config = RetryConfigInfo {
-                max_retries: kbs.retry.max_retries as i32,
-                initial_delay_ms: kbs.retry.initial_delay_ms as i32,
-                max_delay_ms: kbs.retry.max_delay_ms as i32,
-            };
+        // Runtime config (set by ClaimConfig or pre-baked) takes precedence over static config.
+        let runtime = self.claimed_runtime_config.read().await;
 
-            KbsConfigInfo {
-                node_urls: kbs.node_urls.clone(),
-                timeout_seconds: kbs.timeout_seconds as i32,
-                cert_configured: kbs.cert_path.is_some(),
-                retry: Some(retry_config),
-            }
-        });
+        // KBS: prefer runtime node_urls (from claim), fall back to static config
+        let live_kbs_urls = if !runtime.kbs_node_urls.is_empty() {
+            runtime.kbs_node_urls.clone()
+        } else {
+            self.config.kbs.as_ref().map(|k| k.node_urls.clone()).unwrap_or_default()
+        };
+        let kbs_enabled = !live_kbs_urls.is_empty();
+        let kbs_config = if kbs_enabled {
+            let (timeout, cert, retry) = self.config.kbs.as_ref().map(|kbs| {
+                let r = RetryConfigInfo {
+                    max_retries: kbs.retry.max_retries as i32,
+                    initial_delay_ms: kbs.retry.initial_delay_ms as i32,
+                    max_delay_ms: kbs.retry.max_delay_ms as i32,
+                };
+                (kbs.timeout_seconds as i32, kbs.cert_path.is_some(), Some(r))
+            }).unwrap_or((30, false, None));
+            Some(KbsConfigInfo {
+                node_urls: live_kbs_urls,
+                timeout_seconds: timeout,
+                cert_configured: cert,
+                retry,
+            })
+        } else {
+            None
+        };
+
+        // Chain: prefer runtime (from claim), fall back to static config
+        let live_chain_rpc = if !runtime.chain_rpc_url.is_empty() {
+            runtime.chain_rpc_url.clone()
+        } else {
+            self.config.chain.as_ref().map(|c| c.rpc_url.clone()).unwrap_or_default()
+        };
+        let live_chain_contract = if !runtime.chain_contract_address.is_empty() {
+            runtime.chain_contract_address.clone()
+        } else {
+            self.config.chain.as_ref().map(|c| c.contract_address.clone()).unwrap_or_default()
+        };
+        drop(runtime);
+
+        let chain_config = if !live_chain_rpc.is_empty() || !live_chain_contract.is_empty() {
+            Some(ChainConfigInfo {
+                rpc_url: live_chain_rpc,
+                contract_address: live_chain_contract,
+            })
+        } else {
+            None
+        };
 
         // Build complete config info
         let config_info = TappConfigInfo {
@@ -760,6 +813,7 @@ impl TappService for TappServiceImpl {
             boot: Some(boot_config),
             kbs: kbs_config,
             kbs_enabled,
+            chain: chain_config,
         };
 
         Ok(Response::new(GetTappInfoResponse {
@@ -1003,6 +1057,13 @@ impl TappService for TappServiceImpl {
                 e
             )));
         }
+
+        // Store runtime config so get-tapp-info can show live values.
+        *self.claimed_runtime_config.write().await = ClaimedRuntimeConfig {
+            chain_rpc_url: req.chain_rpc_url.clone(),
+            chain_contract_address: req.chain_contract_address.clone(),
+            kbs_node_urls: req.kbs_node_urls.clone(),
+        };
 
         // Dynamically initialize KMS client if kbs_node_urls provided and not
         // already configured (config.toml had no [kbs] section — dynamic mode).
