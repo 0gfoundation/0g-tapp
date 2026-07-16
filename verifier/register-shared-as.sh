@@ -29,7 +29,7 @@ VERSION="${3:?$U}"
 ENV="${4:?$U}"
 # Detect whether arg 5 looks like an owner address or an AS endpoint
 _ARG5="${5:-}"
-if printf '%s' "$_ARG5" | grep -qE '^0[xX][0-9a-fA-F]{40}$'; then
+if printf '%s' "$_ARG5" | grep -qE '^(0[xX])?[0-9a-fA-F]{40}$'; then
   OWNER="$(printf '%s' "$_ARG5" | sed 's/^0[xX]//' | tr 'A-Z' 'a-z')"
   AS="${6:-47.237.201.184:50004}"
 else

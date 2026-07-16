@@ -91,7 +91,9 @@ jobs:
       VERSION: ${{ inputs.version }}
       PUBLISH: ${{ inputs.publish }}
       BUILD_MODE: ${{ inputs.build_mode || 'canonical' }}
-      OWNER: ${{ inputs.owner || vars.OWNER_ADDRESS }}
+      # OWNER is only meaningful in custom mode; empty otherwise so no step can
+      # accidentally use it (canonical images must not know any owner).
+      OWNER: ${{ inputs.build_mode == 'custom' && inputs.owner || '' }}
       # cloud/boot-format dimensions (independent; a CVM = one CLOUD × one BOOT_FORMAT = one measurement
       # chain). cloud defaults to gcp; boot_format defaults to grub (uki is opt-in, any cloud).
       CLOUD: ${{ inputs.cloud || 'gcp' }}
@@ -110,6 +112,40 @@ jobs:
       LIBGUESTFS_BACKEND: direct
     steps:
       - uses: actions/checkout@v4   # checks out the dispatched ref (draft branch while testing, dev once merged)
+
+      - name: Validate inputs (fail fast, before any expensive step)
+        run: |
+          FAIL=0
+          if [ "$BUILD_MODE" = "canonical" ]; then
+            # ClaimConfig RPC (required for canonical mode) was introduced in tapp-server v0.3.0.
+            # A canonical image built from an older binary boots unclaimed and can never be claimed.
+            VER="${VERSION#v}"
+            MAJOR="$(echo "$VER" | cut -d. -f1)"
+            MINOR="$(echo "$VER" | cut -d. -f2)"
+            if [ "$MAJOR" -eq 0 ] && [ "$MINOR" -lt 3 ]; then
+              echo "error: canonical mode requires tapp-server >= v0.3.0 (ClaimConfig RPC); got $VERSION — use build_mode=custom." >&2
+              FAIL=1
+            fi
+          else
+            # custom mode: an explicit, well-formed owner is mandatory (no vars fallback —
+            # a silently-defaulted owner baked into a measured image is how mistakes ship).
+            if ! printf '%s' "$OWNER" | grep -qE '^0[xX][0-9a-fA-F]{40}$'; then
+              echo "error: build_mode=custom requires owner as a full 0x-prefixed 40-hex address; got '${OWNER:-<empty>}'." >&2
+              FAIL=1
+            fi
+          fi
+          # env=both runs two matrix jobs; a fixed image_name would make them clobber each other.
+          if [ -n "${{ inputs.image_name }}" ] && [ "${{ inputs.env }}" = "both" ]; then
+            echo "error: image_name requires a single env (dev or prod), not both." >&2
+            FAIL=1
+          fi
+          # The tapp-server release asset must exist (otherwise the build dies mid-way).
+          URL="https://github.com/0gfoundation/0g-tapp/releases/download/${VERSION}/tapp-server"
+          if ! curl -sfIL --max-time 30 "$URL" >/dev/null; then
+            echo "error: release binary not found: $URL (is the tag published with a tapp-server asset?)" >&2
+            FAIL=1
+          fi
+          exit $FAIL
 
       - name: Resolve variant (env → HARDEN + image base)
         id: v
@@ -131,30 +167,15 @@ jobs:
         # runner). Needed by the build (convert #130) and the reference-value step (fde-host #128).
         run: cvm/ci/setup-toolchain.sh
 
-      - name: Validate build_mode vs version compatibility
-        run: |
-          if [ "$BUILD_MODE" = "canonical" ]; then
-            # ClaimConfig RPC (required for canonical mode) was introduced in tapp-server v0.3.0.
-            # A canonical image built from an older binary boots unclaimed and can never be claimed.
-            VER="${VERSION#v}"
-            MAJOR="$(echo "$VER" | cut -d. -f1)"
-            MINOR="$(echo "$VER" | cut -d. -f2)"
-            if [ "$MAJOR" -eq 0 ] && [ "$MINOR" -lt 3 ]; then
-              echo "error: canonical mode requires tapp-server >= v0.3.0 (ClaimConfig RPC introduced in 0.3.0)" >&2
-              echo "       got: $VERSION — use build_mode=custom for older versions." >&2
-              exit 1
-            fi
-          fi
-
       - name: Stage A+B — build the image
         run: |
           cd cvm
           # canonical: no OWNER_ADDRESS → owner-agnostic image, one refval set for all owners.
           # custom:    OWNER_ADDRESS baked in → per-owner initrd measurement + per-owner refval set.
           EXTRA=""
-          [ "$BUILD_MODE" = "custom" ] && [ -n "$OWNER" ] && EXTRA="OWNER_ADDRESS=$OWNER"
+          [ "$BUILD_MODE" = "custom" ] && EXTRA="OWNER_ADDRESS=$OWNER"
           HARDEN=${{ steps.v.outputs.harden }} ENABLE_SYSBOX=1 \
-            $EXTRA \
+            BUILD_MODE="$BUILD_MODE" $EXTRA \
             KBS_URLS="$KBS_URLS" DISK_SIZE="${{ inputs.disk_size || '20G' }}" \
             TAPP_SERVER_URL="https://github.com/0gfoundation/0g-tapp/releases/download/${VERSION}/tapp-server" \
             ./build-tapp.sh base-noble.qcow2 "out-${{ matrix.env }}.qcow2"
@@ -193,13 +214,11 @@ jobs:
         run: |
           # canonical: no owner tag in name; refvals at <env>.json (no owner subdir)
           # custom:    owner tag in name; refvals at <env>/<owner>.json
-          if [ "$BUILD_MODE" = "custom" ] && [ -n "$OWNER" ]; then
+          if [ "$BUILD_MODE" = "custom" ]; then
             OWNER_TAG="$(printf '%s' "$OWNER" | sed 's/^0[xX]//' | tr 'A-Z' 'a-z')"
-            echo "owner_tag=${OWNER_TAG}"    >> "$GITHUB_OUTPUT"
-            echo "img_suffix=-${OWNER_TAG}"  >> "$GITHUB_OUTPUT"
+            echo "img_suffix=-${OWNER_TAG}"    >> "$GITHUB_OUTPUT"
             echo "family_suffix=-${OWNER_TAG}" >> "$GITHUB_OUTPUT"
           else
-            echo "owner_tag="      >> "$GITHUB_OUTPUT"
             echo "img_suffix="     >> "$GITHUB_OUTPUT"
             echo "family_suffix="  >> "$GITHUB_OUTPUT"
           fi
@@ -227,18 +246,17 @@ jobs:
       - name: Reference values — compute, write, register on AS
         if: ${{ env.PUBLISH == 'true' }}
         run: |
-          OWNER_TAG="${{ steps.names.outputs.owner_tag }}"
+          # canonical: $OWNER is empty and the unquoted expansion vanishes → the scripts
+          # see no owner arg and use the <env>.json path / no-owner policy id.
+          # custom: $OWNER is the full 0x address (scripts strip/lowercase themselves).
           cd cvm
-          # canonical: no owner arg → writes <env>.json; custom: owner arg → writes <env>/<owner>.json
-          ci/gen-reference-values.sh "out-${{ matrix.env }}.qcow2" "$CLOUD" "$BOOT_FORMAT" "$VERSION" "${{ matrix.env }}" $OWNER_TAG
+          ci/gen-reference-values.sh "out-${{ matrix.env }}.qcow2" "$CLOUD" "$BOOT_FORMAT" "$VERSION" "${{ matrix.env }}" $OWNER
           cd ..
-          verifier/register-shared-as.sh "$CLOUD" "$BOOT_FORMAT" "$VERSION" "${{ matrix.env }}" $OWNER_TAG "$AS_ENDPOINT"
+          verifier/register-shared-as.sh "$CLOUD" "$BOOT_FORMAT" "$VERSION" "${{ matrix.env }}" $OWNER "$AS_ENDPOINT"
 
       - name: Open PR with the new reference values → dev
         if: ${{ env.PUBLISH == 'true' }}
-        run: |
-          OWNER_TAG="${{ steps.names.outputs.owner_tag }}"
-          cvm/ci/open-refvalues-pr.sh "$CLOUD" "$BOOT_FORMAT" "$VERSION" "${{ matrix.env }}" $OWNER_TAG
+        run: cvm/ci/open-refvalues-pr.sh "$CLOUD" "$BOOT_FORMAT" "$VERSION" "${{ matrix.env }}" $OWNER
         env:
           # PAT so `gh pr create` works even if the org disables "Actions create/approve PRs".
           # git push still uses GITHUB_TOKEN via the permissions block above. Falls back if unset.

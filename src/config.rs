@@ -121,7 +121,7 @@ pub struct PermissionConfig {
     /// Example: "0x70997970C51812dc3A010C7d01b50e0d17dc79C8"
     ///
     /// OPTIONAL since 0.3: when absent, the tapp boots UNCLAIMED — the first
-    /// valid signer of the ClaimOwner RPC becomes the owner, and the claim is
+    /// valid signer of the ClaimConfig RPC becomes the owner, and the claim is
     /// extended into the runtime measurement. This keeps the CVM image (and
     /// its golden reference values) owner-independent. Setting it here is the
     /// legacy baked-in mode and still works.

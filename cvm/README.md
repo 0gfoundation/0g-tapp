@@ -12,20 +12,21 @@ One CVM = one point in this grid; each combination has its own image, its own re
 | **env** | `dev` (HARDEN=0) \| `prod` (HARDEN=1) | `HARDEN` | dev keeps cloud-init/SSH for debugging; prod purges it |
 | **version** | tapp-server release tag | `TAPP_SERVER_URL` | which tapp-server binary + image-name suffix |
 
-> **owner is no longer a build dimension.** Images are built **ownerless**: the owner is
-> claimed at runtime (`tapp-cli claim-owner`) as a measured `claim_owner` runtime event, so
-> one image serves every owner with one reference set (registered under the `any` owner slot).
-> Legacy escape hatch: setting `OWNER_ADDRESS` still bakes an owner into `config.toml` →
-> folded into the **initrd measurement** → per-owner reference values, as before.
+> **Two build modes** (`BUILD_MODE`, default `canonical`):
+> - **canonical** — owner-agnostic image: owner/chain/kbs are claimed at runtime
+>   (`tapp-cli claim-config`) as a measured `claim_config` event. One image and ONE
+>   reference set serve every owner. Requires tapp-server ≥ v0.3.0.
+> - **custom** — `OWNER_ADDRESS` baked into `config.toml` → folded into the **initrd
+>   measurement** → per-owner image + per-owner reference set (legacy behaviour).
 
 `cloud` and `boot_format` are **independent axes** — a CVM boots one way (one measurement chain), regardless of cloud. The measurement *shape* is decided by `boot_format`, not cloud:
 - **grub** → 5 components: `measurement.{shim,grub,kernel,initrd,kernel_cmdline}.SHA-384`
 - **uki**  → 1 component:  `measurement.uki.SHA-384` (kernel+initrd+cmdline fused into one signed EFI)
 
 Because they yield different images/measurements, **`boot_format` (like `cloud`, `env`, `version`) is part of the identifiers**, so a grub and a uki build never clobber each other:
-- image name: `<imgbase>-<boot_format>-<version>` (e.g. `og-tdx-dev-grub-v0-3-0`)
-- reference value: `verifier/reference-values/<cloud>/<boot_format>/<version>/<env>/any.json` (`any` = the fixed owner slot of ownerless images; legacy baked builds use the 0x-stripped lowercased address)
-- AS policy id: `0g-tapp-<cloud>-<boot_format>-<version>-<env>-any`
+- image name: `<imgbase>-<boot_format>-<version>` (e.g. `og-tdx-dev-grub-v0-3-0`); custom mode appends `-<owner>`
+- reference value: canonical `…/<version>/<env>.json`; custom `…/<version>/<env>/<owner>.json`
+- AS policy id: canonical `0g-tapp-<cloud>-<boot_format>-<version>-<env>`; custom appends `-<owner>`
 
 ### Platform differences (everything else is shared)
 | | GCP (`gcp`) | Alibaba Cloud (`ali`) |
@@ -86,9 +87,10 @@ KBS_URLS='"http://<kbs-host-1>:9091", "http://<kbs-host-2>:9091"' \
 ```
 - **Required**:
   - `KBS_URLS` — KBS node URLs for `[kbs] node_urls`, comma-separated and quoted as shown.
-- **Optional (legacy)**: `OWNER_ADDRESS` — bakes an owner into `config.toml` `[server.permission]`
-  (per-owner reference values). Default (unset) builds an **ownerless** image: the tapp boots
-  unclaimed and the owner is claimed at runtime via `tapp-cli claim-owner` (measured event).
+- **Build mode**: `BUILD_MODE=canonical` (default) builds an owner-agnostic image — the tapp
+  boots unclaimed and owner/config are claimed at runtime via `tapp-cli claim-config`
+  (measured event). `BUILD_MODE=custom` requires `OWNER_ADDRESS=0x…` and bakes it into
+  `config.toml` `[server.permission]` (per-owner reference values, legacy).
 - tapp-server is downloaded by default from GitHub v0.1.0 (includes the guest-components `8d71a3b4` fix, RTMR OK); if you have it locally, set `TAPP_SERVER_BIN=<path>`.
 - Storage / Sysbox knobs: `DATA_ROOT` (docker data-root, default `/data/docker`), `CONTAINERD_ROOT` (default `/data/containerd`), `DOCKER_VERSION` (default `5:27.5.1-…noble`; empty = repo default), `ENABLE_SYSBOX` / `SYSBOX_VERSION` (default `0.7.0`).
 - Publish (Stage C, opt-in): `PUBLISH_AS=<gcp-image-name>` publishes the built image to GCP after the build (see [Publish to GCP](#publish-to-gcp-stage-c)); `GCS_BUCKET` / `GCP_PROJECT` / `GUEST_OS_FEATURES` pass through.

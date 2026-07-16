@@ -24,7 +24,7 @@ tls_enabled = false
 [server.permission]
 enabled = true
 # Owner is OPTIONAL: leave it unset and the tapp boots UNCLAIMED — the first
-# valid signer of `tapp-cli claim-owner` becomes the owner, and the claim is
+# valid signer of `tapp-cli claim-config` becomes the owner, and the claim is
 # extended into the runtime measurement (keeps the CVM image owner-independent).
 # Setting it here is the legacy baked-in mode and still works:
 # owner_address = "0xYourOwnerAddressHere"

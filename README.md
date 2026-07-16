@@ -220,8 +220,8 @@ port = 50051
 [server.permission]
 enabled = true
 # Owner is OPTIONAL: leave it unset and the tapp boots UNCLAIMED — the first
-# valid signer of `tapp-cli claim-owner` becomes the owner, recorded as a
-# measured claim_owner runtime event (keeps the CVM image owner-independent;
+# valid signer of `tapp-cli claim-config` becomes the owner, recorded as a
+# measured claim_config runtime event (keeps the CVM image owner-independent;
 # one image = one set of reference values for every owner).
 # Setting it here is the legacy baked-in mode and still works:
 # owner_address = "0xYourOwnerAddressHere"
@@ -266,7 +266,7 @@ tapp-cli -s http://<tapp>:50051 -k 0x<your-key> claim-owner
   the owner; later claims fail with the current owner. The CLI verifies the
   result end-to-end (server must report your address back as the live owner).
 - **Measured**: the claim is extended into the runtime measurement as a
-  `claim_owner` event (same mechanism as `start_app`), so verifiers see WHO owns
+  `claim_config` event (same mechanism as `start_app`), so verifiers see WHO owns
   the node in the attestation evidence and can reconcile it with the on-chain
   registration — the owner moved from the golden values into the runtime event log.
 - **Restart-safe**: the claimed owner is persisted under `/run` (tmpfs) — a
