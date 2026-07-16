@@ -1065,9 +1065,11 @@ impl TappService for TappServiceImpl {
             kbs_node_urls: req.kbs_node_urls.clone(),
         };
 
-        // Dynamically initialize KMS client if kbs_node_urls provided and not
-        // already configured (config.toml had no [kbs] section — dynamic mode).
-        if !req.kbs_node_urls.is_empty() && self.kms_client.read().await.is_none() {
+        // Initialize or replace KMS client with the claimed kbs_node_urls.
+        // Always overwrite: config.toml may have [kbs] with empty node_urls=[],
+        // which creates a KmsClient stub that would fail on every request. Replace
+        // whenever the claim provides non-empty urls.
+        if !req.kbs_node_urls.is_empty() {
             info!(
                 nodes = req.kbs_node_urls.len(),
                 "Initializing KMS client from ClaimConfig"
