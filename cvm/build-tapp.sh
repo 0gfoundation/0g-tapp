@@ -47,10 +47,6 @@ SYSBOX_DEB_URL="${SYSBOX_DEB_URL:-https://downloads.nestybox.com/sysbox/releases
 # Both exported so prepare-*.sh (stage B) inherits them.
 export CLOUD="${CLOUD:-gcp}"
 export BOOT_FORMAT="${BOOT_FORMAT:-grub}"
-# Boot-disk size of the produced image (the read-only verity rootfs sizes to this). Default 20G =
-# the cached base. A larger value grows the working copy (qemu-img resize + growpart + resize2fs)
-# up front, before the build; shrinking below the current size is unsupported (ignored).
-DISK_SIZE="${DISK_SIZE:-20G}"
 # passed through to prepare-tapp.sh (used by convert)
 export CONFIG_DIR="${CONFIG_DIR:-$HERE/config_dir}"
 export FDE_PACKAGE="${FDE_PACKAGE:-$HERE/cryptpilot-fde-guest_0.8.0_amd64.deb}"   # 0.8.0 in-image runtime (cryptpilot-fde split into -host/-guest at 0.8.0)
@@ -71,21 +67,6 @@ OUT="${2:?usage: $0 <ubuntu-24.04-base.qcow2> <output.qcow2>}"
 [ -f "$HERE/prepare-tapp.sh" ] || { echo "missing prepare-tapp.sh (must be in the same directory as this script)" >&2; exit 1; }
 [ -d "$CONFIG_DIR" ] || { echo "CONFIG_DIR not found: $CONFIG_DIR" >&2; exit 1; }
 [ -f "$FDE_PACKAGE" ] || { echo "FDE_PACKAGE not found: $FDE_PACKAGE" >&2; exit 1; }
-
-# ---- resize the working image up front (before Stage A / convert) ----
-# The final image's read-only verity rootfs is sized from the disk here, so grow the disk + rootfs
-# partition (sda1) + filesystem now. Preserve partition numbering (growpart, NOT virt-resize --expand,
-# which renumbers sda1->sda4 and breaks the sda1=rootfs / sda16=/boot assumptions). Only grows: a
-# DISK_SIZE at or below the current size is a no-op (shrinking a populated fs is unsafe).
-CUR_BYTES="$(qemu-img info --output=json "$IN" | python3 -c 'import sys,json; print(json.load(sys.stdin)["virtual-size"])')"
-WANT_BYTES="$(numfmt --from=iec "$DISK_SIZE")"
-if [ "$WANT_BYTES" -gt "$CUR_BYTES" ]; then
-  echo "==> resize disk -> $DISK_SIZE (grow sda1 + fs; was $(numfmt --to=iec "$CUR_BYTES"))"
-  qemu-img resize "$IN" "$DISK_SIZE"
-  virt-customize -a "$IN" --run-command 'growpart /dev/sda 1 && resize2fs /dev/sda1'
-elif [ "$WANT_BYTES" -lt "$CUR_BYTES" ]; then
-  echo "==> DISK_SIZE=$DISK_SIZE is below the current $(numfmt --to=iec "$CUR_BYTES"); shrinking unsupported — keeping current size" >&2
-fi
 
 TMPD="$(mktemp -d)"
 trap 'rm -rf "$TMPD"' EXIT
