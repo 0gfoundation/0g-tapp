@@ -83,13 +83,17 @@ aliyun ecs ModifyImageAttribute \
   --Features.NvmeSupport supported --force >/dev/null
 
 echo "==> [C4] wait for image $IMAGE_ID to become Available (import task runs async; up to ${POLL_MAX}s)"
+# NOTE: DescribeImages defaults to Status=Available, so an importing image (Status=Creating) returns
+# NOTHING — an empty result means "still importing / not visible yet", NOT failure. Ask for the
+# in-progress statuses explicitly, and only treat CreateFailed (or the timeout) as fatal.
 t=0
 while :; do
-  status="$(aliyun ecs DescribeImages --RegionId "$ALIYUN_REGION" --ImageId "$IMAGE_ID" 2>/dev/null \
-    | python3 -c 'import sys,json; im=json.load(sys.stdin)["Images"]["Image"]; print(im[0]["Status"] if im else "Gone")')"
+  status="$(aliyun ecs DescribeImages --RegionId "$ALIYUN_REGION" --ImageId "$IMAGE_ID" \
+    --Status Creating,Waiting,Available,CreateFailed 2>/dev/null \
+    | python3 -c 'import sys,json; im=json.load(sys.stdin).get("Images",{}).get("Image",[]); print(im[0]["Status"] if im else "Pending")')"
   case "$status" in
     Available) echo "    image is Available"; break ;;
-    CreateFailed|Gone) echo "!! import failed (status=$status)" >&2; exit 1 ;;
+    CreateFailed) echo "!! import failed (status=CreateFailed)" >&2; exit 1 ;;
     *) [ "$t" -ge "$POLL_MAX" ] && { echo "!! timed out waiting (last status=$status)" >&2; exit 1; }
        sleep 20; t=$((t+20)); echo "    status=$status (${t}s)" ;;
   esac
