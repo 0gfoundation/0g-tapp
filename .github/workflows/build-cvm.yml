@@ -19,6 +19,10 @@ on:
   # release version, optionally publishing the image + registering reference values.
   workflow_dispatch:
     inputs:
+      image_name:
+        description: "override the published image name. Blank = auto <imgbase>-<boot_format>-<version>-<owner>. (use a single env, not both)"
+        required: false
+        default: ""
       version:
         description: "tapp-server release tag (e.g. v0.1.0)"
         required: true
@@ -52,10 +56,6 @@ on:
         description: "boot-disk size of the image (e.g. 20G, 40G). Only grows; the verity rootfs sizes to it."
         required: false
         default: "20G"
-      image_name:
-        description: "override the published image name. Blank = auto <imgbase>-<boot_format>-<version>-<owner>. (use a single env, not both)"
-        required: false
-        default: ""
 
 concurrency:
   group: build-cvm-${{ inputs.cloud || 'gcp' }}-${{ inputs.boot_format }}-${{ inputs.version }}-${{ inputs.owner || vars.OWNER_ADDRESS }}
