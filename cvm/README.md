@@ -86,7 +86,6 @@ KBS_URLS='"http://<kbs-host-1>:9091", "http://<kbs-host-2>:9091"' \
 - tapp-server is downloaded by default from GitHub v0.1.0 (includes the guest-components `8d71a3b4` fix, RTMR OK); if you have it locally, set `TAPP_SERVER_BIN=<path>`.
 - Storage / Sysbox knobs: `DATA_ROOT` (docker data-root, default `/data/docker`), `CONTAINERD_ROOT` (default `/data/containerd`), `DOCKER_VERSION` (default `5:27.5.1-…noble`; empty = repo default), `ENABLE_SYSBOX` / `SYSBOX_VERSION` (default `0.7.0`).
 - Publish (Stage C, opt-in): `PUBLISH_AS=<gcp-image-name>` publishes the built image to GCP after the build (see [Publish to GCP](#publish-to-gcp-stage-c)); `GCS_BUCKET` / `GCP_PROJECT` / `GUEST_OS_FEATURES` pass through.
-- `DISK_SIZE` — boot-disk size of the produced image (default `20G` = the cached base). A larger value grows the working copy (`qemu-img resize` + `growpart` + `resize2fs`) before the build; only grows (shrinking is ignored). The read-only verity rootfs sizes to this.
 - Other environment variables: `DNS_FALLBACK` `PURGE_KERNEL` `CONFIG_DIR` `FDE_PACKAGE` `ROOTFS_MODE` `IN_PLACE` `INSTALL_KERNEL` `NBD_RESET` (see the top of the script).
 
 ## Persistent data disk (`/data`) — always configured

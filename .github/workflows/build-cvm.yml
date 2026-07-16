@@ -52,10 +52,6 @@ on:
         description: "replace an existing image of the same name (delete + recreate). Off = fail if it exists."
         type: boolean
         default: false
-      disk_size:
-        description: "boot-disk size of the image (e.g. 20G, 40G). Only grows; the verity rootfs sizes to it."
-        required: false
-        default: "20G"
 
 concurrency:
   group: build-cvm-${{ inputs.cloud || 'gcp' }}-${{ inputs.boot_format }}-${{ inputs.version }}-${{ inputs.owner || vars.OWNER_ADDRESS }}
@@ -124,7 +120,7 @@ jobs:
         run: |
           cd cvm
           HARDEN=${{ steps.v.outputs.harden }} ENABLE_SYSBOX=1 \
-            OWNER_ADDRESS="$OWNER" KBS_URLS="$KBS_URLS" DISK_SIZE="${{ inputs.disk_size || '20G' }}" \
+            OWNER_ADDRESS="$OWNER" KBS_URLS="$KBS_URLS" \
             TAPP_SERVER_URL="https://github.com/0gfoundation/0g-tapp/releases/download/${VERSION}/tapp-server" \
             ./build-tapp.sh base-noble.qcow2 "out-${{ matrix.env }}.qcow2"
 
