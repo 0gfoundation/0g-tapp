@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use tapp_common::proto::{
-    tapp_service_client::TappServiceClient, AddToWhitelistRequest, ClaimOwnerRequest,
+    tapp_service_client::TappServiceClient, AddToWhitelistRequest, ClaimConfigRequest,
     DockerLoginRequest,
     DockerLogoutRequest, GetAppContainerStatusRequest, GetAppInfoRequest, GetAppKeyRequest,
     GetAppLogsRequest, GetAppSecretKeyRequest, GetEvidenceRequest, GetSecretResourceRequest,
@@ -272,12 +272,26 @@ enum Commands {
     },
 
     /// Add address to whitelist (owner only)
-    /// Claim ownership of an unclaimed tapp (first-come-first-served)
+    /// Claim this tapp: set owner + runtime config in one measured step.
     ///
-    /// The signer (your private key's address) becomes the tapp owner.
-    /// Succeeds exactly once per boot; the claim is extended into the
-    /// runtime measurement so verifiers see it in the attestation evidence.
-    ClaimOwner,
+    /// The signer becomes the tapp owner. Optionally supply chain and KBS
+    /// config (dynamic mode: image ships empty, first ClaimConfig call
+    /// configures everything). Succeeds exactly once per boot; the full config
+    /// is extended into the runtime measurement so verifiers see it.
+    ClaimConfig {
+        /// On-chain TappRegistry RPC URL (optional)
+        #[arg(long)]
+        chain_rpc_url: Option<String>,
+
+        /// TappRegistry contract address (optional)
+        #[arg(long)]
+        chain_contract: Option<String>,
+
+        /// KMS cluster node URLs, comma-separated (optional)
+        /// e.g. "http://kms-1:9091,http://kms-2:9091"
+        #[arg(long)]
+        kbs_urls: Option<String>,
+    },
 
     AddToWhitelist {
         /// EVM address to add
@@ -661,9 +675,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let private_key = require_private_key(&cli.private_key)?;
             stop_service(&cli.server, app_id, service_name, private_key).await?;
         }
-        Commands::ClaimOwner => {
+        Commands::ClaimConfig {
+            chain_rpc_url,
+            chain_contract,
+            kbs_urls,
+        } => {
             let private_key = require_private_key(&cli.private_key)?;
-            claim_owner(&cli.server, private_key).await?;
+            let kbs_node_urls: Vec<String> = kbs_urls
+                .unwrap_or_default()
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect();
+            claim_config(
+                &cli.server,
+                private_key,
+                chain_rpc_url.unwrap_or_default(),
+                chain_contract.unwrap_or_default(),
+                kbs_node_urls,
+            )
+            .await?;
         }
         Commands::AddToWhitelist { address } => {
             let private_key = require_private_key(&cli.private_key)?;
@@ -1707,13 +1739,15 @@ async fn stop_service(
     Ok(())
 }
 
-async fn claim_owner(
+async fn claim_config(
     server: &str,
     private_key: String,
+    chain_rpc_url: String,
+    chain_contract_address: String,
+    kbs_node_urls: Vec<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use ethers::signers::Signer;
 
-    // Derive our own address up front so the result can be verified end-to-end
     let key_bytes = hex::decode(private_key.trim_start_matches("0x"))
         .map_err(|e| format!("Invalid private key: {}", e))?;
     let wallet = ethers::signers::LocalWallet::from_bytes(&key_bytes)
@@ -1722,10 +1756,14 @@ async fn claim_owner(
 
     let mut client = create_client(server).await?;
 
-    let mut request = Request::new(ClaimOwnerRequest {});
-    add_signature_metadata(&mut request, &private_key, "ClaimOwner")?;
+    let mut request = Request::new(ClaimConfigRequest {
+        chain_rpc_url: chain_rpc_url.clone(),
+        chain_contract_address: chain_contract_address.clone(),
+        kbs_node_urls: kbs_node_urls.clone(),
+    });
+    add_signature_metadata(&mut request, &private_key, "ClaimConfig")?;
 
-    let result = match client.claim_owner(request).await {
+    let result = match client.claim_config(request).await {
         Ok(response) => response.into_inner(),
         Err(status) if status.code() == tonic::Code::AlreadyExists => {
             eprintln!("✗ {}", status.message());
@@ -1739,8 +1777,14 @@ async fn claim_owner(
         std::process::exit(1);
     }
 
-    println!("✓ Tapp ownership claimed");
-    println!("  Owner: {}", result.owner_address);
+    println!("✓ Tapp config claimed");
+    println!("  Owner:    {}", result.owner_address);
+    if !chain_contract_address.is_empty() {
+        println!("  Chain:    {} @ {}", chain_contract_address, chain_rpc_url);
+    }
+    if !kbs_node_urls.is_empty() {
+        println!("  KBS:      {}", kbs_node_urls.join(", "));
+    }
 
     if result.owner_address != my_address {
         eprintln!(

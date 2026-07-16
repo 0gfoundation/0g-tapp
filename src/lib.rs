@@ -45,7 +45,9 @@ pub struct TappServiceImpl {
     pub config: TappConfig,
     pub boot_service: Arc<BootService>,
     pub app_key_service: app_key::AppKeyService,
-    pub kms_client: Option<kms_client::KmsClient>,
+    /// KMS client, wrapped in RwLock so ClaimConfig can initialize it at runtime
+    /// if kbs_node_urls were not baked into config.toml (dynamic mode).
+    pub kms_client: Arc<tokio::sync::RwLock<Option<kms_client::KmsClient>>>,
     pub nonce_manager: nonce_manager::NonceManager,
     pub logs_service: service_monitor::logs::LogsService,
     pub permission_manager: Option<Arc<permission::PermissionManager>>,
@@ -148,11 +150,13 @@ impl TappServiceImpl {
         let logs_service =
             service_monitor::logs::LogsService::new(config.logging.file_path.clone());
 
-        // Initialize KMS client from KBS config (used for GetSecretResource)
-        let kms_client = config.kbs.as_ref().map(|kbs| {
+        // Initialize KMS client from KBS config (used for GetSecretResource).
+        // Wrapped in Arc<RwLock> so ClaimConfig can (re-)initialize it at runtime
+        // when kbs_node_urls are provided dynamically instead of baked in config.
+        let kms_client = Arc::new(tokio::sync::RwLock::new(config.kbs.as_ref().map(|kbs| {
             info!(nodes = kbs.node_urls.len(), "Initializing KMS client from KBS config");
             kms_client::KmsClient::new(kbs.node_urls.clone(), &kbs.retry)
-        });
+        })));
 
         info!("All TAPP service components initialized successfully");
 
@@ -170,21 +174,24 @@ impl TappServiceImpl {
 }
 
 /// Establish the tapp owner at startup and return it (None = boots unclaimed,
-/// awaiting the ClaimOwner RPC). Sources, in order of resolution:
+/// awaiting the ClaimConfig RPC). Sources, in order of resolution:
 ///
 /// - config `owner_address` (legacy baked-in mode) — measured as a
-///   `claim_owner` event the first time it takes effect in a boot;
+///   `claim_config` event the first time it takes effect in a boot (chain/kbs
+///   values from the same config are included in the measurement data);
 /// - the owner persisted by a previous tapp-server process of the SAME boot
-///   (restored silently: its claim_owner event is already in this boot's
+///   (restored silently: its claim_config event is already in this boot's
 ///   runtime event log);
 /// - neither → unclaimed.
 ///
-/// A config/persisted mismatch is a hard error: it means the state file was
-/// tampered with or the config changed mid-boot — refuse to guess.
+/// A config/persisted mismatch is a hard error.
 pub async fn establish_owner_at_startup(
     pm: &Arc<permission::PermissionManager>,
     measurement_service: &Arc<measurement_service::MeasurementService>,
     config_owner: Option<&str>,
+    chain_rpc_url: &str,
+    chain_contract_address: &str,
+    kbs_node_urls: &[String],
 ) -> Result<Option<String>, String> {
     let config_owner =
         config_owner.map(permission::PermissionManager::normalize_address);
@@ -210,23 +217,23 @@ pub async fn establish_owner_at_startup(
 
         if needs_measurement {
             let measurement_data = serde_json::json!({
-                "operation": measurement_service::OPERATION_NAME_CLAIM_OWNER,
-                "address": owner,
+                "operation": measurement_service::OPERATION_NAME_CLAIM_CONFIG,
+                "owner": owner,
+                "chain_rpc_url": chain_rpc_url,
+                "chain_contract_address": chain_contract_address,
+                "kbs_node_urls": kbs_node_urls,
                 "timestamp": utils::current_timestamp()
             })
             .to_string();
 
-            // Best-effort, like start_app: on a real TEE node this succeeds;
-            // on dev machines without runtime measurement support we log and
-            // keep the legacy (unmeasured, baked-in) semantics.
             if let Err(e) = measurement_service
                 .extend_measurement(
-                    measurement_service::OPERATION_NAME_CLAIM_OWNER,
+                    measurement_service::OPERATION_NAME_CLAIM_CONFIG,
                     &measurement_data,
                 )
                 .await
             {
-                error!(error = %e, "Failed to extend claim_owner measurement at startup");
+                error!(error = %e, "Failed to extend claim_config measurement at startup");
             }
 
             if let Err(e) = pm.persist_owner().await {
@@ -947,15 +954,16 @@ impl TappService for TappServiceImpl {
     // Permission Management Methods
     // ============================================================================
 
-    async fn claim_owner(
+    async fn claim_config(
         &self,
-        request: Request<ClaimOwnerRequest>,
-    ) -> Result<Response<ClaimOwnerResponse>, Status> {
-        info!("Calling ClaimOwner");
+        request: Request<ClaimConfigRequest>,
+    ) -> Result<Response<ClaimConfigResponse>, Status> {
+        info!("Calling ClaimConfig");
 
         // The claimer is whoever signed the request (validated by AuthLayer)
         let signer = auth_layer::get_signer_address(&request)
             .ok_or_else(|| Status::unauthenticated("Signer address not found"))?;
+        let req = request.into_inner();
 
         let pm = self
             .permission_manager
@@ -967,12 +975,16 @@ impl TappService for TappServiceImpl {
             Status::already_exists(format!("Tapp already owned by {}", current))
         })?;
 
-        // Extend runtime measurement — the claim only counts if it is measured.
-        // On failure the claim is rolled back so the tapp stays claimable.
+        // Extend runtime measurement — includes the full config so verifiers
+        // see owner + chain + kbs in one event. On failure the claim is rolled
+        // back so the tapp stays claimable.
         let timestamp = utils::current_timestamp();
         let measurement_data = serde_json::json!({
-            "operation": measurement_service::OPERATION_NAME_CLAIM_OWNER,
-            "address": owner,
+            "operation": measurement_service::OPERATION_NAME_CLAIM_CONFIG,
+            "owner": owner,
+            "chain_rpc_url": req.chain_rpc_url,
+            "chain_contract_address": req.chain_contract_address,
+            "kbs_node_urls": req.kbs_node_urls,
             "timestamp": timestamp
         })
         .to_string();
@@ -980,7 +992,7 @@ impl TappService for TappServiceImpl {
         if let Err(e) = self
             .measurement_service
             .extend_measurement(
-                measurement_service::OPERATION_NAME_CLAIM_OWNER,
+                measurement_service::OPERATION_NAME_CLAIM_CONFIG,
                 &measurement_data,
             )
             .await
@@ -992,21 +1004,33 @@ impl TappService for TappServiceImpl {
             )));
         }
 
-        // Persist so a process restart within this boot cannot reopen the
-        // claim. Best-effort: the measurement (above) is the source of truth.
+        // Dynamically initialize KMS client if kbs_node_urls provided and not
+        // already configured (config.toml had no [kbs] section — dynamic mode).
+        if !req.kbs_node_urls.is_empty() && self.kms_client.read().await.is_none() {
+            info!(
+                nodes = req.kbs_node_urls.len(),
+                "Initializing KMS client from ClaimConfig"
+            );
+            *self.kms_client.write().await =
+                Some(kms_client::KmsClient::new(req.kbs_node_urls.clone(), &Default::default()));
+        }
+
+        // Persist so a process restart within this boot cannot reopen the claim.
         if let Err(e) = pm.persist_owner().await {
             tracing::warn!(error = %e, "Failed to persist claimed owner");
         }
 
         info!(
             owner = %owner,
-            event = "OWNER_CLAIMED",
-            "Tapp ownership claimed and measurement extended"
+            chain_contract = %req.chain_contract_address,
+            kbs_nodes = req.kbs_node_urls.len(),
+            event = "CONFIG_CLAIMED",
+            "Tapp config claimed and measurement extended"
         );
 
-        Ok(Response::new(ClaimOwnerResponse {
+        Ok(Response::new(ClaimConfigResponse {
             success: true,
-            message: format!("Tapp ownership claimed by {}", owner),
+            message: format!("Tapp config claimed by {}", owner),
             owner_address: owner,
             timestamp,
         }))
@@ -1592,8 +1616,12 @@ impl TappService for TappServiceImpl {
         let req = request.into_inner();
         let app_id = &req.app_id;
 
-        let kms = self.kms_client.as_ref().ok_or_else(|| {
-            Status::failed_precondition("KMS not configured (set [kms] cluster_urls in config)")
+        let kms_guard = self.kms_client.read().await;
+        let kms = kms_guard.as_ref().ok_or_else(|| {
+            Status::failed_precondition(
+                "KMS not configured — set [kbs] node_urls in config.toml or call claim-config \
+                 with --kbs-urls",
+            )
         })?;
 
         // Get in-memory key pair: private key for signing + decryption, pubkey for KMS encryption target

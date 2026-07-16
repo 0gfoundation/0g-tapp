@@ -17,7 +17,7 @@ pub const OPERATION_NAME_DOCKER_LOGIN: &str = "docker_login";
 pub const OPERATION_NAME_DOCKER_LOGOUT: &str = "docker_logout";
 pub const OPERATION_NAME_STOP_SERVICE: &str = "stop_service";
 pub const OPERATION_NAME_START_SERVICE: &str = "start_service";
-pub const OPERATION_NAME_CLAIM_OWNER: &str = "claim_owner";
+pub const OPERATION_NAME_CLAIM_CONFIG: &str = "claim_config";
 
 pub struct MeasurementService {
     aa: Arc<Mutex<AttestationAgent>>,

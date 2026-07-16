@@ -214,7 +214,7 @@ fn get_method_permission(method_name: &str) -> MethodPermission {
         // Signature required, but no permission level: while the tapp is
         // unclaimed anybody may claim (first-come-first-served); once claimed
         // the handler rejects with ALREADY_EXISTS.
-        "ClaimOwner" => MethodPermission::Authenticated,
+        "ClaimConfig" => MethodPermission::Authenticated,
 
         // Owner-only methods
         "StartApp"

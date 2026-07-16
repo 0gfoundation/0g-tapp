@@ -94,13 +94,16 @@ service TappService {
   rpc GetSecretResource(GetSecretResourceRequest)
       returns (GetSecretResourceResponse);
 
-  // Claim ownership of an unclaimed tapp (first-come-first-served).
-  // The signer of the request becomes the tapp owner. Succeeds exactly once;
-  // the claim is extended into the runtime measurement (RTMR) so verifiers
-  // see the owner in the attestation evidence instead of baked-in golden
-  // values. Fails with ALREADY_EXISTS once an owner is set (from a previous
-  // claim or from config).
-  rpc ClaimOwner(ClaimOwnerRequest) returns (ClaimOwnerResponse);
+  // Claim this tapp: set owner + runtime configuration in one atomic measured step.
+  // The signer of the request becomes the tapp owner; chain and KBS config are
+  // applied immediately. Succeeds exactly once per boot; the full config is
+  // extended into the runtime measurement (RTMR) so verifiers see the complete
+  // runtime setup in the attestation evidence. Fails with ALREADY_EXISTS once claimed.
+  //
+  // Two modes:
+  //   Pre-baked: owner/chain/kbs in config.toml → claimed automatically at startup.
+  //   Dynamic:   image ships empty; first ClaimConfig call configures everything.
+  rpc ClaimConfig(ClaimConfigRequest) returns (ClaimConfigResponse);
 }
 
 enum LogLevel {
@@ -628,13 +631,23 @@ message GetSecretResourceResponse {
   bytes secret = 3;  // plaintext KMS-derived app key
 }
 
-// Claim Owner Messages
-message ClaimOwnerRequest {
-  // No parameters — the owner is the EVM address recovered from the
-  // request signature (x-signature / x-timestamp metadata).
+// ClaimConfig Messages
+message ClaimConfigRequest {
+  // Owner is the EVM address recovered from the request signature
+  // (x-signature / x-timestamp metadata) — no explicit field needed.
+
+  // Optional: on-chain TappRegistry integration. When provided, applied
+  // immediately and measured so verifiers can reconcile against on-chain data.
+  string chain_rpc_url = 1;
+  string chain_contract_address = 2;
+
+  // Optional: KMS cluster node URLs (e.g. "http://kms-1:9091").
+  // When provided, the KMS client is initialized on this call (no config.toml
+  // [kbs] section needed). Ignored if KBS was already configured at startup.
+  repeated string kbs_node_urls = 3;
 }
 
-message ClaimOwnerResponse {
+message ClaimConfigResponse {
   bool success = 1;
   string message = 2;
   string owner_address = 3;  // The claimed owner address (normalized)
