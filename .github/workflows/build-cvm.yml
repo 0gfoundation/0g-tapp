@@ -131,6 +131,21 @@ jobs:
         # runner). Needed by the build (convert #130) and the reference-value step (fde-host #128).
         run: cvm/ci/setup-toolchain.sh
 
+      - name: Validate build_mode vs version compatibility
+        run: |
+          if [ "$BUILD_MODE" = "canonical" ]; then
+            # ClaimConfig RPC (required for canonical mode) was introduced in tapp-server v0.3.0.
+            # A canonical image built from an older binary boots unclaimed and can never be claimed.
+            VER="${VERSION#v}"
+            MAJOR="$(echo "$VER" | cut -d. -f1)"
+            MINOR="$(echo "$VER" | cut -d. -f2)"
+            if [ "$MAJOR" -eq 0 ] && [ "$MINOR" -lt 3 ]; then
+              echo "error: canonical mode requires tapp-server >= v0.3.0 (ClaimConfig RPC introduced in 0.3.0)" >&2
+              echo "       got: $VERSION — use build_mode=custom for older versions." >&2
+              exit 1
+            fi
+          fi
+
       - name: Stage A+B — build the image
         run: |
           cd cvm
