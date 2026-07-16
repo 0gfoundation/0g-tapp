@@ -214,6 +214,24 @@ tapp.0g.com <operation> {"app_id","operation","result","error",
 - `docker_login` 记 `registry/username/signer/timestamp`（不含密码）。
 - 规律：每次会话第一条运行时事件落 `pcrIndex=1`，之后落 `pcrIndex=4`。
 
+### claim_owner（运行时认领 owner,ownerless 镜像必查）
+
+自运行时 owner 认领起,镜像不再烧 owner(黄金参考值全网一套,注册在 `any` 槽位),
+**owner 从静态度量搬进了运行时事件日志**:
+
+```
+tapp.0g.com claim_owner {"address":"0x<owner>","operation":"claim_owner","timestamp":<ts>}
+```
+
+对账规则(在 §④ 增加一步):
+
+1. 事件日志里**必须存在 `claim_owner` 事件**(无 → 节点无主或走了度量外路径,拒绝);
+2. 若有多条(如 config 模式跨进程重启),**所有 `claim_owner` 的 `address` 必须一致**;
+3. `address` == 链上该节点注册的 owner(不一致 → owner 被抢注或注册不符,拒绝)。
+
+claim 事件由启动后的首次认领产生(ClaimOwner RPC 或 config 里的 legacy owner),
+每次 VM 重启 RTMR 清零、重新认领、重新度量——owner 与 quote 始终同生命周期。
+
 ---
 
 ## 实测走查：`0g-agentic-id-attestor`（严格照本文档端到端跑过）

@@ -219,10 +219,15 @@ port = 50051
 
 [server.permission]
 enabled = true
-owner_address = "0xYourOwnerAddressHere"
-initial_whitelist = [
-    "0xYourWhitelistAddressHere"
-]
+# Owner is OPTIONAL: leave it unset and the tapp boots UNCLAIMED — the first
+# valid signer of `tapp-cli claim-owner` becomes the owner, recorded as a
+# measured claim_owner runtime event (keeps the CVM image owner-independent;
+# one image = one set of reference values for every owner).
+# Setting it here is the legacy baked-in mode and still works:
+# owner_address = "0xYourOwnerAddressHere"
+#
+# Whitelist: use `tapp-cli add-to-whitelist` after claiming (each change is a
+# measured runtime event). The old initial_whitelist config was removed.
 
 [boot]
 socket_path = "/var/run/docker.sock"
@@ -245,6 +250,35 @@ node_urls = [
 rpc_url = "https://evmrpc-testnet.0g.ai"
 contract_address = "0x..."
 ```
+
+## Claiming Ownership (runtime owner claim)
+
+CVM images are built **ownerless**: no owner is baked into the image, so a single
+image (and a single set of boot-chain reference values) serves every owner. A
+freshly booted tapp is UNCLAIMED — every owner-level RPC is rejected until someone
+claims it:
+
+```bash
+tapp-cli -s http://<tapp>:50051 -k 0x<your-key> claim-owner
+```
+
+- **First-come-first-served, exactly once per boot**: the request signer becomes
+  the owner; later claims fail with the current owner. The CLI verifies the
+  result end-to-end (server must report your address back as the live owner).
+- **Measured**: the claim is extended into the runtime measurement as a
+  `claim_owner` event (same mechanism as `start_app`), so verifiers see WHO owns
+  the node in the attestation evidence and can reconcile it with the on-chain
+  registration — the owner moved from the golden values into the runtime event log.
+- **Restart-safe**: the claimed owner is persisted under `/run` (tmpfs) — a
+  tapp-server process restart cannot reopen the claim; a VM reboot clears both
+  the state and the RTMRs, so a rebooted node is claimable (and re-measured) again.
+- **Hijack window**: practically closed — don't expose :50051 before claiming
+  (cloud firewall), and claim right after boot. Even if raced, the intruder's
+  address is indelibly measured, your own claim fails immediately (instant
+  detection), and the box holds no secrets yet — delete and recreate.
+
+Legacy mode: setting `owner_address` in `config.toml` still works (the owner is
+claimed automatically at startup and also measured).
 
 ## On-chain Registration
 

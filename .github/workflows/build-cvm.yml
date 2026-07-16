@@ -5,22 +5,24 @@
 # and network to the shared AS. The cryptpilot 0.8.0 + #128/#130 toolchain is provisioned by
 # ci/setup-toolchain.sh (installs released 0.8.0 + overlays convert #130 / fde-host #128 from the fork).
 #
-# Dimensions (see verifier/reference-values/README.md): cloud × boot_format × env × owner × version.
+# Dimensions (see verifier/reference-values/README.md): cloud × boot_format × env × version.
 #   version = tapp-server release tag                   → which tapp-server + image name suffix
 #   env     = dev (HARDEN=0) | prod (HARDEN=1)          → image variant (og-tdx-dev / og-tdx)
-#   owner   = OWNER_ADDRESS, baked into config.toml     → folded into the initrd measurement,
-#             so it IS an attested dimension (per-owner reference values).
+# owner is NO LONGER a build dimension: images are built OWNERLESS — the owner
+# is claimed at runtime (tapp-cli claim-owner) as a measured claim_owner event,
+# so one image serves every owner with a single reference set (registered under
+# the `any` owner slot of the refvalues path/policy id).
 # KBS/KMS is fixed (vars.TAPP_KBS_URLS), not per-build.
 
 name: build-cvm
 
 on:
-  # Manual entry point: build a chosen cloud × boot_format × env × owner at a given tapp-server
+  # Manual entry point: build a chosen cloud × boot_format × env at a given tapp-server
   # release version, optionally publishing the image + registering reference values.
   workflow_dispatch:
     inputs:
       image_name:
-        description: "override the published image name. Blank = auto <imgbase>-<boot_format>-<version>-<owner>. (use a single env, not both)"
+        description: "override the published image name. Blank = auto <imgbase>-<boot_format>-<version>. (use a single env, not both)"
         required: false
         default: ""
       version:
@@ -31,9 +33,6 @@ on:
         type: choice
         options: [dev, prod, both]
         default: both
-      owner:
-        description: "OWNER_ADDRESS (0x...) baked into the image (measured). Blank = vars.OWNER_ADDRESS (default owner)."
-        required: false
       publish:
         description: "publish image + register reference values"
         type: boolean
@@ -58,7 +57,7 @@ on:
         default: "20G"
 
 concurrency:
-  group: build-cvm-${{ inputs.cloud || 'gcp' }}-${{ inputs.boot_format }}-${{ inputs.version }}-${{ inputs.owner || vars.OWNER_ADDRESS }}
+  group: build-cvm-${{ inputs.cloud || 'gcp' }}-${{ inputs.boot_format }}-${{ inputs.version }}
   cancel-in-progress: false
 
 # The reference-values step pushes a refvalues/* branch and opens a PR into dev with GITHUB_TOKEN;
@@ -79,7 +78,6 @@ jobs:
       # All fixed config lives in repo/org Actions Variables (Settings → Secrets and variables →
       # Actions → Variables), editable without touching this file; the `|| 'default'` is a fallback.
       VERSION: ${{ inputs.version }}
-      OWNER: ${{ inputs.owner || vars.OWNER_ADDRESS }}
       PUBLISH: ${{ inputs.publish }}
       # cloud/boot-format dimensions (independent; a CVM = one CLOUD × one BOOT_FORMAT = one measurement
       # chain). cloud defaults to gcp; boot_format defaults to grub (uki is opt-in, any cloud).
@@ -123,8 +121,9 @@ jobs:
       - name: Stage A+B — build the image
         run: |
           cd cvm
+          # No OWNER_ADDRESS: the image is built ownerless (claim-at-runtime).
           HARDEN=${{ steps.v.outputs.harden }} ENABLE_SYSBOX=1 \
-            OWNER_ADDRESS="$OWNER" KBS_URLS="$KBS_URLS" DISK_SIZE="${{ inputs.disk_size || '20G' }}" \
+            KBS_URLS="$KBS_URLS" DISK_SIZE="${{ inputs.disk_size || '20G' }}" \
             TAPP_SERVER_URL="https://github.com/0gfoundation/0g-tapp/releases/download/${VERSION}/tapp-server" \
             ./build-tapp.sh base-noble.qcow2 "out-${{ matrix.env }}.qcow2"
 
@@ -161,12 +160,11 @@ jobs:
         if: ${{ env.PUBLISH == 'true' && env.CLOUD == 'gcp' }}
         run: |
           cd cvm
-          # owner + boot_format are MEASURED dimensions → both in the name + family. owner: strip 0x +
-          # lowercase (GCP names [a-z][-a-z0-9]*, max 63; og-tdx-dev-grub-<ver>-<40hex> = 63).
-          OWNER_TAG="$(printf '%s' "$OWNER" | sed 's/^0[xX]//' | tr 'A-Z' 'a-z')"
+          # boot_format is a MEASURED dimension → in the name + family. No owner tag:
+          # images are ownerless, one image/reference set serves every owner.
           IMG="${{ inputs.image_name }}"
-          [ -n "$IMG" ] || IMG="${{ steps.v.outputs.imgbase }}-${BOOT_FORMAT}-${VERSION//./-}-${OWNER_TAG}"
-          IMAGE_FAMILY="${{ steps.v.outputs.imgbase }}-${BOOT_FORMAT}-${OWNER_TAG}" \
+          [ -n "$IMG" ] || IMG="${{ steps.v.outputs.imgbase }}-${BOOT_FORMAT}-${VERSION//./-}"
+          IMAGE_FAMILY="${{ steps.v.outputs.imgbase }}-${BOOT_FORMAT}" \
           OVERWRITE=${{ inputs.overwrite && '1' || '0' }} \
             ./publish-gcp-image.sh "out-${{ matrix.env }}.qcow2" "$IMG"
 
@@ -174,10 +172,9 @@ jobs:
         if: ${{ env.PUBLISH == 'true' && env.CLOUD == 'ali' }}
         run: |
           cd cvm
-          # owner + boot_format in the name (measured dimensions). owner: strip 0x + lowercase.
-          OWNER_TAG="$(printf '%s' "$OWNER" | sed 's/^0[xX]//' | tr 'A-Z' 'a-z')"
+          # boot_format in the name (measured dimension). No owner tag: ownerless image.
           IMG="${{ inputs.image_name }}"
-          [ -n "$IMG" ] || IMG="${{ steps.v.outputs.imgbase }}-${BOOT_FORMAT}-${VERSION//./-}-${OWNER_TAG}"
+          [ -n "$IMG" ] || IMG="${{ steps.v.outputs.imgbase }}-${BOOT_FORMAT}-${VERSION//./-}"
           ALIYUN_REGION="$ALIYUN_REGION" OSS_BUCKET="$OSS_BUCKET" \
           OVERWRITE=${{ inputs.overwrite && '1' || '0' }} \
             ./publish-ali-image.sh "out-${{ matrix.env }}.qcow2" "$IMG"
@@ -187,14 +184,15 @@ jobs:
         # uses /usr/bin/cryptpilot-fde-host (#128), set up by the toolchain step above
         run: |
           cd cvm
-          # writes verifier/reference-values/<cloud>/<boot_format>/<version>/<env>/<owner>.json
-          ci/gen-reference-values.sh "out-${{ matrix.env }}.qcow2" "$CLOUD" "$BOOT_FORMAT" "$VERSION" "${{ matrix.env }}" "$OWNER"
+          # Ownerless image: reference values live under the fixed `any` owner slot —
+          # writes verifier/reference-values/<cloud>/<boot_format>/<version>/<env>/any.json
+          ci/gen-reference-values.sh "out-${{ matrix.env }}.qcow2" "$CLOUD" "$BOOT_FORMAT" "$VERSION" "${{ matrix.env }}" any
           cd ..
-          verifier/register-shared-as.sh "$CLOUD" "$BOOT_FORMAT" "$VERSION" "${{ matrix.env }}" "$OWNER" "$AS_ENDPOINT"
+          verifier/register-shared-as.sh "$CLOUD" "$BOOT_FORMAT" "$VERSION" "${{ matrix.env }}" any "$AS_ENDPOINT"
 
       - name: Open PR with the new reference values → dev
         if: ${{ env.PUBLISH == 'true' }}
-        run: cvm/ci/open-refvalues-pr.sh "$CLOUD" "$BOOT_FORMAT" "$VERSION" "${{ matrix.env }}" "$OWNER"
+        run: cvm/ci/open-refvalues-pr.sh "$CLOUD" "$BOOT_FORMAT" "$VERSION" "${{ matrix.env }}" any
         env:
           # PAT so `gh pr create` works even if the org disables "Actions create/approve PRs".
           # git push still uses GITHUB_TOKEN via the permissions block above. Falls back if unset.

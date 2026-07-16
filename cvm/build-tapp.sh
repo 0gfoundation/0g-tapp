@@ -17,7 +17,10 @@ export DEBIAN_FRONTEND=noninteractive
 # ===== Tunables =====
 TAPP_SERVER_BIN="${TAPP_SERVER_BIN:-}"                              # path to a local tapp-server binary; empty -> download from URL
 TAPP_SERVER_URL="${TAPP_SERVER_URL:-https://github.com/0gfoundation/0g-tapp/releases/download/v0.1.0/tapp-server}"
-OWNER_ADDRESS="${OWNER_ADDRESS:-}"   # REQUIRED: tapp-server owner address (0x...), written to config.toml [server.permission]
+OWNER_ADDRESS="${OWNER_ADDRESS:-}"   # OPTIONAL (legacy): bake an owner into config.toml [server.permission].
+                                     # Empty (default) = build an OWNERLESS image: the tapp boots unclaimed and the
+                                     # first valid signer of `tapp-cli claim-owner` becomes the owner (a measured
+                                     # claim_owner runtime event). One image ⇒ one reference set for ALL owners.
 KBS_URLS="${KBS_URLS:-}"             # REQUIRED: KBS node URLs for [kbs] node_urls, comma-separated and quoted, e.g. KBS_URLS='"http://host1:9091", "http://host2:9091"'
 DNS_FALLBACK="${DNS_FALLBACK:-8.8.8.8 8.8.4.4 1.1.1.1}"
 HARDEN="${HARDEN:-1}"                                   # 1=hardened (purge Tier1/2 + mask getty + replace netplan); 0=dev
@@ -66,7 +69,7 @@ PUBLISH_AS="${PUBLISH_AS:-}"
 IN="${1:?usage: $0 <ubuntu-24.04-base.qcow2> <output.qcow2>}"
 OUT="${2:?usage: $0 <ubuntu-24.04-base.qcow2> <output.qcow2>}"
 [ -f "$IN" ] || { echo "input image not found: $IN" >&2; exit 1; }
-[ -n "$OWNER_ADDRESS" ] || { echo "OWNER_ADDRESS is required, e.g. OWNER_ADDRESS=0x... $0 ..." >&2; exit 1; }
+[ -n "$OWNER_ADDRESS" ] && echo "NOTE: baking OWNER_ADDRESS into the image (legacy per-owner reference values); leave it empty for an ownerless, claim-at-runtime image." >&2
 [ -n "$KBS_URLS" ] || { echo "KBS_URLS is required, e.g. KBS_URLS='\"http://host1:9091\", \"http://host2:9091\"' $0 ..." >&2; exit 1; }
 [ -f "$HERE/prepare-tapp.sh" ] || { echo "missing prepare-tapp.sh (must be in the same directory as this script)" >&2; exit 1; }
 [ -d "$CONFIG_DIR" ] || { echo "CONFIG_DIR not found: $CONFIG_DIR" >&2; exit 1; }
@@ -134,6 +137,10 @@ NoNewPrivileges=true
 WantedBy=multi-user.target
 EOF
 
+# legacy baked owner: only emit the line when OWNER_ADDRESS was provided
+OWNER_LINE=""
+[ -n "$OWNER_ADDRESS" ] && OWNER_LINE="owner_address = \"$OWNER_ADDRESS\""
+
 cat > "$TMPD/config.toml" <<EOF
 [logging]
 level = "info"
@@ -150,8 +157,10 @@ unix_socket_path = "/run/tapp/tapp.sock"
 
 [server.permission]
 enabled = true
-owner_address = "$OWNER_ADDRESS"
-initial_whitelist = []
+# owner: unset ⇒ boots UNCLAIMED; first valid `tapp-cli claim-owner` signer
+# becomes the owner (measured claim_owner runtime event). A baked owner
+# (legacy) re-introduces per-owner reference values.
+$OWNER_LINE
 
 [kbs]
 node_urls = [$KBS_URLS]

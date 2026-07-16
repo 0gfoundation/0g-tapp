@@ -7,7 +7,9 @@ a TDX confidential node against a known-good image, consumed by `verifier/policy
 
 ```
 verifier/reference-values/<cloud>/<boot_format>/<tapp-server-version>/<env>/<owner>.json
-#   cloud ∈ {gcp, ali}; boot_format ∈ {grub, uki}; env ∈ {dev, prod}; owner = OWNER_ADDRESS (0x stripped, lowercased)
+#   cloud ∈ {gcp, ali}; boot_format ∈ {grub, uki}; env ∈ {dev, prod}
+#   owner: `any` for ownerless claim-at-runtime images (the default since the
+#   ClaimOwner RPC); a 0x-stripped lowercased OWNER_ADDRESS for legacy baked builds
 ```
 
 - **One set per cloud × boot_format × tapp-server release × environment × owner.** Each combination
@@ -19,9 +21,14 @@ verifier/reference-values/<cloud>/<boot_format>/<tapp-server-version>/<env>/<own
   (grub → 5 components `shim/grub/kernel/initrd/kernel_cmdline`; uki → 1 `measurement.uki`). Without it,
   a grub and a uki image for the same cloud/version/env/owner would collide on the path + AS policy id.
 - **dev and prod images differ** (HARDEN=0 / HARDEN=1) → separate `dev/` / `prod/` per version.
-- **owner is a dimension**: `OWNER_ADDRESS` is baked into `/etc/tapp/config.toml` on the verity
-  rootfs, and `policy.rego` folds rootfs integrity into the **initrd** measurement, so a
-  different owner ⇒ a different `measurement.initrd.SHA-384` ⇒ a distinct reference set.
+- **owner is NO LONGER a build dimension** (since runtime owner claim): images are built
+  ownerless — the owner is claimed at runtime via the ClaimOwner RPC and lands in the
+  **runtime measurement event log** (a `claim_owner` event, like `start_app`), NOT in the
+  boot-chain digests. One image ⇒ one reference set for every owner, registered under the
+  fixed `any` slot. Verifiers get the owner from the claim_owner event in the evidence and
+  reconcile it against the on-chain registration.
+  Legacy builds that bake `OWNER_ADDRESS` into `/etc/tapp/config.toml` still fold the owner
+  into `measurement.initrd.SHA-384` (per-owner reference sets, real address in the path).
 - The policy (`verifier/policy.rego`) is a single, canonical, image-agnostic logic; only
   these values vary. See that file's header for the two verification methods.
 
