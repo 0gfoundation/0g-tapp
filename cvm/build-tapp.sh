@@ -76,7 +76,13 @@ else
   OWNER_ADDRESS=""   # canonical mode never bakes an owner, even if accidentally set
   echo "Build mode: canonical (owner-agnostic, claim at runtime via ClaimConfig RPC)" >&2
 fi
-[ -n "$KBS_URLS" ] || { echo "KBS_URLS is required, e.g. KBS_URLS='\"http://host1:9091\", \"http://host2:9091\"' $0 ..." >&2; exit 1; }
+# KBS_URLS is optional in canonical mode (can be supplied at runtime via ClaimConfig --kbs-urls);
+# required in custom mode so the baked config is complete.
+if [ "$BUILD_MODE" = "custom" ] && [ -z "$KBS_URLS" ]; then
+  echo "BUILD_MODE=custom requires KBS_URLS, e.g. KBS_URLS='\"http://host1:9091\"' $0 ..." >&2
+  exit 1
+fi
+[ -n "$KBS_URLS" ] && echo "KBS: baking node_urls into config.toml" >&2 || echo "KBS: not baked (supply at runtime via ClaimConfig --kbs-urls)" >&2
 [ -f "$HERE/prepare-tapp.sh" ] || { echo "missing prepare-tapp.sh (must be in the same directory as this script)" >&2; exit 1; }
 [ -d "$CONFIG_DIR" ] || { echo "CONFIG_DIR not found: $CONFIG_DIR" >&2; exit 1; }
 [ -f "$FDE_PACKAGE" ] || { echo "FDE_PACKAGE not found: $FDE_PACKAGE" >&2; exit 1; }

@@ -174,9 +174,12 @@ jobs:
           # custom:    OWNER_ADDRESS baked in → per-owner initrd measurement + per-owner refval set.
           EXTRA=""
           [ "$BUILD_MODE" = "custom" ] && EXTRA="OWNER_ADDRESS=$OWNER"
+          # canonical: KBS_URLS optional (can be supplied at runtime via ClaimConfig --kbs-urls)
+          # custom: KBS_URLS required (baked into config.toml); build-tapp.sh enforces this
+          KBS_ARG=""
+          [ -n "$KBS_URLS" ] && KBS_ARG="KBS_URLS=$KBS_URLS"
           HARDEN=${{ steps.v.outputs.harden }} ENABLE_SYSBOX=1 \
-            BUILD_MODE="$BUILD_MODE" $EXTRA \
-            KBS_URLS="$KBS_URLS" DISK_SIZE="${{ inputs.disk_size || '20G' }}" \
+            BUILD_MODE="$BUILD_MODE" $EXTRA $KBS_ARG DISK_SIZE="${{ inputs.disk_size || '20G' }}" \
             TAPP_SERVER_URL="https://github.com/0gfoundation/0g-tapp/releases/download/${VERSION}/tapp-server" \
             ./build-tapp.sh base-noble.qcow2 "out-${{ matrix.env }}.qcow2"
 
