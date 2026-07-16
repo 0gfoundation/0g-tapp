@@ -78,6 +78,9 @@ else
 fi
 # KBS_URLS is optional in canonical mode (can be supplied at runtime via ClaimConfig --kbs-urls);
 # required in custom mode so the baked config is complete.
+# Normalize "empty-looking" values: a literal [] (someone meaning "none") would otherwise be
+# interpolated into node_urls = [$KBS_URLS] as the nested array [[]] — broken TOML semantics.
+[ "$KBS_URLS" = "[]" ] && KBS_URLS=""
 if [ "$BUILD_MODE" = "custom" ] && [ -z "$KBS_URLS" ]; then
   echo "BUILD_MODE=custom requires KBS_URLS, e.g. KBS_URLS='\"http://host1:9091\"' $0 ..." >&2
   exit 1
