@@ -1362,12 +1362,25 @@ async fn verify_app_cmd(
                 println!("  {}", l);
             }
         } else if !d.boot_measurements.is_empty() {
-            // No policy: print the boot-chain component digests in the reference-value
-            // format (measurement.<component>.SHA-384) for direct comparison against
-            // verifier/reference-values/<cloud>/<boot_format>/<version>/<env>.json
-            println!("  boot-chain (no policy — compare against reference values):");
+            // No policy: print the boot-chain component digests as reference-value
+            // JSON (same shape as verifier/reference-values/.../<env>.json) so the
+            // output can be diffed/copied directly.
+            let mut grouped: serde_json::Map<String, serde_json::Value> = Default::default();
             for (component, hash) in &d.boot_measurements {
-                println!("    measurement.{}.SHA-384: {}", component, hash);
+                let key = format!("measurement.{}.SHA-384", component);
+                let arr = grouped.entry(key).or_insert_with(|| serde_json::json!([]));
+                if let Some(a) = arr.as_array_mut() {
+                    let v = serde_json::json!(hash);
+                    if !a.contains(&v) {
+                        a.push(v);
+                    }
+                }
+            }
+            println!("  boot-chain (no policy — reference-value format):");
+            let json = serde_json::to_string_pretty(&serde_json::Value::Object(grouped))
+                .unwrap_or_default();
+            for line in json.lines() {
+                println!("    {}", line);
             }
         }
         if let Some(owner) = &d.claimed_owner {
