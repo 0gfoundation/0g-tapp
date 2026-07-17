@@ -235,6 +235,11 @@ tapp.0g.com claim_config {"owner":"0x<owner>","chain_rpc_url":"…",
 claim 事件由启动后的首次认领产生(ClaimConfig RPC 的动态模式,或 config.toml 预制模式启动自动认领),
 每次 VM 重启 RTMR 清零、重新认领、重新度量——owner 与 quote 始终同生命周期。
 
+**`tapp-cli verify-app` 已自动执行本节规则**(v0.3.0+):chain 模式下 reconcile 行输出
+`owner✓/✗/?`(✓=claim_config owner==链上 owner;✗=不一致,Result ❌;?=无 claim_config 事件,
+0.3 之前的镜像)。另外无 `--policy-ids` 时,boot-chain 组件度量按参考值 JSON 格式原样打印,
+可直接与 `verifier/reference-values/…/<env>.json` diff。
+
 ---
 
 ## 实测走查：`0g-agentic-id-attestor`（严格照本文档端到端跑过）
