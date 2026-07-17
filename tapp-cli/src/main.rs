@@ -1362,10 +1362,16 @@ async fn verify_app_cmd(
                 println!("  {}", l);
             }
         } else if !d.boot_measurements.is_empty() {
-            // No policy: print raw measurements so the user can compare manually
-            println!("  boot-chain :");
-            for (component, hash) in &d.boot_measurements {
-                println!("    {:<20} {}", component, hash);
+            // No policy: print per-event digests grouped by RTMR for manual comparison
+            // against reference values (measurement.shim.SHA-384 etc.)
+            println!("  boot-chain (eventlog digests, no policy):");
+            let mut cur_reg = String::new();
+            for (reg, hash) in &d.boot_measurements {
+                if *reg != cur_reg {
+                    println!("    [{}]", reg);
+                    cur_reg = reg.clone();
+                }
+                println!("      {}", hash);
             }
         }
         if let Some(owner) = &d.claimed_owner {

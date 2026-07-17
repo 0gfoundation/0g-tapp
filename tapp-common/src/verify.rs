@@ -150,12 +150,12 @@ fn latest_successful_start(cc_eventlog_b64: &str, app_id: &str) -> Result<Option
     Ok(last)
 }
 
-/// Parse the cc_eventlog and replay RTMR0/1/2 from boot-phase events.
-/// Returns the final RTMR values as [(register_name, sha384_hex)].
-/// Stops accumulating for each register once RTMR3 events begin (runtime starts).
+/// Parse the cc_eventlog and return individual boot-phase event digests from RTMR0/1/2.
+/// Each entry is (register_name, sha384_hex) — these are the per-event digests that
+/// were extended into each RTMR, i.e. the values to compare against reference values
+/// (measurement.shim.SHA-384, measurement.grub.SHA-384, etc.).
+/// Stops at the first RTMR3 event (runtime measurements begin there).
 fn extract_boot_measurements(cc_eventlog_b64: &str) -> Result<Vec<(String, String)>> {
-    use sha2::Digest as _;
-
     let log = B64.decode(cc_eventlog_b64).map_err(|e| anyhow!("eventlog b64: {}", e))?;
     let u32le = |b: &[u8]| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize;
 
@@ -165,9 +165,7 @@ fn extract_boot_measurements(cc_eventlog_b64: &str) -> Result<Vec<(String, Strin
     let ds = u32le(&log[o..o + 4]);
     o += 4 + ds;
 
-    // Replay state: each RTMR starts as 48 zero bytes; h = SHA384(h || digest)
-    let mut rtmr: [Vec<u8>; 3] = [vec![0u8; 48], vec![0u8; 48], vec![0u8; 48]];
-    let mut seen = [false; 3]; // any event extended into this RTMR?
+    let mut results: Vec<(String, String)> = Vec::new();
 
     while o + 12 <= log.len() {
         let pcr = u32le(&log[o..o + 4]); o += 4;
@@ -177,14 +175,14 @@ fn extract_boot_measurements(cc_eventlog_b64: &str) -> Result<Vec<(String, Strin
         // imr→rtmr: 1=RTMR0, 2=RTMR1, 3=RTMR2, 4=RTMR3; 0=informational
         let idx: Option<usize> = match pcr { 1 => Some(0), 2 => Some(1), 3 => Some(2), _ => None };
 
-        let mut sha384: Option<Vec<u8>> = None;
+        let mut sha384: Option<String> = None;
         for _ in 0..cnt {
             if o + 2 > log.len() { break; }
             let alg = u16::from_le_bytes([log[o], log[o + 1]]);
             let sz = alg_size(alg);
             o += 2;
             if alg == 0xc && o + sz <= log.len() {
-                sha384 = Some(log[o..o + sz].to_vec());
+                sha384 = Some(hex::encode(&log[o..o + sz]));
             }
             o += sz;
         }
@@ -193,24 +191,14 @@ fn extract_boot_measurements(cc_eventlog_b64: &str) -> Result<Vec<(String, Strin
         if o + dl > log.len() { break; }
         o += dl;
 
-        // Stop once we hit RTMR3 (runtime measurements begin)
+        // Stop once runtime starts (RTMR3)
         if pcr == 4 { break; }
 
-        if let (Some(i), Some(digest)) = (idx, sha384) {
-            // h = SHA384(h || digest)
-            let mut hasher = sha2::Sha384::new();
-            hasher.update(&rtmr[i]);
-            hasher.update(&digest);
-            rtmr[i] = hasher.finalize().to_vec();
-            seen[i] = true;
+        if let (Some(i), Some(h)) = (idx, sha384) {
+            results.push((format!("rtmr{}", i), h));
         }
     }
-
-    let names = ["rtmr0", "rtmr1", "rtmr2"];
-    Ok(names.iter().enumerate()
-        .filter(|(i, _)| seen[*i])
-        .map(|(i, name)| (name.to_string(), hex::encode(&rtmr[i])))
-        .collect())
+    Ok(results)
 }
 
 /// Parse the cc_eventlog and extract the claimed owner from `claim_config` events.
