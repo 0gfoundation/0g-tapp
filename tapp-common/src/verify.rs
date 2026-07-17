@@ -150,6 +150,69 @@ fn latest_successful_start(cc_eventlog_b64: &str, app_id: &str) -> Result<Option
     Ok(last)
 }
 
+/// Parse the cc_eventlog and replay RTMR0/1/2 from boot-phase events.
+/// Returns the final RTMR values as [(register_name, sha384_hex)].
+/// Stops accumulating for each register once RTMR3 events begin (runtime starts).
+fn extract_boot_measurements(cc_eventlog_b64: &str) -> Result<Vec<(String, String)>> {
+    use sha2::Digest as _;
+
+    let log = B64.decode(cc_eventlog_b64).map_err(|e| anyhow!("eventlog b64: {}", e))?;
+    let u32le = |b: &[u8]| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize;
+
+    // skip SpecID event
+    let mut o = 8 + 20;
+    if o + 4 > log.len() { return Ok(vec![]); }
+    let ds = u32le(&log[o..o + 4]);
+    o += 4 + ds;
+
+    // Replay state: each RTMR starts as 48 zero bytes; h = SHA384(h || digest)
+    let mut rtmr: [Vec<u8>; 3] = [vec![0u8; 48], vec![0u8; 48], vec![0u8; 48]];
+    let mut seen = [false; 3]; // any event extended into this RTMR?
+
+    while o + 12 <= log.len() {
+        let pcr = u32le(&log[o..o + 4]); o += 4;
+        let _et = u32le(&log[o..o + 4]); o += 4;
+        let cnt = u32le(&log[o..o + 4]); o += 4;
+
+        // imr→rtmr: 1=RTMR0, 2=RTMR1, 3=RTMR2, 4=RTMR3; 0=informational
+        let idx: Option<usize> = match pcr { 1 => Some(0), 2 => Some(1), 3 => Some(2), _ => None };
+
+        let mut sha384: Option<Vec<u8>> = None;
+        for _ in 0..cnt {
+            if o + 2 > log.len() { break; }
+            let alg = u16::from_le_bytes([log[o], log[o + 1]]);
+            let sz = alg_size(alg);
+            o += 2;
+            if alg == 0xc && o + sz <= log.len() {
+                sha384 = Some(log[o..o + sz].to_vec());
+            }
+            o += sz;
+        }
+        if o + 4 > log.len() { break; }
+        let dl = u32le(&log[o..o + 4]); o += 4;
+        if o + dl > log.len() { break; }
+        o += dl;
+
+        // Stop once we hit RTMR3 (runtime measurements begin)
+        if pcr == 4 { break; }
+
+        if let (Some(i), Some(digest)) = (idx, sha384) {
+            // h = SHA384(h || digest)
+            let mut hasher = sha2::Sha384::new();
+            hasher.update(&rtmr[i]);
+            hasher.update(&digest);
+            rtmr[i] = hasher.finalize().to_vec();
+            seen[i] = true;
+        }
+    }
+
+    let names = ["rtmr0", "rtmr1", "rtmr2"];
+    Ok(names.iter().enumerate()
+        .filter(|(i, _)| seen[*i])
+        .map(|(i, name)| (name.to_string(), hex::encode(&rtmr[i])))
+        .collect())
+}
+
 /// Parse the cc_eventlog and extract the claimed owner from `claim_config` events.
 /// Returns:
 ///   Ok(Some(owner)) — all claim_config events agree, returns the (normalized) owner
@@ -228,6 +291,8 @@ pub struct AsVerdict {
     /// AR4SI executables trust claim (== EXECUTABLES_MATCHED when the boot chain matched
     /// the policy reference values); None if the policy set no executables / no policy applied.
     pub executables: Option<i64>,
+    /// Unused — boot measurements now come from eventlog parsing, not AS token.
+    pub boot_measurements: Vec<(String, String)>,
 }
 
 /// Submit evidence to CoCo-AS (gRPC). `policy_ids` selects the policy to enforce; pass an
@@ -272,7 +337,8 @@ async fn verify_with_as(
     let tdx = &cpu0["ear.veraison.annotated-evidence"]["tdx"];
     let tcb = tdx["tcb_status"].as_str().unwrap_or("unknown").to_string();
     let adv = tdx["advisory_ids"].as_array().map(|a| a.len()).unwrap_or(0);
-    Ok(AsVerdict { ear_status, tcb_status: tcb, advisories: adv, executables })
+
+    Ok(AsVerdict { ear_status, tcb_status: tcb, advisories: adv, executables, boot_measurements: vec![] })
 }
 
 async fn fetch_evidence(tee_url: &str, app_id: &str) -> Result<Vec<u8>> {
@@ -299,6 +365,8 @@ pub struct DirectVerdict {
     pub tcb_status: String,
     pub advisories: usize,
     pub boot_executables: Option<i64>, // AR4SI executables claim (3 = boot chain matched policy)
+    /// Boot-chain measurements from AS (printed when no policy selected).
+    pub boot_measurements: Vec<(String, String)>,
     pub compose_hash: String, // from latest successful start_app, if any
     pub images: Vec<String>,
     /// Owner address from claim_config event (if present). No chain comparison in direct mode.
@@ -319,6 +387,7 @@ pub async fn verify_node_direct(
         tcb_status: "-".to_string(),
         advisories: 0,
         boot_executables: None,
+        boot_measurements: Vec::new(),
         compose_hash: String::new(),
         images: Vec::new(),
         claimed_owner: None,
@@ -342,6 +411,7 @@ pub async fn verify_node_direct(
             v.tcb_status = av.tcb_status;
             v.advisories = av.advisories;
             v.boot_executables = av.executables;
+            v.boot_measurements = av.boot_measurements;
         }
         Err(e) => v.note = format!("{}AS: {}", v.note, e),
     }
@@ -349,6 +419,11 @@ pub async fn verify_node_direct(
     if let Ok(Some(m)) = latest_successful_start(cc_b64, app_id) {
         v.compose_hash = m.compose_hash;
         v.images = m.image_hash.into_values().collect();
+    }
+
+    // boot measurements from eventlog (not from AS — no policy needed)
+    if let Ok(measurements) = extract_boot_measurements(cc_b64) {
+        v.boot_measurements = measurements;
     }
 
     // claim_config owner — direct mode: print without chain comparison

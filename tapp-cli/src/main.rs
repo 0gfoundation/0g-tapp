@@ -1357,8 +1357,16 @@ async fn verify_app_cmd(
         println!("  server      : {}", d.server);
         println!("  signer      : {}  (attested in report_data)", d.signer);
         println!("  AS          : ear.status={} tcb_status={} advisories={}", d.ear_status, d.tcb_status, d.advisories);
-        if let Some(l) = boot_chain_line(d.boot_executables, show_boot) {
-            println!("  {}", l);
+        if show_boot {
+            if let Some(l) = boot_chain_line(d.boot_executables, show_boot) {
+                println!("  {}", l);
+            }
+        } else if !d.boot_measurements.is_empty() {
+            // No policy: print raw measurements so the user can compare manually
+            println!("  boot-chain :");
+            for (component, hash) in &d.boot_measurements {
+                println!("    {:<20} {}", component, hash);
+            }
         }
         if let Some(owner) = &d.claimed_owner {
             println!("  owner       : {}  (from claim_config event; no chain comparison in direct mode)", owner);
