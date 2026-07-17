@@ -1338,6 +1338,28 @@ fn boot_chain_line(executables: Option<i64>, show: bool) -> Option<String> {
     })
 }
 
+/// Print boot-chain component digests as reference-value JSON (same shape as
+/// verifier/reference-values/.../<env>.json) so the output can be diffed/copied.
+fn print_boot_measurements(measurements: &[(String, String)], indent: &str) {
+    let mut grouped: serde_json::Map<String, serde_json::Value> = Default::default();
+    for (component, hash) in measurements {
+        let key = format!("measurement.{}.SHA-384", component);
+        let arr = grouped.entry(key).or_insert_with(|| serde_json::json!([]));
+        if let Some(a) = arr.as_array_mut() {
+            let v = serde_json::json!(hash);
+            if !a.contains(&v) {
+                a.push(v);
+            }
+        }
+    }
+    println!("{}boot-chain (no policy — reference-value format):", indent);
+    let json =
+        serde_json::to_string_pretty(&serde_json::Value::Object(grouped)).unwrap_or_default();
+    for line in json.lines() {
+        println!("{}  {}", indent, line);
+    }
+}
+
 async fn verify_app_cmd(
     server: &str,
     app_id: &str,
@@ -1357,8 +1379,15 @@ async fn verify_app_cmd(
         println!("  server      : {}", d.server);
         println!("  signer      : {}  (attested in report_data)", d.signer);
         println!("  AS          : ear.status={} tcb_status={} advisories={}", d.ear_status, d.tcb_status, d.advisories);
-        if let Some(l) = boot_chain_line(d.boot_executables, show_boot) {
-            println!("  {}", l);
+        if show_boot {
+            if let Some(l) = boot_chain_line(d.boot_executables, show_boot) {
+                println!("  {}", l);
+            }
+        } else if !d.boot_measurements.is_empty() {
+            print_boot_measurements(&d.boot_measurements, "  ");
+        }
+        if let Some(owner) = &d.claimed_owner {
+            println!("  owner       : {}  (from claim_config event; no chain comparison in direct mode)", owner);
         }
         if !d.compose_hash.is_empty() {
             println!("  compose     : {}", d.compose_hash);
@@ -1397,12 +1426,29 @@ async fn verify_app_cmd(
             "    AS         : ear.status={} tcb_status={} advisories={}",
             n.ear_status, n.tcb_status, n.advisories
         );
+        let owner_str = match &n.owner_claim {
+            Some(Ok(_))  => "✓",
+            Some(Err(_)) => "✗",
+            None         => "?",
+        };
         println!(
-            "    reconcile  : signer{} compose{} volumes{} image{}",
-            yn(n.signer_ok), yn(n.compose_ok), yn(n.volumes_ok), yn(n.image_ok)
+            "    reconcile  : signer{} compose{} volumes{} image{} owner{}",
+            yn(n.signer_ok), yn(n.compose_ok), yn(n.volumes_ok), yn(n.image_ok), owner_str
         );
-        if let Some(l) = boot_chain_line(n.boot_executables, show_boot) {
-            println!("    {}", l);
+        if let Some(Err(claimed)) = &n.owner_claim {
+            println!("    owner      : ✗ claim_config says {} but on-chain owner differs", claimed);
+            all_ok = false;
+        } else if let Some(Ok(claimed)) = &n.owner_claim {
+            println!("    owner      : ✓ {}", claimed);
+        } else {
+            println!("    owner      : ? no claim_config event in eventlog");
+        }
+        if show_boot {
+            if let Some(l) = boot_chain_line(n.boot_executables, show_boot) {
+                println!("    {}", l);
+            }
+        } else if !n.boot_measurements.is_empty() {
+            print_boot_measurements(&n.boot_measurements, "    ");
         }
         if !n.note.is_empty() {
             println!("    note       : {}", n.note);
