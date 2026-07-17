@@ -1360,6 +1360,9 @@ async fn verify_app_cmd(
         if let Some(l) = boot_chain_line(d.boot_executables, show_boot) {
             println!("  {}", l);
         }
+        if let Some(owner) = &d.claimed_owner {
+            println!("  owner       : {}  (from claim_config event; no chain comparison in direct mode)", owner);
+        }
         if !d.compose_hash.is_empty() {
             println!("  compose     : {}", d.compose_hash);
         }
@@ -1397,10 +1400,23 @@ async fn verify_app_cmd(
             "    AS         : ear.status={} tcb_status={} advisories={}",
             n.ear_status, n.tcb_status, n.advisories
         );
+        let owner_str = match &n.owner_claim {
+            Some(Ok(_))  => "✓",
+            Some(Err(_)) => "✗",
+            None         => "?",
+        };
         println!(
-            "    reconcile  : signer{} compose{} volumes{} image{}",
-            yn(n.signer_ok), yn(n.compose_ok), yn(n.volumes_ok), yn(n.image_ok)
+            "    reconcile  : signer{} compose{} volumes{} image{} owner{}",
+            yn(n.signer_ok), yn(n.compose_ok), yn(n.volumes_ok), yn(n.image_ok), owner_str
         );
+        if let Some(Err(claimed)) = &n.owner_claim {
+            println!("    owner      : ✗ claim_config says {} but on-chain owner differs", claimed);
+            all_ok = false;
+        } else if let Some(Ok(claimed)) = &n.owner_claim {
+            println!("    owner      : ✓ {}", claimed);
+        } else {
+            println!("    owner      : ? no claim_config event in eventlog");
+        }
         if let Some(l) = boot_chain_line(n.boot_executables, show_boot) {
             println!("    {}", l);
         }

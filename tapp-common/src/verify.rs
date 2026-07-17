@@ -31,6 +31,11 @@ pub struct NodeVerdict {
     pub volumes_ok: bool,
     pub image_ok: bool,
     pub boot_executables: Option<i64>, // AR4SI executables claim (3 = boot chain matched policy)
+    /// claim_config owner from event log:
+    ///   Some(Ok(addr))  = found and matches on-chain app owner
+    ///   Some(Err(addr)) = found but mismatches (addr is what the event says)
+    ///   None            = no claim_config event found in event log
+    pub owner_claim: Option<Result<String, String>>,
     pub note: String,
 }
 
@@ -145,6 +150,60 @@ fn latest_successful_start(cc_eventlog_b64: &str, app_id: &str) -> Result<Option
     Ok(last)
 }
 
+/// Parse the cc_eventlog and extract the claimed owner from `claim_config` events.
+/// Returns:
+///   Ok(Some(owner)) — all claim_config events agree, returns the (normalized) owner
+///   Ok(None)        — no claim_config events found
+///   Err(msg)        — events found but inconsistent owners
+fn eventlog_claim_config_owner(cc_eventlog_b64: &str) -> Result<Option<String>> {
+    let log = B64.decode(cc_eventlog_b64).map_err(|e| anyhow!("eventlog b64: {}", e))?;
+    let u32le = |b: &[u8]| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize;
+
+    let mut o = 8 + 20;
+    if o + 4 > log.len() { return Ok(None); }
+    let ds = u32le(&log[o..o + 4]);
+    o += 4 + ds;
+
+    let mut owners: Vec<String> = Vec::new();
+    while o + 12 <= log.len() {
+        o += 4;
+        let et = u32le(&log[o..o + 4]); o += 4;
+        let cnt = u32le(&log[o..o + 4]); o += 4;
+        for _ in 0..cnt {
+            if o + 2 > log.len() { return Ok(owners.into_iter().next()); }
+            let alg = u16::from_le_bytes([log[o], log[o + 1]]);
+            o += 2 + alg_size(alg);
+        }
+        if o + 4 > log.len() { break; }
+        let dl = u32le(&log[o..o + 4]); o += 4;
+        if o + dl > log.len() { break; }
+        let data = &log[o..o + dl]; o += dl;
+
+        if et == 0x6 && dl >= 8 {
+            let tsz = u32le(&data[4..8]);
+            if 8 + tsz <= data.len() {
+                if let Ok(text) = std::str::from_utf8(&data[8..8 + tsz]) {
+                    if let Some(payload) = text.strip_prefix("tapp.0g.com claim_config ") {
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(payload) {
+                            if let Some(owner) = v["owner"].as_str() {
+                                owners.push(owner.to_lowercase());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if owners.is_empty() { return Ok(None); }
+    let first = owners[0].clone();
+    if owners.iter().all(|o| o == &first) {
+        Ok(Some(first))
+    } else {
+        Err(anyhow!("inconsistent claim_config owners: {:?}", owners))
+    }
+}
+
 fn json_str_map(v: &serde_json::Value) -> HashMap<String, String> {
     let mut m = HashMap::new();
     if let Some(obj) = v.as_object() {
@@ -242,6 +301,8 @@ pub struct DirectVerdict {
     pub boot_executables: Option<i64>, // AR4SI executables claim (3 = boot chain matched policy)
     pub compose_hash: String, // from latest successful start_app, if any
     pub images: Vec<String>,
+    /// Owner address from claim_config event (if present). No chain comparison in direct mode.
+    pub claimed_owner: Option<String>,
     pub note: String,
 }
 
@@ -260,6 +321,7 @@ pub async fn verify_node_direct(
         boot_executables: None,
         compose_hash: String::new(),
         images: Vec::new(),
+        claimed_owner: None,
         note: String::new(),
     };
 
@@ -288,6 +350,13 @@ pub async fn verify_node_direct(
         v.compose_hash = m.compose_hash;
         v.images = m.image_hash.into_values().collect();
     }
+
+    // claim_config owner — direct mode: print without chain comparison
+    match eventlog_claim_config_owner(cc_b64) {
+        Ok(owner) => v.claimed_owner = owner,
+        Err(e) => v.note = format!("{}claim_config: {}", v.note, e),
+    }
+
     Ok(v)
 }
 
@@ -308,6 +377,12 @@ pub async fn verify_app(
         .await?
         .into_iter()
         .collect();
+    // On-chain app owner (who registered the app via registerApp)
+    let onchain_owner = onchain::get_app_owner(rpc_url, contract, app_id)
+        .await
+        .ok()
+        .map(|a| format!("0x{:x}", a))
+        .unwrap_or_default();
 
     let mut nodes = Vec::new();
     for signer in signers {
@@ -323,6 +398,7 @@ pub async fn verify_app(
             volumes_ok: false,
             image_ok: false,
             boot_executables: None,
+            owner_claim: None,
             note: String::new(),
         };
 
@@ -391,6 +467,19 @@ pub async fn verify_app(
             }
             Ok(None) => v.note = format!("{}no successful start_app in eventlog", v.note),
             Err(e) => v.note = format!("{}eventlog parse: {}", v.note, e),
+        }
+
+        // ④c reconcile claim_config owner vs on-chain app owner
+        match eventlog_claim_config_owner(cc_b64) {
+            Ok(Some(claimed)) => {
+                if onchain_owner.is_empty() || claimed == onchain_owner.to_lowercase() {
+                    v.owner_claim = Some(Ok(claimed));
+                } else {
+                    v.owner_claim = Some(Err(claimed));
+                }
+            }
+            Ok(None) => {} // no claim_config event — leave owner_claim as None
+            Err(e) => v.note = format!("{}claim_config: {}", v.note, e),
         }
 
         nodes.push(v);
