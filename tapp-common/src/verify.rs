@@ -31,6 +31,8 @@ pub struct NodeVerdict {
     pub volumes_ok: bool,
     pub image_ok: bool,
     pub boot_executables: Option<i64>, // AR4SI executables claim (3 = boot chain matched policy)
+    /// Boot-chain component digests from the eventlog (printed when no policy selected).
+    pub boot_measurements: Vec<(String, String)>,
     /// claim_config owner from event log:
     ///   Some(Ok(addr))  = found and matches on-chain app owner
     ///   Some(Err(addr)) = found but mismatches (addr is what the event says)
@@ -490,6 +492,7 @@ pub async fn verify_app(
             volumes_ok: false,
             image_ok: false,
             boot_executables: None,
+            boot_measurements: Vec::new(),
             owner_claim: None,
             note: String::new(),
         };
@@ -559,6 +562,11 @@ pub async fn verify_app(
             }
             Ok(None) => v.note = format!("{}no successful start_app in eventlog", v.note),
             Err(e) => v.note = format!("{}eventlog parse: {}", v.note, e),
+        }
+
+        // boot measurements from eventlog (shown by the CLI when no policy selected)
+        if let Ok(measurements) = extract_boot_measurements(cc_b64) {
+            v.boot_measurements = measurements;
         }
 
         // ④c reconcile claim_config owner vs on-chain app owner
