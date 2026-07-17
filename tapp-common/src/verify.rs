@@ -150,12 +150,28 @@ fn latest_successful_start(cc_eventlog_b64: &str, app_id: &str) -> Result<Option
     Ok(last)
 }
 
-/// Parse the cc_eventlog and return individual boot-phase event digests from RTMR0/1/2.
-/// Each entry is (register_name, sha384_hex) — these are the per-event digests that
-/// were extended into each RTMR, i.e. the values to compare against reference values
-/// (measurement.shim.SHA-384, measurement.grub.SHA-384, etc.).
-/// Stops at the first RTMR3 event (runtime measurements begin there).
+/// ASCII view of (possibly UTF-16LE) event data: drop NULs, lowercase.
+fn event_data_ascii(data: &[u8]) -> String {
+    data.iter()
+        .filter(|&&b| b != 0)
+        .map(|&b| (b as char).to_ascii_lowercase())
+        .collect()
+}
+
+/// Parse the cc_eventlog and return the boot-chain component digests that AS
+/// policies compare against reference values — the SAME selection rules as
+/// verifier/policy.rego:
+///   shim           EV_EFI_BOOT_SERVICES_APPLICATION, device_path ~ shimx64.efi
+///   grub           EV_EFI_BOOT_SERVICES_APPLICATION, device_path ~ grubx64.efi
+///   uki            EV_EFI_BOOT_SERVICES_APPLICATION, device_path ~ bootx64.efi (UKI boot)
+///   kernel         EV_IPL, string contains vmlinuz
+///   initrd         EV_IPL, string contains initrd
+///   kernel_cmdline EV_IPL, string starts with "kernel_cmdline:"
+/// Returns (component, sha384_hex) pairs in eventlog order.
 fn extract_boot_measurements(cc_eventlog_b64: &str) -> Result<Vec<(String, String)>> {
+    const EV_IPL: usize = 0xd;
+    const EV_EFI_BSA: usize = 0x8000_0003;
+
     let log = B64.decode(cc_eventlog_b64).map_err(|e| anyhow!("eventlog b64: {}", e))?;
     let u32le = |b: &[u8]| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize;
 
@@ -168,16 +184,13 @@ fn extract_boot_measurements(cc_eventlog_b64: &str) -> Result<Vec<(String, Strin
     let mut results: Vec<(String, String)> = Vec::new();
 
     while o + 12 <= log.len() {
-        let pcr = u32le(&log[o..o + 4]); o += 4;
-        let _et = u32le(&log[o..o + 4]); o += 4;
+        let _pcr = u32le(&log[o..o + 4]); o += 4;
+        let et = u32le(&log[o..o + 4]); o += 4;
         let cnt = u32le(&log[o..o + 4]); o += 4;
-
-        // imr→rtmr: 1=RTMR0, 2=RTMR1, 3=RTMR2, 4=RTMR3; 0=informational
-        let idx: Option<usize> = match pcr { 1 => Some(0), 2 => Some(1), 3 => Some(2), _ => None };
 
         let mut sha384: Option<String> = None;
         for _ in 0..cnt {
-            if o + 2 > log.len() { break; }
+            if o + 2 > log.len() { return Ok(results); }
             let alg = u16::from_le_bytes([log[o], log[o + 1]]);
             let sz = alg_size(alg);
             o += 2;
@@ -189,13 +202,29 @@ fn extract_boot_measurements(cc_eventlog_b64: &str) -> Result<Vec<(String, Strin
         if o + 4 > log.len() { break; }
         let dl = u32le(&log[o..o + 4]); o += 4;
         if o + dl > log.len() { break; }
+        let data = &log[o..o + dl];
         o += dl;
 
-        // Stop once runtime starts (RTMR3)
-        if pcr == 4 { break; }
+        let Some(h) = sha384 else { continue };
+        let text = event_data_ascii(data);
 
-        if let (Some(i), Some(h)) = (idx, sha384) {
-            results.push((format!("rtmr{}", i), h));
+        let component = match et {
+            EV_EFI_BSA => {
+                if text.contains("shimx64.efi") { Some("shim") }
+                else if text.contains("grubx64.efi") { Some("grub") }
+                else if text.contains("bootx64.efi") { Some("uki") }
+                else { None }
+            }
+            EV_IPL => {
+                if text.starts_with("kernel_cmdline:") { Some("kernel_cmdline") }
+                else if text.contains("vmlinuz") { Some("kernel") }
+                else if text.contains("initrd") { Some("initrd") }
+                else { None }
+            }
+            _ => None,
+        };
+        if let Some(c) = component {
+            results.push((c.to_string(), h));
         }
     }
     Ok(results)
