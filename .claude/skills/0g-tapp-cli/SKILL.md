@@ -57,8 +57,10 @@ tapp-cli -s <server> -k 0x<key> get-service-logs -f <file> [-n 100] # tapp-serve
 tapp-cli -s <server> -k 0x<key> docker-logout                    # logout from Docker registry on this server
 ```
 
-### verify-app: boot-chain check (`--policy-ids`)
-- **`--policy-ids <id>` is what triggers the boot-chain check** (shim/grub/kernel/initrd/kernel_cmdline vs an image's reference values). **Without it**, the AS uses its default policy and **no `boot-chain` line is printed** — only `ear.status`/`tcb_status`.
+### verify-app: two independent reference axes
+- **`--contract`+`--rpc-url` = dynamic references** (on-chain): reconciles runtime events vs the registry → `reconcile : signer✓ compose✓ volumes✓ image✓ owner✓`. The **owner** check (v0.3.0+) compares the `claim_config` event's owner against the on-chain app owner (`✗` = hijacked/mismatched → Result ❌; `?` = no claim_config event, pre-0.3 image).
+- **`--policy-ids <id>` = static references** (AS boot-chain check: shim/grub/kernel/initrd/kernel_cmdline or uki vs the image's reference values).
+- **Whichever axis has NO reference, the measured values are printed verbatim**: no `--contract` → owner/compose/images as attested; no `--policy-ids` → boot-chain component digests in reference-value JSON (`{"measurement.<comp>.SHA-384": [...]}`), directly diffable against `verifier/reference-values/<cloud>/<boot_format>/<version>/<env>.json`.
 - Output line: `boot-chain : ✓ (executables=3, matches policy reference)` = matched; `✗ (executables=33, ...)` = did not match; `?` = policy set no executables claim. (`executables` is the AR4SI claim: **3** = approved boot chain, **33** = unrecognized.)
 - **`--as-endpoint <host:port>`** picks the Attestation Service (default `47.237.201.184:50004`, the shared AS). Point it at a self-hosted local AS (e.g. `127.0.0.1:50004`, see the `verifier/0g-tapp-verifier` submodule) to use RVPS-backed reference values.
 - **Policy ids** — two formats depending on build mode:

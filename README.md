@@ -353,21 +353,32 @@ tapp-cli -s http://<any-tapp>:50051 -k 0x<deployer-key> withdraw \
 
 ### Verifying an App
 
-`tapp-cli verify-app` checks that what a node actually runs matches what is registered on-chain.
+`tapp-cli verify-app` checks that what a node actually runs matches its reference values.
+Two independent axes select which references are enforced:
 
-**Chain mode** (pass `--contract` + `--rpc-url`): reads the registry, fetches evidence from every node's on-chain `teeUrl`, verifies each TDX quote via the CoCo Attestation Service, and reconciles the evidence (signer, compose, volumes, image) against the chain.
+- **`--contract` + `--rpc-url` → dynamic references** (on-chain): reconciles the runtime
+  events against the registry — signer, compose, volumes, image, and **owner** (the
+  `claim_config` event's owner vs the on-chain app owner) → `signer✓ compose✓ volumes✓ image✓ owner✓`.
+- **`--policy-ids` → static references** (AS-registered boot-chain values): the AS enforces
+  the policy and returns the AR4SI executables claim → `boot-chain ✓ (executables=3)`.
+
+Whichever axis has NO reference supplied, verify-app prints that side's **measured values
+verbatim** so you can compare manually:
+- no `--contract` → prints owner / compose / images as attested;
+- no `--policy-ids` → prints the boot-chain component digests in reference-value JSON
+  (`{"measurement.<shim|grub|kernel|initrd|kernel_cmdline|uki>.SHA-384": [...]}`), directly
+  diffable against `verifier/reference-values/<cloud>/<boot_format>/<version>/<env>.json`.
 
 ```bash
+# full verification: dynamic (chain) + static (policy)
 tapp-cli verify-app \
   --app-id my-app \
   --rpc-url https://evmrpc-testnet.0g.ai \
-  --contract 0x<TappRegistry>
+  --contract 0x<TappRegistry> \
+  --policy-ids 0g-tapp-<cloud>-<boot_format>-<version>-<env>
   # --as-endpoint host:port   # CoCo-AS gRPC endpoint, default 47.237.201.184:50004
-```
 
-**Direct mode** (omit `--contract`, pass `-s <server>`): verifies a single node's evidence + quote and shows what it attests, without on-chain reconciliation — useful for apps not yet registered.
-
-```bash
+# direct mode (single node, not yet registered): prints attested values verbatim
 tapp-cli -s http://<tapp>:50051 verify-app --app-id my-app
 ```
 
