@@ -185,7 +185,7 @@ Scans `volumes:` and uploads sources starting with `./` (files or dirs, recursiv
 | container stuck `restarting` | `get-app-logs --service <svc>` → missing env var / mount file |
 | `Bind for 0.0.0.0:<port> failed: port is already allocated` | usually transient (old container hadn't released port) → retry start-app; if persistent, another app holds the port |
 | `lookup registry-1.docker.io ... connection refused` | that host's docker has no DNS → fix `/etc/docker/daemon.json` `"dns"` then restart docker |
-| on-chain `imageHashes` empty `[]` / `Image Hash: {}` | tapp-server bugs (both server-side; fix = deploy newer binary): ① old binary parses `docker compose images` JSON array as NDJSON → 0 images; ② <0.3.1: `--register-onchain` measure step read `image: ${VAR}` refs literally (no interpolation) → inspect failed → empty hash silently registered (running app fine; `update-onchain` could backfill). 0.3.1+ interpolates via `docker compose config` and hard-fails on missing digests. |
+| on-chain `imageHashes` empty `[]` / `Image Hash: {}` | tapp-server bug: old binary parses `docker compose images --format json` (a JSON array) line-by-line as NDJSON → 0 images. **Server-side**: only fixed by deploying the current tapp-server build (array parsing). prune/re-register won't help. Confirm via `get-app-info`. |
 | `app already exists` (register) | app-id taken globally; use add-node/update-node |
 | `gas tip cap ... below minimum` (cast send) | add `--legacy --gas-price 3000000000` |
 
