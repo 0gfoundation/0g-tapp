@@ -219,10 +219,15 @@ port = 50051
 
 [server.permission]
 enabled = true
-owner_address = "0xYourOwnerAddressHere"
-initial_whitelist = [
-    "0xYourWhitelistAddressHere"
-]
+# Owner is OPTIONAL: leave it unset and the tapp boots UNCLAIMED — the first
+# valid signer of `tapp-cli claim-config` becomes the owner, recorded as a
+# measured claim_config runtime event (keeps the CVM image owner-independent;
+# one image = one set of reference values for every owner).
+# Setting it here is the legacy baked-in mode and still works:
+# owner_address = "0xYourOwnerAddressHere"
+#
+# Whitelist: use `tapp-cli add-to-whitelist` after claiming (each change is a
+# measured runtime event). The old initial_whitelist config was removed.
 
 [boot]
 socket_path = "/var/run/docker.sock"
@@ -245,6 +250,35 @@ node_urls = [
 rpc_url = "https://evmrpc-testnet.0g.ai"
 contract_address = "0x..."
 ```
+
+## Claiming Ownership (runtime owner claim)
+
+CVM images are built **ownerless**: no owner is baked into the image, so a single
+image (and a single set of boot-chain reference values) serves every owner. A
+freshly booted tapp is UNCLAIMED — every owner-level RPC is rejected until someone
+claims it:
+
+```bash
+tapp-cli -s http://<tapp>:50051 -k 0x<your-key> claim-owner
+```
+
+- **First-come-first-served, exactly once per boot**: the request signer becomes
+  the owner; later claims fail with the current owner. The CLI verifies the
+  result end-to-end (server must report your address back as the live owner).
+- **Measured**: the claim is extended into the runtime measurement as a
+  `claim_config` event (same mechanism as `start_app`), so verifiers see WHO owns
+  the node in the attestation evidence and can reconcile it with the on-chain
+  registration — the owner moved from the golden values into the runtime event log.
+- **Restart-safe**: the claimed owner is persisted under `/run` (tmpfs) — a
+  tapp-server process restart cannot reopen the claim; a VM reboot clears both
+  the state and the RTMRs, so a rebooted node is claimable (and re-measured) again.
+- **Hijack window**: practically closed — don't expose :50051 before claiming
+  (cloud firewall), and claim right after boot. Even if raced, the intruder's
+  address is indelibly measured, your own claim fails immediately (instant
+  detection), and the box holds no secrets yet — delete and recreate.
+
+Legacy mode: setting `owner_address` in `config.toml` still works (the owner is
+claimed automatically at startup and also measured).
 
 ## On-chain Registration
 
@@ -319,21 +353,32 @@ tapp-cli -s http://<any-tapp>:50051 -k 0x<deployer-key> withdraw \
 
 ### Verifying an App
 
-`tapp-cli verify-app` checks that what a node actually runs matches what is registered on-chain.
+`tapp-cli verify-app` checks that what a node actually runs matches its reference values.
+Two independent axes select which references are enforced:
 
-**Chain mode** (pass `--contract` + `--rpc-url`): reads the registry, fetches evidence from every node's on-chain `teeUrl`, verifies each TDX quote via the CoCo Attestation Service, and reconciles the evidence (signer, compose, volumes, image) against the chain.
+- **`--contract` + `--rpc-url` → dynamic references** (on-chain): reconciles the runtime
+  events against the registry — signer, compose, volumes, image, and **owner** (the
+  `claim_config` event's owner vs the on-chain app owner) → `signer✓ compose✓ volumes✓ image✓ owner✓`.
+- **`--policy-ids` → static references** (AS-registered boot-chain values): the AS enforces
+  the policy and returns the AR4SI executables claim → `boot-chain ✓ (executables=3)`.
+
+Whichever axis has NO reference supplied, verify-app prints that side's **measured values
+verbatim** so you can compare manually:
+- no `--contract` → prints owner / compose / images as attested;
+- no `--policy-ids` → prints the boot-chain component digests in reference-value JSON
+  (`{"measurement.<shim|grub|kernel|initrd|kernel_cmdline|uki>.SHA-384": [...]}`), directly
+  diffable against `verifier/reference-values/<cloud>/<boot_format>/<version>/<env>.json`.
 
 ```bash
+# full verification: dynamic (chain) + static (policy)
 tapp-cli verify-app \
   --app-id my-app \
   --rpc-url https://evmrpc-testnet.0g.ai \
-  --contract 0x<TappRegistry>
+  --contract 0x<TappRegistry> \
+  --policy-ids 0g-tapp-<cloud>-<boot_format>-<version>-<env>
   # --as-endpoint host:port   # CoCo-AS gRPC endpoint, default 47.237.201.184:50004
-```
 
-**Direct mode** (omit `--contract`, pass `-s <server>`): verifies a single node's evidence + quote and shows what it attests, without on-chain reconciliation — useful for apps not yet registered.
-
-```bash
+# direct mode (single node, not yet registered): prints attested values verbatim
 tapp-cli -s http://<tapp>:50051 verify-app --app-id my-app
 ```
 

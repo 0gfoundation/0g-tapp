@@ -1,7 +1,7 @@
 ---
 name: 0g-tapp-cli
 description: Use this skill when the user wants to deploy, manage, or troubleshoot applications on a 0G Tapp (Trusted Application Platform) server using tapp-cli. Covers start/stop apps, on-chain registration, registry login, check task status, view logs, and manage docker compose deployments across multiple remote TEE servers.
-version: 1.3.0
+version: 1.4.0
 author: 0G Labs
 tags: [0g, tapp, tee, docker, deployment, cli, onchain]
 ---
@@ -20,11 +20,12 @@ Deploy and manage containerized applications on 0G Tapp TEE servers using `tapp-
 
 ## Keys & servers — read this first
 
-Each server has an **owner** address (set in its config). App/onchain operations require the right key:
+Each server has an **owner** address. From tapp-server v0.3.0, canonical images boot **UNCLAIMED** — owner-level RPCs are rejected until someone calls `claim-config`.
 
+- **Unclaimed server**: `get-tapp-info` shows empty Owner. Must run `claim-config` first before any owner-level op.
 - **Server ops** (start/stop/login/get-*): key must be the **server owner** (or whitelisted). Wrong key → `PermissionDenied`.
 - **On-chain** (`register-onchain` etc.): the SAME `--private-key` is used to BOTH auth the `--server` AND sign+pay the tx. So it must satisfy **three things at once**: server-authorized + the app's on-chain owner + funded (stake + gas). If they can't be the same address, do the on-chain part with raw `cast send` (see below) using the funded owner key, bypassing `--server`.
-- **Find a server's owner**: `tapp-cli -s <server> -k <anykey> get-tapp-info` (read-only; prints `Owner Address`). Then match the key whose address equals it.
+- **Find a server's owner**: `tapp-cli -s <server> get-tapp-info` (read-only; prints `Owner Address`, empty = unclaimed). Then match the key whose address equals it.
 - Convert a key → address: `docker run --rm --entrypoint cast ghcr.io/foundry-rs/foundry:latest wallet address 0x<key>`, or if you have `cast` installed locally: `cast wallet address 0x<key>`.
 
 Record which key maps to which server/owner in memory — it changes per deployment.
@@ -56,12 +57,30 @@ tapp-cli -s <server> -k 0x<key> get-service-logs -f <file> [-n 100] # tapp-serve
 tapp-cli -s <server> -k 0x<key> docker-logout                    # logout from Docker registry on this server
 ```
 
-### verify-app: boot-chain check (`--policy-ids`)
-- **`--policy-ids <id>` is what triggers the boot-chain check** (shim/grub/kernel/initrd/kernel_cmdline vs an image's reference values). **Without it**, the AS uses its default policy and **no `boot-chain` line is printed** — only `ear.status`/`tcb_status`.
+### verify-app: two independent reference axes
+- **`--contract`+`--rpc-url` = dynamic references** (on-chain): reconciles runtime events vs the registry → `reconcile : signer✓ compose✓ volumes✓ image✓ owner✓`. The **owner** check (v0.3.0+) compares the `claim_config` event's owner against the on-chain app owner (`✗` = hijacked/mismatched → Result ❌; `?` = no claim_config event, pre-0.3 image).
+- **`--policy-ids <id>` = static references** (AS boot-chain check: shim/grub/kernel/initrd/kernel_cmdline or uki vs the image's reference values).
+- **Whichever axis has NO reference, the measured values are printed verbatim**: no `--contract` → owner/compose/images as attested; no `--policy-ids` → boot-chain component digests in reference-value JSON (`{"measurement.<comp>.SHA-384": [...]}`), directly diffable against `verifier/reference-values/<cloud>/<boot_format>/<version>/<env>.json`.
 - Output line: `boot-chain : ✓ (executables=3, matches policy reference)` = matched; `✗ (executables=33, ...)` = did not match; `?` = policy set no executables claim. (`executables` is the AR4SI claim: **3** = approved boot chain, **33** = unrecognized.)
 - **`--as-endpoint <host:port>`** picks the Attestation Service (default `47.237.201.184:50004`, the shared AS). Point it at a self-hosted local AS (e.g. `127.0.0.1:50004`, see the `verifier/0g-tapp-verifier` submodule) to use RVPS-backed reference values.
-- **Policy ids** follow `0g-tapp-<tapp-server-version>-<env>` (e.g. `0g-tapp-v0.1.0-dev`), one per release × `{dev,prod}` — reference values live in `verifier/reference-values/<version>/<env>.json`. They must be registered on that AS first (the AS appends `_cpu`, so the id is stored as `<id>_cpu`); on the shared AS use `verifier/register-shared-as.sh <version> <env> [as-endpoint]`. Use the id whose reference values match the node's image.
+- **Policy ids** — two formats depending on build mode:
+  - **canonical** (v0.3.0+): `0g-tapp-<cloud>-<boot_format>-<version>-<env>` (e.g. `0g-tapp-gcp-grub-v0.3.0-dev`). Reference values at `verifier/reference-values/<cloud>/<boot_format>/<version>/<env>.json`.
+  - **custom** (per-owner): `0g-tapp-<cloud>-<boot_format>-<version>-<env>-<owner>`. Reference values at `.../env/<owner>.json`.
+  - Must be registered on the AS first (stored as `<id>_cpu`); use `verifier/register-shared-as.sh <cloud> <boot_format> <version> <env> [owner] [as-endpoint]`.
 - Note: `ear.status=affirming` also needs platform TCB `UpToDate`; `executables=3` alone (boot chain matched) is the boot-chain conclusion independent of TCB.
+
+### Claim ownership (v0.3.0+, canonical images)
+```bash
+# Must run before any owner-level op on a freshly booted canonical image:
+tapp-cli -s <server> -k 0x<key> claim-config                                # claim owner only
+tapp-cli -s <server> -k 0x<key> claim-config \
+  --chain-rpc-url https://evmrpc-testnet.0g.ai \
+  --chain-contract 0x<TappRegistry> \
+  --kbs-urls "http://kms-1:9091,http://kms-2:9091"                           # claim + set chain + KMS
+```
+- First-come-first-served, exactly once per boot. CLI verifies result end-to-end.
+- `--chain-*` and `--kbs-urls` optional if already baked into config.toml.
+- After VM reboot the server is UNCLAIMED again and must be claimed again.
 
 ### Server health & whitelist
 ```bash
@@ -160,7 +179,7 @@ Scans `volumes:` and uploads sources starting with `./` (files or dirs, recursiv
 
 | Symptom | Cause / fix |
 |---|---|
-| `PermissionDenied` | wrong key for this server; check `get-tapp-info` Owner, use matching key |
+| `PermissionDenied` | wrong key, or server is UNCLAIMED (v0.3.0+ canonical image) — run `claim-config` first |
 | `unauthorized: authentication required` (pull) | registry token expired → `docker-login` with fresh token, retry |
 | `required variable TAPP_REGISTRY is missing` (compose interpolation) | that var absent from the uploaded `.env` |
 | container stuck `restarting` | `get-app-logs --service <svc>` → missing env var / mount file |

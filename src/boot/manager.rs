@@ -194,13 +194,30 @@ impl DockerComposeManager {
             .into());
         }
 
-        // Resolve service -> image digest from the pulled (local) images
+        // Resolve service -> image digest from the pulled (local) images.
+        // Image refs must come from the INTERPOLATED compose (docker compose
+        // config resolves ${VAR} from the staged .env) — parsing the raw YAML
+        // returns literal "${VAR}/img" refs whose inspect fails, silently
+        // registering empty image hashes on-chain.
         let mut image_map = std::collections::BTreeMap::new();
-        for (service, image) in Self::compose_service_images(compose_content)? {
+        for (service, image) in Self::compose_service_images(&base_path).await? {
             let digest = Self::get_image_digest(&image).await.unwrap_or_else(|e| {
                 warn!(service = %service, image = %image, error = %e, "Failed to get image digest");
                 String::new()
             });
+            if digest.is_empty() {
+                // Loud failure: an empty digest would be registered on-chain and
+                // break verification later. The image was just pulled, so a
+                // missing digest means the ref didn't resolve — fail the task.
+                return Err(DockerError::ContainerOperationFailed {
+                    operation: "measure_images".to_string(),
+                    reason: format!(
+                        "No digest for service '{}' (image '{}') after pull — cannot register empty image hash",
+                        service, image
+                    ),
+                }
+                .into());
+            }
             image_map.insert(service, digest);
         }
 
@@ -212,23 +229,44 @@ impl DockerComposeManager {
         Ok(image_map)
     }
 
-    /// Parse service_name -> image reference from compose content.
+    /// Resolve service_name -> image reference from the INTERPOLATED compose:
+    /// runs `docker compose config --format json` in the staged app directory,
+    /// so ${VAR} refs are substituted from the staged .env (raw-YAML parsing
+    /// would return literal "${VAR}/img" strings — see pull_and_measure).
     /// Services without an `image` key (e.g. build-only) are skipped.
-    fn compose_service_images(compose_content: &str) -> TappResult<Vec<(String, String)>> {
-        let compose: serde_yaml::Value =
-            serde_yaml::from_str(compose_content).map_err(|e| TappError::InvalidParameter {
+    async fn compose_service_images(
+        base_path: &std::path::Path,
+    ) -> TappResult<Vec<(String, String)>> {
+        let output = Command::new("docker")
+            .current_dir(base_path)
+            .args(["compose", "-f", "docker-compose.yml", "config", "--format", "json"])
+            .output()
+            .await
+            .map_err(|e| DockerError::ContainerOperationFailed {
+                operation: "docker_compose_config".to_string(),
+                reason: format!("Failed to execute docker compose config: {}", e),
+            })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(DockerError::ContainerOperationFailed {
+                operation: "docker_compose_config".to_string(),
+                reason: format!("docker compose config failed: {}", stderr),
+            }
+            .into());
+        }
+
+        let config: serde_json::Value =
+            serde_json::from_slice(&output.stdout).map_err(|e| TappError::InvalidParameter {
                 field: "compose_content".to_string(),
-                reason: format!("Failed to parse compose file: {}", e),
+                reason: format!("Failed to parse docker compose config output: {}", e),
             })?;
 
         let mut result = Vec::new();
-        if let Some(services) = compose.get("services").and_then(|s| s.as_mapping()) {
+        if let Some(services) = config.get("services").and_then(|s| s.as_object()) {
             for (name, service) in services {
-                if let (Some(name), Some(image)) = (
-                    name.as_str(),
-                    service.get("image").and_then(|i| i.as_str()),
-                ) {
-                    result.push((name.to_string(), image.to_string()));
+                if let Some(image) = service.get("image").and_then(|i| i.as_str()) {
+                    result.push((name.clone(), image.to_string()));
                 }
             }
         }

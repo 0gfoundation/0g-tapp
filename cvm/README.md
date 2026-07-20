@@ -10,17 +10,23 @@ One CVM = one point in this grid; each combination has its own image, its own re
 | **cloud** | `gcp` \| `ali` | `CLOUD` | kernel + guest agent + publish target (see platform table) |
 | **boot_format** | `grub` \| `uki` | `BOOT_FORMAT` (default `grub` for any cloud; `uki` is opt-in) | boot chain ⇒ **shape of the measurement** (see below) |
 | **env** | `dev` (HARDEN=0) \| `prod` (HARDEN=1) | `HARDEN` | dev keeps cloud-init/SSH for debugging; prod purges it |
-| **owner** | `0x…` address | `OWNER_ADDRESS` | baked into `config.toml` → folded into the **initrd measurement** (an attested dimension) |
 | **version** | tapp-server release tag | `TAPP_SERVER_URL` | which tapp-server binary + image-name suffix |
+
+> **Two build modes** (`BUILD_MODE`, default `canonical`):
+> - **canonical** — owner-agnostic image: owner/chain/kbs are claimed at runtime
+>   (`tapp-cli claim-config`) as a measured `claim_config` event. One image and ONE
+>   reference set serve every owner. Requires tapp-server ≥ v0.3.0.
+> - **custom** — `OWNER_ADDRESS` baked into `config.toml` → folded into the **initrd
+>   measurement** → per-owner image + per-owner reference set (legacy behaviour).
 
 `cloud` and `boot_format` are **independent axes** — a CVM boots one way (one measurement chain), regardless of cloud. The measurement *shape* is decided by `boot_format`, not cloud:
 - **grub** → 5 components: `measurement.{shim,grub,kernel,initrd,kernel_cmdline}.SHA-384`
 - **uki**  → 1 component:  `measurement.uki.SHA-384` (kernel+initrd+cmdline fused into one signed EFI)
 
-Because they yield different images/measurements, **`boot_format` (like `cloud`, `env`, `owner`, `version`) is part of the identifiers**, so a grub and a uki build never clobber each other:
-- image name: `<imgbase>-<boot_format>-<version>-<owner>` (e.g. `og-tdx-dev-grub-v0-2-0-<40hex>`; owner has `0x` stripped + lowercased to fit GCP's 63-char limit)
-- reference value: `verifier/reference-values/<cloud>/<boot_format>/<version>/<env>/<owner>.json`
-- AS policy id: `0g-tapp-<cloud>-<boot_format>-<version>-<env>-<owner>`
+Because they yield different images/measurements, **`boot_format` (like `cloud`, `env`, `version`) is part of the identifiers**, so a grub and a uki build never clobber each other:
+- image name: `<imgbase>-<boot_format>-<version>` (e.g. `og-tdx-dev-grub-v0-3-0`); custom mode appends `-<owner>`
+- reference value: canonical `…/<version>/<env>.json`; custom `…/<version>/<env>/<owner>.json`
+- AS policy id: canonical `0g-tapp-<cloud>-<boot_format>-<version>-<env>`; custom appends `-<owner>`
 
 ### Platform differences (everything else is shared)
 | | GCP (`gcp`) | Alibaba Cloud (`ali`) |
@@ -76,13 +82,15 @@ See `cryptpilot-gcp-boot-fix.md` §0.1 for details.
 ```bash
 export LIBGUESTFS_BACKEND=direct
 CLOUD=gcp \                       # or CLOUD=ali (default gcp; picks kernel/guest/boot-format/publish)
-OWNER_ADDRESS=0x<your-owner-address> \
 KBS_URLS='"http://<kbs-host-1>:9091", "http://<kbs-host-2>:9091"' \
 ./build-tapp.sh <bare-ubuntu-24.04.qcow2> tapp.qcow2
 ```
-- **Required** (no defaults — the build aborts if unset, so no deployment-specific value is ever baked in):
-  - `OWNER_ADDRESS` — tapp-server owner address, written to `config.toml` `[server.permission]`.
+- **Required**:
   - `KBS_URLS` — KBS node URLs for `[kbs] node_urls`, comma-separated and quoted as shown.
+- **Build mode**: `BUILD_MODE=canonical` (default) builds an owner-agnostic image — the tapp
+  boots unclaimed and owner/config are claimed at runtime via `tapp-cli claim-config`
+  (measured event). `BUILD_MODE=custom` requires `OWNER_ADDRESS=0x…` and bakes it into
+  `config.toml` `[server.permission]` (per-owner reference values, legacy).
 - tapp-server is downloaded by default from GitHub v0.1.0 (includes the guest-components `8d71a3b4` fix, RTMR OK); if you have it locally, set `TAPP_SERVER_BIN=<path>`.
 - Storage / Sysbox knobs: `DATA_ROOT` (docker data-root, default `/data/docker`), `CONTAINERD_ROOT` (default `/data/containerd`), `DOCKER_VERSION` (default `5:27.5.1-…noble`; empty = repo default), `ENABLE_SYSBOX` / `SYSBOX_VERSION` (default `0.7.0`).
 - Publish (Stage C, opt-in): `PUBLISH_AS=<gcp-image-name>` publishes the built image to GCP after the build (see [Publish to GCP](#publish-to-gcp-stage-c)); `GCS_BUCKET` / `GCP_PROJECT` / `GUEST_OS_FEATURES` pass through.
@@ -125,7 +133,7 @@ The cryptpilot rootfs writable overlay is **RAM-backed (zram) and ephemeral** �
 ## Multi-tenant container isolation — Sysbox (issue #21, opt-in)
 For hostile-multi-tenant workloads (e.g. 0g-sandbox), build with `ENABLE_SYSBOX=1` to install [Sysbox](https://github.com/nestybox/sysbox) and register `sysbox-runc` as a dockerd runtime, so in-container `root` is user-namespace-remapped (a kernel CVE in a sandbox is no longer host-equivalent):
 ```bash
-ENABLE_SYSBOX=1 OWNER_ADDRESS=0x... KBS_URLS='...' ./build-tapp.sh base.qcow2 gcp-tapp.qcow2
+ENABLE_SYSBOX=1 KBS_URLS='...' ./build-tapp.sh base.qcow2 gcp-tapp.qcow2
 ```
 - Only the runtime registration is gated behind `ENABLE_SYSBOX`; the `/data` storage pinning above happens regardless. Sysbox's own data store is also moved off the RAM root: `sysbox-mgr --data-root` → **`/data/sysbox`** (it holds inner-container images).
 - **Docker is pinned to 27.5.1** (`DOCKER_VERSION`). Docker 28+/29+ emit the Linux *time namespace* in the OCI spec, which `sysbox-runc` rejects (`namespace ... does not exist`); Nestybox supports Docker 20.10–27.x only.
@@ -154,7 +162,7 @@ gcloud auth login            # gcloud + gsutil must be authenticated with write 
 ```
 Defaults `GCS_BUCKET=gs://tapp-image`, `GCP_PROJECT=g-devops`, `GUEST_OS_FEATURES=UEFI_COMPATIBLE,GVNIC,SEV_CAPABLE,TDX_CAPABLE` (all overridable). It refuses to clobber an existing image name (delete it, or publish under a new name). Or fold it into the build as an opt-in final stage:
 ```bash
-PUBLISH_AS=og-tdx-dev ENABLE_SYSBOX=1 OWNER_ADDRESS=0x... KBS_URLS='...' ./build-tapp.sh base.qcow2 og-tdx-dev.qcow2
+PUBLISH_AS=og-tdx-dev ENABLE_SYSBOX=1 KBS_URLS='...' ./build-tapp.sh base.qcow2 og-tdx-dev.qcow2
 ```
 Create a confidential instance from the published image with `--image=<name> --image-project=g-devops --confidential-compute-type=TDX`.
 

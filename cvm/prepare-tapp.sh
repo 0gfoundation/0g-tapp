@@ -73,7 +73,46 @@ if [ "$CLOUD" = gcp ]; then
     echo "vmlinuz -> $k"
   '
 else
-  echo "==> [1/4] CLOUD=$CLOUD: keeping the base generic kernel (no gcp kernel swap / fix A)"
+  # Ali (and other clouds) boot the generic kernel via virtio — but the noble GA
+  # generic kernel is 6.8, which lacks the TDX RTMR runtime-measurement interface
+  # (sysfs measurements/rtmrN:sha384 + EXTEND_RTMR ioctl, mainlined in 6.16).
+  # Without it every extend_runtime_measurement fails (claim_config/start_app!).
+  # Install the HWE generic kernel (≥6.16, same generation as the gcp kernel).
+  if [ "$INSTALL_KERNEL" = 1 ]; then
+    echo "==> [1/4] CLOUD=$CLOUD: installing newest COMPLETE generic kernel (TDX RTMR extend needs >=6.16)"
+    # Not the bare HWE meta: it can race ahead of the archive (e.g. pulls a 7.0 image
+    # whose linux-modules-extra-* is not published yet, which cryptpilot-convert needs
+    # for zram). Pick the newest versioned generic kernel that HAS its modules-extra.
+    vc_args=(-a "$WORK" --run-command '
+      set -e
+      apt-get update
+      v=$(apt-cache pkgnames linux-modules-extra- \
+          | grep -E "^linux-modules-extra-[0-9]+\.[0-9]+\.[0-9]+-[0-9]+-generic$" \
+          | sed "s/^linux-modules-extra-//" | sort -V | tail -1)
+      [ -n "$v" ] || { echo "ERROR: no generic kernel with modules-extra found"; exit 1; }
+      case "$v" in 6.[0-9].*|6.1[0-5].*|[1-5].*) echo "ERROR: newest complete kernel $v lacks TDX RTMR extend (>=6.16 needed)"; exit 1 ;; esac
+      echo "installing kernel $v"
+      DEBIAN_FRONTEND=noninteractive apt-get install -y "linux-image-$v" "linux-modules-extra-$v"
+    ')
+    # Purge the GA 6.8 kernel: it lacks TDX RTMR extend, and (grub mode) would
+    # linger as an alternate bootable menu entry. The kernel installed above
+    # stays, satisfying convert's need for one *-generic kernel.
+    vc_args+=(--run-command 'apt-get purge -y "linux-image-6.8.*" "linux-modules-6.8.*" "linux-headers-6.8*" 2>/dev/null || true; apt-get autoremove -y || true')
+    [ -n "$PURGE_KERNEL" ] && vc_args+=(--run-command "apt-get autoremove --purge $PURGE_KERNEL -y || true")
+    vc_args+=(--run-command 'update-grub')
+    virt-customize "${vc_args[@]}"
+  else
+    echo "==> [1/4] skipping kernel install (INSTALL_KERNEL=0)"
+  fi
+  echo "==> [fix A] point /boot/vmlinuz and initrd.img symlinks at the newest generic kernel"
+  virt-customize -a "$WORK" --run-command '
+    set -e
+    k=$(ls /boot/vmlinuz-*-generic 2>/dev/null | sort -V | tail -1 | sed "s#/boot/##")
+    [ -n "$k" ] || { echo "ERROR: no generic kernel (vmlinuz-*-generic) in the image"; exit 1; }
+    ln -sf "$k" /boot/vmlinuz
+    ln -sf "initrd.img-${k#vmlinuz-}" /boot/initrd.img
+    echo "vmlinuz -> $k"
+  '
 fi
 
 # --- [1b/4] boot-format prerequisites (BOOT_FORMAT-specific): UKI needs dracut + systemd-boot ---

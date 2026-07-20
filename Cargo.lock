@@ -5512,7 +5512,7 @@ checksum = "55937e1799185b12863d447f42597ed69d9928686b8d88a1df17376a097d8369"
 
 [[package]]
 name = "tapp-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -5550,6 +5550,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha2",
  "sha3",
  "thiserror 1.0.69",
  "tokio",
@@ -5562,7 +5563,7 @@ dependencies = [
 
 [[package]]
 name = "tapp-server"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-recursion",

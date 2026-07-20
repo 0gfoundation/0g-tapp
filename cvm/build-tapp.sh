@@ -17,7 +17,9 @@ export DEBIAN_FRONTEND=noninteractive
 # ===== Tunables =====
 TAPP_SERVER_BIN="${TAPP_SERVER_BIN:-}"                              # path to a local tapp-server binary; empty -> download from URL
 TAPP_SERVER_URL="${TAPP_SERVER_URL:-https://github.com/0gfoundation/0g-tapp/releases/download/v0.1.0/tapp-server}"
-OWNER_ADDRESS="${OWNER_ADDRESS:-}"   # REQUIRED: tapp-server owner address (0x...), written to config.toml [server.permission]
+BUILD_MODE="${BUILD_MODE:-canonical}"  # canonical (default): owner-agnostic image, one refval set for all owners.
+                                       # custom: OWNER_ADDRESS baked in, per-owner initrd measurement + refval set.
+OWNER_ADDRESS="${OWNER_ADDRESS:-}"     # Required when BUILD_MODE=custom; ignored in canonical mode.
 KBS_URLS="${KBS_URLS:-}"             # REQUIRED: KBS node URLs for [kbs] node_urls, comma-separated and quoted, e.g. KBS_URLS='"http://host1:9091", "http://host2:9091"'
 DNS_FALLBACK="${DNS_FALLBACK:-8.8.8.8 8.8.4.4 1.1.1.1}"
 HARDEN="${HARDEN:-1}"                                   # 1=hardened (purge Tier1/2 + mask getty + replace netplan); 0=dev
@@ -62,8 +64,24 @@ PUBLISH_AS="${PUBLISH_AS:-}"
 IN="${1:?usage: $0 <ubuntu-24.04-base.qcow2> <output.qcow2>}"
 OUT="${2:?usage: $0 <ubuntu-24.04-base.qcow2> <output.qcow2>}"
 [ -f "$IN" ] || { echo "input image not found: $IN" >&2; exit 1; }
-[ -n "$OWNER_ADDRESS" ] || { echo "OWNER_ADDRESS is required, e.g. OWNER_ADDRESS=0x... $0 ..." >&2; exit 1; }
-[ -n "$KBS_URLS" ] || { echo "KBS_URLS is required, e.g. KBS_URLS='\"http://host1:9091\", \"http://host2:9091\"' $0 ..." >&2; exit 1; }
+if [ "$BUILD_MODE" = "custom" ]; then
+  [ -n "$OWNER_ADDRESS" ] || { echo "BUILD_MODE=custom requires OWNER_ADDRESS" >&2; exit 1; }
+  echo "Build mode: custom (baking OWNER_ADDRESS=$OWNER_ADDRESS into image)" >&2
+else
+  BUILD_MODE=canonical
+  OWNER_ADDRESS=""   # canonical mode never bakes an owner, even if accidentally set
+  echo "Build mode: canonical (owner-agnostic, claim at runtime via ClaimConfig RPC)" >&2
+fi
+# KBS_URLS is optional in canonical mode (can be supplied at runtime via ClaimConfig --kbs-urls);
+# required in custom mode so the baked config is complete.
+# Normalize "empty-looking" values: a literal [] (someone meaning "none") would otherwise be
+# interpolated into node_urls = [$KBS_URLS] as the nested array [[]] — broken TOML semantics.
+[ "$KBS_URLS" = "[]" ] && KBS_URLS=""
+if [ "$BUILD_MODE" = "custom" ] && [ -z "$KBS_URLS" ]; then
+  echo "BUILD_MODE=custom requires KBS_URLS, e.g. KBS_URLS='\"http://host1:9091\"' $0 ..." >&2
+  exit 1
+fi
+[ -n "$KBS_URLS" ] && echo "KBS: baking node_urls into config.toml" >&2 || echo "KBS: not baked (supply at runtime via ClaimConfig --kbs-urls)" >&2
 [ -f "$HERE/prepare-tapp.sh" ] || { echo "missing prepare-tapp.sh (must be in the same directory as this script)" >&2; exit 1; }
 [ -d "$CONFIG_DIR" ] || { echo "CONFIG_DIR not found: $CONFIG_DIR" >&2; exit 1; }
 [ -f "$FDE_PACKAGE" ] || { echo "FDE_PACKAGE not found: $FDE_PACKAGE" >&2; exit 1; }
@@ -100,6 +118,11 @@ Group=root
 # (/run/tapp/tapp.sock, see config.toml [server]) — app containers bind-mount this dir/socket.
 RuntimeDirectory=tapp
 RuntimeDirectoryMode=0755
+# Preserve /run/tapp across process restarts: the claimed_owner file must
+# survive `systemctl restart` (process restart) but be cleared on VM reboot
+# (tmpfs lifetime = same as RTMR lifetime). Without this, systemd removes
+# /run/tapp on every stop, wiping the claim and allowing re-claim on restart.
+RuntimeDirectoryPreserve=yes
 ExecStart=/usr/local/bin/tapp-server
 Restart=always
 RestartSec=10
@@ -114,6 +137,10 @@ NoNewPrivileges=true
 [Install]
 WantedBy=multi-user.target
 EOF
+
+# legacy baked owner: only emit the line when OWNER_ADDRESS was provided
+OWNER_LINE=""
+[ -n "$OWNER_ADDRESS" ] && OWNER_LINE="owner_address = \"$OWNER_ADDRESS\""
 
 cat > "$TMPD/config.toml" <<EOF
 [logging]
@@ -131,8 +158,10 @@ unix_socket_path = "/run/tapp/tapp.sock"
 
 [server.permission]
 enabled = true
-owner_address = "$OWNER_ADDRESS"
-initial_whitelist = []
+# owner: unset ⇒ boots UNCLAIMED; first valid `tapp-cli claim-owner` signer
+# becomes the owner (measured claim_owner runtime event). A baked owner
+# (legacy) re-introduces per-owner reference values.
+$OWNER_LINE
 
 [kbs]
 node_urls = [$KBS_URLS]

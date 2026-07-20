@@ -42,7 +42,8 @@ for t in ossutil aliyun python3; do command -v "$t" >/dev/null || { echo "missin
 # An existing image name is immutable by default (a published version image may back running
 # instances; silently replacing it would change its measurements and break their attestation).
 # OVERWRITE=1 opts into delete-then-recreate for deliberate re-runs of the same version.
-EXIST_ID="$(aliyun ecs DescribeImages --RegionId "$ALIYUN_REGION" --ImageName "$NAME" 2>/dev/null \
+EXIST_ID="$(aliyun ecs DescribeImages --RegionId "$ALIYUN_REGION" --ImageName "$NAME" \
+    --Status Creating,Waiting,Available,UnAvailable,CreateFailed,Deprecated 2>/dev/null \
   | python3 -c 'import sys,json; im=json.load(sys.stdin).get("Images",{}).get("Image",[]); print(im[0]["ImageId"] if im else "")')"
 if [ -n "$EXIST_ID" ]; then
   if [ "$OVERWRITE" = 1 ]; then
@@ -83,18 +84,19 @@ aliyun ecs ModifyImageAttribute \
   --Features.NvmeSupport supported --force >/dev/null
 
 echo "==> [C4] wait for image $IMAGE_ID to become Available (import task runs async; up to ${POLL_MAX}s)"
-# NOTE: DescribeImages defaults to Status=Available, so an importing image (Status=Creating) returns
-# NOTHING — an empty result means "still importing / not visible yet", NOT failure. Ask for the
-# in-progress statuses explicitly, and only treat CreateFailed (or the timeout) as fatal.
+# NOTE: DescribeImages defaults to Status=Available ONLY — a just-imported image
+# (Creating/Waiting) is invisible without an explicit multi-status filter, which
+# would misread "still importing" as "gone". Query all lifecycle states.
 t=0
 while :; do
   status="$(aliyun ecs DescribeImages --RegionId "$ALIYUN_REGION" --ImageId "$IMAGE_ID" \
-    --Status Creating,Waiting,Available,CreateFailed 2>/dev/null \
+      --Status Creating,Waiting,Available,UnAvailable,CreateFailed,Deprecated 2>/dev/null \
     | python3 -c 'import sys,json; im=json.load(sys.stdin).get("Images",{}).get("Image",[]); print(im[0]["Status"] if im else "Pending")')"
   case "$status" in
     Available) echo "    image is Available"; break ;;
-    CreateFailed) echo "!! import failed (status=CreateFailed)" >&2; exit 1 ;;
-    *) [ "$t" -ge "$POLL_MAX" ] && { echo "!! timed out waiting (last status=$status)" >&2; exit 1; }
+    CreateFailed|UnAvailable) echo "!! import failed (status=$status)" >&2; exit 1 ;;
+    *) # Creating / Waiting / Pending (not yet listed) → keep polling
+       [ "$t" -ge "$POLL_MAX" ] && { echo "!! timed out waiting (last status=$status)" >&2; exit 1; }
        sleep 20; t=$((t+20)); echo "    status=$status (${t}s)" ;;
   esac
 done

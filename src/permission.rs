@@ -29,10 +29,18 @@ pub struct AppOwnership {
     pub stopped_at: Option<i64>,
 }
 
-/// Permission manager - manages whitelist and app ownership
+/// Permission manager - manages the (claimable) tapp owner, whitelist and app ownership
 pub struct PermissionManager {
-    /// Tapp owner EVM address (from config)
-    tapp_owner_address: String,
+    /// Tapp owner EVM address. `None` = unclaimed: nobody holds Owner
+    /// permission until `claim_owner` succeeds (first-come-first-served via
+    /// the ClaimOwner RPC) or an owner is restored at startup (from config or
+    /// the persisted claim of the current boot).
+    tapp_owner_address: RwLock<Option<String>>,
+
+    /// Where the claimed owner is persisted so a tapp-server process restart
+    /// within the same boot cannot reopen the claim. Lives on tmpfs (/run) by
+    /// design: cleared on VM reboot, exactly matching the RTMR lifetime.
+    owner_state_path: Option<std::path::PathBuf>,
 
     /// Whitelist of EVM addresses allowed to start apps
     whitelist: Arc<RwLock<HashSet<String>>>,
@@ -42,16 +50,25 @@ pub struct PermissionManager {
 }
 
 impl PermissionManager {
-    pub fn new(tapp_owner_address: String) -> Self {
+    pub fn new(tapp_owner_address: Option<String>) -> Self {
         Self {
-            tapp_owner_address: Self::normalize_address(&tapp_owner_address),
+            tapp_owner_address: RwLock::new(
+                tapp_owner_address.map(|a| Self::normalize_address(&a)),
+            ),
+            owner_state_path: None,
             whitelist: Arc::new(RwLock::new(HashSet::new())),
             app_ownership: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
+    /// Enable owner-claim persistence at `path` (see `owner_state_path`).
+    pub fn with_owner_state_path(mut self, path: std::path::PathBuf) -> Self {
+        self.owner_state_path = Some(path);
+        self
+    }
+
     /// Normalize EVM address (lowercase, with 0x prefix)
-    fn normalize_address(addr: &str) -> String {
+    pub fn normalize_address(addr: &str) -> String {
         let addr = addr.trim().to_lowercase();
         if addr.starts_with("0x") {
             addr
@@ -60,11 +77,12 @@ impl PermissionManager {
         }
     }
 
-    /// Get permission level for an EVM address
+    /// Get permission level for an EVM address.
+    /// While the tapp is unclaimed, nobody has Owner permission.
     pub async fn get_permission(&self, evm_address: &str) -> Permission {
         let addr = Self::normalize_address(evm_address);
 
-        if addr == self.tapp_owner_address {
+        if self.is_owner(&addr).await {
             return Permission::Owner;
         }
 
@@ -73,6 +91,72 @@ impl PermissionManager {
         }
 
         Permission::Public
+    }
+
+    /// Whether `evm_address` is the claimed tapp owner (false while unclaimed).
+    pub async fn is_owner(&self, evm_address: &str) -> bool {
+        let addr = Self::normalize_address(evm_address);
+        self.tapp_owner_address.read().await.as_deref() == Some(addr.as_str())
+    }
+
+    /// The claimed tapp owner address, if any.
+    pub async fn owner_address(&self) -> Option<String> {
+        self.tapp_owner_address.read().await.clone()
+    }
+
+    /// Claim tapp ownership for `evm_address` (first-come-first-served).
+    /// Succeeds exactly once; returns the normalized owner address.
+    /// Fails with the current owner if already claimed.
+    pub async fn claim_owner(&self, evm_address: &str) -> Result<String, String> {
+        let addr = Self::normalize_address(evm_address);
+        let mut owner = self.tapp_owner_address.write().await;
+        match &*owner {
+            Some(current) => Err(current.clone()),
+            None => {
+                *owner = Some(addr.clone());
+                Ok(addr)
+            }
+        }
+    }
+
+    /// Roll back a just-committed claim (only used when the measurement
+    /// extension for the claim fails, before anything was persisted).
+    pub async fn rollback_claim(&self) {
+        *self.tapp_owner_address.write().await = None;
+    }
+
+    /// Persist the claimed owner to `owner_state_path` (no-op when unset).
+    pub async fn persist_owner(&self) -> std::io::Result<()> {
+        let Some(path) = &self.owner_state_path else {
+            return Ok(());
+        };
+        let Some(owner) = self.owner_address().await else {
+            return Ok(());
+        };
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, owner)
+    }
+
+    /// Read the owner persisted by a previous process of the current boot.
+    pub fn load_persisted_owner(&self) -> Option<String> {
+        let path = self.owner_state_path.as_ref()?;
+        let content = std::fs::read_to_string(path).ok()?;
+        let addr = content.trim();
+        if addr.is_empty() {
+            return None;
+        }
+        Some(Self::normalize_address(addr))
+    }
+
+    /// Set the owner directly (startup restore from config/persisted state).
+    /// Unlike `claim_owner` this overwrites unconditionally — callers resolve
+    /// config/persisted conflicts before calling.
+    pub async fn set_owner(&self, evm_address: &str) -> String {
+        let addr = Self::normalize_address(evm_address);
+        *self.tapp_owner_address.write().await = Some(addr.clone());
+        addr
     }
 
     /// Add address to whitelist (tapp owner only)
@@ -121,7 +205,7 @@ impl PermissionManager {
         let addr = Self::normalize_address(evm_address);
 
         // Tapp owner can manage all apps
-        if addr == self.tapp_owner_address {
+        if self.is_owner(&addr).await {
             return true;
         }
 
@@ -143,10 +227,6 @@ impl PermissionManager {
         self.app_ownership.read().await.values().cloned().collect()
     }
 
-    /// Get tapp owner address
-    pub fn get_tapp_owner_address(&self) -> &str {
-        &self.tapp_owner_address
-    }
 }
 
 #[cfg(test)]
@@ -155,7 +235,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_permission_levels() {
-        let pm = PermissionManager::new("0x1234567890123456789012345678901234567890".to_string());
+        let pm = PermissionManager::new(Some(
+            "0x1234567890123456789012345678901234567890".to_string(),
+        ));
 
         // Test tapp owner
         let perm = pm
@@ -180,8 +262,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_unclaimed_then_claim() {
+        let pm = PermissionManager::new(None);
+        let alice = "0xABCDEFabcdefABCDEFabcdefabcdefABCDEFabcd";
+        let bob = "0x1234567890123456789012345678901234567890";
+
+        // Unclaimed: nobody is owner
+        assert!(pm.owner_address().await.is_none());
+        assert_eq!(pm.get_permission(alice).await, Permission::Public);
+        assert!(!pm.can_manage_app("any-app", alice).await);
+
+        // First claim wins (address normalized)
+        let owner = pm.claim_owner(alice).await.unwrap();
+        assert_eq!(owner, "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
+        assert_eq!(pm.get_permission(alice).await, Permission::Owner);
+
+        // Second claim rejected, reports current owner
+        let err = pm.claim_owner(bob).await.unwrap_err();
+        assert_eq!(err, owner);
+        assert_eq!(pm.get_permission(bob).await, Permission::Public);
+
+        // Rollback reopens the claim (extend-measurement failure path)
+        pm.rollback_claim().await;
+        assert!(pm.owner_address().await.is_none());
+        pm.claim_owner(bob).await.unwrap();
+        assert_eq!(pm.get_permission(bob).await, Permission::Owner);
+    }
+
+    #[tokio::test]
+    async fn test_owner_persistence_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("tapp-owner-test-{}", std::process::id()));
+        let state = dir.join("claimed_owner");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let pm = PermissionManager::new(None).with_owner_state_path(state.clone());
+        assert!(pm.load_persisted_owner().is_none());
+
+        pm.claim_owner("0xABCDEFabcdefABCDEFabcdefabcdefABCDEFabcd")
+            .await
+            .unwrap();
+        pm.persist_owner().await.unwrap();
+
+        // A fresh manager (process restart) restores the claim from disk
+        let pm2 = PermissionManager::new(None).with_owner_state_path(state);
+        let restored = pm2.load_persisted_owner().unwrap();
+        assert_eq!(restored, "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
+        pm2.set_owner(&restored).await;
+        assert!(pm2.is_owner(&restored).await);
+        // ... and the claim stays closed
+        assert!(pm2.claim_owner("0x1234").await.is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn test_app_ownership_lifecycle() {
-        let pm = PermissionManager::new("0x1234567890123456789012345678901234567890".to_string());
+        let pm = PermissionManager::new(Some(
+            "0x1234567890123456789012345678901234567890".to_string(),
+        ));
         let app_owner = "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd";
 
         // Record ownership

@@ -1,7 +1,8 @@
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use tapp_common::proto::{
-    tapp_service_client::TappServiceClient, AddToWhitelistRequest, DockerLoginRequest,
+    tapp_service_client::TappServiceClient, AddToWhitelistRequest, ClaimConfigRequest,
+    DockerLoginRequest,
     DockerLogoutRequest, GetAppContainerStatusRequest, GetAppInfoRequest, GetAppKeyRequest,
     GetAppLogsRequest, GetAppSecretKeyRequest, GetEvidenceRequest, GetSecretResourceRequest,
     GetServiceLogsRequest, GetServiceStatusRequest, GetTappInfoRequest, GetTaskStatusRequest,
@@ -271,6 +272,27 @@ enum Commands {
     },
 
     /// Add address to whitelist (owner only)
+    /// Claim this tapp: set owner + runtime config in one measured step.
+    ///
+    /// The signer becomes the tapp owner. Optionally supply chain and KBS
+    /// config (dynamic mode: image ships empty, first ClaimConfig call
+    /// configures everything). Succeeds exactly once per boot; the full config
+    /// is extended into the runtime measurement so verifiers see it.
+    ClaimConfig {
+        /// On-chain TappRegistry RPC URL (optional)
+        #[arg(long)]
+        chain_rpc_url: Option<String>,
+
+        /// TappRegistry contract address (optional)
+        #[arg(long)]
+        chain_contract: Option<String>,
+
+        /// KMS cluster node URLs, comma-separated (optional)
+        /// e.g. "http://kms-1:9091,http://kms-2:9091"
+        #[arg(long)]
+        kbs_urls: Option<String>,
+    },
+
     AddToWhitelist {
         /// EVM address to add
         #[arg(short, long)]
@@ -652,6 +674,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             let private_key = require_private_key(&cli.private_key)?;
             stop_service(&cli.server, app_id, service_name, private_key).await?;
+        }
+        Commands::ClaimConfig {
+            chain_rpc_url,
+            chain_contract,
+            kbs_urls,
+        } => {
+            let private_key = require_private_key(&cli.private_key)?;
+            let kbs_node_urls: Vec<String> = kbs_urls
+                .unwrap_or_default()
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect();
+            claim_config(
+                &cli.server,
+                private_key,
+                chain_rpc_url.unwrap_or_default(),
+                chain_contract.unwrap_or_default(),
+                kbs_node_urls,
+            )
+            .await?;
         }
         Commands::AddToWhitelist { address } => {
             let private_key = require_private_key(&cli.private_key)?;
@@ -1294,6 +1338,28 @@ fn boot_chain_line(executables: Option<i64>, show: bool) -> Option<String> {
     })
 }
 
+/// Print boot-chain component digests as reference-value JSON (same shape as
+/// verifier/reference-values/.../<env>.json) so the output can be diffed/copied.
+fn print_boot_measurements(measurements: &[(String, String)], indent: &str) {
+    let mut grouped: serde_json::Map<String, serde_json::Value> = Default::default();
+    for (component, hash) in measurements {
+        let key = format!("measurement.{}.SHA-384", component);
+        let arr = grouped.entry(key).or_insert_with(|| serde_json::json!([]));
+        if let Some(a) = arr.as_array_mut() {
+            let v = serde_json::json!(hash);
+            if !a.contains(&v) {
+                a.push(v);
+            }
+        }
+    }
+    println!("{}boot-chain (no policy — reference-value format):", indent);
+    let json =
+        serde_json::to_string_pretty(&serde_json::Value::Object(grouped)).unwrap_or_default();
+    for line in json.lines() {
+        println!("{}  {}", indent, line);
+    }
+}
+
 async fn verify_app_cmd(
     server: &str,
     app_id: &str,
@@ -1313,8 +1379,15 @@ async fn verify_app_cmd(
         println!("  server      : {}", d.server);
         println!("  signer      : {}  (attested in report_data)", d.signer);
         println!("  AS          : ear.status={} tcb_status={} advisories={}", d.ear_status, d.tcb_status, d.advisories);
-        if let Some(l) = boot_chain_line(d.boot_executables, show_boot) {
-            println!("  {}", l);
+        if show_boot {
+            if let Some(l) = boot_chain_line(d.boot_executables, show_boot) {
+                println!("  {}", l);
+            }
+        } else if !d.boot_measurements.is_empty() {
+            print_boot_measurements(&d.boot_measurements, "  ");
+        }
+        if let Some(owner) = &d.claimed_owner {
+            println!("  owner       : {}  (from claim_config event; no chain comparison in direct mode)", owner);
         }
         if !d.compose_hash.is_empty() {
             println!("  compose     : {}", d.compose_hash);
@@ -1353,12 +1426,29 @@ async fn verify_app_cmd(
             "    AS         : ear.status={} tcb_status={} advisories={}",
             n.ear_status, n.tcb_status, n.advisories
         );
+        let owner_str = match &n.owner_claim {
+            Some(Ok(_))  => "✓",
+            Some(Err(_)) => "✗",
+            None         => "?",
+        };
         println!(
-            "    reconcile  : signer{} compose{} volumes{} image{}",
-            yn(n.signer_ok), yn(n.compose_ok), yn(n.volumes_ok), yn(n.image_ok)
+            "    reconcile  : signer{} compose{} volumes{} image{} owner{}",
+            yn(n.signer_ok), yn(n.compose_ok), yn(n.volumes_ok), yn(n.image_ok), owner_str
         );
-        if let Some(l) = boot_chain_line(n.boot_executables, show_boot) {
-            println!("    {}", l);
+        if let Some(Err(claimed)) = &n.owner_claim {
+            println!("    owner      : ✗ claim_config says {} but on-chain owner differs", claimed);
+            all_ok = false;
+        } else if let Some(Ok(claimed)) = &n.owner_claim {
+            println!("    owner      : ✓ {}", claimed);
+        } else {
+            println!("    owner      : ? no claim_config event in eventlog");
+        }
+        if show_boot {
+            if let Some(l) = boot_chain_line(n.boot_executables, show_boot) {
+                println!("    {}", l);
+            }
+        } else if !n.boot_measurements.is_empty() {
+            print_boot_measurements(&n.boot_measurements, "    ");
         }
         if !n.note.is_empty() {
             println!("    note       : {}", n.note);
@@ -1695,6 +1785,86 @@ async fn stop_service(
     Ok(())
 }
 
+async fn claim_config(
+    server: &str,
+    private_key: String,
+    chain_rpc_url: String,
+    chain_contract_address: String,
+    kbs_node_urls: Vec<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use ethers::signers::Signer;
+
+    let key_bytes = hex::decode(private_key.trim_start_matches("0x"))
+        .map_err(|e| format!("Invalid private key: {}", e))?;
+    let wallet = ethers::signers::LocalWallet::from_bytes(&key_bytes)
+        .map_err(|e| format!("Invalid private key: {}", e))?;
+    let my_address = format!("0x{:x}", wallet.address());
+
+    let mut client = create_client(server).await?;
+
+    let mut request = Request::new(ClaimConfigRequest {
+        chain_rpc_url: chain_rpc_url.clone(),
+        chain_contract_address: chain_contract_address.clone(),
+        kbs_node_urls: kbs_node_urls.clone(),
+    });
+    add_signature_metadata(&mut request, &private_key, "ClaimConfig")?;
+
+    let result = match client.claim_config(request).await {
+        Ok(response) => response.into_inner(),
+        Err(status) if status.code() == tonic::Code::AlreadyExists => {
+            eprintln!("✗ {}", status.message());
+            std::process::exit(1);
+        }
+        Err(e) => return Err(e.into()),
+    };
+
+    if !result.success {
+        eprintln!("✗ {}", result.message);
+        std::process::exit(1);
+    }
+
+    println!("✓ Tapp config claimed");
+    println!("  Owner:    {}", result.owner_address);
+    if !chain_contract_address.is_empty() {
+        println!("  Chain:    {} @ {}", chain_contract_address, chain_rpc_url);
+    }
+    if !kbs_node_urls.is_empty() {
+        println!("  KBS:      {}", kbs_node_urls.join(", "));
+    }
+
+    if result.owner_address != my_address {
+        eprintln!(
+            "⚠️  Server reported owner {} but this key is {} — investigate!",
+            result.owner_address, my_address
+        );
+        std::process::exit(1);
+    }
+
+    // Close the loop: re-read the server's live owner state
+    let info = client
+        .get_tapp_info(Request::new(GetTappInfoRequest {}))
+        .await?
+        .into_inner();
+    let live_owner = info
+        .config
+        .as_ref()
+        .and_then(|c| c.server.as_ref())
+        .map(|s| s.owner_address.clone())
+        .unwrap_or_default();
+
+    if live_owner == my_address {
+        println!("  Verified: server now reports this address as owner");
+    } else {
+        eprintln!(
+            "⚠️  Verification failed: server reports owner '{}' (expected {})",
+            live_owner, my_address
+        );
+        std::process::exit(1);
+    }
+
+    Ok(())
+}
+
 async fn add_to_whitelist(
     server: &str,
     address: String,
@@ -1906,6 +2076,21 @@ async fn get_tapp_info(server: &str) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(boot_config) = config.boot {
             println!("\nBoot:");
             println!("  AA Config Path: {}", boot_config.aa_config_path);
+        }
+
+        if let Some(chain) = config.chain {
+            println!("\nChain:");
+            println!("  RPC URL: {}", chain.rpc_url);
+            println!("  Contract: {}", chain.contract_address);
+        }
+
+        if config.kbs_enabled {
+            if let Some(kbs) = config.kbs {
+                println!("\nKBS:");
+                for url in &kbs.node_urls {
+                    println!("  {}", url);
+                }
+            }
         }
     }
 

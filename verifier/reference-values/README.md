@@ -6,8 +6,10 @@ a TDX confidential node against a known-good image, consumed by `verifier/policy
 ## Layout
 
 ```
-verifier/reference-values/<cloud>/<boot_format>/<tapp-server-version>/<env>/<owner>.json
-#   cloud ∈ {gcp, ali}; boot_format ∈ {grub, uki}; env ∈ {dev, prod}; owner = OWNER_ADDRESS (0x stripped, lowercased)
+canonical: verifier/reference-values/<cloud>/<boot_format>/<version>/<env>.json
+custom:    verifier/reference-values/<cloud>/<boot_format>/<version>/<env>/<owner>.json
+#   cloud ∈ {gcp, ali}; boot_format ∈ {grub, uki}; env ∈ {dev, prod}
+#   owner (custom mode only): 0x-stripped, lowercased OWNER_ADDRESS
 ```
 
 - **One set per cloud × boot_format × tapp-server release × environment × owner.** Each combination
@@ -19,9 +21,14 @@ verifier/reference-values/<cloud>/<boot_format>/<tapp-server-version>/<env>/<own
   (grub → 5 components `shim/grub/kernel/initrd/kernel_cmdline`; uki → 1 `measurement.uki`). Without it,
   a grub and a uki image for the same cloud/version/env/owner would collide on the path + AS policy id.
 - **dev and prod images differ** (HARDEN=0 / HARDEN=1) → separate `dev/` / `prod/` per version.
-- **owner is a dimension**: `OWNER_ADDRESS` is baked into `/etc/tapp/config.toml` on the verity
-  rootfs, and `policy.rego` folds rootfs integrity into the **initrd** measurement, so a
-  different owner ⇒ a different `measurement.initrd.SHA-384` ⇒ a distinct reference set.
+- **owner is a dimension only in custom builds**. Canonical images (the default,
+  `BUILD_MODE=canonical`) are owner-agnostic: owner/chain/kbs are claimed at runtime via the
+  ClaimConfig RPC and land in the **runtime measurement event log** (a `claim_config` event,
+  like `start_app`), NOT in the boot-chain digests — one image ⇒ one reference set at
+  `<env>.json`, no owner path segment at all. Verifiers get the owner from the claim_config
+  event in the evidence and reconcile it against the on-chain registration.
+  Custom builds bake `OWNER_ADDRESS` into `/etc/tapp/config.toml`, folding the owner into
+  `measurement.initrd.SHA-384` → per-owner reference sets at `<env>/<owner>.json`.
 - The policy (`verifier/policy.rego`) is a single, canonical, image-agnostic logic; only
   these values vary. See that file's header for the two verification methods.
 
