@@ -212,6 +212,48 @@ systemctl enable docker tapp-server
 # crash the runner ("bridge-nf-call-iptables: no such file"). Persist it so every boot has it.
 echo br_netfilter > /etc/modules-load.d/br_netfilter.conf
 
+# ---- NO unattended package changes / service restarts (issue #71) -- UNCONDITIONAL ----
+# A measured image must only change when an operator changes it. Ubuntu's apt-daily-upgrade
+# (unattended-upgrades) breaks that twice over:
+#   1) needrestart, invoked after the upgrade, restarts every service linked against an updated
+#      library -- tapp-server included. tapp derives the app signer in memory, so a restart
+#      silently rotates it: on-chain nodes/services of every app on this node go stale with
+#      nobody having touched the machine (this is exactly what happened on wei-tapp 2026-07-28).
+#   2) an auto-upgraded kernel/initrd/grub changes RTMR + kernel_cmdline -> the whole image's
+#      attestation reference values are invalidated and every quote fails to verify.
+# Applied to BOTH variants, here rather than in the HARDEN=1 purge list: purging the package is
+# not enough on its own (the apt-daily* units ship with `apt` itself), and it was the dev
+# (HARDEN=0) image -- which purged nothing -- that actually bit us.
+dpkg -s unattended-upgrades >/dev/null 2>&1 && apt-get purge -y unattended-upgrades || true
+# a) kill the timers/services (mask, not disable: mask survives a package reinstall re-enabling them)
+systemctl mask apt-daily.timer apt-daily-upgrade.timer apt-daily.service apt-daily-upgrade.service
+# b) belt-and-braces for anything invoking apt.systemd.daily directly (the periodic knobs it reads)
+cat > /etc/apt/apt.conf.d/20auto-upgrades <<'APTCONF'
+// tapp: a measured image is never upgraded unattended (issue #71) -- see build-tapp.sh
+APT::Periodic::Update-Package-Lists "0";
+APT::Periodic::Download-Upgradeable-Packages "0";
+APT::Periodic::Unattended-Upgrade "0";
+APT::Periodic::AutocleanInterval "0";
+APTCONF
+# c) needrestart: list only, NEVER restart services on its own. This is the piece that restarted
+#    tapp-server; it applies to manual `apt install/upgrade` too, so an operator patching a
+#    library can no longer rotate the signer by accident -- they must restart deliberately.
+mkdir -p /etc/needrestart/conf.d
+cat > /etc/needrestart/conf.d/00-tapp-no-auto-restart.conf <<'NRCONF'
+# tapp: restart services only when an operator says so (issue #71).
+# 'l' = list outdated services, restart nothing. Do NOT set 'a' (automatic).
+$nrconf{restart} = 'l';
+$nrconf{kernelhints} = 0;
+NRCONF
+# d) fail the BUILD (not the fleet) if any of the above did not take effect
+for u in apt-daily.timer apt-daily-upgrade.timer apt-daily.service apt-daily-upgrade.service; do
+  [ "$(readlink -f "/etc/systemd/system/$u" 2>/dev/null)" = /dev/null ] \
+    || { echo "ERROR: $u is not masked -- auto-update would still run (issue #71)"; exit 1; }
+done
+grep -q 'Unattended-Upgrade "0"' /etc/apt/apt.conf.d/20auto-upgrades \
+  || { echo "ERROR: 20auto-upgrades not written"; exit 1; }
+echo "auto-update: apt-daily* masked, unattended-upgrades purged, needrestart=list-only"
+
 # ---- pin container storage OFF the ephemeral RAM rootfs (rw_overlay="ram") -- UNCONDITIONAL ----
 # The cryptpilot writable rootfs overlay is RAM-backed and RAM-capped, so container state MUST NOT
 # accumulate on "/". Independent of Sysbox. Two distinct stores must both move to the /data disk:
@@ -340,11 +382,13 @@ EOF
 # ===== Hardening (appended when HARDEN=1): remove software that can bypass tapp and mutate the environment (Tier1+Tier2, audit in doc §11) =====
 if [ "${HARDEN:-1}" = 1 ]; then
   echo "==> [harden] HARDEN=1: purge Tier1/2 + mask console getty + replace netplan with a MAC-agnostic one"
+  # NOTE: unattended-upgrades is purged UNCONDITIONALLY in the block above (issue #71) --
+  # it is deliberately no longer listed here, dev images must not keep auto-upgrades either.
   cat >> "$TMPD/provision-base.sh" <<'EOF'
 PURGE_PKGS="openssh-server \
   google-guest-agent google-compute-engine google-compute-engine-oslogin google-osconfig-agent \
   cloud-init cloud-initramfs-copymods cloud-initramfs-dyn-netconf \
-  snapd unattended-upgrades open-vm-tools google-cloud-ops-agent pollinate \
+  snapd open-vm-tools google-cloud-ops-agent pollinate \
   landscape-common ubuntu-pro-client ubuntu-advantage-tools"
 to_purge=""
 for p in $PURGE_PKGS; do dpkg -s "$p" >/dev/null 2>&1 && to_purge="$to_purge $p" || true; done

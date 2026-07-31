@@ -181,7 +181,15 @@ Defaults `OSS_BUCKET=0g-confidential-disk` (`ALIYUN_REGION` required, no default
 - Also: DNS must be written to a static `/etc/resolv.conf` with **guestfish** (virt-customize wipes what it writes itself); reset nbd before convert with `modprobe nbd max_part=16`.
 
 ## Security hardening (integrated in build stage A, see doc §11)
-purge: openssh-server / cloud-init / snapd / google-guest-agent / google-compute-engine (+oslogin) / google-osconfig-agent / google-cloud-ops-agent / open-vm-tools / unattended-upgrades / pollinate / landscape-common; mask the serial/local getty; switch netplan to MAC-independent DHCP.
+purge: openssh-server / cloud-init / snapd / google-guest-agent / google-compute-engine (+oslogin) / google-osconfig-agent / google-cloud-ops-agent / open-vm-tools / pollinate / landscape-common; mask the serial/local getty; switch netplan to MAC-independent DHCP.
+
+### No self-updating, both variants (issue #71) — applied unconditionally, dev images too
+A measured image must only change when an operator changes it, so stage A always:
+- purges `unattended-upgrades` and **masks** `apt-daily{,-upgrade}.{timer,service}` (masking the timers matters on its own: they ship with `apt`, not with unattended-upgrades);
+- zeroes every `APT::Periodic::*` knob in `/etc/apt/apt.conf.d/20auto-upgrades`;
+- sets needrestart to **list-only** (`$nrconf{restart} = 'l'`), so even a manual `apt install` never restarts a service by itself.
+
+Why it is a build-time hard gate (`cvm/ci/check-no-auto-update.sh`, run on the final image in `build-cvm.yml`): an auto-upgrade restarts tapp-server → the in-memory app signer is re-derived → every on-chain node/service of every app on that node silently goes stale; and an auto kernel/initrd upgrade changes RTMR + `kernel_cmdline` → the image's whole reference-value set is invalidated. Both surface days later, far from the build. Package updates go through a rebuild (which regenerates reference values), never through the running node.
 
 ## Verification (passed)
 - Image static checks: all the above packages gone, getty masked, netplan = 01-dhcp, resolv.conf 3 lines, gcp initrd cryptpilot = 16.
