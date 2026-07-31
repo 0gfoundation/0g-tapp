@@ -183,13 +183,15 @@ Defaults `OSS_BUCKET=0g-confidential-disk` (`ALIYUN_REGION` required, no default
 ## Security hardening (integrated in build stage A, see doc §11)
 purge: openssh-server / cloud-init / snapd / google-guest-agent / google-compute-engine (+oslogin) / google-osconfig-agent / google-cloud-ops-agent / open-vm-tools / pollinate / landscape-common; mask the serial/local getty; switch netplan to MAC-independent DHCP.
 
-### No self-updating, both variants (issue #71) — applied unconditionally, dev images too
-A measured image must only change when an operator changes it, so stage A always:
+### No unattended apt changes, both variants (issue #71) — applied unconditionally, dev images too
+Stage A always:
 - purges `unattended-upgrades` and **masks** `apt-daily{,-upgrade}.{timer,service}` (masking the timers matters on its own: they ship with `apt`, not with unattended-upgrades);
 - zeroes every `APT::Periodic::*` knob in `/etc/apt/apt.conf.d/20auto-upgrades`;
-- sets needrestart to **list-only** (`$nrconf{restart} = 'l'`), so even a manual `apt install` never restarts a service by itself.
+- sets needrestart to **list-only** (`$nrconf{restart} = 'l'`, drop-in `99-tapp-no-auto-restart.conf` — the name must sort **last**, needrestart reads `conf.d/*.conf` sorted and the last assignment wins), so even a manual `apt install` never restarts a service by itself.
 
-Why it is a build-time hard gate (`cvm/ci/check-no-auto-update.sh`, run on the final image in `build-cvm.yml`): an auto-upgrade restarts tapp-server → the in-memory app signer is re-derived → every on-chain node/service of every app on that node silently goes stale; and an auto kernel/initrd upgrade changes RTMR + `kernel_cmdline` → the image's whole reference-value set is invalidated. Both surface days later, far from the build. Package updates go through a rebuild (which regenerates reference values), never through the running node.
+Why it is a build-time hard gate (`cvm/ci/check-no-auto-update.sh`, run on the final image in `build-cvm.yml`): an auto-upgrade restarts tapp-server — observed on testnet as a glibc upgrade restarting `tapp-server` + `containerd` + `sysbox` in one go — and tapp derives the app signer in memory, so **within that same boot** every on-chain node/service of every app on the node silently goes stale. (On an image variant whose `/boot`/ESP is writable at runtime, an auto kernel upgrade would additionally change RTMR + `kernel_cmdline` and invalidate the reference values; here the rootfs overlay is RAM-backed, so that one is the secondary concern.) Package updates go through a rebuild, which regenerates reference values, never through the running node.
+
+Scope: this covers **apt**. `HARDEN=1` additionally purges the other self-changing components (`snapd` auto-refresh, `ubuntu-pro-client`'s `ua-timer`/`apt-news`/`esm-cache`, `motd-news`); on a `HARDEN=0` dev image those are still present.
 
 ## Verification (passed)
 - Image static checks: all the above packages gone, getty masked, netplan = 01-dhcp, resolv.conf 3 lines, gcp initrd cryptpilot = 16.
