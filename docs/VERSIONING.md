@@ -2,7 +2,7 @@
 
 ## Overview
 
-This workspace produces two binaries — **tapp-server** and **tapp-cli** — plus an internal library **tapp-common**. Alongside them lives the on-chain **TappRegistry** contract, which is also versioned. **Compatibility between artifacts is resolved at runtime rather than by matching version numbers** — see [Compatibility](#compatibility) below.
+This workspace produces two binaries — **tapp-server** and **tapp-cli** — plus an internal library **tapp-common**. Alongside them live the on-chain **TappRegistry** contract and the **CVM image** (the confidential VM the server runs inside), both also versioned. **Compatibility between artifacts is resolved at runtime rather than by matching version numbers** — see [Compatibility](#compatibility) below.
 
 ## Version Sources
 
@@ -12,6 +12,7 @@ This workspace produces two binaries — **tapp-server** and **tapp-cli** — pl
 | tapp-cli | `tapp-cli/Cargo.toml` → `[package] version` | `tapp-cli --version` |
 | tapp-common | `tapp-common/Cargo.toml` → `[package] version` | (internal, no standalone release) |
 | TappRegistry (contract) | Implementation version (on-chain `version()` view — see [Contract](#contract-tappregistry)) | `version()` call against the proxy |
+| CVM image | `build-cvm` workflow inputs `version` + `image_rev` — see [CVM image](#cvm-image) | published image name, e.g. `og-tdx-dev-grub-v0-3-0-r2` |
 
 ## How to Build
 
@@ -71,12 +72,23 @@ Version is injected at compile time via `env!("CARGO_PKG_VERSION")` — no hardc
 
 tapp-common is an internal dependency, not a standalone release artifact. Bump its version only on breaking API changes that affect downstream crates. Both tapp-cli and tapp-server pin it via path dependency, so a tapp-common bump requires rebuilding dependents.
 
+### CVM image release
+
+The image is **not** built from a git tag — it is built by dispatching the `build-cvm` workflow. Its version is `<tapp-server version>[-r<image_rev>]`:
+
+1. Dispatch `build-cvm` with `version` = the tapp-server release tag and `image_rev` = the image revision (see [CVM image](#cvm-image) for when to bump it).
+2. The workflow publishes the image, writes the reference values and registers the AS policy — all three keyed on the image version, not the binary version.
+3. Tag the commit the image was built from, for traceability: `git tag cvm-image-v0.3.0-r2 && git push origin cvm-image-v0.3.0-r2`.
+
+The `cvm-image-*` tag does **not** trigger a binary release — `build.yml` fires on `v*` only. It records *which source produced this image*; nothing consumes it.
+
 ## Tag Naming Convention
 
 ```
 tapp-server-v<version>    # e.g. tapp-server-v0.1.0
 tapp-cli-v<version>       # e.g. tapp-cli-v0.1.0
 contract-v<version>       # e.g. contract-v0.1.0  (TappRegistry implementation)
+cvm-image-v<version>      # e.g. cvm-image-v0.3.0-r2  (traceability only, builds no binary)
 ```
 
 Using the `v` prefix with crate name avoids ambiguity and sorts correctly in `git tag -l`.
@@ -115,7 +127,34 @@ The contract's "interface" is its **ABI**:
 | **Y** — MINOR | The **ABI changed** — external/public function or event added, removed, or changed. |
 | **Z** — PATCH | Logic-only change with an **unchanged ABI** — and it **must preserve storage layout** (beacon-upgrade safety, see below). |
 
-Rules that apply to all three:
+### CVM image
+
+The image is a **separate artifact from the binary it carries**, and it is measured: its identity is what remote attestation verifies against. It has no version number of its own — it is identified by the tapp-server version it ships plus a **revision**:
+
+```
+<tapp-server version>[-r<image_rev>]      # rev 1 = no suffix: v0.3.0, v0.3.0-r2, v0.3.0-r3 …
+```
+
+| Digit | Bump when |
+|---|---|
+| `<tapp-server version>` | A new tapp-server release goes into the image. Revision restarts at 1. |
+| **`-r<N>`** — REVISION | The **image content changed while the binary did not**: kernel, docker/containerd pin, CVM/cryptpilot config, hardening, anything in `cvm/`. |
+
+**Never rebuild a changed image under an identity that is already published.** The image version keys three things at once:
+
+| | example |
+|---|---|
+| published image name | `og-tdx-dev-grub-v0-3-0-r2` |
+| reference values | `verifier/reference-values/gcp/grub/v0.3.0-r2/dev.json` |
+| AS policy id | `0g-tapp-gcp-grub-v0.3.0-r2-dev` |
+
+Any change to the image changes its measurements. Reusing the identity makes `register-shared-as.sh` overwrite the reference values behind the **same policy id**, so every node still running the previous image fails verification from that moment on — no deploy, no warning. Bumping the revision leaves the old values registered and gives the new image its own policy.
+
+Consequence to plan for: **verifiers must be told the new policy id** (`verify-app --policy-ids`, plus anywhere ops has one written down). That is the cost of separate identities, and it is much cheaper than a silent fleet-wide verification failure.
+
+Do **not** bump tapp-server just to give a changed image a new number — the binary did not change, and a release whose artifact is byte-identical to the previous one is a lie to everyone reading the version.
+
+Rules that apply to all three binaries/contract:
 
 - `X` is reserved for product milestones; code changes never bump it on their own.
 - Bump the relevant artifact's version in the **same PR** that makes the change.
@@ -132,6 +171,10 @@ Rules that apply to all three:
 - **Add a `--json` output flag to an existing CLI command** (no RPC touched) →
   **`tapp-cli` MINOR bump**, everything else unchanged. The gRPC interface does
   not move.
+- **Disable unattended apt upgrades in the CVM image** (issue #71 — only `cvm/`
+  changed, no crate touched) → **no crate version moves at all**; rebuild the
+  image as **`v0.3.0-r2`** (`build-cvm` with `version=v0.3.0`, `image_rev=2`) and
+  tag the source commit `cvm-image-v0.3.0-r2`.
 
 ## Compatibility
 
