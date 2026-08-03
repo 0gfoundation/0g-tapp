@@ -177,6 +177,13 @@ jobs:
             TAPP_SERVER_URL="https://github.com/0gfoundation/0g-tapp/releases/download/${VERSION}/tapp-server" \
             ./build-tapp.sh base-noble.qcow2 "out-${{ matrix.env }}.qcow2"
 
+      - name: Verify the image cannot update or restart itself (issue #71)
+        # HARD GATE (unlike the boot smoke test below): offline guestfish check on the final
+        # converted image — apt-daily* masked, unattended-upgrades purged, needrestart list-only.
+        # An image that can auto-upgrade rotates the tapp signer (stale on-chain nodes) and
+        # changes RTMR/cmdline (dead reference values) days after this build; catch it here.
+        run: cvm/ci/check-no-auto-update.sh "cvm/out-${{ matrix.env }}.qcow2"
+
       # Boot smoke test intentionally NOT run here: this builder has no /dev/kvm, so under TCG the
       # 600s window is truncated before multi-user (false negatives) and it never gated (advisory).
       # cvm/test/boot-smoke-test.sh is kept for local / KVM-capable runs; make it a hard gate once a
