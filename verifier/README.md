@@ -61,7 +61,12 @@ the policy** at registration time and registered under a per-release/env id:
 ```bash
 ./verifier/register-shared-as.sh v0.1.0 dev            # → policy id 0g-tapp-v0.1.0-dev
 ./verifier/register-shared-as.sh v0.1.0 dev 47.237.201.184:50004
+# gated AS (issue #82): the write needs a key; reads (AttestationEvaluate /
+# GetAttestationChallenge) stay open. Unset = unchanged, and an ungated AS ignores the header.
+AS_WRITE_KEY=<key> ./verifier/register-shared-as.sh v0.1.0 dev
 ```
+
+Keys are issued against the registry's on-chain `admin` signature, expire (30d / 90d / never) and can be revoked. In CI the key comes from the `AS_WRITE_KEY` repository secret. Note what a key does **not** buy: an EAR token records the policy *id* it evaluated, never a hash of the policy, so a write made with a stolen key is as undetectable to verifiers as one made against an open port — the key makes writes attributable and revocable, not verifiable.
 
 Then evaluate (the AS appends the `_cpu` device-class suffix internally):
 

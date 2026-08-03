@@ -29,5 +29,18 @@ git checkout -B "$BR" origin/dev
 git add "$REF"
 git commit -m "$TITLE" || { echo "no change to commit"; exit 0; }
 git push -u origin "$BR" --force-with-lease
-gh pr create --base dev --head "$BR" --title "$TITLE" --body "$BODY" \
-  || echo "(PR may already exist for $BR)"
+# `gh pr create` fails for two very different reasons and they must not be treated alike:
+# the PR already exists (benign — a rebuild of the same identity), or the credential is
+# broken (expired RELEASE_PAT → "HTTP 401: Bad credentials"). Swallowing both made a dead
+# PAT look like a green build with no PR: the branch was pushed, the reference values were
+# registered on the AS, and nobody noticed the PR was missing. Only the benign case passes.
+if OUT="$(gh pr create --base dev --head "$BR" --title "$TITLE" --body "$BODY" 2>&1)"; then
+  printf '%s\n' "$OUT"
+else
+  printf '%s\n' "$OUT" >&2
+  case "$OUT" in
+    *"already exists"*) echo "(PR already exists for $BR — nothing to do)" ;;
+    *) echo "error: gh pr create failed for $BR (branch IS pushed — check GH_TOKEN/RELEASE_PAT, then open the PR by hand)" >&2
+       exit 1 ;;
+  esac
+fi
