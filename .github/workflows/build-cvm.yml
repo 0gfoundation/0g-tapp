@@ -13,8 +13,16 @@
 #                        Per-owner image + per-owner reference set (legacy mode).
 #                        Identifiers: image og-tdx-dev-grub-<ver>-<owner>, refval .../<owner>.json
 #
-# Dimensions: cloud × boot_format × env × version (× owner only in custom mode).
+# Dimensions: cloud × boot_format × env × image version (× owner only in custom mode).
 # KBS/KMS is fixed (vars.TAPP_KBS_URLS), not per-build.
+#
+# TWO versions, do not conflate them (docs/VERSIONING.md → CVM image):
+#   version    tapp-server release tag. Used ONLY to fetch the binary.
+#   image_rev  revision of the IMAGE at that binary version. <ver> below means <version>[-r<rev>]
+#              (rev 1 = no suffix) and keys the image name, reference-value path and AS policy id.
+#              Bump it whenever the image changes but the binary does not — otherwise the rebuilt
+#              image re-registers its measurements under the old policy id and every node still
+#              running the previous image silently stops verifying.
 
 name: build-cvm
 
@@ -39,6 +47,10 @@ on:
       version:
         description: "tapp-server release tag (e.g. v0.1.0)"
         required: true
+      image_rev:
+        description: "image revision for THIS tapp-server version. Bump when the image changes but the binary does not (kernel, docker, CVM config, hardening). 1 = no suffix (as before); 2+ appends -r<N> to the image name, reference-value path and AS policy id, so the previous image's values stay registered and its nodes keep verifying."
+        required: false
+        default: "1"
       env:
         description: "image variant"
         type: choice
@@ -64,7 +76,7 @@ on:
         default: false
 
 concurrency:
-  group: build-cvm-${{ inputs.cloud || 'gcp' }}-${{ inputs.boot_format }}-${{ inputs.build_mode || 'canonical' }}-${{ inputs.version }}-${{ inputs.owner }}
+  group: build-cvm-${{ inputs.cloud || 'gcp' }}-${{ inputs.boot_format }}-${{ inputs.build_mode || 'canonical' }}-${{ inputs.version }}-r${{ inputs.image_rev || '1' }}-${{ inputs.owner }}
   cancel-in-progress: false
 
 # The reference-values step pushes a refvalues/* branch and opens a PR into dev with GITHUB_TOKEN;
@@ -84,7 +96,8 @@ jobs:
     env:
       # All fixed config lives in repo/org Actions Variables (Settings → Secrets and variables →
       # Actions → Variables), editable without touching this file; the `|| 'default'` is a fallback.
-      VERSION: ${{ inputs.version }}
+      VERSION: ${{ inputs.version }}          # tapp-server release tag — ONLY for fetching the binary
+      IMAGE_REV: ${{ inputs.image_rev || '1' }}
       PUBLISH: ${{ inputs.publish }}
       BUILD_MODE: ${{ inputs.build_mode || 'canonical' }}
       # OWNER is only meaningful in custom mode; empty otherwise so no step can
@@ -130,6 +143,12 @@ jobs:
               FAIL=1
             fi
           fi
+          # image_rev keys the image identity (name / refval path / policy id) — a non-numeric or
+          # zero value would silently produce a bogus identity, so reject it before building.
+          if ! printf '%s' "$IMAGE_REV" | grep -qE '^[1-9][0-9]*$'; then
+            echo "error: image_rev must be a positive integer; got '${IMAGE_REV:-<empty>}'." >&2
+            FAIL=1
+          fi
           # env=both runs two matrix jobs; a fixed image_name would make them clobber each other.
           if [ -n "${{ inputs.image_name }}" ] && [ "${{ inputs.env }}" = "both" ]; then
             echo "error: image_name requires a single env (dev or prod), not both." >&2
@@ -143,7 +162,7 @@ jobs:
           fi
           exit $FAIL
 
-      - name: Resolve variant (env → HARDEN + image base)
+      - name: Resolve variant (env → HARDEN + image base) and image version
         id: v
         run: |
           if [ "${{ matrix.env }}" = prod ]; then
@@ -153,6 +172,16 @@ jobs:
             echo "harden=0"           >> "$GITHUB_OUTPUT"
             echo "imgbase=og-tdx-dev" >> "$GITHUB_OUTPUT"
           fi
+          # IMAGE VERSION vs BINARY VERSION. $VERSION identifies the tapp-server binary and is used
+          # for exactly one thing: downloading it. Everything that identifies the IMAGE — published
+          # name, reference-value path, AS policy id — uses $IMGVER, because the image can change
+          # while the binary does not (kernel, docker pin, CVM config, hardening). Reusing $VERSION
+          # for a changed image would overwrite the reference values already registered for the old
+          # one under the same policy id, and every node still running it would stop verifying.
+          # rev 1 == no suffix, so identifiers built before image_rev existed keep working.
+          if [ "$IMAGE_REV" = 1 ]; then IMGVER="$VERSION"; else IMGVER="${VERSION}-r${IMAGE_REV}"; fi
+          echo "imgver=$IMGVER" >> "$GITHUB_OUTPUT"
+          echo "image version: $IMGVER (tapp-server binary: $VERSION)"
 
       - name: Fetch build inputs (base image + 0.8.0 guest deb)
         run: cvm/ci/fetch-inputs.sh "$VERSION"   # → cvm/base-noble.qcow2 + cryptpilot-fde-guest_0.8.0_amd64.deb
@@ -232,7 +261,8 @@ jobs:
         run: |
           cd cvm
           IMG="${{ inputs.image_name }}"
-          [ -n "$IMG" ] || IMG="${{ steps.v.outputs.imgbase }}-${BOOT_FORMAT}-${VERSION//./-}${{ steps.names.outputs.img_suffix }}"
+          IMGVER="${{ steps.v.outputs.imgver }}"
+          [ -n "$IMG" ] || IMG="${{ steps.v.outputs.imgbase }}-${BOOT_FORMAT}-${IMGVER//./-}${{ steps.names.outputs.img_suffix }}"
           IMAGE_FAMILY="${{ steps.v.outputs.imgbase }}-${BOOT_FORMAT}${{ steps.names.outputs.family_suffix }}" \
           OVERWRITE=${{ inputs.overwrite && '1' || '0' }} \
             ./publish-gcp-image.sh "out-${{ matrix.env }}.qcow2" "$IMG"
@@ -242,7 +272,8 @@ jobs:
         run: |
           cd cvm
           IMG="${{ inputs.image_name }}"
-          [ -n "$IMG" ] || IMG="${{ steps.v.outputs.imgbase }}-${BOOT_FORMAT}-${VERSION//./-}${{ steps.names.outputs.img_suffix }}"
+          IMGVER="${{ steps.v.outputs.imgver }}"
+          [ -n "$IMG" ] || IMG="${{ steps.v.outputs.imgbase }}-${BOOT_FORMAT}-${IMGVER//./-}${{ steps.names.outputs.img_suffix }}"
           ALIYUN_REGION="$ALIYUN_REGION" OSS_BUCKET="$OSS_BUCKET" \
           OVERWRITE=${{ inputs.overwrite && '1' || '0' }} \
             ./publish-ali-image.sh "out-${{ matrix.env }}.qcow2" "$IMG"
@@ -254,13 +285,14 @@ jobs:
           # see no owner arg and use the <env>.json path / no-owner policy id.
           # custom: $OWNER is the full 0x address (scripts strip/lowercase themselves).
           cd cvm
-          ci/gen-reference-values.sh "out-${{ matrix.env }}.qcow2" "$CLOUD" "$BOOT_FORMAT" "$VERSION" "${{ matrix.env }}" $OWNER
+          IMGVER="${{ steps.v.outputs.imgver }}"
+          ci/gen-reference-values.sh "out-${{ matrix.env }}.qcow2" "$CLOUD" "$BOOT_FORMAT" "$IMGVER" "${{ matrix.env }}" $OWNER
           cd ..
-          verifier/register-shared-as.sh "$CLOUD" "$BOOT_FORMAT" "$VERSION" "${{ matrix.env }}" $OWNER "$AS_ENDPOINT"
+          verifier/register-shared-as.sh "$CLOUD" "$BOOT_FORMAT" "$IMGVER" "${{ matrix.env }}" $OWNER "$AS_ENDPOINT"
 
       - name: Open PR with the new reference values → dev
         if: ${{ env.PUBLISH == 'true' }}
-        run: cvm/ci/open-refvalues-pr.sh "$CLOUD" "$BOOT_FORMAT" "$VERSION" "${{ matrix.env }}" $OWNER
+        run: cvm/ci/open-refvalues-pr.sh "$CLOUD" "$BOOT_FORMAT" "${{ steps.v.outputs.imgver }}" "${{ matrix.env }}" $OWNER
         env:
           # PAT so `gh pr create` works even if the org disables "Actions create/approve PRs".
           # git push still uses GITHUB_TOKEN via the permissions block above. Falls back if unset.

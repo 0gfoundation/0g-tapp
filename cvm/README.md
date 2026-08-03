@@ -28,6 +28,8 @@ Because they yield different images/measurements, **`boot_format` (like `cloud`,
 - reference value: canonical `…/<version>/<env>.json`; custom `…/<version>/<env>/<owner>.json`
 - AS policy id: canonical `0g-tapp-<cloud>-<boot_format>-<version>-<env>`; custom appends `-<owner>`
 
+Here `<version>` is the **image** version `<tapp-server tag>[-r<image_rev>]` (`build-cvm` inputs `version` + `image_rev`; rev 1 = no suffix), **not** the binary version — the two diverge whenever the image changes and the binary does not, which is most `cvm/` changes. Rebuilding a changed image under an already-published identity re-registers new measurements behind the **same AS policy id**, and every node still running the old image stops verifying on the spot. See [docs/VERSIONING.md → CVM image](../docs/VERSIONING.md#cvm-image).
+
 ### Platform differences (everything else is shared)
 | | GCP (`gcp`) | Alibaba Cloud (`ali`) |
 |---|---|---|
