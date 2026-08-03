@@ -1,0 +1,18 @@
+{
+  "measurement.kernel_cmdline.SHA-384": [
+    "f79a49eeca97527d40daab782112380fe5f1fccc1c7237ed46ccf73417cd7568591e8670bbdf2a569e55f83be19ddc1d",
+    "dc382ee4244027da66434dde26d89c9386873fb8855a0ec749449b29bb8047b4983d5f20f0a515f7e9069188d3f67d54"
+  ],
+  "measurement.kernel.SHA-384": [
+    "92b51839d44716898b81e878daf257dc2b65b1f16e5a8f120ae923bd086f4c0b85ff4d4371ffd48aac171d9b3ca9280c"
+  ],
+  "measurement.initrd.SHA-384": [
+    "dc36ed5ca45d35f63cd053f013e0f3da2569e73dda8d31bb45c52c1f733632dc3746b84ca2efa774385a4c76df2f8b38"
+  ],
+  "measurement.grub.SHA-384": [
+    "d9c40784e214bb829477f46245758e74f6b145dbf012960d4053c2fe27545738d89833297b4fd9ec348dde75910bfa33"
+  ],
+  "measurement.shim.SHA-384": [
+    "4637fb5cd30847e5f09ae24f8a50ce1611c4d21afd0ecb69c8ec40bc82dc11bc48abda1f8044fe340bfb70b29606eb47"
+  ]
+}
