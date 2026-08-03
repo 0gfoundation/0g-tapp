@@ -28,6 +28,8 @@ Because they yield different images/measurements, **`boot_format` (like `cloud`,
 - reference value: canonical `…/<version>/<env>.json`; custom `…/<version>/<env>/<owner>.json`
 - AS policy id: canonical `0g-tapp-<cloud>-<boot_format>-<version>-<env>`; custom appends `-<owner>`
 
+Here `<version>` is the **image** version `<tapp-server tag>[-r<image_rev>]` (`build-cvm` inputs `version` + `image_rev`; rev 1 = no suffix), **not** the binary version — the two diverge whenever the image changes and the binary does not, which is most `cvm/` changes. Rebuilding a changed image under an already-published identity re-registers new measurements behind the **same AS policy id**, and every node still running the old image stops verifying on the spot. See [docs/VERSIONING.md → CVM image](../docs/VERSIONING.md#cvm-image).
+
 ### Platform differences (everything else is shared)
 | | GCP (`gcp`) | Alibaba Cloud (`ali`) |
 |---|---|---|
@@ -181,7 +183,17 @@ Defaults `OSS_BUCKET=0g-confidential-disk` (`ALIYUN_REGION` required, no default
 - Also: DNS must be written to a static `/etc/resolv.conf` with **guestfish** (virt-customize wipes what it writes itself); reset nbd before convert with `modprobe nbd max_part=16`.
 
 ## Security hardening (integrated in build stage A, see doc §11)
-purge: openssh-server / cloud-init / snapd / google-guest-agent / google-compute-engine (+oslogin) / google-osconfig-agent / google-cloud-ops-agent / open-vm-tools / unattended-upgrades / pollinate / landscape-common; mask the serial/local getty; switch netplan to MAC-independent DHCP.
+purge: openssh-server / cloud-init / snapd / google-guest-agent / google-compute-engine (+oslogin) / google-osconfig-agent / google-cloud-ops-agent / open-vm-tools / pollinate / landscape-common; mask the serial/local getty; switch netplan to MAC-independent DHCP.
+
+### No unattended apt changes, both variants (issue #71) — applied unconditionally, dev images too
+Stage A always:
+- purges `unattended-upgrades` and **masks** `apt-daily{,-upgrade}.{timer,service}` (masking the timers matters on its own: they ship with `apt`, not with unattended-upgrades);
+- zeroes every `APT::Periodic::*` knob in `/etc/apt/apt.conf.d/20auto-upgrades`;
+- sets needrestart to **list-only** (`$nrconf{restart} = 'l'`, drop-in `99-tapp-no-auto-restart.conf` — the name must sort **last**, needrestart reads `conf.d/*.conf` sorted and the last assignment wins), so even a manual `apt install` never restarts a service by itself.
+
+Why it is a build-time hard gate (`cvm/ci/check-no-auto-update.sh`, run on the final image in `build-cvm.yml`): an auto-upgrade restarts tapp-server — observed on testnet as a glibc upgrade restarting `tapp-server` + `containerd` + `sysbox` in one go — and tapp derives the app signer in memory, so **within that same boot** every on-chain node/service of every app on the node silently goes stale. (On an image variant whose `/boot`/ESP is writable at runtime, an auto kernel upgrade would additionally change RTMR + `kernel_cmdline` and invalidate the reference values; here the rootfs overlay is RAM-backed, so that one is the secondary concern.) Package updates go through a rebuild, which regenerates reference values, never through the running node.
+
+Scope: this covers **apt**. `HARDEN=1` additionally purges the other self-changing components (`snapd` auto-refresh, `ubuntu-pro-client`'s `ua-timer`/`apt-news`/`esm-cache`, `motd-news`); on a `HARDEN=0` dev image those are still present.
 
 ## Verification (passed)
 - Image static checks: all the above packages gone, getty masked, netplan = 01-dhcp, resolv.conf 3 lines, gcp initrd cryptpilot = 16.

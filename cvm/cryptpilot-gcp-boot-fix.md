@@ -386,7 +386,7 @@ The goal of a confidential appliance is that "the instance's internal environmen
 | 🔴 T1 | `cloud-init` | create users, write files, run commands from metadata/user-data | purge |
 | 🔴 T1 | `serial-getty@ttyS0` | GCP serial console login | mask |
 | 🟠 T2 | `snapd` | remotely install/refresh snaps | purge + clean /snap |
-| 🟠 T2 | `unattended-upgrades` | automatically change packages | purge |
+| 🔴 T1 | `unattended-upgrades` + `apt-daily{,-upgrade}.{timer,service}` + `needrestart` | automatically change packages **and restart tapp-server** → signer rotates + RTMR/cmdline reference values die (issue #71) | purge + mask timers + needrestart list-only — **unconditional, dev images too** |
 | 🟠 T2 | `open-vm-tools` | hypervisor → guest operations | purge |
 | 🟠 T2 | `google-cloud-ops-agent` | exfiltrate monitoring/logs | purge |
 | 🟠 T2 | `pollinate` | contact an external server at boot | purge |
