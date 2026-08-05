@@ -27,6 +27,11 @@ pub struct NodeVerdict {
     pub tcb_status: String,
     pub advisories: usize,
     pub signer_ok: bool,  // report_data binds the on-chain signer
+    /// sha256 of the TLS public key the quote vouches for, `0x…`. Empty when the app has
+    /// no TLS key. A client that compares this against the certificate it was served
+    /// during a handshake learns the peer holds a key attested inside this TEE — which is
+    /// the whole of layer-1 verification, and needs no CA.
+    pub tls_public_key: String,
     pub compose_ok: bool, // start_app compose == node effective compose
     pub volumes_ok: bool,
     pub image_ok: bool,
@@ -62,6 +67,9 @@ struct StartAppMeasure {
 struct Attested {
     /// The signer the quote names, `0x…`. Empty if it could not be read.
     signer: String,
+    /// sha256 of the app's TLS public key, `0x…`, empty when the app has no TLS key yet.
+    /// A client compares this against the key it was handed during a handshake.
+    tls_public_key: String,
     /// `None` when no challenge was sent or the server predates the field, so a caller
     /// that does not care about freshness is never reported as failing.
     fresh: Option<bool>,
@@ -90,6 +98,7 @@ impl Attested {
 fn read_report_data(evidence: &serde_json::Value, quote_b64: &str, nonce: &[u8]) -> Attested {
     let mut a = Attested {
         signer: String::new(),
+        tls_public_key: String::new(),
         fresh: None,
         structured: false,
         note: String::new(),
@@ -132,6 +141,7 @@ fn read_report_data(evidence: &serde_json::Value, quote_b64: &str, nonce: &[u8])
     };
 
     a.signer = parsed.signer;
+    a.tls_public_key = parsed.tls_public_key;
     if !nonce.is_empty() {
         let echoed = crate::report_data::strip_hex(&parsed.nonce)
             .eq_ignore_ascii_case(&hex::encode(nonce));
@@ -481,6 +491,8 @@ async fn fetch_evidence(tee_url: &str, app_id: &str, nonce: &[u8]) -> Result<Vec
 pub struct DirectVerdict {
     pub server: String,
     pub signer: String, // from quote report_data (0x…), as attested (not reconciled)
+    /// sha256 of the attested TLS public key, `0x…`. Empty when the app has no TLS key.
+    pub tls_public_key: String,
     pub ear_status: String,
     pub tcb_status: String,
     pub advisories: usize,
@@ -503,6 +515,7 @@ pub async fn verify_node_direct(
     let mut v = DirectVerdict {
         server: server.to_string(),
         signer: String::new(),
+        tls_public_key: String::new(),
         ear_status: "-".to_string(),
         tcb_status: "-".to_string(),
         advisories: 0,
@@ -524,6 +537,7 @@ pub async fn verify_node_direct(
     // is that the app may not be registered — so report what the node attested.
     let attested = read_report_data(&j, quote_b64, &nonce);
     v.signer = attested.signer.clone();
+    v.tls_public_key = attested.tls_public_key.clone();
     v.note = attested.note.clone();
 
     match verify_with_as(as_endpoint, &raw, policy_ids).await {
@@ -590,6 +604,7 @@ pub async fn verify_app(
             tcb_status: "-".to_string(),
             advisories: 0,
             signer_ok: false,
+            tls_public_key: String::new(),
             compose_ok: false,
             volumes_ok: false,
             image_ok: false,
@@ -636,6 +651,7 @@ pub async fn verify_app(
         // ④a signer binding: the quote names the signer the chain registered
         let attested = read_report_data(&j, quote_b64, &nonce);
         v.signer_ok = attested.is(signer.as_bytes());
+        v.tls_public_key = attested.tls_public_key.clone();
         v.note = attested.note.clone();
 
         // ③ AS quote verification

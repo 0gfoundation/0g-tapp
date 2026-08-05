@@ -202,14 +202,31 @@ enum MethodPermission {
     Whitelist,     // Owner or whitelisted users
 }
 
-/// Get permission requirement for a method
+/// Get permission requirement for a method.
+///
+/// An unclassified method gets OwnerOnly, which fails closed — a new RPC is unreachable
+/// until someone decides what guards it, rather than quietly inheriting the weakest rule.
 fn get_method_permission(method_name: &str) -> MethodPermission {
-    match method_name {
-        // Public methods (no authentication required)
+    classify(method_name).unwrap_or_else(|| {
+        warn!(method = %method_name, "Unknown method, defaulting to OwnerOnly");
+        MethodPermission::OwnerOnly
+    })
+}
+
+/// `None` means the method is not listed here. Split out from the fallback so a test can
+/// tell "explicitly OwnerOnly" from "nobody decided", which the return type alone cannot.
+fn classify(method_name: &str) -> Option<MethodPermission> {
+    Some(match method_name {
+        // No signature required. For most of these there is nothing to protect — the
+        // answer is public. GetAppSecretKey, GetSecretResource and GetAppTlsCert are the
+        // exceptions: they hand over key material, and "public" here means *the signature
+        // is not the control*. Their caller is an app container inside this CVM, which has
+        // no key to sign with — it is calling in order to obtain one. What guards them is
+        // the locality check in each handler, which refuses anything that is not
+        // localhost, the Docker network, or the Unix socket.
         "GetEvidence" | "GetAppKey" | "GetAppInfo" | "ListApps" | "GetTaskStatus"
-        | "GetServiceStatus" | "GetAppSecretKey" | "GetTappInfo" | "GetSecretResource" => {
-            MethodPermission::Public
-        }
+        | "GetServiceStatus" | "GetAppSecretKey" | "GetTappInfo" | "GetSecretResource"
+        | "GetAppTlsCert" => MethodPermission::Public,
 
         // Signature required, but no permission level: while the tapp is
         // unclaimed anybody may claim (first-come-first-served); once claimed
@@ -224,17 +241,59 @@ fn get_method_permission(method_name: &str) -> MethodPermission {
         | "ListWhitelist"
         | "ListAllOwnerships"
         | "StopService"
-        | "StartService" => MethodPermission::OwnerOnly,
+        | "StartService"
+        // These two were never listed and reached OwnerOnly through the fallback. Stated
+        // explicitly to keep the behaviour they already had — ListAppMeasurements is a
+        // deprecated stub that errors either way, and tapp-cli already signs for
+        // GetAppContainerStatus.
+        | "ListAppMeasurements"
+        | "GetAppContainerStatus" => MethodPermission::OwnerOnly,
 
         // Owner or whitelist methods
         "GetServiceLogs" | "GetAppLogs" | "GetAppOwnership" | "WithdrawBalance" | "DockerLogin"
         | "DockerLogout" | "PruneImages" => MethodPermission::Whitelist,
 
-        // Default: require owner permission
-        _ => {
-            warn!(method = %method_name, "Unknown method, defaulting to OwnerOnly");
-            MethodPermission::OwnerOnly
+        _ => return None,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every RPC the service declares must be classified on purpose.
+    ///
+    /// The fallback is OwnerOnly, so forgetting one does not open a hole — it makes the
+    /// RPC unusable by the callers that need it, which is how GetAppTlsCert first failed:
+    /// an app container has no key to sign with, so it got "Missing signature" from a rule
+    /// nobody had chosen. Reading the method list out of the proto rather than repeating it
+    /// here is the point; a list maintained by hand would drift the same way.
+    #[test]
+    fn every_rpc_in_the_proto_has_a_deliberate_permission() {
+        let proto = include_str!("../proto/tapp_service.proto");
+        let mut unclassified = Vec::new();
+        let mut seen = 0usize;
+        for line in proto.lines() {
+            let line = line.trim();
+            let Some(rest) = line.strip_prefix("rpc ") else {
+                continue;
+            };
+            let name = rest.split('(').next().unwrap_or("").trim();
+            if name.is_empty() {
+                continue;
+            }
+            seen += 1;
+            if classify(name).is_none() {
+                unclassified.push(name.to_string());
+            }
         }
+        assert!(seen > 20, "parsed only {} rpcs — the proto layout changed", seen);
+        assert!(
+            unclassified.is_empty(),
+            "these RPCs fall through to the OwnerOnly default; classify them in \
+             get_method_permission: {:?}",
+            unclassified
+        );
     }
 }
 

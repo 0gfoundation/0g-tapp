@@ -37,15 +37,15 @@ pub const MAX_NONCE_LEN: usize = 64;
 /// is unused.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RuntimeData {
-    /// The app's TEE-derived signer, `0x…`. This is the identity TappRegistry records.
-    pub signer: String,
-
     /// Caller-supplied challenge, `0x…`. Evidence is self-authenticating but undated:
     /// nothing in a quote says when it was produced, so a cached copy is indistinguishable
     /// from a fresh one. A caller that sends a random value per request can tell them
     /// apart; one that serves cached results to many readers sends nothing.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub nonce: String,
+
+    /// The app's TEE-derived signer, `0x…`. This is the identity TappRegistry records.
+    pub signer: String,
 
     /// sha256 of the app's TLS public key, `0x…`. Reserved — populated once apps derive a
     /// TLS key, at which point this is what lets a client tie the certificate it was
@@ -78,12 +78,12 @@ impl RuntimeData {
             .into());
         }
         Ok(Self {
-            signer: format!("0x{}", hex::encode(signer_eth_address)),
             nonce: if nonce.is_empty() {
                 String::new()
             } else {
                 format!("0x{}", hex::encode(nonce))
             },
+            signer: format!("0x{}", hex::encode(signer_eth_address)),
             tls_public_key: String::new(),
         })
     }

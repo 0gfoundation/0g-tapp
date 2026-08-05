@@ -87,6 +87,15 @@ impl TappServiceImpl {
             )
         })?;
 
+        // Create-if-missing first. `get_private_key` below only reads the cache, so without
+        // this a KMS request fails outright when it is the app's very first call — which is
+        // exactly what happens when an app asks for its TLS certificate before anything
+        // else has touched its key.
+        self.app_key_service
+            .get_app_key(app_id, "ethereum", false)
+            .await
+            .map_err(|e| Status::internal(format!("Failed to create app key: {}", e)))?;
+
         // Get in-memory key pair: private key for signing + decryption, pubkey for KMS encryption target
         let private_key = self
             .app_key_service
