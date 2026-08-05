@@ -201,6 +201,11 @@ enum Commands {
         /// Application ID
         #[arg(short, long)]
         app_id: String,
+
+        /// Challenge, hex, up to 64 bytes. The server echoes it into report_data, which
+        /// is what distinguishes a quote made for this request from a cached one.
+        #[arg(long)]
+        nonce: Option<String>,
     },
 
     /// Get application public key
@@ -208,10 +213,6 @@ enum Commands {
         /// Application ID
         #[arg(short, long)]
         app_id: String,
-
-        /// Key type (default: ethereum)
-        #[arg(short = 't', long, default_value = "ethereum")]
-        key_type: String,
 
         /// Use X25519 key pair
         #[arg(long)]
@@ -640,15 +641,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let private_key = require_private_key(&cli.private_key)?;
             get_app_container_status(&cli.server, app_id, private_key).await?;
         }
-        Commands::GetEvidence { app_id } => {
-            get_evidence(&cli.server, app_id).await?;
+        Commands::GetEvidence { app_id, nonce } => {
+            get_evidence(&cli.server, app_id, nonce).await?;
         }
-        Commands::GetAppKey {
-            app_id,
-            key_type,
-            x25519,
-        } => {
-            get_app_key(&cli.server, app_id, key_type, x25519).await?;
+        Commands::GetAppKey { app_id, x25519 } => {
+            get_app_key(&cli.server, app_id, x25519).await?;
         }
         Commands::GetAppSecretKey {
             app_id,
@@ -1559,16 +1556,65 @@ async fn get_app_container_status(
     Ok(())
 }
 
-async fn get_evidence(server: &str, app_id: String) -> Result<(), Box<dyn std::error::Error>> {
+async fn get_evidence(
+    server: &str,
+    app_id: String,
+    nonce_hex: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut client = create_client(server).await?;
 
-    let request = Request::new(GetEvidenceRequest { app_id });
+    let nonce = match nonce_hex.as_deref() {
+        Some(h) => hex::decode(h.trim_start_matches("0x"))
+            .map_err(|e| format!("--nonce must be hex: {}", e))?,
+        None => Vec::new(),
+    };
+
+    let request = Request::new(GetEvidenceRequest {
+        app_id,
+        nonce: nonce.clone(),
+    });
 
     let response = client.get_evidence(request).await?;
     let result = response.into_inner();
 
     println!("✓ Evidence generated successfully");
     println!("  TEE Type: {}", result.tee_type);
+
+    // Show what report_data committed to, so the challenge can be checked by eye rather
+    // than only by verify-app. A server that predates the field says so plainly here
+    // instead of looking like a failure.
+    match serde_json::from_slice::<serde_json::Value>(&result.evidence) {
+        Ok(j) => match j[tapp_common::report_data::EVIDENCE_FIELD].as_str() {
+            Some(b64) => match base64::decode(b64) {
+                Ok(bytes) => {
+                    println!("  runtime_data: {}", String::from_utf8_lossy(&bytes));
+                    println!(
+                        "  report_data : {}",
+                        hex::encode(tapp_common::report_data::report_data_of(&bytes))
+                    );
+                    if !nonce.is_empty() {
+                        let parsed: tapp_common::report_data::RuntimeData =
+                            serde_json::from_slice(&bytes)?;
+                        let echoed = tapp_common::report_data::strip_hex(&parsed.nonce)
+                            .eq_ignore_ascii_case(&hex::encode(&nonce));
+                        println!(
+                            "  challenge   : {}",
+                            if echoed {
+                                "echoed — this quote was produced for this request"
+                            } else {
+                                "NOT echoed — this quote was not produced for this request"
+                            }
+                        );
+                    }
+                }
+                Err(e) => println!("  runtime_data: unreadable ({})", e),
+            },
+            None if nonce.is_empty() => {}
+            None => println!("  challenge   : ignored — this server predates the nonce field"),
+        },
+        Err(_) => println!("  (evidence is not JSON; nothing to inspect)"),
+    }
+
     println!("  Evidence (hex): {}", hex::encode(&result.evidence));
     println!("  Evidence (base64): {}", base64::encode(&result.evidence));
 
@@ -1578,14 +1624,16 @@ async fn get_evidence(server: &str, app_id: String) -> Result<(), Box<dyn std::e
 async fn get_app_key(
     server: &str,
     app_id: String,
-    key_type: String,
     x25519: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut client = create_client(server).await?;
 
+    // key_type is left empty: the server treats that as "ethereum", the only kind that
+    // exists. There used to be a --key-type flag here that was sent but ignored, so
+    // `--key-type rsa` printed "rsa" over ethereum key material.
     let request = Request::new(GetAppKeyRequest {
         app_id: app_id.clone(),
-        key_type: key_type.clone(),
+        key_type: String::new(),
         additional_data: vec![],
         kbs_resource_uri: String::new(),
         x25519,
@@ -1601,11 +1649,10 @@ async fn get_app_key(
 
     println!("✓ Application key retrieved");
     println!("  App ID: {}", app_id);
-    println!("  Key Type: {}", key_type);
     println!("  Key Source: {}", result.key_source);
     println!("  Public Key (hex): 0x{}", hex::encode(&result.public_key));
 
-    if key_type == "ethereum" && !result.eth_address.is_empty() {
+    if !result.eth_address.is_empty() {
         println!("  Ethereum Address: 0x{}", hex::encode(&result.eth_address));
     }
 

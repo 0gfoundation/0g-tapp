@@ -14,6 +14,41 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
+/// Put the hashed bytes into the evidence next to `quote` and `cc_eventlog`, so a
+/// verifier receives everything it needs as one object and never has to be told
+/// separately what `report_data` committed to.
+///
+/// The attester's output is JSON for every TEE we support, but if it ever isn't the
+/// evidence is passed through untouched: losing the field degrades a verifier to the
+/// old signer-only reading, whereas returning a mangled blob would break it outright.
+fn attach_runtime_data(evidence: Vec<u8>, runtime_data: &[u8]) -> Vec<u8> {
+    use base64::Engine;
+    let mut parsed: serde_json::Value = match serde_json::from_slice(&evidence) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(error = %e, "evidence is not JSON; runtime_data not attached");
+            return evidence;
+        }
+    };
+    let Some(obj) = parsed.as_object_mut() else {
+        warn!("evidence is not a JSON object; runtime_data not attached");
+        return evidence;
+    };
+    obj.insert(
+        crate::report_data::EVIDENCE_FIELD.to_string(),
+        serde_json::Value::String(
+            base64::engine::general_purpose::STANDARD.encode(runtime_data),
+        ),
+    );
+    match serde_json::to_vec(&parsed) {
+        Ok(v) => v,
+        Err(e) => {
+            error!(error = %e, "re-serialising evidence failed; returning original");
+            evidence
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct AppComposeContent {
     pub hash: String,
@@ -538,28 +573,35 @@ enable_eventlog = true
             }
         }
 
-        if signer_eth_address.len() != 20 {
+        if request.nonce.len() > crate::report_data::MAX_NONCE_LEN {
             return Err(TappError::InvalidParameter {
-                field: "signer_eth_address".to_string(),
+                field: "nonce".to_string(),
                 reason: format!(
-                    "Invalid signer address length: expected 20 bytes, got {}",
-                    signer_eth_address.len()
+                    "nonce must be at most {} bytes, got {}",
+                    crate::report_data::MAX_NONCE_LEN,
+                    request.nonce.len()
                 ),
             });
         }
 
-        // Prepare report_data: pad signer EVM address (20 bytes) to 64 bytes
-        let mut report_data = vec![0u8; 64];
-        report_data[..signer_eth_address.len()].copy_from_slice(signer_eth_address);
+        // report_data commits to a small structure rather than to the signer alone, so
+        // the caller's challenge (and later the app's TLS key) fit alongside it. The
+        // structure travels with the quote — a quote on its own no longer names its
+        // signer. See tapp_common::report_data.
+        let runtime_data =
+            crate::report_data::RuntimeData::new(signer_eth_address, &request.nonce)?;
+        let (runtime_data_bytes, report_data) = runtime_data.seal()?;
 
         info!(
             app_id = %app_id,
-            signer = %format!("0x{}", hex::encode(signer_eth_address)),
+            signer = %runtime_data.signer,
+            nonce_len = request.nonce.len(),
             report_data = %hex::encode(&report_data),
-            "Generating evidence with app signer as report_data"
+            "Generating evidence"
         );
 
         let evidence = self.measurement_service.get_evidence(&report_data).await?;
+        let evidence = attach_runtime_data(evidence, &runtime_data_bytes);
         let tee_type = self.measurement_service.get_tee_type().await;
         Ok(GetEvidenceResponse {
             success: true,

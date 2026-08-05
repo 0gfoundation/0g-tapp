@@ -2,6 +2,7 @@
 pub use tapp_common::app_key;
 pub use tapp_common::onchain;
 pub use tapp_common::error;
+pub use tapp_common::report_data;
 pub use tapp_common::verify;
 pub use tapp_common::proto;
 pub use tapp_common::as_proto;
@@ -66,6 +67,74 @@ pub struct TappServiceImpl {
 }
 
 impl TappServiceImpl {
+    /// Record that a KMS-derived secret left this node, into RTMR3.
+    ///
+    /// Without this, a derived key can be pulled by any container on the box and nothing
+    /// in the attestation says it happened — `get_app_secret_key` has always been measured,
+    /// but this path, which is how a key derived from the KMS namespace is obtained, was
+    /// not. It is what makes "re-acquiring a key leaves a trace" true rather than assumed.
+    ///
+    /// `material` is recorded because it names the derivation namespace, which is the part
+    /// that says *which* secret was taken. Failure to measure never fails the request: the
+    /// caller already holds the secret by this point, so refusing to answer would hide the
+    /// event rather than prevent it.
+    async fn measure_secret_resource(&self, app_id: &str, material: &str, success: bool) {
+        // Best-effort: an app fetching a secret before its measurements are known is
+        // unusual but must still be recorded, so missing app_info leaves empty hashes
+        // rather than skipping the event.
+        let info = self.boot_service.get_app_info(app_id).await.ok().flatten();
+        let m = boot::AppMeasurement {
+            app_id: app_id.to_string(),
+            operation: measurement_service::OPERATION_NAME_GET_SECRET_RESOURCE.to_string(),
+            result: String::new(),
+            error: None,
+            compose_hash: info
+                .as_ref()
+                .map(|i| i.compose_content.hash.clone())
+                .unwrap_or_default(),
+            volumes_hash: info
+                .as_ref()
+                .map(|i| i.mount_files.hash.clone())
+                .unwrap_or_default(),
+            image_hash: info
+                .as_ref()
+                .map(|i| i.compose_content.image_hash.clone())
+                .unwrap_or_default(),
+            deployer: info.as_ref().map(|i| i.owner.clone()).unwrap_or_default(),
+            timestamp: utils::current_timestamp(),
+        };
+        let m = if success {
+            m.with_success()
+        } else {
+            m.with_failure("KMS request or decryption failed".to_string())
+        };
+
+        // `material` has no field on AppMeasurement, so it is added to the serialised
+        // object rather than changing a struct every other measured operation shares.
+        let mut payload = match serde_json::to_value(&m) {
+            Ok(serde_json::Value::Object(o)) => o,
+            _ => {
+                tracing::error!("failed to serialise get_secret_resource measurement");
+                return;
+            }
+        };
+        payload.insert(
+            "material".to_string(),
+            serde_json::Value::String(material.to_string()),
+        );
+
+        if let Err(e) = self
+            .measurement_service
+            .extend_measurement(
+                measurement_service::OPERATION_NAME_GET_SECRET_RESOURCE,
+                &serde_json::Value::Object(payload).to_string(),
+            )
+            .await
+        {
+            tracing::error!("Failed to extend measurement for get_secret_resource: {}", e);
+        }
+    }
+
     /// Check if an IP address is allowed for local access
     /// Allows:
     /// - Localhost (127.0.0.1, ::1)
@@ -449,13 +518,15 @@ impl TappService for TappServiceImpl {
         debug!("Request: {:?}", request);
         let req = request.into_inner();
 
-        // Default to "ethereum" if key_type is not specified
-        // TODO: Remove
-        // let key_type = if req.key_type.is_empty() {
-        //     "ethereum"
-        // } else {
-        //     &req.key_type
-        // };
+        // Empty means "ethereum", the only kind that exists. Anything else is refused
+        // rather than quietly answered with ethereum material: the field was accepted and
+        // discarded for a long time, so a caller asking for "rsa" got an ethereum key and
+        // no indication that its request had not been honoured.
+        let key_type = if req.key_type.is_empty() {
+            "ethereum"
+        } else {
+            &req.key_type
+        };
 
         // Create-if-missing (same as GetEvidence): allows fetching the signer
         // address BEFORE the app starts, e.g. for on-chain pre-registration.
@@ -463,7 +534,7 @@ impl TappService for TappServiceImpl {
         // when it actually starts.
         let key_pair = self
             .app_key_service
-            .get_app_key(&req.app_id, "ethereum", req.x25519)
+            .get_app_key(&req.app_id, key_type, req.x25519)
             .await?;
         Ok(Response::new(GetAppKeyResponse {
             success: true,
@@ -1723,6 +1794,8 @@ impl TappService for TappServiceImpl {
         // Decrypt with our private key
         let secret = ecies::decrypt(&private_key, &encrypted)
             .map_err(|e| Status::internal(format!("Failed to decrypt KMS secret: {}", e)))?;
+
+        self.measure_secret_resource(app_id, &req.material, true).await;
 
         info!(app_id = %app_id, "GetSecretResource succeeded");
 

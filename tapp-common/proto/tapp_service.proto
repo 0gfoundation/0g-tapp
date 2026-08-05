@@ -223,8 +223,17 @@ message ListAppMeasurementsResponse {
 // Get Evidence Messages
 message GetEvidenceRequest {
   string app_id = 1;  // Application identifier
-                      // The TEE-derived signer EVM address of the app will
-                      // be automatically used as report_data
+
+  // Optional challenge, at most 64 bytes, echoed into the quote's report_data.
+  //
+  // A quote says nothing about when it was produced, so a cached blob looks exactly
+  // like a fresh one. A caller that sends a random value per request can tell them
+  // apart. A caller that fetches once and serves the result to many readers (and
+  // reports it "as of" a timestamp) sends nothing and leaves the field out.
+  //
+  // report_data is sha512 of the `runtime_data` object returned alongside the quote;
+  // see tapp_common::report_data.
+  bytes nonce = 2;
 }
 
 message GetEvidenceResponse {
@@ -239,7 +248,10 @@ message GetEvidenceResponse {
 // Get App Key Messages (replaces GetPubkey)
 message GetAppKeyRequest {
   string app_id = 1;            // Application identifier
-  string key_type = 2;          // Key type: "ethereum", "rsa", "ec"
+  // Only "ethereum" is implemented; empty means "ethereum". Anything else is
+  // refused rather than silently substituted. "rsa"/"ec" were advertised here for a
+  // long time and never existed.
+  string key_type = 2;
   bytes additional_data = 3;    // Additional binding data
   string kbs_resource_uri = 4;  // KBS resource URI for key material
   bool x25519 = 5;              // Use X25519 key pair
@@ -261,7 +273,7 @@ message GetAppKeyResponse {
 // Get App Secret Key Messages (local access only)
 message GetAppSecretKeyRequest {
   string app_id = 1;    // Application identifier
-  string key_type = 2;  // Key type: "ethereum", "rsa", "ec"
+  string key_type = 2;  // Only "ethereum" is implemented; empty means "ethereum"
   bool x25519 = 3;      // Use X25519 key pair
 }
 

@@ -31,6 +31,8 @@ sha3 = "0.10"
 hex = "0.4"
 k256 = { version = "0.13", features = ["ecdsa", "std"] }
 x25519-dalek = { version = "2.0", features = ["static_secrets"] }
+# Challenges for evidence freshness — must be random, never a counter or a clock.
+rand = "0.8.5"
 
 # Logging (used by app_key, onchain, verify)
 tracing = "0.1"
