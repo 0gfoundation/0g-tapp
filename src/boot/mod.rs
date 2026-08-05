@@ -552,6 +552,7 @@ enable_eventlog = true
         &self,
         request: GetEvidenceRequest,
         signer_eth_address: &[u8],
+        tls_public_key: Option<String>,
     ) -> TappResult<GetEvidenceResponse> {
         // Get app_id from request
         let app_id = request.app_id;
@@ -588,8 +589,9 @@ enable_eventlog = true
         // the caller's challenge (and later the app's TLS key) fit alongside it. The
         // structure travels with the quote — a quote on its own no longer names its
         // signer. See tapp_common::report_data.
-        let runtime_data =
+        let mut runtime_data =
             crate::report_data::RuntimeData::new(signer_eth_address, &request.nonce)?;
+        runtime_data.tls_public_key = tls_public_key.unwrap_or_default();
         let (runtime_data_bytes, report_data) = runtime_data.seal()?;
 
         info!(

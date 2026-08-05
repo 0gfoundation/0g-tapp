@@ -4,7 +4,8 @@ use tapp_common::proto::{
     tapp_service_client::TappServiceClient, AddToWhitelistRequest, ClaimConfigRequest,
     DockerLoginRequest,
     DockerLogoutRequest, GetAppContainerStatusRequest, GetAppInfoRequest, GetAppKeyRequest,
-    GetAppLogsRequest, GetAppSecretKeyRequest, GetEvidenceRequest, GetSecretResourceRequest,
+    GetAppLogsRequest, GetAppSecretKeyRequest, GetAppTlsCertRequest, GetEvidenceRequest,
+    GetSecretResourceRequest,
     GetServiceLogsRequest, GetServiceStatusRequest, GetTappInfoRequest, GetTaskStatusRequest,
     ListAppsRequest, ListWhitelistRequest, MountFile, PruneImagesRequest, RemoveFromWhitelistRequest,
     StartAppRequest, StartServiceRequest, StopAppRequest, StopServiceRequest, WithdrawBalanceRequest,
@@ -217,6 +218,21 @@ enum Commands {
         /// Use X25519 key pair
         #[arg(long)]
         x25519: bool,
+    },
+
+    /// Get the app's TLS key and certificate (local access only)
+    GetAppTlsCert {
+        /// Application ID
+        #[arg(short, long)]
+        app_id: String,
+
+        /// Write the private key here instead of printing it
+        #[arg(long)]
+        out_key: Option<String>,
+
+        /// Write the certificate here instead of printing it
+        #[arg(long)]
+        out_cert: Option<String>,
     },
 
     /// Get application secret key (local access only)
@@ -646,6 +662,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::GetAppKey { app_id, x25519 } => {
             get_app_key(&cli.server, app_id, x25519).await?;
+        }
+        Commands::GetAppTlsCert {
+            app_id,
+            out_key,
+            out_cert,
+        } => {
+            get_app_tls_cert(&cli.server, app_id, out_key, out_cert).await?;
         }
         Commands::GetAppSecretKey {
             app_id,
@@ -1661,6 +1684,68 @@ async fn get_app_key(
             "  X25519 Public Key: 0x{}",
             hex::encode(&result.x25519_public_key)
         );
+    }
+
+    Ok(())
+}
+
+/// Fetch the app's TLS key and certificate.
+///
+/// Writing to files is the normal use — an app's entrypoint calls this and points its
+/// server at the two paths. Printing exists for looking at what a node holds; the key is
+/// written with owner-only permissions so a shell redirect cannot quietly leave it
+/// world-readable.
+async fn get_app_tls_cert(
+    server: &str,
+    app_id: String,
+    out_key: Option<String>,
+    out_cert: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut client = create_client(server).await?;
+
+    let response = client
+        .get_app_tls_cert(Request::new(GetAppTlsCertRequest {
+            app_id: app_id.clone(),
+        }))
+        .await?;
+    let result = response.into_inner();
+
+    if !result.success {
+        eprintln!("✗ {}", result.message);
+        std::process::exit(1);
+    }
+
+    println!("✓ {}", result.message);
+    println!("  Public key sha256: {}", result.public_key_sha256);
+    println!("  Issuer           : {}", result.issuer);
+    if result.issuer == "self-signed" {
+        println!(
+            "  A verifier checks the public key against the attestation, so the issuer does not"
+        );
+        println!(
+            "  matter to it. Clients that only check a trust store (browsers) will refuse this."
+        );
+    }
+
+    match out_cert {
+        Some(path) => {
+            std::fs::write(&path, &result.cert_pem)?;
+            println!("  Certificate → {}", path);
+        }
+        None => println!("\n{}", result.cert_pem),
+    }
+
+    match out_key {
+        Some(path) => {
+            std::fs::write(&path, &result.key_pem)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+            }
+            println!("  Private key → {} (0600)", path);
+        }
+        None => println!("{}", result.key_pem),
     }
 
     Ok(())

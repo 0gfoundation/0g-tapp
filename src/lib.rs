@@ -19,14 +19,17 @@ pub mod permission;
 pub mod service_monitor;
 pub mod signature_auth;
 pub mod task_manager;
+pub mod tls_cert;
 pub mod utils;
 
 pub use boot::BootService;
 pub use config::TappConfig;
 pub use tapp_common::error::{TappError, TappResult};
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 pub use task_manager::TaskStatus;
+use tokio::sync::Mutex;
 use tonic::{Request, Response, Status};
 use tracing::{debug, error, info};
 
@@ -64,9 +67,116 @@ pub struct TappServiceImpl {
     pub measurement_service: Arc<measurement_service::MeasurementService>,
     /// Runtime config set by ClaimConfig or establish_owner_at_startup.
     pub claimed_runtime_config: Arc<tokio::sync::RwLock<ClaimedRuntimeConfig>>,
+    /// Per-app TLS identity, derived on first use. Same lifetime as the app key cache:
+    /// the key itself is deterministic, so a restart re-derives the identical one.
+    pub tls_identities: Arc<Mutex<HashMap<String, Arc<tls_cert::TlsIdentity>>>>,
 }
 
 impl TappServiceImpl {
+    /// Fetch a KMS-derived secret for `app_id` under the `material` namespace.
+    ///
+    /// Shared by `GetSecretResource` and by TLS key derivation, so both authenticate to
+    /// KMS the same way — with the app's own signer — and neither can drift into a second
+    /// convention.
+    async fn kms_derive(&self, app_id: &str, material: &str) -> Result<Vec<u8>, Status> {
+        let kms_guard = self.kms_client.read().await;
+        let kms = kms_guard.as_ref().ok_or_else(|| {
+            Status::failed_precondition(
+                "KMS not configured — set [kbs] node_urls in config.toml or call claim-config \
+                 with --kbs-urls",
+            )
+        })?;
+
+        // Get in-memory key pair: private key for signing + decryption, pubkey for KMS encryption target
+        let private_key = self
+            .app_key_service
+            .get_private_key(app_id)
+            .await
+            .map_err(|e| Status::internal(format!("Failed to get app key: {}", e)))?;
+
+        let (_, secp256k1_pubkey_64, _) = self
+            .app_key_service
+            .get_public_key(app_id)
+            .await
+            .map_err(|e| Status::internal(format!("Failed to get app public key: {}", e)))?;
+
+        // ecies expects uncompressed secp256k1 pubkey: 0x04 || 64 bytes
+        let pubkey_uncompressed = [&[0x04u8], secp256k1_pubkey_64.as_slice()].concat();
+        let pubkey_hex = hex::encode(&pubkey_uncompressed);
+
+        // Sign KMS request: EIP-191 personal_sign over "GetSecretResource:{timestamp}"
+        // (KMS server verifies via ecrecover, so signature must be 65-byte r||s||v).
+        let timestamp = chrono::Utc::now().timestamp();
+        let message = signature_auth::build_sign_message("GetSecretResource", timestamp);
+        let signature = app_key::sign_message_eip191(&private_key, message.as_bytes())
+            .map_err(|e| Status::internal(format!("Failed to sign KMS request: {}", e)))?;
+        let signature_hex = hex::encode(&signature);
+
+        // Call KMS cluster → get ECIES-encrypted app key. `material` is opaque
+        // derivation material forwarded verbatim (empty = omitted, derives
+        // purely from the app_id namespace as before) — see issue #33.
+        let encrypted = kms
+            .get_encrypted_secret(app_id, timestamp, &pubkey_hex, &signature_hex, material)
+            .await
+            .map_err(|e| Status::unavailable(format!("KMS request failed: {}", e)))?;
+
+        // Decrypt with our private key
+        ecies::decrypt(&private_key, &encrypted)
+            .map_err(|e| Status::internal(format!("Failed to decrypt KMS secret: {}", e)))
+    }
+
+    /// The app's TLS identity, derived on first use and kept for the process lifetime.
+    ///
+    /// Cached because the certificate is asked for on every app start and on every
+    /// renewal check, while the underlying key never changes — and because `GetEvidence`
+    /// needs the public key without being allowed to trigger a KMS round trip of its own
+    /// (it is an unauthenticated RPC; an outside caller must not be able to drive KMS
+    /// traffic).
+    async fn tls_identity(&self, app_id: &str) -> Result<Arc<tls_cert::TlsIdentity>, Status> {
+        if let Some(id) = self.tls_identities.lock().await.get(app_id) {
+            return Ok(id.clone());
+        }
+
+        let secret = self
+            .kms_derive(app_id, tls_cert::KMS_MATERIAL)
+            .await
+            .map_err(|e| {
+                Status::failed_precondition(format!(
+                    "cannot derive the TLS key for {}: {}",
+                    app_id, e
+                ))
+            })?;
+        // Taking a derived secret is a measured event wherever it happens, so a key
+        // pulled for TLS shows up in the runtime log exactly like one pulled by the app.
+        self.measure_secret_resource(app_id, tls_cert::KMS_MATERIAL, true)
+            .await;
+
+        let ca_url = self.config.server.ca_url.clone();
+        let id = Arc::new(
+            tls_cert::build(app_id, &secret, ca_url.as_deref())
+                .await
+                .map_err(|e| Status::internal(format!("{}", e)))?,
+        );
+        self.tls_identities
+            .lock()
+            .await
+            .insert(app_id.to_string(), id.clone());
+        Ok(id)
+    }
+
+    /// The TLS public key hash to put in `report_data`, if one has been derived.
+    ///
+    /// Absent means no TLS key exists yet for this app — not that one is being withheld.
+    /// The two are distinguishable in practice: an endpoint serving TLS whose evidence
+    /// names no key fails the comparison a verifier makes.
+    async fn tls_public_key_for_evidence(&self, app_id: &str) -> Option<String> {
+        self.tls_identities
+            .lock()
+            .await
+            .get(app_id)
+            .map(|id| format!("0x{}", id.public_key_sha256))
+    }
+
     /// Record that a KMS-derived secret left this node, into RTMR3.
     ///
     /// Without this, a derived key can be pulled by any container on the box and nothing
@@ -248,6 +358,7 @@ impl TappServiceImpl {
         info!("All TAPP service components initialized successfully");
 
         Ok(Self {
+            tls_identities: Arc::new(Mutex::new(HashMap::new())),
             boot_service,
             app_key_service,
             kms_client,
@@ -349,9 +460,13 @@ impl TappService for TappServiceImpl {
             .app_key_service
             .get_app_key(&req.app_id, "ethereum", false)
             .await?;
+        // Reported only if a TLS key has already been derived. Deriving one here would let
+        // an unauthenticated caller drive KMS traffic, and would also mint a key for an
+        // app that never asked for one.
+        let tls_public_key = self.tls_public_key_for_evidence(&req.app_id).await;
         let evidence = self
             .boot_service
-            .get_evidence(req, &key_pair.eth_address)
+            .get_evidence(req, &key_pair.eth_address, tls_public_key)
             .await?;
         Ok(Response::new(evidence))
     }
@@ -543,6 +658,60 @@ impl TappService for TappServiceImpl {
             public_key: key_pair.public_key,
             x25519_public_key: key_pair.x25519_public_key.unwrap_or_default(),
             key_source: "in-memory".to_string(),
+        }))
+    }
+
+    async fn get_app_tls_cert(
+        &self,
+        request: Request<GetAppTlsCertRequest>,
+    ) -> Result<Response<GetAppTlsCertResponse>, Status> {
+        info!("Calling GetAppTlsCert");
+
+        // SECURITY: this hands over a private key, so it is restricted exactly like
+        // GetAppSecretKey — same host only. The app container is inside this CVM, so the
+        // key does not cross the enclave boundary.
+        let remote_addr = request.remote_addr();
+        let allowed = remote_addr
+            .map(|a| Self::is_allowed_local_access(a.ip()))
+            .unwrap_or(true); // Unix socket
+        if !allowed {
+            tracing::error!(
+                remote_addr = ?remote_addr,
+                event = "TLS_CERT_ACCESS_DENIED",
+                "Rejected GetAppTlsCert from a non-local address"
+            );
+            return Err(Status::permission_denied(
+                "GetAppTlsCert can only be called from localhost or same-host Docker containers",
+            ));
+        }
+
+        let req = request.into_inner();
+        if req.app_id.is_empty() {
+            return Err(Status::invalid_argument("app_id cannot be empty"));
+        }
+
+        let id = self.tls_identity(&req.app_id).await?;
+
+        tracing::warn!(
+            app_id = %req.app_id,
+            issuer = id.issuer,
+            public_key_sha256 = %id.public_key_sha256,
+            event = "TLS_CERT_RETRIEVED",
+            "TLS key and certificate handed to a local caller"
+        );
+
+        Ok(Response::new(GetAppTlsCertResponse {
+            success: true,
+            message: format!(
+                "TLS identity for {} ({})",
+                tls_cert::dns_name(&req.app_id),
+                id.issuer
+            ),
+            key_pem: id.key_pem.clone(),
+            cert_pem: id.cert_pem.clone(),
+            issuer: id.issuer.to_string(),
+            csr_pem: id.csr_pem.clone(),
+            public_key_sha256: id.public_key_sha256.clone(),
         }))
     }
 
@@ -1750,50 +1919,7 @@ impl TappService for TappServiceImpl {
         let req = request.into_inner();
         let app_id = &req.app_id;
 
-        let kms_guard = self.kms_client.read().await;
-        let kms = kms_guard.as_ref().ok_or_else(|| {
-            Status::failed_precondition(
-                "KMS not configured — set [kbs] node_urls in config.toml or call claim-config \
-                 with --kbs-urls",
-            )
-        })?;
-
-        // Get in-memory key pair: private key for signing + decryption, pubkey for KMS encryption target
-        let private_key = self
-            .app_key_service
-            .get_private_key(app_id)
-            .await
-            .map_err(|e| Status::internal(format!("Failed to get app key: {}", e)))?;
-
-        let (_, secp256k1_pubkey_64, _) = self
-            .app_key_service
-            .get_public_key(app_id)
-            .await
-            .map_err(|e| Status::internal(format!("Failed to get app public key: {}", e)))?;
-
-        // ecies expects uncompressed secp256k1 pubkey: 0x04 || 64 bytes
-        let pubkey_uncompressed = [&[0x04u8], secp256k1_pubkey_64.as_slice()].concat();
-        let pubkey_hex = hex::encode(&pubkey_uncompressed);
-
-        // Sign KMS request: EIP-191 personal_sign over "GetSecretResource:{timestamp}"
-        // (KMS server verifies via ecrecover, so signature must be 65-byte r||s||v).
-        let timestamp = chrono::Utc::now().timestamp();
-        let message = signature_auth::build_sign_message("GetSecretResource", timestamp);
-        let signature = app_key::sign_message_eip191(&private_key, message.as_bytes())
-            .map_err(|e| Status::internal(format!("Failed to sign KMS request: {}", e)))?;
-        let signature_hex = hex::encode(&signature);
-
-        // Call KMS cluster → get ECIES-encrypted app key. `material` is opaque
-        // derivation material forwarded verbatim (empty = omitted, derives
-        // purely from the app_id namespace as before) — see issue #33.
-        let encrypted = kms
-            .get_encrypted_secret(app_id, timestamp, &pubkey_hex, &signature_hex, &req.material)
-            .await
-            .map_err(|e| Status::unavailable(format!("KMS request failed: {}", e)))?;
-
-        // Decrypt with our private key
-        let secret = ecies::decrypt(&private_key, &encrypted)
-            .map_err(|e| Status::internal(format!("Failed to decrypt KMS secret: {}", e)))?;
+        let secret = self.kms_derive(app_id, &req.material).await?;
 
         self.measure_secret_resource(app_id, &req.material, true).await;
 

@@ -110,6 +110,9 @@ rand = "0.8.5"
 tower = "0.4"
 http = "1.0"
 hyper = "1.0"
+rcgen = { version = "0.13", default-features = false, features = ["pem", "ring"] }
+p256 = { version = "0.13", features = ["pkcs8", "ecdsa"] }
+rustls-pki-types = "1"
 
 [build-dependencies]
 tonic-build = "0.12"

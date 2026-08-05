@@ -26,6 +26,11 @@ service TappService {
   // Get application secret key (private key) - local access only
   rpc GetAppSecretKey(GetAppSecretKeyRequest) returns (GetAppSecretKeyResponse);
 
+  // Get the app's TLS key and certificate - local access only.
+  // The key is derived from KMS, so it is the same on every restart and on every node
+  // of the app; the app just writes two PEM files and points its server at them.
+  rpc GetAppTlsCert(GetAppTlsCertRequest) returns (GetAppTlsCertResponse);
+
   // Get application information
   rpc GetAppInfo(GetAppInfoRequest) returns (GetAppInfoResponse);
 
@@ -268,6 +273,35 @@ message GetAppKeyResponse {
   bytes x25519_public_key = 5;  // 32-byte X25519 public key
   // Key provenance
   string key_source = 6;  // Source: "kbs", "in-memory"
+}
+
+// Get App TLS Cert Messages (local access only — carries a private key)
+message GetAppTlsCertRequest {
+  string app_id = 1;  // Application identifier
+}
+
+message GetAppTlsCertResponse {
+  bool success = 1;
+  string message = 2;
+
+  // The two files an ordinary TLS server wants. No crypto work left for the app.
+  string key_pem = 3;
+  string cert_pem = 4;
+
+  // "ca" when a CA signed it, "self-signed" when none is configured. Self-signed is
+  // not a lesser certificate here: what a verifier checks is the public key against
+  // the quote, not the issuer. The issuer matters only to clients that will not do
+  // that check — browsers, anything using a system trust store.
+  string issuer = 5;
+
+  // Always present, so the certificate can be reissued by whatever authority the
+  // deployer prefers (Let's Encrypt, their own CA) without asking for the key again.
+  string csr_pem = 6;
+
+  // sha256 of the SubjectPublicKeyInfo, hex. This is the value the quote's report_data
+  // commits to, so a verifier compares this against the key it was handed during the
+  // handshake. Returned here to save every caller re-deriving it.
+  string public_key_sha256 = 7;
 }
 
 // Get App Secret Key Messages (local access only)

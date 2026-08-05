@@ -105,6 +105,14 @@ pub struct ServerConfig {
     /// TLS private key path (if TLS enabled)
     pub tls_key_path: Option<PathBuf>,
 
+    /// Certificate authority for app TLS certificates, e.g. `http://ca:8080`.
+    ///
+    /// Optional on purpose. Unset, `GetAppTlsCert` self-signs, which is enough for any
+    /// client that checks the public key against the attestation — the issuer is
+    /// irrelevant to that check. A CA is what makes the same certificate acceptable to
+    /// clients that will not do it, such as browsers driving off a trust store.
+    pub ca_url: Option<String>,
+
     /// Permission configuration for signature-based authentication
     #[serde(default)]
     pub permission: Option<PermissionConfig>,
@@ -261,6 +269,7 @@ impl Default for ServerConfig {
             tls_enabled: false,
             tls_cert_path: None,
             tls_key_path: None,
+            ca_url: None,
             permission: None,
         }
     }
