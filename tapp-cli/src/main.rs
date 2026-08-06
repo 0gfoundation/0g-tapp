@@ -1220,6 +1220,42 @@ async fn ensure_registered_onchain(
         // Store a per-node override only when it differs from the app-level default
         let (compose_override, volumes_override) =
             node_override_hashes(&rpc_url, &contract, app_id, compose_hash, volumes_hash).await?;
+
+        // A signer that is not in the node list is usually not a new machine — it is this
+        // machine after a restart, which re-derives the signer. Adding would leave the dead
+        // address registered, holding its stake, and being fetched for evidence it can no
+        // longer produce; every restart would add another. Replacing keeps the slot and moves
+        // the stake, which is what the KMS runbook already tells operators to do by hand.
+        //
+        // Only when the chain shows exactly one other node, though: with several, which one
+        // this replaces is not knowable from here, and guessing moves someone else's stake.
+        // Then adding is the safe reading, and an operator who meant to replace can say so
+        // with update-node-onchain --old-signer.
+        match node_being_replaced(&rpc_url, &contract, app_id, signer).await {
+            Ok(Some(old)) => {
+                let tx = onchain::update_node(
+                    &params,
+                    app_id,
+                    old,
+                    signer,
+                    server.to_string(),
+                    compose_override,
+                    volumes_override,
+                )
+                .await?;
+                println!("✓ Node signer replaced on-chain (stake and slot preserved)");
+                println!("  Old Signer: 0x{:x}", old);
+                println!("  New Signer: 0x{:x}", signer);
+                println!("  Tx Hash: 0x{:x}", tx);
+                return Ok(());
+            }
+            Ok(None) => {}
+            Err(e) => {
+                println!("ℹ️  {}", e);
+                println!("   Adding this node instead; use update-node-onchain --old-signer to replace one.");
+            }
+        }
+
         let tx = onchain::add_node(
             &params,
             app_id,
@@ -2664,6 +2700,50 @@ async fn remove_node_onchain(
     Ok(())
 }
 
+/// The node on chain that a drifted signer is replacing.
+///
+/// A restart re-derives the signer, so the address on chain belongs to an instance that no
+/// longer exists — and cannot be asked what it was. Only the chain still knows, which is why
+/// this reads the node list rather than the server.
+///
+/// With one node there is nothing to guess. With several, which one died is not knowable from
+/// here: they share an app and may share a teeUrl, and picking wrong moves the wrong stake.
+/// So the caller is told to say, rather than a guess being made on their behalf.
+async fn node_being_replaced(
+    rpc_url: &str,
+    contract: &str,
+    app_id: &str,
+    new_signer: ethers::types::Address,
+) -> Result<Option<ethers::types::Address>, Box<dyn std::error::Error>> {
+    let nodes = tapp_common::onchain::get_node_list(rpc_url, contract, app_id).await?;
+    pick_replaced_node(&nodes, new_signer, app_id).map_err(Into::into)
+}
+
+/// The rule, kept apart from fetching so it can be tested: of the nodes on chain, which one
+/// is this signer replacing?
+fn pick_replaced_node(
+    nodes: &[ethers::types::Address],
+    new_signer: ethers::types::Address,
+    app_id: &str,
+) -> Result<Option<ethers::types::Address>, String> {
+    let others: Vec<_> = nodes.iter().copied().filter(|n| *n != new_signer).collect();
+    match others.len() {
+        0 => Ok(None),
+        1 => Ok(Some(others[0])),
+        _ => Err(format!(
+            "app {} has {} other nodes on chain ({}); pass --old-signer to say which one \
+             this replaces",
+            app_id,
+            others.len(),
+            others
+                .iter()
+                .map(|a| format!("0x{:x}", a))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+}
+
 async fn update_node_onchain(
     server: &str,
     app_id: String,
@@ -2678,12 +2758,6 @@ async fn update_node_onchain(
     use std::str::FromStr;
     use tapp_common::onchain::OnchainParams;
 
-    let old_signer_addr = if let Some(addr) = old_signer_arg {
-        Address::from_str(addr.trim_start_matches("0x"))
-            .map_err(|_| format!("Invalid old signer address: {}", addr))?
-    } else {
-        fetch_signer_address(server, &app_id).await?
-    };
     let (new_signer, tee_url) = if let Some(addr) = new_signer_arg {
         let parsed = Address::from_str(addr.trim_start_matches("0x"))
             .map_err(|_| format!("Invalid new signer address: {}", addr))?;
@@ -2691,6 +2765,26 @@ async fn update_node_onchain(
     } else {
         let fetched = fetch_signer_address(server, &app_id).await?;
         (fetched, tee_url_arg.unwrap_or_else(|| server.to_string()))
+    };
+
+    // `--server` names the node that is *taking over* — that is where the new signer is read
+    // from. The one being replaced is dead by definition after a restart, so asking the same
+    // server for it would return the new signer and updateNode would revert with "old node
+    // not found": the only case where the default worked was the one where nothing needed
+    // changing.
+    let old_signer_addr = match old_signer_arg {
+        Some(addr) => Address::from_str(addr.trim_start_matches("0x"))
+            .map_err(|_| format!("Invalid old signer address: {}", addr))?,
+        None => match node_being_replaced(&rpc_url, &contract, &app_id, new_signer).await? {
+            Some(old) => old,
+            None => {
+                println!(
+                    "✓ Nothing to update: 0x{:x} is already the only node on chain for {}",
+                    new_signer, app_id
+                );
+                return Ok(());
+            }
+        },
     };
 
     // refresh this node's compose/volumes from its server; store as a per-node override
@@ -2937,5 +3031,54 @@ mod tests {
 
         let mounts = extract_volume_mounts(&compose_path, &content).unwrap();
         assert!(mounts.is_empty(), "named volumes and absolute paths must be skipped");
+    }
+}
+
+#[cfg(test)]
+mod replaced_node {
+    use super::*;
+    use ethers::types::Address;
+
+    fn a(b: u8) -> Address {
+        Address::from([b; 20])
+    }
+
+    #[test]
+    fn one_other_node_is_the_one_being_replaced() {
+        // The restart case: the chain holds the address of an instance that no longer exists,
+        // and only the chain still knows it. Nothing to guess, so no flag should be needed.
+        assert_eq!(
+            pick_replaced_node(&[a(1)], a(2), "app").unwrap(),
+            Some(a(1))
+        );
+    }
+
+    #[test]
+    fn a_signer_already_registered_alone_replaces_nothing() {
+        // Not an error: re-running after a successful update should be quiet, not fail.
+        assert_eq!(pick_replaced_node(&[a(2)], a(2), "app").unwrap(), None);
+    }
+
+    #[test]
+    fn no_nodes_at_all_replaces_nothing() {
+        // A registered app whose only node was removed. Adding is the right move.
+        assert_eq!(pick_replaced_node(&[], a(2), "app").unwrap(), None);
+    }
+
+    #[test]
+    fn several_other_nodes_refuse_to_guess() {
+        // Which of them died is not knowable here — they share an app and may share a teeUrl.
+        // Guessing would move the wrong node's stake, so the operator is asked instead.
+        let e = pick_replaced_node(&[a(1), a(3)], a(2), "app").unwrap_err();
+        assert!(e.contains("--old-signer"), "got: {}", e);
+        assert!(e.contains("2 other nodes"), "got: {}", e);
+    }
+
+    #[test]
+    fn the_signer_itself_is_never_counted_as_a_candidate() {
+        // Present among several: still two others, and it must not be offered as its own
+        // predecessor.
+        let e = pick_replaced_node(&[a(1), a(2), a(3)], a(2), "app").unwrap_err();
+        assert!(!e.contains(&format!("0x{:x}", a(2))), "got: {}", e);
     }
 }

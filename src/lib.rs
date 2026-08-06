@@ -457,7 +457,7 @@ impl TappService for TappServiceImpl {
         debug!("Request: {:?}", request);
         let signer = auth_layer::get_signer_address(&request);
         let req_inner = request.into_inner();
-        // let app_id = req_inner.app_id.clone();
+        let app_id = req_inner.app_id.clone();
 
         // Get deployer address (signer EVM address)
         // If no signer (auth disabled), use a default placeholder
@@ -471,6 +471,32 @@ impl TappService for TappServiceImpl {
             .clone()
             .start_app(req_inner, deployer.clone())
             .await?;
+
+        // Derive the app's TLS identity now rather than waiting for it to be asked for.
+        //
+        // The rule is one sentence — the key exists as soon as the app runs — and it holds
+        // for both key sources, which matters: a verifier reading "no TLS key" out of
+        // evidence must not have to wonder whether it means "none" or "not fetched yet".
+        //
+        // Waiting is not an unlucky race but the normal case. Deployment goes start → register
+        // on chain → the app fetches its certificate, and a registry event is exactly what
+        // makes tappscan re-verify — so it would fetch evidence in the gap, record "no TLS
+        // key", and keep saying so until its hourly backstop.
+        //
+        // Doing it here rather than in GetEvidence keeps it behind the owner's signature.
+        // GetEvidence is unauthenticated, and deriving there would let anyone drive KMS
+        // traffic, and mint keys for apps that never wanted one.
+        //
+        // Best effort: a KMS-sourced key needs the app registered on chain and the cluster
+        // reachable, neither of which is true on a first deploy. Failing here would fail a
+        // start that has already succeeded, so it is logged and the lazy path picks it up.
+        if let Err(e) = self.tls_identity(&app_id).await {
+            info!(
+                app_id = %app_id,
+                error = %e,
+                "TLS identity not derived at start; it will be derived when first requested"
+            );
+        }
 
         // Record ownership if permission management is enabled
         // if let Some(pm) = &self.permission_manager {
