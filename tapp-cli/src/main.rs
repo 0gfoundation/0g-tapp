@@ -4,7 +4,8 @@ use tapp_common::proto::{
     tapp_service_client::TappServiceClient, AddToWhitelistRequest, ClaimConfigRequest,
     DockerLoginRequest,
     DockerLogoutRequest, GetAppContainerStatusRequest, GetAppInfoRequest, GetAppKeyRequest,
-    GetAppLogsRequest, GetAppSecretKeyRequest, GetEvidenceRequest, GetSecretResourceRequest,
+    GetAppLogsRequest, GetAppSecretKeyRequest, GetAppTlsCertRequest, GetEvidenceRequest,
+    GetSecretResourceRequest,
     GetServiceLogsRequest, GetServiceStatusRequest, GetTappInfoRequest, GetTaskStatusRequest,
     ListAppsRequest, ListWhitelistRequest, MountFile, PruneImagesRequest, RemoveFromWhitelistRequest,
     StartAppRequest, StartServiceRequest, StopAppRequest, StopServiceRequest, WithdrawBalanceRequest,
@@ -164,7 +165,7 @@ enum Commands {
         #[arg(long)]
         contract: Option<String>,
         /// CoCo Attestation Service gRPC endpoint (host:port)
-        #[arg(long, default_value = "47.237.201.184:50004")]
+        #[arg(long, default_value = "34.171.164.181:50004")]
         as_endpoint: String,
         /// AS policy id to enforce (enables boot-chain check). Empty = AS default
         /// policy (no boot-chain check). E.g. --policy-ids 0g-tapp-v0.1.0-dev
@@ -201,6 +202,11 @@ enum Commands {
         /// Application ID
         #[arg(short, long)]
         app_id: String,
+
+        /// Challenge, hex, up to 64 bytes. The server echoes it into report_data, which
+        /// is what distinguishes a quote made for this request from a cached one.
+        #[arg(long)]
+        nonce: Option<String>,
     },
 
     /// Get application public key
@@ -209,13 +215,24 @@ enum Commands {
         #[arg(short, long)]
         app_id: String,
 
-        /// Key type (default: ethereum)
-        #[arg(short = 't', long, default_value = "ethereum")]
-        key_type: String,
-
         /// Use X25519 key pair
         #[arg(long)]
         x25519: bool,
+    },
+
+    /// Get the app's TLS key and certificate (local access only)
+    GetAppTlsCert {
+        /// Application ID
+        #[arg(short, long)]
+        app_id: String,
+
+        /// Write the private key here instead of printing it
+        #[arg(long)]
+        out_key: Option<String>,
+
+        /// Write the certificate here instead of printing it
+        #[arg(long)]
+        out_cert: Option<String>,
     },
 
     /// Get application secret key (local access only)
@@ -291,6 +308,17 @@ enum Commands {
         /// e.g. "http://kms-1:9091,http://kms-2:9091"
         #[arg(long)]
         kbs_urls: Option<String>,
+
+        /// Where app TLS keys come from: "local" (default) or "kms".
+        ///
+        /// local  — derived from the app signer, never leaves this CVM, so an attested
+        ///          key proves you reached *this* instance. Changes on every restart,
+        ///          so it cannot be pinned.
+        /// kms    — stable across restarts and shared by every node of the app, which
+        ///          pinning and certificate renewal need. Requires the app registered
+        ///          on chain and the cluster reachable.
+        #[arg(long)]
+        tls_key_source: Option<String>,
     },
 
     AddToWhitelist {
@@ -640,15 +668,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let private_key = require_private_key(&cli.private_key)?;
             get_app_container_status(&cli.server, app_id, private_key).await?;
         }
-        Commands::GetEvidence { app_id } => {
-            get_evidence(&cli.server, app_id).await?;
+        Commands::GetEvidence { app_id, nonce } => {
+            get_evidence(&cli.server, app_id, nonce).await?;
         }
-        Commands::GetAppKey {
+        Commands::GetAppKey { app_id, x25519 } => {
+            get_app_key(&cli.server, app_id, x25519).await?;
+        }
+        Commands::GetAppTlsCert {
             app_id,
-            key_type,
-            x25519,
+            out_key,
+            out_cert,
         } => {
-            get_app_key(&cli.server, app_id, key_type, x25519).await?;
+            get_app_tls_cert(&cli.server, app_id, out_key, out_cert).await?;
         }
         Commands::GetAppSecretKey {
             app_id,
@@ -679,6 +710,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             chain_rpc_url,
             chain_contract,
             kbs_urls,
+            tls_key_source,
         } => {
             let private_key = require_private_key(&cli.private_key)?;
             let kbs_node_urls: Vec<String> = kbs_urls
@@ -694,6 +726,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 chain_rpc_url.unwrap_or_default(),
                 chain_contract.unwrap_or_default(),
                 kbs_node_urls,
+                tls_key_source,
             )
             .await?;
         }
@@ -1187,6 +1220,42 @@ async fn ensure_registered_onchain(
         // Store a per-node override only when it differs from the app-level default
         let (compose_override, volumes_override) =
             node_override_hashes(&rpc_url, &contract, app_id, compose_hash, volumes_hash).await?;
+
+        // A signer that is not in the node list is usually not a new machine — it is this
+        // machine after a restart, which re-derives the signer. Adding would leave the dead
+        // address registered, holding its stake, and being fetched for evidence it can no
+        // longer produce; every restart would add another. Replacing keeps the slot and moves
+        // the stake, which is what the KMS runbook already tells operators to do by hand.
+        //
+        // Only when the chain shows exactly one other node, though: with several, which one
+        // this replaces is not knowable from here, and guessing moves someone else's stake.
+        // Then adding is the safe reading, and an operator who meant to replace can say so
+        // with update-node-onchain --old-signer.
+        match node_being_replaced(&rpc_url, &contract, app_id, signer).await {
+            Ok(Some(old)) => {
+                let tx = onchain::update_node(
+                    &params,
+                    app_id,
+                    old,
+                    signer,
+                    server.to_string(),
+                    compose_override,
+                    volumes_override,
+                )
+                .await?;
+                println!("✓ Node signer replaced on-chain (stake and slot preserved)");
+                println!("  Old Signer: 0x{:x}", old);
+                println!("  New Signer: 0x{:x}", signer);
+                println!("  Tx Hash: 0x{:x}", tx);
+                return Ok(());
+            }
+            Ok(None) => {}
+            Err(e) => {
+                println!("ℹ️  {}", e);
+                println!("   Adding this node instead; use update-node-onchain --old-signer to replace one.");
+            }
+        }
+
         let tx = onchain::add_node(
             &params,
             app_id,
@@ -1324,6 +1393,42 @@ async fn get_app_info(server: &str, app_id: String) -> Result<(), Box<dyn std::e
 /// Returns None when no policy was selected (`show=false`) — the AS default policy's
 /// executables claim is not our boot-chain check, so we don't show it. The caller adds
 /// section-appropriate indentation.
+/// What the quote vouches for about the app's TLS key.
+///
+/// Printed as something to compare rather than as a pass/fail, because this command never
+/// touches the app's service port — it cannot know which key is actually being served. The
+/// comparison is the reader's to make, and it is one command: connect, take the public key
+/// out of the certificate, hash it.
+///
+/// An empty value means the app has no TLS key yet, which is not a failure — most apps
+/// have never asked for one.
+fn print_tls_binding(tls_public_key: &str, indent: &str, label_width: usize) {
+    if tls_public_key.is_empty() {
+        return;
+    }
+    // The two modes indent differently and label differently, so the width comes from
+    // the caller rather than being guessed — getting it wrong leaves one line visibly
+    // out of step with every other line around it.
+    let pad = " ".repeat(label_width + 2);
+    println!(
+        "{}{:<w$}: {}  (sha256 of the public key, attested)",
+        indent,
+        "tls key",
+        tls_public_key,
+        w = label_width
+    );
+    println!("{}{}compare against the endpoint with:", indent, pad);
+    println!(
+        "{}{}openssl s_client -connect HOST:PORT </dev/null 2>/dev/null \\",
+        indent, pad
+    );
+    println!(
+        "{}{}  | openssl x509 -pubkey -noout | openssl pkey -pubin -outform der \\",
+        indent, pad
+    );
+    println!("{}{}  | openssl dgst -sha256", indent, pad);
+}
+
 fn boot_chain_line(executables: Option<i64>, show: bool) -> Option<String> {
     use tapp_common::verify::EXECUTABLES_MATCHED;
     if !show {
@@ -1378,6 +1483,7 @@ async fn verify_app_cmd(
         println!("Verifying app: {}  (direct mode — no on-chain reconciliation)", app_id);
         println!("  server      : {}", d.server);
         println!("  signer      : {}  (attested in report_data)", d.signer);
+        print_tls_binding(&d.tls_public_key, "  ", 12);
         println!("  AS          : ear.status={} tcb_status={} advisories={}", d.ear_status, d.tcb_status, d.advisories);
         if show_boot {
             if let Some(l) = boot_chain_line(d.boot_executables, show_boot) {
@@ -1435,6 +1541,7 @@ async fn verify_app_cmd(
             "    reconcile  : signer{} compose{} volumes{} image{} owner{}",
             yn(n.signer_ok), yn(n.compose_ok), yn(n.volumes_ok), yn(n.image_ok), owner_str
         );
+        print_tls_binding(&n.tls_public_key, "    ", 11);
         if let Some(Err(claimed)) = &n.owner_claim {
             println!("    owner      : ✗ claim_config says {} but on-chain owner differs", claimed);
             all_ok = false;
@@ -1559,16 +1666,65 @@ async fn get_app_container_status(
     Ok(())
 }
 
-async fn get_evidence(server: &str, app_id: String) -> Result<(), Box<dyn std::error::Error>> {
+async fn get_evidence(
+    server: &str,
+    app_id: String,
+    nonce_hex: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut client = create_client(server).await?;
 
-    let request = Request::new(GetEvidenceRequest { app_id });
+    let nonce = match nonce_hex.as_deref() {
+        Some(h) => hex::decode(h.trim_start_matches("0x"))
+            .map_err(|e| format!("--nonce must be hex: {}", e))?,
+        None => Vec::new(),
+    };
+
+    let request = Request::new(GetEvidenceRequest {
+        app_id,
+        nonce: nonce.clone(),
+    });
 
     let response = client.get_evidence(request).await?;
     let result = response.into_inner();
 
     println!("✓ Evidence generated successfully");
     println!("  TEE Type: {}", result.tee_type);
+
+    // Show what report_data committed to, so the challenge can be checked by eye rather
+    // than only by verify-app. A server that predates the field says so plainly here
+    // instead of looking like a failure.
+    match serde_json::from_slice::<serde_json::Value>(&result.evidence) {
+        Ok(j) => match j[tapp_common::report_data::EVIDENCE_FIELD].as_str() {
+            Some(b64) => match base64::decode(b64) {
+                Ok(bytes) => {
+                    println!("  runtime_data: {}", String::from_utf8_lossy(&bytes));
+                    println!(
+                        "  report_data : {}",
+                        hex::encode(tapp_common::report_data::report_data_of(&bytes))
+                    );
+                    if !nonce.is_empty() {
+                        let parsed: tapp_common::report_data::RuntimeData =
+                            serde_json::from_slice(&bytes)?;
+                        let echoed = tapp_common::report_data::strip_hex(&parsed.nonce)
+                            .eq_ignore_ascii_case(&hex::encode(&nonce));
+                        println!(
+                            "  challenge   : {}",
+                            if echoed {
+                                "echoed — this quote was produced for this request"
+                            } else {
+                                "NOT echoed — this quote was not produced for this request"
+                            }
+                        );
+                    }
+                }
+                Err(e) => println!("  runtime_data: unreadable ({})", e),
+            },
+            None if nonce.is_empty() => {}
+            None => println!("  challenge   : ignored — this server predates the nonce field"),
+        },
+        Err(_) => println!("  (evidence is not JSON; nothing to inspect)"),
+    }
+
     println!("  Evidence (hex): {}", hex::encode(&result.evidence));
     println!("  Evidence (base64): {}", base64::encode(&result.evidence));
 
@@ -1578,14 +1734,16 @@ async fn get_evidence(server: &str, app_id: String) -> Result<(), Box<dyn std::e
 async fn get_app_key(
     server: &str,
     app_id: String,
-    key_type: String,
     x25519: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut client = create_client(server).await?;
 
+    // key_type is left empty: the server treats that as "ethereum", the only kind that
+    // exists. There used to be a --key-type flag here that was sent but ignored, so
+    // `--key-type rsa` printed "rsa" over ethereum key material.
     let request = Request::new(GetAppKeyRequest {
         app_id: app_id.clone(),
-        key_type: key_type.clone(),
+        key_type: String::new(),
         additional_data: vec![],
         kbs_resource_uri: String::new(),
         x25519,
@@ -1601,11 +1759,10 @@ async fn get_app_key(
 
     println!("✓ Application key retrieved");
     println!("  App ID: {}", app_id);
-    println!("  Key Type: {}", key_type);
     println!("  Key Source: {}", result.key_source);
     println!("  Public Key (hex): 0x{}", hex::encode(&result.public_key));
 
-    if key_type == "ethereum" && !result.eth_address.is_empty() {
+    if !result.eth_address.is_empty() {
         println!("  Ethereum Address: 0x{}", hex::encode(&result.eth_address));
     }
 
@@ -1614,6 +1771,74 @@ async fn get_app_key(
             "  X25519 Public Key: 0x{}",
             hex::encode(&result.x25519_public_key)
         );
+    }
+
+    Ok(())
+}
+
+/// Fetch the app's TLS key and certificate.
+///
+/// Writing to files is the normal use — an app's entrypoint calls this and points its
+/// server at the two paths. Printing exists for looking at what a node holds; the key is
+/// written with owner-only permissions so a shell redirect cannot quietly leave it
+/// world-readable.
+async fn get_app_tls_cert(
+    server: &str,
+    app_id: String,
+    out_key: Option<String>,
+    out_cert: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut client = create_client(server).await?;
+
+    let response = client
+        .get_app_tls_cert(Request::new(GetAppTlsCertRequest {
+            app_id: app_id.clone(),
+        }))
+        .await?;
+    let result = response.into_inner();
+
+    if !result.success {
+        eprintln!("✗ {}", result.message);
+        std::process::exit(1);
+    }
+
+    println!("✓ {}", result.message);
+    println!("  Public key sha256: {}", result.public_key_sha256);
+    println!("  Key source       : {}", result.key_source);
+    if result.key_source == "local" {
+        println!("  Bound to this instance, and regenerated when it restarts — do not pin it.");
+    } else {
+        println!("  Derived from KMS: stable across restarts and shared by every node of this app.");
+    }
+    println!("  Issuer           : {}", result.issuer);
+    if result.issuer == "self-signed" {
+        println!(
+            "  A verifier checks the public key against the attestation, so the issuer does not"
+        );
+        println!(
+            "  matter to it. Clients that only check a trust store (browsers) will refuse this."
+        );
+    }
+
+    match out_cert {
+        Some(path) => {
+            std::fs::write(&path, &result.cert_pem)?;
+            println!("  Certificate → {}", path);
+        }
+        None => println!("\n{}", result.cert_pem),
+    }
+
+    match out_key {
+        Some(path) => {
+            std::fs::write(&path, &result.key_pem)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+            }
+            println!("  Private key → {} (0600)", path);
+        }
+        None => println!("{}", result.key_pem),
     }
 
     Ok(())
@@ -1791,6 +2016,7 @@ async fn claim_config(
     chain_rpc_url: String,
     chain_contract_address: String,
     kbs_node_urls: Vec<String>,
+    tls_key_source: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use ethers::signers::Signer;
 
@@ -1806,6 +2032,7 @@ async fn claim_config(
         chain_rpc_url: chain_rpc_url.clone(),
         chain_contract_address: chain_contract_address.clone(),
         kbs_node_urls: kbs_node_urls.clone(),
+        tls_key_source: tls_key_source.clone().unwrap_or_default(),
     });
     add_signature_metadata(&mut request, &private_key, "ClaimConfig")?;
 
@@ -1851,6 +2078,10 @@ async fn claim_config(
         .and_then(|c| c.server.as_ref())
         .map(|s| s.owner_address.clone())
         .unwrap_or_default();
+
+    if let Some(src) = tls_key_source.as_deref().filter(|s| !s.is_empty()) {
+        println!("  TLS keys: {}", src);
+    }
 
     if live_owner == my_address {
         println!("  Verified: server now reports this address as owner");
@@ -2469,6 +2700,50 @@ async fn remove_node_onchain(
     Ok(())
 }
 
+/// The node on chain that a drifted signer is replacing.
+///
+/// A restart re-derives the signer, so the address on chain belongs to an instance that no
+/// longer exists — and cannot be asked what it was. Only the chain still knows, which is why
+/// this reads the node list rather than the server.
+///
+/// With one node there is nothing to guess. With several, which one died is not knowable from
+/// here: they share an app and may share a teeUrl, and picking wrong moves the wrong stake.
+/// So the caller is told to say, rather than a guess being made on their behalf.
+async fn node_being_replaced(
+    rpc_url: &str,
+    contract: &str,
+    app_id: &str,
+    new_signer: ethers::types::Address,
+) -> Result<Option<ethers::types::Address>, Box<dyn std::error::Error>> {
+    let nodes = tapp_common::onchain::get_node_list(rpc_url, contract, app_id).await?;
+    pick_replaced_node(&nodes, new_signer, app_id).map_err(Into::into)
+}
+
+/// The rule, kept apart from fetching so it can be tested: of the nodes on chain, which one
+/// is this signer replacing?
+fn pick_replaced_node(
+    nodes: &[ethers::types::Address],
+    new_signer: ethers::types::Address,
+    app_id: &str,
+) -> Result<Option<ethers::types::Address>, String> {
+    let others: Vec<_> = nodes.iter().copied().filter(|n| *n != new_signer).collect();
+    match others.len() {
+        0 => Ok(None),
+        1 => Ok(Some(others[0])),
+        _ => Err(format!(
+            "app {} has {} other nodes on chain ({}); pass --old-signer to say which one \
+             this replaces",
+            app_id,
+            others.len(),
+            others
+                .iter()
+                .map(|a| format!("0x{:x}", a))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+}
+
 async fn update_node_onchain(
     server: &str,
     app_id: String,
@@ -2483,12 +2758,6 @@ async fn update_node_onchain(
     use std::str::FromStr;
     use tapp_common::onchain::OnchainParams;
 
-    let old_signer_addr = if let Some(addr) = old_signer_arg {
-        Address::from_str(addr.trim_start_matches("0x"))
-            .map_err(|_| format!("Invalid old signer address: {}", addr))?
-    } else {
-        fetch_signer_address(server, &app_id).await?
-    };
     let (new_signer, tee_url) = if let Some(addr) = new_signer_arg {
         let parsed = Address::from_str(addr.trim_start_matches("0x"))
             .map_err(|_| format!("Invalid new signer address: {}", addr))?;
@@ -2496,6 +2765,26 @@ async fn update_node_onchain(
     } else {
         let fetched = fetch_signer_address(server, &app_id).await?;
         (fetched, tee_url_arg.unwrap_or_else(|| server.to_string()))
+    };
+
+    // `--server` names the node that is *taking over* — that is where the new signer is read
+    // from. The one being replaced is dead by definition after a restart, so asking the same
+    // server for it would return the new signer and updateNode would revert with "old node
+    // not found": the only case where the default worked was the one where nothing needed
+    // changing.
+    let old_signer_addr = match old_signer_arg {
+        Some(addr) => Address::from_str(addr.trim_start_matches("0x"))
+            .map_err(|_| format!("Invalid old signer address: {}", addr))?,
+        None => match node_being_replaced(&rpc_url, &contract, &app_id, new_signer).await? {
+            Some(old) => old,
+            None => {
+                println!(
+                    "✓ Nothing to update: 0x{:x} is already the only node on chain for {}",
+                    new_signer, app_id
+                );
+                return Ok(());
+            }
+        },
     };
 
     // refresh this node's compose/volumes from its server; store as a per-node override
@@ -2742,5 +3031,54 @@ mod tests {
 
         let mounts = extract_volume_mounts(&compose_path, &content).unwrap();
         assert!(mounts.is_empty(), "named volumes and absolute paths must be skipped");
+    }
+}
+
+#[cfg(test)]
+mod replaced_node {
+    use super::*;
+    use ethers::types::Address;
+
+    fn a(b: u8) -> Address {
+        Address::from([b; 20])
+    }
+
+    #[test]
+    fn one_other_node_is_the_one_being_replaced() {
+        // The restart case: the chain holds the address of an instance that no longer exists,
+        // and only the chain still knows it. Nothing to guess, so no flag should be needed.
+        assert_eq!(
+            pick_replaced_node(&[a(1)], a(2), "app").unwrap(),
+            Some(a(1))
+        );
+    }
+
+    #[test]
+    fn a_signer_already_registered_alone_replaces_nothing() {
+        // Not an error: re-running after a successful update should be quiet, not fail.
+        assert_eq!(pick_replaced_node(&[a(2)], a(2), "app").unwrap(), None);
+    }
+
+    #[test]
+    fn no_nodes_at_all_replaces_nothing() {
+        // A registered app whose only node was removed. Adding is the right move.
+        assert_eq!(pick_replaced_node(&[], a(2), "app").unwrap(), None);
+    }
+
+    #[test]
+    fn several_other_nodes_refuse_to_guess() {
+        // Which of them died is not knowable here — they share an app and may share a teeUrl.
+        // Guessing would move the wrong node's stake, so the operator is asked instead.
+        let e = pick_replaced_node(&[a(1), a(3)], a(2), "app").unwrap_err();
+        assert!(e.contains("--old-signer"), "got: {}", e);
+        assert!(e.contains("2 other nodes"), "got: {}", e);
+    }
+
+    #[test]
+    fn the_signer_itself_is_never_counted_as_a_candidate() {
+        // Present among several: still two others, and it must not be offered as its own
+        // predecessor.
+        let e = pick_replaced_node(&[a(1), a(2), a(3)], a(2), "app").unwrap_err();
+        assert!(!e.contains(&format!("0x{:x}", a(2))), "got: {}", e);
     }
 }

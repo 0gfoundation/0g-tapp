@@ -7,7 +7,7 @@ license = "Apache-2.0"
 
 [package]
 name = "tapp-server"
-version = "0.3.0"
+version = "0.4.0"
 edition.workspace = true
 authors = ["TDX TAPP Developers"]
 description = "TDX Trusted Application Platform Service - Rust Implementation"
@@ -110,6 +110,9 @@ rand = "0.8.5"
 tower = "0.4"
 http = "1.0"
 hyper = "1.0"
+rcgen = { version = "0.13", default-features = false, features = ["pem", "ring"] }
+p256 = { version = "0.13", features = ["pkcs8", "ecdsa"] }
+rustls-pki-types = "1"
 
 [build-dependencies]
 tonic-build = "0.12"

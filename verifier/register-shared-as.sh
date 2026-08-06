@@ -15,7 +15,15 @@
 # Usage:
 #   ./register-shared-as.sh <cloud> <boot_format> <version> <env> [owner] [as-endpoint]
 #     owner       optional: OWNER_ADDRESS (0x...); omit for canonical mode
-#     as-endpoint default 47.237.201.184:50004
+#     as-endpoint default 34.171.164.181:50004
+#
+# Env:
+#   AS_WRITE_KEY  optional: bearer key for a gated AS (issue #82). The hosted deployment
+#                 keeps the AS on an internal network behind a proxy that allows
+#                 AttestationEvaluate/GetAttestationChallenge but requires a key for this
+#                 write; keys are issued against the registry's on-chain admin signature,
+#                 expire and can be revoked. Unset = today's behaviour, and an AS that
+#                 requires no key ignores the header — so this is safe in both directions.
 #
 # Prereqs: grpcurl, python3, base64; run from the repo (paths are relative to it).
 # =============================================================================
@@ -31,10 +39,10 @@ ENV="${4:?$U}"
 _ARG5="${5:-}"
 if printf '%s' "$_ARG5" | grep -qE '^(0[xX])?[0-9a-fA-F]{40}$'; then
   OWNER="$(printf '%s' "$_ARG5" | sed 's/^0[xX]//' | tr 'A-Z' 'a-z')"
-  AS="${6:-47.237.201.184:50004}"
+  AS="${6:-34.171.164.181:50004}"
 else
   OWNER=""
-  AS="${_ARG5:-47.237.201.184:50004}"
+  AS="${_ARG5:-34.171.164.181:50004}"
 fi
 
 if [ -n "$OWNER" ]; then
@@ -100,7 +108,16 @@ trap 'rm -f "$TMP"' EXIT
 B64=$(printf '%s' "$INJECTED" | base64 -w0 | tr '+/' '-_' | tr -d '=')
 python3 -c 'import json,sys; print(json.dumps({"policy_id":sys.argv[1],"policy":sys.argv[2]}))' \
   "${POLICY_ID}_cpu" "$B64" > "$TMP"
-grpcurl -plaintext -import-path "$PROTO_DIR" -proto attestation.proto -d @ \
+# Bearer key for a gated AS. Kept in an array so an unset key adds no argument at all
+# (an empty -H "" would be sent as a malformed header rather than omitted).
+AUTH=()
+if [ -n "${AS_WRITE_KEY:-}" ]; then
+  AUTH=(-H "authorization: Bearer ${AS_WRITE_KEY}")
+  echo "using AS_WRITE_KEY for the write call"
+fi
+# ${AUTH[@]+"${AUTH[@]}"}: expands to nothing when AUTH is empty, and does not trip
+# `set -u` on bash < 4.4 (macOS ships 3.2, where a bare "${AUTH[@]}" is an unbound variable).
+grpcurl -plaintext ${AUTH[@]+"${AUTH[@]}"} -import-path "$PROTO_DIR" -proto attestation.proto -d @ \
   "$AS" attestation.AttestationService/SetAttestationPolicy < "$TMP"
 echo "registered policy ${POLICY_ID} (as ${POLICY_ID}_cpu) on ${AS}"
 echo "verify with: tapp-cli verify-app --app-id <id> --as-endpoint ${AS} --policy-ids ${POLICY_ID}"

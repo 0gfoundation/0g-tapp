@@ -19,7 +19,7 @@ contract/verify
 contract/internal/
 
 
-# GCP CVM 构建：大文件/二进制不入库（本地保留）
+# GCP CVM build: large files and binaries stay local, never committed
 cvm/*.qcow2
 cvm/*.deb
 cvm/disk.raw

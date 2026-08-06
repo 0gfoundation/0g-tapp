@@ -27,6 +27,11 @@ pub struct NodeVerdict {
     pub tcb_status: String,
     pub advisories: usize,
     pub signer_ok: bool,  // report_data binds the on-chain signer
+    /// sha256 of the TLS public key the quote vouches for, `0x…`. Empty when the app has
+    /// no TLS key. A client that compares this against the certificate it was served
+    /// during a handshake learns the peer holds a key attested inside this TEE — which is
+    /// the whole of layer-1 verification, and needs no CA.
+    pub tls_public_key: String,
     pub compose_ok: bool, // start_app compose == node effective compose
     pub volumes_ok: bool,
     pub image_ok: bool,
@@ -56,6 +61,98 @@ struct StartAppMeasure {
     compose_hash: String,                  // hex
     volumes_hash: HashMap<String, String>, // file -> hex (empty for legacy string format)
     image_hash: HashMap<String, String>,   // service -> "sha256:…"
+}
+
+/// What a quote's `report_data` commits to, read in whichever era applies.
+struct Attested {
+    /// The signer the quote names, `0x…`. Empty if it could not be read.
+    signer: String,
+    /// sha256 of the app's TLS public key, `0x…`, empty when the app has no TLS key yet.
+    /// A client compares this against the key it was handed during a handshake.
+    tls_public_key: String,
+    /// `None` when no challenge was sent or the server predates the field, so a caller
+    /// that does not care about freshness is never reported as failing.
+    fresh: Option<bool>,
+    /// False means the old signer-only `report_data`, which carries no challenge at all.
+    structured: bool,
+    note: String,
+}
+
+impl Attested {
+    /// True when `signer` is the address the caller expected.
+    fn is(&self, expected: &[u8]) -> bool {
+        crate::report_data::strip_hex(&self.signer).eq_ignore_ascii_case(&hex::encode(expected))
+    }
+}
+
+/// Read the signer, and the challenge if there is one, out of a quote.
+///
+/// Which era applies is decided by whether the evidence carries a `runtime_data` field —
+/// never guessed from the bytes:
+///
+/// - **With it**, `report_data` is `sha512(runtime_data)`. Recompute from the bytes as
+///   received (never re-serialise) and read the fields out of the structure. Confirming
+///   the challenge came back is the only way to tell a fresh quote from a replayed one.
+/// - **Without it**, `report_data` is the bare 20-byte address. Take the leading 20
+///   bytes — that is where every server that produced this format put it.
+fn read_report_data(evidence: &serde_json::Value, quote_b64: &str, nonce: &[u8]) -> Attested {
+    let mut a = Attested {
+        signer: String::new(),
+        tls_public_key: String::new(),
+        fresh: None,
+        structured: false,
+        note: String::new(),
+    };
+
+    let rd = match quote_report_data(quote_b64) {
+        Ok(rd) => rd,
+        Err(e) => {
+            a.note = format!("quote parse failed: {}; ", e);
+            return a;
+        }
+    };
+
+    let Some(rdata_b64) = evidence[crate::report_data::EVIDENCE_FIELD].as_str() else {
+        a.signer = format!("0x{}", hex::encode(&rd[..20]));
+        if !nonce.is_empty() {
+            a.note = "server predates the challenge field, freshness unproven; ".to_string();
+        }
+        return a;
+    };
+    a.structured = true;
+
+    let bytes = match B64.decode(rdata_b64) {
+        Ok(b) => b,
+        Err(e) => {
+            a.note = format!("runtime_data b64: {}; ", e);
+            return a;
+        }
+    };
+    if crate::report_data::report_data_of(&bytes) != rd {
+        a.note = "runtime_data does not hash to the quote's report_data; ".to_string();
+        return a;
+    }
+    let parsed: crate::report_data::RuntimeData = match serde_json::from_slice(&bytes) {
+        Ok(p) => p,
+        Err(e) => {
+            a.note = format!("runtime_data parse: {}; ", e);
+            return a;
+        }
+    };
+
+    a.signer = parsed.signer;
+    a.tls_public_key = parsed.tls_public_key;
+    if !nonce.is_empty() {
+        let echoed = crate::report_data::strip_hex(&parsed.nonce)
+            .eq_ignore_ascii_case(&hex::encode(nonce));
+        a.fresh = Some(echoed);
+        if !echoed {
+            a.note =
+                "challenge not echoed — this evidence was not produced for this request; "
+                    .to_string();
+        }
+    }
+    a
 }
 
 /// report_data (64 bytes) from a TDX quote, header offset resolved by version (v4=48, v5=54).
@@ -328,7 +425,11 @@ async fn verify_with_as(
         verification_requests: vec![IndividualAttestationRequest {
             tee: "tdx".to_string(),
             evidence: B64URL.encode(raw_evidence),
-            runtime_data: None, // no nonce binding for pre-generated, signer-bound evidence
+            // Left unset deliberately. report_data is now sha512 of the runtime_data we
+            // could hand over here, which would make the AS check the binding for us — but
+            // only if its hash choice matches ours, and that is unconfirmed. Until then we
+            // check it ourselves in read_report_data, which loses nothing.
+            runtime_data: None,
             init_data: None,
             runtime_data_hash_algorithm: String::new(),
         }],
@@ -360,13 +461,23 @@ async fn verify_with_as(
     Ok(AsVerdict { ear_status, tcb_status: tcb, advisories: adv, executables, boot_measurements: vec![] })
 }
 
-async fn fetch_evidence(tee_url: &str, app_id: &str) -> Result<Vec<u8>> {
+/// A fresh challenge. Random per call, never a counter or a timestamp: the point is that
+/// the node cannot have produced this quote before we asked.
+fn fresh_nonce() -> Vec<u8> {
+    use rand::RngCore;
+    let mut n = vec![0u8; 16];
+    rand::thread_rng().fill_bytes(&mut n);
+    n
+}
+
+async fn fetch_evidence(tee_url: &str, app_id: &str, nonce: &[u8]) -> Result<Vec<u8>> {
     let mut client = TappServiceClient::connect(tee_url.to_string())
         .await
         .map_err(|e| anyhow!("connect {}: {}", tee_url, e))?;
     let resp = client
         .get_evidence(tonic::Request::new(GetEvidenceRequest {
             app_id: app_id.to_owned(),
+            nonce: nonce.to_vec(),
         }))
         .await
         .map_err(|e| anyhow!("{}", e))?
@@ -380,6 +491,8 @@ async fn fetch_evidence(tee_url: &str, app_id: &str) -> Result<Vec<u8>> {
 pub struct DirectVerdict {
     pub server: String,
     pub signer: String, // from quote report_data (0x…), as attested (not reconciled)
+    /// sha256 of the attested TLS public key, `0x…`. Empty when the app has no TLS key.
+    pub tls_public_key: String,
     pub ear_status: String,
     pub tcb_status: String,
     pub advisories: usize,
@@ -402,6 +515,7 @@ pub async fn verify_node_direct(
     let mut v = DirectVerdict {
         server: server.to_string(),
         signer: String::new(),
+        tls_public_key: String::new(),
         ear_status: "-".to_string(),
         tcb_status: "-".to_string(),
         advisories: 0,
@@ -413,16 +527,18 @@ pub async fn verify_node_direct(
         note: String::new(),
     };
 
-    let raw = fetch_evidence(server, app_id).await?;
+    let nonce = fresh_nonce();
+    let raw = fetch_evidence(server, app_id, &nonce).await?;
     let j: serde_json::Value = serde_json::from_slice(&raw)?;
     let quote_b64 = j["quote"].as_str().unwrap_or("");
     let cc_b64 = j["cc_eventlog"].as_str().unwrap_or("");
 
-    if let Ok(rd) = quote_report_data(quote_b64) {
-        v.signer = format!("0x{}", hex::encode(&rd[..20]));
-    } else {
-        v.note = "quote parse failed; ".to_string();
-    }
+    // There is no on-chain signer to compare against here — the whole point of this path
+    // is that the app may not be registered — so report what the node attested.
+    let attested = read_report_data(&j, quote_b64, &nonce);
+    v.signer = attested.signer.clone();
+    v.tls_public_key = attested.tls_public_key.clone();
+    v.note = attested.note.clone();
 
     match verify_with_as(as_endpoint, &raw, policy_ids).await {
         Ok(av) => {
@@ -488,6 +604,7 @@ pub async fn verify_app(
             tcb_status: "-".to_string(),
             advisories: 0,
             signer_ok: false,
+            tls_public_key: String::new(),
             compose_ok: false,
             volumes_ok: false,
             image_ok: false,
@@ -509,8 +626,9 @@ pub async fn verify_app(
             };
         v.tee_url = tee_url.clone();
 
-        // ② fetch evidence
-        let raw = match fetch_evidence(&tee_url, app_id).await {
+        // ② fetch evidence, with a challenge so a cached blob is distinguishable
+        let nonce = fresh_nonce();
+        let raw = match fetch_evidence(&tee_url, app_id, &nonce).await {
             Ok(b) => b,
             Err(e) => {
                 v.note = format!("get-evidence failed: {}", e);
@@ -530,13 +648,11 @@ pub async fn verify_app(
         let quote_b64 = j["quote"].as_str().unwrap_or("");
         let cc_b64 = j["cc_eventlog"].as_str().unwrap_or("");
 
-        // ④a signer binding: on-chain signer (20 bytes) present in report_data
-        if let Ok(rd) = quote_report_data(quote_b64) {
-            let needle = signer.as_bytes();
-            v.signer_ok = rd.windows(needle.len()).any(|w| w == needle);
-        } else {
-            v.note = "quote parse failed; ".to_string();
-        }
+        // ④a signer binding: the quote names the signer the chain registered
+        let attested = read_report_data(&j, quote_b64, &nonce);
+        v.signer_ok = attested.is(signer.as_bytes());
+        v.tls_public_key = attested.tls_public_key.clone();
+        v.note = attested.note.clone();
 
         // ③ AS quote verification
         match verify_with_as(as_endpoint, &raw, policy_ids).await {
@@ -589,4 +705,88 @@ pub async fn verify_app(
         app_id: app_id.to_string(),
         nodes,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SIGNER: [u8; 20] = [0x11; 20];
+
+    /// Smallest thing `quote_report_data` will parse: v4 header (48 bytes) followed by a
+    /// 584-byte body whose last 64 bytes are report_data.
+    fn quote_with(report_data: &[u8]) -> String {
+        let mut q = vec![0u8; 48 + 584];
+        q[0..2].copy_from_slice(&4u16.to_le_bytes());
+        q[48 + 520..48 + 584].copy_from_slice(report_data);
+        B64.encode(q)
+    }
+
+    fn legacy_report_data(signer: &[u8]) -> Vec<u8> {
+        let mut rd = vec![0u8; 64];
+        rd[..signer.len()].copy_from_slice(signer);
+        rd
+    }
+
+    #[test]
+    fn a_server_that_predates_runtime_data_still_has_its_signer_read() {
+        let quote = quote_with(&legacy_report_data(&SIGNER));
+        let a = read_report_data(&serde_json::json!({}), &quote, &[]);
+        assert!(a.is(&SIGNER));
+        assert!(!a.structured);
+        assert_eq!(a.fresh, None);
+        assert!(a.note.is_empty());
+    }
+
+    #[test]
+    fn sending_a_challenge_to_an_old_server_says_so_instead_of_failing_the_signer() {
+        let quote = quote_with(&legacy_report_data(&SIGNER));
+        let a = read_report_data(&serde_json::json!({}), &quote, b"chal");
+        assert!(a.is(&SIGNER), "the signer binding still holds");
+        assert_eq!(a.fresh, None, "not a failure — the server cannot answer it");
+        assert!(a.note.contains("predates"), "got {}", a.note);
+    }
+
+    #[test]
+    fn an_echoed_challenge_proves_the_quote_was_made_for_this_request() {
+        let rdata = crate::report_data::RuntimeData::new(&SIGNER, b"chal").unwrap();
+        let (bytes, rd) = rdata.seal().unwrap();
+        let ev = serde_json::json!({ crate::report_data::EVIDENCE_FIELD: B64.encode(&bytes) });
+        let a = read_report_data(&ev, &quote_with(&rd), b"chal");
+        assert!(a.is(&SIGNER));
+        assert!(a.structured);
+        assert_eq!(a.fresh, Some(true));
+        assert!(a.note.is_empty());
+    }
+
+    #[test]
+    fn a_replayed_quote_is_caught_by_the_challenge_not_by_the_signer() {
+        // Evidence produced for someone else's challenge: signer still binds, freshness does not.
+        let rdata = crate::report_data::RuntimeData::new(&SIGNER, b"theirs").unwrap();
+        let (bytes, rd) = rdata.seal().unwrap();
+        let ev = serde_json::json!({ crate::report_data::EVIDENCE_FIELD: B64.encode(&bytes) });
+        let a = read_report_data(&ev, &quote_with(&rd), b"mine");
+        assert!(a.is(&SIGNER));
+        assert_eq!(a.fresh, Some(false));
+        assert!(a.note.contains("not echoed"), "got {}", a.note);
+    }
+
+    #[test]
+    fn runtime_data_that_does_not_hash_to_the_quote_names_nobody() {
+        // A structure swapped for one naming a different signer: it no longer reproduces
+        // report_data, so nothing in it may be believed — including the signer.
+        let (_, rd) = crate::report_data::RuntimeData::new(&SIGNER, b"chal")
+            .unwrap()
+            .seal()
+            .unwrap();
+        let (other, _) = crate::report_data::RuntimeData::new(&[0x22; 20], b"chal")
+            .unwrap()
+            .seal()
+            .unwrap();
+        let ev = serde_json::json!({ crate::report_data::EVIDENCE_FIELD: B64.encode(&other) });
+        let a = read_report_data(&ev, &quote_with(&rd), b"chal");
+        assert!(!a.is(&SIGNER));
+        assert!(!a.is(&[0x22; 20]), "the swapped signer must not be believed either");
+        assert!(a.note.contains("does not hash"), "got {}", a.note);
+    }
 }

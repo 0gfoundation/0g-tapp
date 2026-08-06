@@ -7,41 +7,17 @@
 Explorer: https://chainscan-galileo.0g.ai
 RPC: https://evmrpc-testnet.0g.ai
 
-### Dev
+### Dev — **the registry in use**
 
-> For local development and integration testing. Data may be reset at any time.
-
-**Deployed:** 2026-04-10
-**Deployer:** `0xB831371eb2703305f1d9F8542163633D0675CEd7`
-**Min stake:** 1 0G (`1000000000000000000` wei)
-**Lock period:** 86400 s (1 day)
-
-| Contract | Address | Tx Hash |
-|----------|---------|---------|
-| TappRegistry Implementation (initial) | `0xE03de87Dc82ABeacD48deEDCAA6D607Fa6EA05b6` | `0x465379c54d379b9a7b5be0e2442eaf32e363419aabf40e8817b8d65704687f32` |
-| **TappRegistry Implementation (current)** | `0x259c066ef1030a42cDf1bea5Acc928e49aa46822` | `0x7e1b4d078544e5ba877a1f4eb816fa19be5adbae8d9e4aa36e9c9bfedcc0714a` |
-| UpgradeableBeacon | `0x8fD880b7FCc9f0170a6F2aA58Ee90B4A012a509E` | `0x92a77f5c52cce763b8e9d26d30efbe0ce305a63019a4f0fd842744dd9c2b1fc0` |
-| **BeaconProxy (stable)** | `0x95a0BF4148b30F6F8D86870534c51df46Da5511c` | `0x1e360fa0236bf3b2857ee7c69ce4680415ea5bfa34ac9b6826f2d643249f33ee` |
-
-**Upgrades:**
-
-| Date | New Implementation | Upgrade Tx | Notes |
-|------|--------------------|-----------|-------|
-| 2026-06-02 | `0xcE835faCd6381aaFA3fA2DB921DbFb2209f4523c` | `0x6390a0c5fcb9002c379a0f14378a2139e5499a09127427d73675051beba49ee0` | Add user revoke ack + authorize/revoke invalidator + invalidateAcks |
-| 2026-06-02 | `0x259c066ef1030a42cDf1bea5Acc928e49aa46822` | `0x21542dd5a4edb72925419bfc7d71380739e40fbbac063dea3aa022619ec73046` | Add batch acknowledgeApps / revokeAcknowledgements |
+> For development and integration testing. Data may be reset at any time.
 
 ```env
-TAPP_REGISTRY_CONTRACT=0x95a0BF4148b30F6F8D86870534c51df46Da5511c
+TAPP_REGISTRY_CONTRACT=0x2Ce80374318B1d7Fb3345724457a182E0ad165c9
 ```
 
-#### Per-node-compose e2e test instance (branch `fix/tappregistry-per-node-compose-hash`)
-
-> Standalone throwaway instance deployed to e2e-test the per-node compose/volumes
-> change (issue #535). NOT the canonical Dev registry above — the live beacon was
-> not touched. Safe to discard. All three contracts source-verified on the explorer.
-
 **Deployed:** 2026-06-23  **Deployer:** `0xea695C312CE119dE347425B29AFf85371c9d1837`
-**Min stake:** 1 0G  **Lock:** 86400 s
+**Min stake:** 1 0G (`1000000000000000000` wei)  **Lock period:** 86400 s (1 day)
+All three contracts source-verified on the explorer.
 
 | Contract | Address |
 |----------|---------|
@@ -57,9 +33,41 @@ TAPP_REGISTRY_CONTRACT=0x95a0BF4148b30F6F8D86870534c51df46Da5511c
 |------|--------------------|-----------|-------|
 | 2026-07-07 | `0x9Ea52Ef383e8eA3fe7F0890309D3C62b2FC1Ac2B` | `0x8a003a1a05c381f59bf213c19e2340b63094ad3230d84e0f42ac9c71d7f84505` | Add `version()` view (baseline `0.1.0`); storage layout unchanged, source-verified |
 
+**`getNode` returns 5 fields here** — `(teeUrl, addedAt, stakeAmount, composeHash, volumesHash)`.
+The superseded deployment below returns 3. Decoding with the wrong arity either errors or
+silently truncates, so always match the registry you are querying.
+
+Sanity check which one you are talking to: `cast call <proxy> "version()(string)"` returns
+`"0.1.0"` here and **reverts** on the superseded one.
+
 e2e exercised on app `0g-kms`: register-onchain (app-level default + first node
 inherit), add-node-onchain (per-node override), update-node-onchain — all verified
 on-chain via getNode/getAppInfo.
+
+#### Superseded: original Dev deployment
+
+> ⚠️ **Do not use for new work.** Predates per-node compose/volumes overrides (issue #535)
+> and has no `version()` — `cast call … "version()(string)"` reverts. `getNode` returns
+> only 3 fields. Some long-lived apps (e.g. the testnet sandbox provider / attestor) are
+> still registered here, which is the only reason it is documented.
+
+**Deployed:** 2026-04-10
+**Deployer:** `0xB831371eb2703305f1d9F8542163633D0675CEd7`
+**Min stake:** 1 0G  **Lock period:** 86400 s
+
+| Contract | Address | Tx Hash |
+|----------|---------|---------|
+| TappRegistry Implementation (initial) | `0xE03de87Dc82ABeacD48deEDCAA6D607Fa6EA05b6` | `0x465379c54d379b9a7b5be0e2442eaf32e363419aabf40e8817b8d65704687f32` |
+| **TappRegistry Implementation (last)** | `0x259c066ef1030a42cDf1bea5Acc928e49aa46822` | `0x7e1b4d078544e5ba877a1f4eb816fa19be5adbae8d9e4aa36e9c9bfedcc0714a` |
+| UpgradeableBeacon | `0x8fD880b7FCc9f0170a6F2aA58Ee90B4A012a509E` | `0x92a77f5c52cce763b8e9d26d30efbe0ce305a63019a4f0fd842744dd9c2b1fc0` |
+| **BeaconProxy (stable)** | `0x95a0BF4148b30F6F8D86870534c51df46Da5511c` | `0x1e360fa0236bf3b2857ee7c69ce4680415ea5bfa34ac9b6826f2d643249f33ee` |
+
+**Upgrades:**
+
+| Date | New Implementation | Upgrade Tx | Notes |
+|------|--------------------|-----------|-------|
+| 2026-06-02 | `0xcE835faCd6381aaFA3fA2DB921DbFb2209f4523c` | `0x6390a0c5fcb9002c379a0f14378a2139e5499a09127427d73675051beba49ee0` | Add user revoke ack + authorize/revoke invalidator + invalidateAcks |
+| 2026-06-02 | `0x259c066ef1030a42cDf1bea5Acc928e49aa46822` | `0x21542dd5a4edb72925419bfc7d71380739e40fbbac063dea3aa022619ec73046` | Add batch acknowledgeApps / revokeAcknowledgements |
 
 ### Testnet
 
