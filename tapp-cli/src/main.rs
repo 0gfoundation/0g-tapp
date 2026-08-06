@@ -1366,21 +1366,31 @@ async fn get_app_info(server: &str, app_id: String) -> Result<(), Box<dyn std::e
 ///
 /// An empty value means the app has no TLS key yet, which is not a failure — most apps
 /// have never asked for one.
-fn print_tls_binding(tls_public_key: &str, indent: &str) {
+fn print_tls_binding(tls_public_key: &str, indent: &str, label_width: usize) {
     if tls_public_key.is_empty() {
         return;
     }
-    println!("{}tls key     : {}  (sha256 of the public key, attested)", indent, tls_public_key);
-    println!("{}              compare against the endpoint with:", indent);
+    // The two modes indent differently and label differently, so the width comes from
+    // the caller rather than being guessed — getting it wrong leaves one line visibly
+    // out of step with every other line around it.
+    let pad = " ".repeat(label_width + 2);
     println!(
-        "{}              openssl s_client -connect HOST:PORT </dev/null 2>/dev/null \\",
-        indent
+        "{}{:<w$}: {}  (sha256 of the public key, attested)",
+        indent,
+        "tls key",
+        tls_public_key,
+        w = label_width
+    );
+    println!("{}{}compare against the endpoint with:", indent, pad);
+    println!(
+        "{}{}openssl s_client -connect HOST:PORT </dev/null 2>/dev/null \\",
+        indent, pad
     );
     println!(
-        "{}                | openssl x509 -pubkey -noout | openssl pkey -pubin -outform der \\",
-        indent
+        "{}{}  | openssl x509 -pubkey -noout | openssl pkey -pubin -outform der \\",
+        indent, pad
     );
-    println!("{}                | openssl dgst -sha256", indent);
+    println!("{}{}  | openssl dgst -sha256", indent, pad);
 }
 
 fn boot_chain_line(executables: Option<i64>, show: bool) -> Option<String> {
@@ -1437,7 +1447,7 @@ async fn verify_app_cmd(
         println!("Verifying app: {}  (direct mode — no on-chain reconciliation)", app_id);
         println!("  server      : {}", d.server);
         println!("  signer      : {}  (attested in report_data)", d.signer);
-        print_tls_binding(&d.tls_public_key, "  ");
+        print_tls_binding(&d.tls_public_key, "  ", 12);
         println!("  AS          : ear.status={} tcb_status={} advisories={}", d.ear_status, d.tcb_status, d.advisories);
         if show_boot {
             if let Some(l) = boot_chain_line(d.boot_executables, show_boot) {
@@ -1495,7 +1505,7 @@ async fn verify_app_cmd(
             "    reconcile  : signer{} compose{} volumes{} image{} owner{}",
             yn(n.signer_ok), yn(n.compose_ok), yn(n.volumes_ok), yn(n.image_ok), owner_str
         );
-        print_tls_binding(&n.tls_public_key, "    ");
+        print_tls_binding(&n.tls_public_key, "    ", 11);
         if let Some(Err(claimed)) = &n.owner_claim {
             println!("    owner      : ✗ claim_config says {} but on-chain owner differs", claimed);
             all_ok = false;
