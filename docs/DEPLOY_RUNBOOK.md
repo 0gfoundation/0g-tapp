@@ -2,7 +2,7 @@
 
 把一个 app（以 sandbox **provider** + **broker** 为例）从零部署到 tapp、并在 TappRegistry 上链可用的标准流程与踩坑清单。
 
-- **合约**：TappRegistry BeaconProxy `0x95a0BF4148b30F6F8D86870534c51df46Da5511c`
+- **合约**：TappRegistry BeaconProxy `0x2Ce80374318B1d7Fb3345724457a182E0ad165c9`
 - **RPC / chainId**：`https://evmrpc-testnet.0g.ai` / `16602`
 - **compose**：provider → `0g-sandbox/docker/sandbox/docker-compose.yml`，broker → `0g-sandbox/docker/broker/docker-compose.yml`
 
@@ -32,16 +32,16 @@ tapp-cli -s http://<server>:50051 -k 0x<owner-key> start-app -f <compose> --app-
 # 3. 注册上链（key 必须既是 server owner 又是有钱的 app owner）
 tapp-cli -s http://<server>:50051 -k 0x<owner-key> register-onchain \
   --app-id <appId> --rpc-url https://evmrpc-testnet.0g.ai \
-  --contract 0x95a0BF4148b30F6F8D86870534c51df46Da5511c --stake-wei 1000000000000000000
+  --contract 0x2Ce80374318B1d7Fb3345724457a182E0ad165c9 --stake-wei 1000000000000000000
 
 # 2+3 合并版：先注册再起（幂等，可反复跑）
 tapp-cli -s http://<server>:50051 -k 0x<owner-key> start-app -f <compose> --app-id <appId> \
   --register-onchain --rpc-url https://evmrpc-testnet.0g.ai \
-  --contract 0x95a0BF4148b30F6F8D86870534c51df46Da5511c --stake-wei 1000000000000000000
+  --contract 0x2Ce80374318B1d7Fb3345724457a182E0ad165c9 --stake-wei 1000000000000000000
 
 # 4. 授权 invalidator（注意：授权的是 SandboxServing 合约地址，不是 owner 钱包）
 #    暂无 tapp-cli 子命令，直接 cast send（注意 gas）
-cast send 0x95a0BF4148b30F6F8D86870534c51df46Da5511c \
+cast send 0x2Ce80374318B1d7Fb3345724457a182E0ad165c9 \
   "authorizeInvalidator(string,address)" "<appId>" 0x<SANDBOX_SERVING_CONTRACT> \
   --rpc-url https://evmrpc-testnet.0g.ai --private-key 0x<owner-key> \
   --legacy --gas-price 3000000000

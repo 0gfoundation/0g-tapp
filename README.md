@@ -12,6 +12,7 @@
 - **Signature-based Authentication**: EVM-compatible signature verification for access control
 - **On-chain Registration**: Register apps and TEE nodes on TappRegistry smart contract
 - **KMS Integration**: Fetch hardware-independent app secrets from a KMS cluster (decrypted locally within the TEE)
+- **Attested TLS**: Hand an app a TLS certificate whose public key is committed to by the attestation evidence, so a client can tie the connection it made to the TEE it verified
 
 ## Getting Started
 
@@ -140,7 +141,41 @@ This security model is ideal for scenarios requiring maximum trust minimization,
 
 All applications run within TEE boundaries and are cryptographically measured. The runtime measurements are extended to the TEE event log for remote attestation.
 
-Attestation evidence returned by `GetEvidence` binds the application's TEE-derived signer (an Ethereum address derived inside the enclave) into the TDX `report_data` field — the first 20 bytes of `report_data` equal the signer address, with the remaining bytes zero-padded. Verifiers can match this against the signer address registered on `TappRegistry` to prove that a signed message and the on-chain identity both come from the same app running on this TEE.
+Attestation evidence returned by `GetEvidence` commits the application's TEE-derived identity into the TDX `report_data` field. `report_data` is `sha512` of a small JSON object — `runtime_data` — that travels as a third field of the evidence alongside `quote` and `cc_eventlog`:
+
+```json
+{"nonce": "0x…", "signer": "0x…", "tls_public_key": "0x…"}
+```
+
+| field | meaning |
+|---|---|
+| `nonce` | Caller-supplied challenge, echoed back. A quote is self-authenticating but undated, so without a challenge a cached quote is indistinguishable from a fresh one. Pass `get-evidence --nonce <hex>` (≤64 bytes, must be random). |
+| `signer` | The Ethereum address derived inside the enclave — the identity `TappRegistry` records. Verifiers match it against the registered `signerAddress` to prove a signed message and the on-chain identity come from the same app on this TEE. |
+| `tls_public_key` | sha256 of the app's TLS SubjectPublicKeyInfo, when it has one. This is what lets a client tie the certificate it was handed during a TLS handshake to a TEE running this app. |
+
+Empty fields are omitted rather than serialised as `""`, so evidence produced before a field existed and after it are byte-identical whenever the field is unused. Two consequences for verifiers:
+
+- **A quote alone no longer names its signer** — the structure must accompany it. Nothing in the system passes a bare quote.
+- **Hash the bytes exactly as transmitted.** Never re-serialise: there is then no canonical form for the two sides to agree on and drift apart over.
+
+`sha512` is not arbitrary — `report_data` is 64 bytes and `sha512` fills it exactly, which is also what CoCo-AS expects when handed `runtime_data` and asked to check the binding itself.
+
+Evidence from servers before v0.4.0 has no `runtime_data` field and a `report_data` whose first 20 bytes are the signer, zero-padded. Both readings are supported (`tapp-common/src/report_data.rs`, `tapp-common/src/verify.rs`); a missing field is reported as such rather than as a signer mismatch.
+
+### App TLS certificates
+
+`GetAppTlsCert` hands an application the two files a TLS server wants — `key_pem` and `cert_pem` (P-256) — plus a `csr_pem` for reissuing elsewhere and `public_key_sha256`. The certificate is self-signed unless `ca_url` is configured.
+
+What makes it trustworthy is the binding, not the issuer: `public_key_sha256` is the value `report_data` commits to, so a client compares the key it was offered during the handshake against attested evidence. A self-signed certificate is not weaker for a client that performs that check — the issuer matters only to clients that will not, such as browsers driving off a system trust store. That is the one thing a CA adds.
+
+`[server].tls_key_source` decides where the private key comes from, and the two options trade the same property in opposite directions:
+
+| | derived from | survives a restart | what evidence then says |
+|---|---|---|---|
+| `local` (default) | this CVM's own signer, which never leaves it | **no** — the signer is regenerated every boot | "the endpoint I am talking to is *this TEE instance*" — the strongest statement available |
+| `kms` | `(app_id, "tls")` at the KMS cluster | yes, and identical on every node of the app | "some TEE of this app" |
+
+Certificate pinning, Certificate Transparency monitoring and ACME renewal all need a key that outlives a restart, so they need `kms`. `local` involves nothing external — no KMS, no on-chain registration — so it works from first boot, which is why it is the default; stability is what you opt into once something needs it. Set it in `config.toml` or at claim time with `claim-config --tls-key-source local|kms`.
 
 ### Measurement Design Philosophy
 
@@ -214,8 +249,20 @@ Create a `config.toml` file:
 
 ```toml
 [server]
-host = "0.0.0.0"
-port = 50051
+bind_address = "0.0.0.0:50051"
+
+# Recommended. Listened on IN ADDITION to bind_address, and the only transport that
+# serves key material (GetAppSecretKey / GetSecretResource / GetAppTlsCert).
+unix_socket_path = "/run/tapp/tapp.sock"
+
+# Where app TLS private keys come from: "local" (default, bound to this instance,
+# changes every boot) or "kms" (stable across restarts and shared by every node of
+# the app, needs [kbs] and [chain]). See "App TLS certificates" above.
+tls_key_source = "local"
+
+# Optional CA for app TLS certificates. Unset, GetAppTlsCert self-signs — which is
+# enough for any client that checks the public key against the attestation.
+# ca_url = "http://ca:8080"
 
 [server.permission]
 enabled = true
@@ -259,7 +306,15 @@ freshly booted tapp is UNCLAIMED — every owner-level RPC is rejected until som
 claims it:
 
 ```bash
-tapp-cli -s http://<tapp>:50051 -k 0x<your-key> claim-owner
+tapp-cli -s http://<tapp>:50051 -k 0x<your-key> claim-config
+
+# Or claim and configure in one call — chain, KMS cluster and TLS key source are
+# all optional here if already present in config.toml:
+tapp-cli -s http://<tapp>:50051 -k 0x<your-key> claim-config \
+  --chain-rpc-url https://evmrpc-testnet.0g.ai \
+  --chain-contract 0x<TappRegistry> \
+  --kbs-urls "http://kms-1:9091,http://kms-2:9091" \
+  --tls-key-source kms
 ```
 
 - **First-come-first-served, exactly once per boot**: the request signer becomes
@@ -369,6 +424,12 @@ verbatim** so you can compare manually:
   (`{"measurement.<shim|grub|kernel|initrd|kernel_cmdline|uki>.SHA-384": [...]}`), directly
   diffable against `verifier/reference-values/<cloud>/<boot_format>/<version>/<env>.json`.
 
+Both modes also print `tls key : <sha256>  (sha256 of the public key, attested)` when the app
+has a TLS key, followed by the `openssl s_client | … | openssl dgst -sha256` one-liner for
+comparing it against a live endpoint — that comparison is what ties a TLS connection to the
+node just verified. The line is absent when the app has never asked for a key, which is not a
+failure.
+
 ```bash
 # full verification: dynamic (chain) + static (policy)
 tapp-cli verify-app \
@@ -376,7 +437,7 @@ tapp-cli verify-app \
   --rpc-url https://evmrpc-testnet.0g.ai \
   --contract 0x<TappRegistry> \
   --policy-ids 0g-tapp-<cloud>-<boot_format>-<version>-<env>
-  # --as-endpoint host:port   # CoCo-AS gRPC endpoint, default 47.237.201.184:50004
+  # --as-endpoint host:port   # CoCo-AS gRPC endpoint, default 34.171.164.181:50004
 
 # direct mode (single node, not yet registered): prints attested values verbatim
 tapp-cli -s http://<tapp>:50051 verify-app --app-id my-app
@@ -410,11 +471,15 @@ tapp-cli -k 0x<owner-key> revoke-invalidator-onchain \
 
 ## KMS Integration
 
-When `[kbs]` is configured, apps running inside the TEE can retrieve a hardware-independent, KMS-derived secret via the `GetSecretResource` gRPC call. This call is **local access only** (localhost / same-host Docker network).
+When `[kbs]` is configured, apps running inside the TEE can retrieve a hardware-independent, KMS-derived secret via the `GetSecretResource` gRPC call.
 
-### Local key retrieval: Unix socket (recommended)
+### Key material is served only on the Unix socket
 
-Set `unix_socket_path` in the server config. The server then listens on this Unix domain socket **in addition to** the TCP `bind_address` (not instead of it) — so a same-host client (e.g. a Docker container fetching its key) uses the socket, while remote clients keep using TCP. The container mounts the socket file instead of using `extra_hosts: host.docker.internal:host-gateway`.
+Three RPCs hand over private key material — `GetAppSecretKey`, `GetSecretResource` and `GetAppTlsCert` — and from v0.4.0 they are reachable **only over the Unix socket**. Over TCP they are refused with `PermissionDenied`, including from `localhost` and from a container using `host.docker.internal:host-gateway`.
+
+The check is the transport answering rather than a judgement about an address: tonic records connect-info per listener, and a TCP connection always carries a peer address while a Unix one never does. Before v0.4.0 this was an address check that accepted the Docker bridge ranges, which meant any host that could reach `:50051` could fetch any app's private key.
+
+Set `unix_socket_path` in the server config. The server listens on the socket **in addition to** the TCP `bind_address` (not instead of it), so management, `teeUrl` and `verify-app` keep working over TCP while key material does not travel that way at all.
 
 ```toml
 [server]
@@ -430,8 +495,9 @@ services:
 ```
 
 ```bash
-# From inside the container or on the host:
+# From inside the container or on the host — no signature needed, the socket is the authorization:
 grpcurl -unix -plaintext -d '{"app_id": "my-app"}' /run/tapp/tapp.sock tapp_service.TappService/GetSecretResource
+grpcurl -unix -plaintext -d '{"app_id": "my-app"}' /run/tapp/tapp.sock tapp_service.TappService/GetAppTlsCert
 ```
 
 > **⚠️ Security note:** The Unix socket grants access to all app keys and secret
@@ -440,22 +506,15 @@ grpcurl -unix -plaintext -d '{"app_id": "my-app"}' /run/tapp/tapp.sock tapp_serv
 > owner, single trust domain) but must not be bind-mounted into untrusted or
 > multi-tenant containers.
 
+> **⚠️ Upgrading a node to v0.4.0:** any app still fetching key material over
+> `host.docker.internal:50051` stops working. Add the socket mount to its compose
+> before upgrading the server.
+
+The returned `secret` bytes are the HKDF-derived app key from the KMS cluster, decrypted inside the TEE. The KMS authenticates the request by verifying the TEE node's on-chain registered `signerAddress` — so an app must be registered on chain, and shortly after a fresh registration the cluster may still answer `401` until its own view of the chain catches up ([0g-kms#11](https://github.com/0gfoundation/0g-kms/issues/11)).
+
 ### Remote / TCP access
 
-The server always listens on `bind_address` (default `0.0.0.0:50051`) for remote clients (management, on-chain `teeUrl`, verify-app) — the Unix socket above is additional, not a replacement. A container reaching the server over TCP instead of the socket needs `extra_hosts`:
-
-```yaml
-services:
-  app:
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-```
-
-```bash
-grpcurl -plaintext -d '{"app_id": "my-app"}' host.docker.internal:50051 tapp_service.TappService/GetSecretResource
-```
-
-The returned `secret` bytes are the HKDF-derived app key from the KMS cluster, decrypted inside the TEE. The KMS authenticates the request by verifying the TEE node's on-chain registered `signerAddress`.
+The server always listens on `bind_address` (default `0.0.0.0:50051`) for remote clients — management, the on-chain `teeUrl`, `verify-app`. The Unix socket above is additional, not a replacement. Everything except the three key-material RPCs works over either.
 
 ### Derivation material (per-caller keys)
 
