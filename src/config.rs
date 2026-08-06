@@ -69,6 +69,44 @@ impl TappConfig {
     }
 }
 
+/// Where an app's TLS private key comes from. The two are not better and worse — they
+/// trade the same thing in opposite directions.
+///
+/// **`Local`** derives it from the app's own signer, which is generated inside this CVM and
+/// never leaves it. The key is therefore bound to *this instance*: a verifier that compares
+/// it against `report_data` learns "the endpoint I am talking to is this TEE", the strongest
+/// statement available. Nothing external is involved — no KMS, no on-chain registration — so
+/// it works from first boot. The cost is that the signer is regenerated on every restart, so
+/// the key changes with it: certificate pinning breaks, Certificate Transparency monitoring
+/// sees churn instead of signal, and an ACME certificate would need reissuing every restart
+/// against a rate limit.
+///
+/// **`Kms`** derives it from `(app_id, material)` at the KMS cluster, so it is stable across
+/// restarts and identical on every node of the app. That is what makes pinning, transparency
+/// monitoring and normal certificate renewal work. The cost is that the key exists outside
+/// this CVM — the answering KMS node reconstructs it — and any registered signer of the app
+/// can obtain it, so the statement weakens to "some TEE of this app". It also needs the app
+/// registered on chain and the cluster reachable.
+///
+/// Local is the default because it always works and asks nothing of the deployer; stability
+/// is the thing you opt into once something needs it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum TlsKeySource {
+    #[default]
+    Local,
+    Kms,
+}
+
+impl TlsKeySource {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TlsKeySource::Local => "local",
+            TlsKeySource::Kms => "kms",
+        }
+    }
+}
+
 /// Server configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
@@ -104,6 +142,18 @@ pub struct ServerConfig {
 
     /// TLS private key path (if TLS enabled)
     pub tls_key_path: Option<PathBuf>,
+
+    /// Where an app's TLS private key comes from. See [`TlsKeySource`].
+    #[serde(default)]
+    pub tls_key_source: TlsKeySource,
+
+    /// Certificate authority for app TLS certificates, e.g. `http://ca:8080`.
+    ///
+    /// Optional on purpose. Unset, `GetAppTlsCert` self-signs, which is enough for any
+    /// client that checks the public key against the attestation — the issuer is
+    /// irrelevant to that check. A CA is what makes the same certificate acceptable to
+    /// clients that will not do it, such as browsers driving off a trust store.
+    pub ca_url: Option<String>,
 
     /// Permission configuration for signature-based authentication
     #[serde(default)]
@@ -261,6 +311,8 @@ impl Default for ServerConfig {
             tls_enabled: false,
             tls_cert_path: None,
             tls_key_path: None,
+            tls_key_source: TlsKeySource::default(),
+            ca_url: None,
             permission: None,
         }
     }

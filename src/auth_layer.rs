@@ -114,6 +114,35 @@ where
                 return inner.call(req).await;
             }
 
+            // Socket-only methods: no signature, but the request must have arrived on the
+            // Unix socket. tonic records connect-info per listener, and a TCP connection
+            // always carries a peer address while a Unix one never does — so this is the
+            // transport itself answering, not a judgement about the address.
+            if method_permission == MethodPermission::LocalOnly {
+                let over_tcp = req
+                    .extensions()
+                    .get::<tonic::transport::server::TcpConnectInfo>()
+                    .and_then(|i| i.remote_addr())
+                    .is_some();
+                if over_tcp {
+                    warn!(
+                        method = %method_name,
+                        event = "AUTH_NOT_LOCAL",
+                        "Refused: this method hands over key material and is served only on \
+                         the Unix socket"
+                    );
+                    let response = Status::permission_denied(format!(
+                        "{} is served only on the tapp Unix socket; mount it into the \
+                         container instead of connecting over TCP",
+                        method_name
+                    ))
+                    .into_http();
+                    return Ok(response);
+                }
+                debug!(method = %method_name, "Local socket method, no auth required");
+                return inner.call(req).await;
+            }
+
             // Extract headers needed for validation
             let signature = req
                 .headers()
@@ -197,18 +226,42 @@ pub struct SignerAddress(pub String);
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum MethodPermission {
     Public,        // No auth required
+    /// Reachable only over the Unix socket, never over TCP. No signature either — the
+    /// caller is a container inside this CVM asking for key material, and it has no key
+    /// to sign with; it is calling in order to obtain one.
+    ///
+    /// The socket is the control, and it is a precise one: `main.rs` creates it 0600
+    /// inside a 0700 directory, so reaching it means holding a file descriptor the
+    /// filesystem granted. The check it replaces asked whether the source IP was private
+    /// — which is true of every machine in the same VPC, not just this one.
+    LocalOnly,
     Authenticated, // Any valid signature (permission decided in the handler)
     OwnerOnly,     // Only tapp owner
     Whitelist,     // Owner or whitelisted users
 }
 
-/// Get permission requirement for a method
+/// Get permission requirement for a method.
+///
+/// An unclassified method gets OwnerOnly, which fails closed — a new RPC is unreachable
+/// until someone decides what guards it, rather than quietly inheriting the weakest rule.
 fn get_method_permission(method_name: &str) -> MethodPermission {
-    match method_name {
-        // Public methods (no authentication required)
+    classify(method_name).unwrap_or_else(|| {
+        warn!(method = %method_name, "Unknown method, defaulting to OwnerOnly");
+        MethodPermission::OwnerOnly
+    })
+}
+
+/// `None` means the method is not listed here. Split out from the fallback so a test can
+/// tell "explicitly OwnerOnly" from "nobody decided", which the return type alone cannot.
+fn classify(method_name: &str) -> Option<MethodPermission> {
+    Some(match method_name {
+        // Nothing to protect — the answer is public either way.
         "GetEvidence" | "GetAppKey" | "GetAppInfo" | "ListApps" | "GetTaskStatus"
-        | "GetServiceStatus" | "GetAppSecretKey" | "GetTappInfo" | "GetSecretResource" => {
-            MethodPermission::Public
+        | "GetServiceStatus" | "GetTappInfo" => MethodPermission::Public,
+
+        // Hand over key material. Socket only.
+        "GetAppSecretKey" | "GetSecretResource" | "GetAppTlsCert" => {
+            MethodPermission::LocalOnly
         }
 
         // Signature required, but no permission level: while the tapp is
@@ -224,17 +277,59 @@ fn get_method_permission(method_name: &str) -> MethodPermission {
         | "ListWhitelist"
         | "ListAllOwnerships"
         | "StopService"
-        | "StartService" => MethodPermission::OwnerOnly,
+        | "StartService"
+        // These two were never listed and reached OwnerOnly through the fallback. Stated
+        // explicitly to keep the behaviour they already had — ListAppMeasurements is a
+        // deprecated stub that errors either way, and tapp-cli already signs for
+        // GetAppContainerStatus.
+        | "ListAppMeasurements"
+        | "GetAppContainerStatus" => MethodPermission::OwnerOnly,
 
         // Owner or whitelist methods
         "GetServiceLogs" | "GetAppLogs" | "GetAppOwnership" | "WithdrawBalance" | "DockerLogin"
         | "DockerLogout" | "PruneImages" => MethodPermission::Whitelist,
 
-        // Default: require owner permission
-        _ => {
-            warn!(method = %method_name, "Unknown method, defaulting to OwnerOnly");
-            MethodPermission::OwnerOnly
+        _ => return None,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every RPC the service declares must be classified on purpose.
+    ///
+    /// The fallback is OwnerOnly, so forgetting one does not open a hole — it makes the
+    /// RPC unusable by the callers that need it, which is how GetAppTlsCert first failed:
+    /// an app container has no key to sign with, so it got "Missing signature" from a rule
+    /// nobody had chosen. Reading the method list out of the proto rather than repeating it
+    /// here is the point; a list maintained by hand would drift the same way.
+    #[test]
+    fn every_rpc_in_the_proto_has_a_deliberate_permission() {
+        let proto = include_str!("../proto/tapp_service.proto");
+        let mut unclassified = Vec::new();
+        let mut seen = 0usize;
+        for line in proto.lines() {
+            let line = line.trim();
+            let Some(rest) = line.strip_prefix("rpc ") else {
+                continue;
+            };
+            let name = rest.split('(').next().unwrap_or("").trim();
+            if name.is_empty() {
+                continue;
+            }
+            seen += 1;
+            if classify(name).is_none() {
+                unclassified.push(name.to_string());
+            }
         }
+        assert!(seen > 20, "parsed only {} rpcs — the proto layout changed", seen);
+        assert!(
+            unclassified.is_empty(),
+            "these RPCs fall through to the OwnerOnly default; classify them in \
+             get_method_permission: {:?}",
+            unclassified
+        );
     }
 }
 
@@ -242,6 +337,9 @@ fn get_method_permission(method_name: &str) -> MethodPermission {
 fn is_authorized(required: &MethodPermission, actual: &Permission) -> bool {
     match required {
         MethodPermission::Public => true,
+        // Never reaches here — the middleware answers socket-only methods before any
+        // signature exists. Returning false keeps it that way if the order ever changes.
+        MethodPermission::LocalOnly => false,
         MethodPermission::Authenticated => true, // signature already validated
         MethodPermission::OwnerOnly => *actual == Permission::Owner,
         MethodPermission::Whitelist => {

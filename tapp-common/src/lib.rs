@@ -5,6 +5,7 @@
 pub mod error;
 pub mod onchain;
 pub mod app_key;
+pub mod report_data;
 pub mod verify;
 pub mod compat;
 
