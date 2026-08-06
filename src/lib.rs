@@ -52,6 +52,8 @@ pub struct ClaimedRuntimeConfig {
     pub chain_rpc_url: String,
     pub chain_contract_address: String,
     pub kbs_node_urls: Vec<String>,
+    /// Empty means "not claimed" — fall back to config.toml, which is the pre-baked mode.
+    pub tls_key_source: String,
 }
 
 pub struct TappServiceImpl {
@@ -149,7 +151,18 @@ impl TappServiceImpl {
             return Ok(id.clone());
         }
 
-        let source = self.config.server.tls_key_source;
+        // Claimed value wins over the pre-baked one, same as chain and KBS config.
+        let source = match self
+            .claimed_runtime_config
+            .read()
+            .await
+            .tls_key_source
+            .as_str()
+        {
+            "kms" => config::TlsKeySource::Kms,
+            "local" => config::TlsKeySource::Local,
+            _ => self.config.server.tls_key_source,
+        };
         let secret = match source {
             config::TlsKeySource::Local => {
                 // Create-if-missing, then derive from the signer. `get_private_key` only
@@ -387,6 +400,7 @@ impl TappServiceImpl {
             chain_rpc_url: config.chain.as_ref().map(|c| c.rpc_url.clone()).unwrap_or_default(),
             chain_contract_address: config.chain.as_ref().map(|c| c.contract_address.clone()).unwrap_or_default(),
             kbs_node_urls: config.kbs.as_ref().map(|k| k.node_urls.clone()).unwrap_or_default(),
+            tls_key_source: config.server.tls_key_source.as_str().to_string(),
         }));
 
         info!("All TAPP service components initialized successfully");
@@ -1305,6 +1319,22 @@ impl TappService for TappServiceImpl {
             Status::already_exists(format!("Tapp already owned by {}", current))
         })?;
 
+        // Reject an unknown value rather than falling back: this decides whether the
+        // attested TLS key survives a restart, and a typo silently becoming "local" is
+        // exactly the kind of thing nobody notices until a pin breaks.
+        let tls_key_source = match req.tls_key_source.as_str() {
+            "" => self.config.server.tls_key_source,
+            "local" => config::TlsKeySource::Local,
+            "kms" => config::TlsKeySource::Kms,
+            other => {
+                pm.rollback_claim().await;
+                return Err(Status::invalid_argument(format!(
+                    "tls_key_source must be \"local\" or \"kms\", got {:?}",
+                    other
+                )));
+            }
+        };
+
         // Extend runtime measurement — includes the full config so verifiers
         // see owner + chain + kbs in one event. On failure the claim is rolled
         // back so the tapp stays claimable.
@@ -1315,6 +1345,7 @@ impl TappService for TappServiceImpl {
             "chain_rpc_url": req.chain_rpc_url,
             "chain_contract_address": req.chain_contract_address,
             "kbs_node_urls": req.kbs_node_urls,
+            "tls_key_source": tls_key_source.as_str(),
             "timestamp": timestamp
         })
         .to_string();
@@ -1339,6 +1370,7 @@ impl TappService for TappServiceImpl {
             chain_rpc_url: req.chain_rpc_url.clone(),
             chain_contract_address: req.chain_contract_address.clone(),
             kbs_node_urls: req.kbs_node_urls.clone(),
+            tls_key_source: tls_key_source.as_str().to_string(),
         };
 
         // Initialize or replace KMS client with the claimed kbs_node_urls.

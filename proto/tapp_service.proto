@@ -704,6 +704,16 @@ message ClaimConfigRequest {
   // When provided, the KMS client is initialized on this call (no config.toml
   // [kbs] section needed). Ignored if KBS was already configured at startup.
   repeated string kbs_node_urls = 3;
+
+  // Optional: where app TLS private keys come from — "local" (default) or "kms".
+  //
+  // Here rather than in config.toml for the same reason the owner is: config.toml
+  // lives in the CVM image, so a field there means a separate image and a separate
+  // set of reference values per choice. Claimed instead, the image stays generic and
+  // the choice becomes a measured fact a verifier can read out of the event log —
+  // which matters, because it decides whether the attested public key survives a
+  // restart.
+  string tls_key_source = 4;
 }
 
 message ClaimConfigResponse {

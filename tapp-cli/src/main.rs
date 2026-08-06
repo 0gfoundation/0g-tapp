@@ -308,6 +308,17 @@ enum Commands {
         /// e.g. "http://kms-1:9091,http://kms-2:9091"
         #[arg(long)]
         kbs_urls: Option<String>,
+
+        /// Where app TLS keys come from: "local" (default) or "kms".
+        ///
+        /// local  — derived from the app signer, never leaves this CVM, so an attested
+        ///          key proves you reached *this* instance. Changes on every restart,
+        ///          so it cannot be pinned.
+        /// kms    — stable across restarts and shared by every node of the app, which
+        ///          pinning and certificate renewal need. Requires the app registered
+        ///          on chain and the cluster reachable.
+        #[arg(long)]
+        tls_key_source: Option<String>,
     },
 
     AddToWhitelist {
@@ -699,6 +710,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             chain_rpc_url,
             chain_contract,
             kbs_urls,
+            tls_key_source,
         } => {
             let private_key = require_private_key(&cli.private_key)?;
             let kbs_node_urls: Vec<String> = kbs_urls
@@ -714,6 +726,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 chain_rpc_url.unwrap_or_default(),
                 chain_contract.unwrap_or_default(),
                 kbs_node_urls,
+                tls_key_source,
             )
             .await?;
         }
@@ -1960,6 +1973,7 @@ async fn claim_config(
     chain_rpc_url: String,
     chain_contract_address: String,
     kbs_node_urls: Vec<String>,
+    tls_key_source: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use ethers::signers::Signer;
 
@@ -1975,6 +1989,7 @@ async fn claim_config(
         chain_rpc_url: chain_rpc_url.clone(),
         chain_contract_address: chain_contract_address.clone(),
         kbs_node_urls: kbs_node_urls.clone(),
+        tls_key_source: tls_key_source.clone().unwrap_or_default(),
     });
     add_signature_metadata(&mut request, &private_key, "ClaimConfig")?;
 
@@ -2020,6 +2035,10 @@ async fn claim_config(
         .and_then(|c| c.server.as_ref())
         .map(|s| s.owner_address.clone())
         .unwrap_or_default();
+
+    if let Some(src) = tls_key_source.as_deref().filter(|s| !s.is_empty()) {
+        println!("  TLS keys: {}", src);
+    }
 
     if live_owner == my_address {
         println!("  Verified: server now reports this address as owner");
