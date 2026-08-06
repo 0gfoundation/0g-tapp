@@ -114,6 +114,35 @@ where
                 return inner.call(req).await;
             }
 
+            // Socket-only methods: no signature, but the request must have arrived on the
+            // Unix socket. tonic records connect-info per listener, and a TCP connection
+            // always carries a peer address while a Unix one never does — so this is the
+            // transport itself answering, not a judgement about the address.
+            if method_permission == MethodPermission::LocalOnly {
+                let over_tcp = req
+                    .extensions()
+                    .get::<tonic::transport::server::TcpConnectInfo>()
+                    .and_then(|i| i.remote_addr())
+                    .is_some();
+                if over_tcp {
+                    warn!(
+                        method = %method_name,
+                        event = "AUTH_NOT_LOCAL",
+                        "Refused: this method hands over key material and is served only on \
+                         the Unix socket"
+                    );
+                    let response = Status::permission_denied(format!(
+                        "{} is served only on the tapp Unix socket; mount it into the \
+                         container instead of connecting over TCP",
+                        method_name
+                    ))
+                    .into_http();
+                    return Ok(response);
+                }
+                debug!(method = %method_name, "Local socket method, no auth required");
+                return inner.call(req).await;
+            }
+
             // Extract headers needed for validation
             let signature = req
                 .headers()
@@ -197,6 +226,15 @@ pub struct SignerAddress(pub String);
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum MethodPermission {
     Public,        // No auth required
+    /// Reachable only over the Unix socket, never over TCP. No signature either — the
+    /// caller is a container inside this CVM asking for key material, and it has no key
+    /// to sign with; it is calling in order to obtain one.
+    ///
+    /// The socket is the control, and it is a precise one: `main.rs` creates it 0600
+    /// inside a 0700 directory, so reaching it means holding a file descriptor the
+    /// filesystem granted. The check it replaces asked whether the source IP was private
+    /// — which is true of every machine in the same VPC, not just this one.
+    LocalOnly,
     Authenticated, // Any valid signature (permission decided in the handler)
     OwnerOnly,     // Only tapp owner
     Whitelist,     // Owner or whitelisted users
@@ -217,16 +255,14 @@ fn get_method_permission(method_name: &str) -> MethodPermission {
 /// tell "explicitly OwnerOnly" from "nobody decided", which the return type alone cannot.
 fn classify(method_name: &str) -> Option<MethodPermission> {
     Some(match method_name {
-        // No signature required. For most of these there is nothing to protect — the
-        // answer is public. GetAppSecretKey, GetSecretResource and GetAppTlsCert are the
-        // exceptions: they hand over key material, and "public" here means *the signature
-        // is not the control*. Their caller is an app container inside this CVM, which has
-        // no key to sign with — it is calling in order to obtain one. What guards them is
-        // the locality check in each handler, which refuses anything that is not
-        // localhost, the Docker network, or the Unix socket.
+        // Nothing to protect — the answer is public either way.
         "GetEvidence" | "GetAppKey" | "GetAppInfo" | "ListApps" | "GetTaskStatus"
-        | "GetServiceStatus" | "GetAppSecretKey" | "GetTappInfo" | "GetSecretResource"
-        | "GetAppTlsCert" => MethodPermission::Public,
+        | "GetServiceStatus" | "GetTappInfo" => MethodPermission::Public,
+
+        // Hand over key material. Socket only.
+        "GetAppSecretKey" | "GetSecretResource" | "GetAppTlsCert" => {
+            MethodPermission::LocalOnly
+        }
 
         // Signature required, but no permission level: while the tapp is
         // unclaimed anybody may claim (first-come-first-served); once claimed
@@ -301,6 +337,9 @@ mod tests {
 fn is_authorized(required: &MethodPermission, actual: &Permission) -> bool {
     match required {
         MethodPermission::Public => true,
+        // Never reaches here — the middleware answers socket-only methods before any
+        // signature exists. Returning false keeps it that way if the order ever changes.
+        MethodPermission::LocalOnly => false,
         MethodPermission::Authenticated => true, // signature already validated
         MethodPermission::OwnerOnly => *actual == Permission::Owner,
         MethodPermission::Whitelist => {

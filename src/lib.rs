@@ -26,7 +26,6 @@ pub use boot::BootService;
 pub use config::TappConfig;
 pub use tapp_common::error::{TappError, TappResult};
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 pub use task_manager::TaskStatus;
 use tokio::sync::Mutex;
@@ -290,77 +289,6 @@ impl TappServiceImpl {
         {
             tracing::error!("Failed to extend measurement for get_secret_resource: {}", e);
         }
-    }
-
-    /// Check if an IP address is allowed for local access
-    /// Allows:
-    /// - Localhost (127.0.0.1, ::1)
-    /// - Docker bridge networks (172.16.0.0/12)
-    /// - Private networks (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16)
-    fn is_allowed_local_access(ip: IpAddr) -> bool {
-        use std::net::IpAddr;
-
-        match ip {
-            IpAddr::V4(ipv4) => {
-                // Localhost: 127.0.0.1
-                if ipv4.is_loopback() {
-                    return true;
-                }
-
-                // Private networks (includes Docker networks)
-                // 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
-                if ipv4.is_private() {
-                    return true;
-                }
-
-                false
-            }
-            IpAddr::V6(ipv6) => {
-                // Localhost: ::1
-                ipv6.is_loopback()
-            }
-        }
-    }
-
-    /// Determine the source type for logging
-    /// Get source type description for logging
-    fn get_source_type(ip: IpAddr) -> &'static str {
-        use std::net::IpAddr;
-
-        match ip {
-            IpAddr::V4(ipv4) => {
-                if ipv4.is_loopback() {
-                    "localhost"
-                } else if Self::is_docker_bridge_network(ipv4) {
-                    "docker-bridge"
-                } else if Self::is_docker_custom_network(ipv4) {
-                    "docker-custom"
-                } else if ipv4.is_private() {
-                    "private-network"
-                } else {
-                    "public-network"
-                }
-            }
-            IpAddr::V6(ipv6) => {
-                if ipv6.is_loopback() {
-                    "localhost-ipv6"
-                } else {
-                    "ipv6-network"
-                }
-            }
-        }
-    }
-
-    /// Check if IP is from Docker default bridge network (172.17.0.0/16)
-    fn is_docker_bridge_network(ip: Ipv4Addr) -> bool {
-        let octets = ip.octets();
-        octets[0] == 172 && octets[1] == 17
-    }
-
-    /// Check if IP is from Docker custom networks (172.18-31.0.0/16)
-    fn is_docker_custom_network(ip: Ipv4Addr) -> bool {
-        let octets = ip.octets();
-        octets[0] == 172 && (18..=31).contains(&octets[1])
     }
 
     pub async fn new(
@@ -715,23 +643,8 @@ impl TappService for TappServiceImpl {
     ) -> Result<Response<GetAppTlsCertResponse>, Status> {
         info!("Calling GetAppTlsCert");
 
-        // SECURITY: this hands over a private key, so it is restricted exactly like
-        // GetAppSecretKey — same host only. The app container is inside this CVM, so the
-        // key does not cross the enclave boundary.
-        let remote_addr = request.remote_addr();
-        let allowed = remote_addr
-            .map(|a| Self::is_allowed_local_access(a.ip()))
-            .unwrap_or(true); // Unix socket
-        if !allowed {
-            tracing::error!(
-                remote_addr = ?remote_addr,
-                event = "TLS_CERT_ACCESS_DENIED",
-                "Rejected GetAppTlsCert from a non-local address"
-            );
-            return Err(Status::permission_denied(
-                "GetAppTlsCert can only be called from localhost or same-host Docker containers",
-            ));
-        }
+        // Reachability is the control and AuthLayer enforces it: this method is served
+        // only on the Unix socket. See MethodPermission::LocalOnly.
 
         let req = request.into_inner();
         if req.app_id.is_empty() {
@@ -771,32 +684,10 @@ impl TappService for TappServiceImpl {
     ) -> Result<Response<GetAppSecretKeyResponse>, Status> {
         info!("Calling GetAppSecretKey");
         debug!("Request: {:?}", request);
-        // SECURITY: Extract remote address BEFORE consuming request
+        // Reachability is the control and AuthLayer enforces it: this method is served
+        // only on the Unix socket. See MethodPermission::LocalOnly.
         let remote_addr = request.remote_addr();
-
-        // SECURITY: Validate that the request is from localhost or Docker network
-        let (is_allowed, source_type) = if let Some(addr) = remote_addr {
-            let ip = addr.ip();
-            let allowed = Self::is_allowed_local_access(ip);
-            let source = Self::get_source_type(ip);
-            (allowed, source)
-        } else {
-            // No remote address (e.g., Unix socket) - allow
-            (true, "unix-socket")
-        };
-
-        if !is_allowed {
-            tracing::error!(
-                remote_addr = ?remote_addr,
-                event = "SECRET_KEY_ACCESS_DENIED",
-                reason = "not in allowed network range",
-                "Rejected GetAppSecretKey request from non-allowed address"
-            );
-
-            return Err(Status::permission_denied(
-                "GetAppSecretKey can only be called from localhost or same-host Docker containers",
-            ));
-        }
+        let source_type = "unix-socket";
 
         // Get signer address from signature (handled by AuthLayer)
         // let signer = auth_layer::get_signer_address(&request);
@@ -1973,16 +1864,8 @@ impl TappService for TappServiceImpl {
     ) -> Result<Response<GetSecretResourceResponse>, Status> {
         info!("Calling GetSecretResource");
 
-        // SECURITY: local access only
-        let remote_addr = request.remote_addr();
-        let allowed = remote_addr
-            .map(|a| Self::is_allowed_local_access(a.ip()))
-            .unwrap_or(true); // Unix socket
-        if !allowed {
-            return Err(Status::permission_denied(
-                "GetSecretResource can only be called from localhost or same-host Docker containers",
-            ));
-        }
+        // Reachability is the control and AuthLayer enforces it: this method is served
+        // only on the Unix socket. See MethodPermission::LocalOnly.
 
         let req = request.into_inner();
         let app_id = &req.app_id;
