@@ -1370,20 +1370,17 @@ fn print_tls_binding(tls_public_key: &str, indent: &str) {
     if tls_public_key.is_empty() {
         return;
     }
-    println!("{}tls key    : {}  (sha256 of the public key, attested)", indent, tls_public_key);
+    println!("{}tls key     : {}  (sha256 of the public key, attested)", indent, tls_public_key);
+    println!("{}              compare against the endpoint with:", indent);
     println!(
-        "{}             compare against the endpoint with:",
+        "{}              openssl s_client -connect HOST:PORT </dev/null 2>/dev/null \\",
         indent
     );
     println!(
-        "{}             openssl s_client -connect HOST:PORT </dev/null 2>/dev/null \\",
+        "{}                | openssl x509 -pubkey -noout | openssl pkey -pubin -outform der \\",
         indent
     );
-    println!(
-        "{}               | openssl x509 -pubkey -noout | openssl pkey -pubin -outform der \\",
-        indent
-    );
-    println!("{}               | openssl dgst -sha256", indent);
+    println!("{}                | openssl dgst -sha256", indent);
 }
 
 fn boot_chain_line(executables: Option<i64>, show: bool) -> Option<String> {
