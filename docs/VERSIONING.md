@@ -46,27 +46,48 @@ Version is injected at compile time via `env!("CARGO_PKG_VERSION")` — no hardc
 
 ## Bump Workflow
 
-### tapp-cli release
+### Binary release (tapp-server and tapp-cli)
 
-1. Edit `tapp-cli/Cargo.toml`:
-   ```toml
-   version = "0.2.0"   # was "0.1.0"
-   ```
-2. Commit with message: `chore(tapp-cli): bump version to 0.2.0`
-3. Tag: `git tag tapp-cli-v0.2.0`
-4. Push: `git push origin tapp-cli-v0.2.0`
-5. CI auto-builds and creates GitHub Release.
+**A tag names a release, not a binary version.** One tag produces one GitHub Release
+containing *both* binaries, each reporting whatever its own `Cargo.toml` says. The two
+things are independent, and that is what lets the binaries move at different speeds without
+needing separate tags.
 
-### tapp-server release
+```bash
+# 1. Edit whichever Cargo.toml actually changed — one, both, or neither.
+#      tapp-server → root Cargo.toml
+#      tapp-cli    → tapp-cli/Cargo.toml
+# 2. Commit, e.g.  chore(tapp-cli): bump version to 0.4.1
+# 3. Tag the release. Conventionally the version of whatever moved:
+git tag v0.4.1
+git push origin v0.4.1
+# 4. build.yml fires on v* and publishes the release: both binaries, both cosign
+#    bundles, and one SHA256SUMS covering both.
+```
 
-1. Edit root `Cargo.toml`:
-   ```toml
-   version = "0.2.0"   # was "0.1.0"
-   ```
-2. Commit with message: `chore(tapp-server): bump version to 0.2.0`
-3. Tag: `git tag tapp-server-v0.2.0`
-4. Push: `git push origin tapp-server-v0.2.0`
-5. CI auto-builds and creates GitHub Release.
+So a release where only the CLI moved looks like: tag `v0.4.1`, and inside it
+`tapp-cli --version` → `0.4.1` while `tapp-server --version` → `0.4.0`. That is correct and
+expected — do not bump a binary that did not change just to make the numbers line up. To
+find out what you actually have, ask the binary, never the tag it came from.
+
+A change can also ride an existing version instead of earning a new one, and **whether it
+reaches users depends entirely on whether the tag has been cut yet**:
+
+- **Before tagging — it ships.** The `measure_only` fix landed in `f45299c` with tapp-server
+  deliberately held at 0.3.0, and `v0.3.0` was tagged afterwards, so the released binary
+  contains it.
+- **After tagging — it does not.** The `--as-endpoint` default was corrected in `bce9954`,
+  after `v0.4.0` had been tagged and released. Version numbers stayed put, so the published
+  `tapp-cli` still has the old default and always will; the fix only reaches users at the
+  next release.
+
+Moving a tag to close that gap is not an option: release artifacts are cosign-signed, so
+re-cutting them under the same version means two different binaries with two different
+signatures for one version — the exact thing signing exists to prevent. Either bump and cut
+a new tag, or accept that the released binary keeps the old behaviour until the next one.
+
+Only the binaries share a release. The contract and the CVM image are versioned and shipped
+separately — see below.
 
 ### tapp-common (rare)
 
@@ -76,7 +97,7 @@ tapp-common is an internal dependency, not a standalone release artifact. Bump i
 
 The image is **not** built from a git tag — it is built by dispatching the `build-cvm` workflow. Its version is `<tapp-server version>[-r<image_rev>]`:
 
-1. Dispatch `build-cvm` with `version` = the tapp-server release tag and `image_rev` = the image revision (see [CVM image](#cvm-image) for when to bump it).
+1. Dispatch `build-cvm` with `version` = the **tapp-server** version (`tapp-server --version`, i.e. root `Cargo.toml`) and `image_rev` = the image revision (see [CVM image](#cvm-image) for when to bump it). Take it from the binary, not from the release tag it shipped under — a release named `v0.4.1` can perfectly well contain tapp-server 0.4.0, and the image version has to follow the server.
 2. The workflow publishes the image, writes the reference values and registers the AS policy — all three keyed on the image version, not the binary version.
 3. Tag the commit the image was built from, for traceability: `git tag cvm-image-v0.3.0-r2 && git push origin cvm-image-v0.3.0-r2`.
 
@@ -85,13 +106,19 @@ The `cvm-image-*` tag does **not** trigger a binary release — `build.yml` fire
 ## Tag Naming Convention
 
 ```
-tapp-server-v<version>    # e.g. tapp-server-v0.1.0
-tapp-cli-v<version>       # e.g. tapp-cli-v0.1.0
-contract-v<version>       # e.g. contract-v0.1.0  (TappRegistry implementation)
-cvm-image-v<version>      # e.g. cvm-image-v0.3.0-r2  (traceability only, builds no binary)
+v<version>                # e.g. v0.4.0   ← the only tag that builds and releases binaries
+contract-v<version>       # e.g. contract-v0.1.0    (TappRegistry implementation)
+cvm-image-v<version>      # e.g. cvm-image-v0.3.0-r2 (traceability only, builds nothing)
 ```
 
-Using the `v` prefix with crate name avoids ambiguity and sorts correctly in `git tag -l`.
+`build.yml` triggers on `v*` and nothing else, so **only a bare `v<version>` tag releases
+anything**. The other two prefixes are records, not triggers: pushing them runs no workflow.
+
+There is deliberately no `tapp-server-v*` / `tapp-cli-v*` split. The reproducible build
+produces both binaries in a single container run and signs them under one `SHA256SUMS`, so
+per-binary tags would require splitting the checksum, the signing loop and the release body
+to gain nothing — a binary's version already lives in the binary. See the release workflow
+above for how to ship a change to just one of them.
 
 ## Versioning Policy
 
