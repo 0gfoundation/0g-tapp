@@ -1748,6 +1748,12 @@ async fn get_app_tls_cert(
 
     println!("✓ {}", result.message);
     println!("  Public key sha256: {}", result.public_key_sha256);
+    println!("  Key source       : {}", result.key_source);
+    if result.key_source == "local" {
+        println!("  Bound to this instance, and regenerated when it restarts — do not pin it.");
+    } else {
+        println!("  Derived from KMS: stable across restarts and shared by every node of this app.");
+    }
     println!("  Issuer           : {}", result.issuer);
     if result.issuer == "self-signed" {
         println!(

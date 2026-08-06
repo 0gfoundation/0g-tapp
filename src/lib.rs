@@ -136,33 +136,58 @@ impl TappServiceImpl {
 
     /// The app's TLS identity, derived on first use and kept for the process lifetime.
     ///
-    /// Cached because the certificate is asked for on every app start and on every
-    /// renewal check, while the underlying key never changes — and because `GetEvidence`
-    /// needs the public key without being allowed to trigger a KMS round trip of its own
-    /// (it is an unauthenticated RPC; an outside caller must not be able to drive KMS
+    /// Cached because the certificate is asked for on every app start and every renewal
+    /// check while the key behind it does not change within a boot — and because
+    /// `GetEvidence` needs the public key without being allowed to trigger a KMS round trip
+    /// of its own (it is unauthenticated; an outside caller must not be able to drive KMS
     /// traffic).
+    ///
+    /// Where the key comes from is a real choice, not a fallback — see
+    /// [`config::TlsKeySource`].
     async fn tls_identity(&self, app_id: &str) -> Result<Arc<tls_cert::TlsIdentity>, Status> {
         if let Some(id) = self.tls_identities.lock().await.get(app_id) {
             return Ok(id.clone());
         }
 
-        let secret = self
-            .kms_derive(app_id, tls_cert::KMS_MATERIAL)
-            .await
-            .map_err(|e| {
-                Status::failed_precondition(format!(
-                    "cannot derive the TLS key for {}: {}",
-                    app_id, e
-                ))
-            })?;
-        // Taking a derived secret is a measured event wherever it happens, so a key
-        // pulled for TLS shows up in the runtime log exactly like one pulled by the app.
-        self.measure_secret_resource(app_id, tls_cert::KMS_MATERIAL, true)
-            .await;
+        let source = self.config.server.tls_key_source;
+        let secret = match source {
+            config::TlsKeySource::Local => {
+                // Create-if-missing, then derive from the signer. `get_private_key` only
+                // reads the cache, so an app asking for a certificate as its first action
+                // would otherwise find nothing.
+                self.app_key_service
+                    .get_app_key(app_id, "ethereum", false)
+                    .await
+                    .map_err(|e| Status::internal(format!("Failed to create app key: {}", e)))?;
+                let signer_key = self
+                    .app_key_service
+                    .get_private_key(app_id)
+                    .await
+                    .map_err(|e| Status::internal(format!("Failed to get app key: {}", e)))?;
+                tls_cert::derive_from_signer(&signer_key)
+            }
+            config::TlsKeySource::Kms => {
+                let secret = self
+                    .kms_derive(app_id, tls_cert::KMS_MATERIAL)
+                    .await
+                    .map_err(|e| {
+                        Status::failed_precondition(format!(
+                            "cannot derive the TLS key for {}: {}",
+                            app_id, e
+                        ))
+                    })?;
+                // Taking a derived secret is a measured event wherever it happens, so a key
+                // pulled for TLS shows up in the runtime log exactly like one pulled by the
+                // app itself. The local path has nothing to measure — no secret moved.
+                self.measure_secret_resource(app_id, tls_cert::KMS_MATERIAL, true)
+                    .await;
+                secret
+            }
+        };
 
         let ca_url = self.config.server.ca_url.clone();
         let id = Arc::new(
-            tls_cert::build(app_id, &secret, ca_url.as_deref())
+            tls_cert::build(app_id, &secret, source.as_str(), ca_url.as_deref())
                 .await
                 .map_err(|e| Status::internal(format!("{}", e)))?,
         );
@@ -712,8 +737,9 @@ impl TappService for TappServiceImpl {
         Ok(Response::new(GetAppTlsCertResponse {
             success: true,
             message: format!(
-                "TLS identity for {} ({})",
+                "TLS identity for {} ({} key, {} certificate)",
                 tls_cert::dns_name(&req.app_id),
+                id.key_source,
                 id.issuer
             ),
             key_pem: id.key_pem.clone(),
@@ -721,6 +747,7 @@ impl TappService for TappServiceImpl {
             issuer: id.issuer.to_string(),
             csr_pem: id.csr_pem.clone(),
             public_key_sha256: id.public_key_sha256.clone(),
+            key_source: id.key_source.to_string(),
         }))
     }
 

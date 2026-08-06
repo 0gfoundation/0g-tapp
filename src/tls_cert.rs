@@ -1,17 +1,22 @@
-//! The app's TLS identity: a P-256 key derived from KMS, plus a certificate for it.
+//! The app's TLS identity: a P-256 key plus a certificate for it.
 //!
-//! Two properties are load-bearing and neither is obvious from the code alone:
+//! Three things here are load-bearing and none is obvious from the code alone.
 //!
-//! **The key is derived, not generated.** KMS derives it from `(app_id, "tls")`, so it is
-//! the same key after a restart and the same key on every node serving the app. That is
-//! what lets a certificate outlive a reboot, lets a client pin the public key, and makes
-//! an unexpected key in a Certificate Transparency log meaningful rather than noise. A
-//! freshly random key per boot would give up all three.
+//! **The key is always derived, never randomly generated** — but from one of two places,
+//! and the choice changes what a verifier learns. See [`crate::config::TlsKeySource`]: from
+//! the app's own signer, the key never leaves this CVM and the statement is "you are talking
+//! to *this* TEE"; from KMS, the key is stable across restarts and shared by every node of
+//! the app, which is what pinning and transparency monitoring need, and the statement
+//! weakens to "some TEE of this app". Neither is the safe default for all cases.
 //!
 //! **Self-signed is not a lesser certificate here.** What a verifier checks is the public
-//! key against the one the quote committed to; who signed the certificate is irrelevant to
+//! key against the one the quote committed to; who signed the certificate has no part in
 //! that. The issuer matters only for clients that will not do the check — browsers and
 //! anything else driving off a system trust store.
+//!
+//! **Randomness would be worse than either.** A fresh key per process would still be
+//! attestable, but it could not be reproduced by anything, so a key that appeared in a log
+//! or a pin could never be checked against an expectation.
 
 use crate::error::{DockerError, TappResult};
 use p256::pkcs8::EncodePrivateKey;
@@ -20,7 +25,12 @@ use sha2::{Digest, Sha256};
 /// Derivation namespace. Deliberately not the app's signer material: a key used for TLS
 /// handshakes should not also be the identity that signs chain transactions and decrypts
 /// KMS payloads.
-pub const KMS_MATERIAL: &str = "tls";
+///
+/// **Hex, because KMS decodes it** (`proto/tapp_service.proto`: "hex-encoded derivation
+/// material"). Passing the ASCII `"tls"` gets a 500 from the cluster, which is not obvious
+/// from anything on this side — hence the constant rather than a literal at the call site.
+/// This is `hex("tls")`, kept legible so it can still be recognised in a log.
+pub const KMS_MATERIAL: &str = "746c73";
 
 /// Names are ours to hand out, so no domain-control validation is involved. A private CA
 /// that would sign arbitrary names is an interception tool against everyone holding its
@@ -38,6 +48,9 @@ pub struct TlsIdentity {
     pub cert_pem: String,
     pub csr_pem: String,
     pub issuer: &'static str,
+    /// "local" or "kms" — which derivation produced this key. Reported because a client
+    /// deciding whether to pin the public key needs to know if it survives a restart.
+    pub key_source: &'static str,
     /// sha256 of the SubjectPublicKeyInfo, hex. What `report_data` commits to.
     pub public_key_sha256: String,
 }
@@ -64,12 +77,31 @@ pub fn public_key_sha256_hex(spki_der: &[u8]) -> String {
     hex::encode(Sha256::digest(spki_der))
 }
 
-/// Turn KMS-derived bytes into a certificate, asking `ca_url` to sign when one is set.
+/// The TLS key belonging to an app signer, for the local (no-KMS) source.
+///
+/// Hashed with a domain separator rather than used directly: the signer is a secp256k1
+/// scalar and this must be a P-256 one, ranges differ, and one key doing two jobs on two
+/// curves is how cross-protocol mistakes start. Hashing also makes the derivation one-way,
+/// so possession of the TLS key says nothing about the signer — which matters, because the
+/// signer is the identity that signs chain transactions and decrypts KMS payloads.
+pub fn derive_from_signer(signer_private_key: &[u8]) -> Vec<u8> {
+    let mut h = Sha256::new();
+    h.update(b"tapp-tls-v1");
+    h.update(signer_private_key);
+    h.finalize().to_vec()
+}
+
+/// Turn derived bytes into a certificate, asking `ca_url` to sign when one is set.
 ///
 /// Without a CA the certificate is self-signed and the signing request is returned
 /// alongside, so the deployer can obtain a publicly-trusted certificate for the same key
 /// later without coming back for the key.
-pub async fn build(app_id: &str, secret: &[u8], ca_url: Option<&str>) -> TappResult<TlsIdentity> {
+pub async fn build(
+    app_id: &str,
+    secret: &[u8],
+    key_source: &'static str,
+    ca_url: Option<&str>,
+) -> TappResult<TlsIdentity> {
     // A derived secret is uniform bytes; P-256 wants a scalar in range, which from_slice
     // enforces. Rejecting is correct rather than reducing: a secret that does not map to a
     // valid key means the derivation changed shape, and quietly mangling it would produce
@@ -128,6 +160,7 @@ pub async fn build(app_id: &str, secret: &[u8], ca_url: Option<&str>) -> TappRes
         cert_pem,
         csr_pem,
         issuer,
+        key_source,
         public_key_sha256,
     })
 }
@@ -170,8 +203,8 @@ mod tests {
     async fn the_same_derived_secret_always_yields_the_same_public_key() {
         // This is the property the whole design leans on: restarts and other nodes of the
         // same app must present the same key, or pinning and CT monitoring are worthless.
-        let a = build("demo", &SECRET, None).await.unwrap();
-        let b = build("demo", &SECRET, None).await.unwrap();
+        let a = build("demo", &SECRET, "local", None).await.unwrap();
+        let b = build("demo", &SECRET, "local", None).await.unwrap();
         assert_eq!(a.public_key_sha256, b.public_key_sha256);
         assert_eq!(a.key_pem, b.key_pem);
     }
@@ -180,15 +213,15 @@ mod tests {
     async fn a_different_app_gets_a_different_key_only_because_kms_derives_differently() {
         // Same secret, different app: identical keys. The separation comes from the
         // derivation namespace, never from anything this module does.
-        let a = build("one", &SECRET, None).await.unwrap();
-        let b = build("two", &SECRET, None).await.unwrap();
+        let a = build("one", &SECRET, "local", None).await.unwrap();
+        let b = build("two", &SECRET, "local", None).await.unwrap();
         assert_eq!(a.public_key_sha256, b.public_key_sha256);
         assert_ne!(a.cert_pem, b.cert_pem, "but the names differ");
     }
 
     #[tokio::test]
     async fn without_a_ca_the_certificate_is_self_signed_and_the_request_still_comes_back() {
-        let id = build("demo", &SECRET, None).await.unwrap();
+        let id = build("demo", &SECRET, "local", None).await.unwrap();
         assert_eq!(id.issuer, "self-signed");
         assert!(id.cert_pem.contains("BEGIN CERTIFICATE"));
         assert!(id.csr_pem.contains("BEGIN CERTIFICATE REQUEST"));
@@ -202,7 +235,61 @@ mod tests {
 
     #[tokio::test]
     async fn a_secret_that_is_not_a_valid_key_is_refused_rather_than_reduced() {
-        assert!(build("demo", &[0u8; 32], None).await.is_err(), "zero is not a scalar");
-        assert!(build("demo", &[0u8; 16], None).await.is_err(), "wrong length");
+        assert!(build("demo", &[0u8; 32], "local", None).await.is_err(), "zero is not a scalar");
+        assert!(build("demo", &[0u8; 16], "local", None).await.is_err(), "wrong length");
+    }
+}
+
+#[cfg(test)]
+mod material {
+    /// KMS decodes the derivation material as hex, so a readable ASCII namespace silently
+    /// becomes a 500 from the cluster. Cheap to assert, and the failure it prevents costs
+    /// a real deployment to discover.
+    #[test]
+    fn the_derivation_material_is_valid_hex() {
+        assert!(
+            hex::decode(super::KMS_MATERIAL).is_ok(),
+            "KMS_MATERIAL must be hex; KMS rejects anything else"
+        );
+    }
+}
+
+#[cfg(test)]
+mod local_derivation {
+    use super::*;
+
+    const SIGNER: [u8; 32] = [0x7f; 32];
+
+    #[test]
+    fn the_tls_key_is_not_the_signer_key() {
+        // Reusing the signer scalar directly would put one key on two curves doing two
+        // jobs — and would mean holding the TLS key implies holding the chain identity.
+        assert_ne!(derive_from_signer(&SIGNER), SIGNER.to_vec());
+    }
+
+    #[test]
+    fn the_same_signer_always_gives_the_same_tls_key() {
+        // Within one boot the signer does not change, so neither may this: an app asking
+        // twice must get the same certificate rather than silently rotating.
+        assert_eq!(derive_from_signer(&SIGNER), derive_from_signer(&SIGNER));
+    }
+
+    #[test]
+    fn a_different_signer_gives_a_different_tls_key() {
+        // The point of the local source: the key is bound to this instance, and a restart
+        // re-derives the signer, so the TLS key must move with it.
+        assert_ne!(derive_from_signer(&SIGNER), derive_from_signer(&[0x11; 32]));
+    }
+
+    #[tokio::test]
+    async fn a_locally_derived_secret_is_a_usable_p256_key() {
+        // sha256 output is uniform over 32 bytes, so it can in principle fall outside the
+        // P-256 order. Checking a real derivation reaches a certificate keeps that from
+        // being a theory nobody tested.
+        let id = build("demo", &derive_from_signer(&SIGNER), "local", None)
+            .await
+            .unwrap();
+        assert_eq!(id.key_source, "local");
+        assert!(id.cert_pem.contains("BEGIN CERTIFICATE"));
     }
 }
