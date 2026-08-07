@@ -14,17 +14,15 @@ tapp exists.
 The application does not fetch its own certificate. A sidecar does, writes two PEM files into
 a shared volume, and exits; the application waits for it and then reads ordinary files.
 
-That indirection is the point. Fetching means speaking gRPC over a Unix socket, and requiring
-every application to grow that client is what makes a pattern "only for apps we wrote".
+Fetching means speaking gRPC over a Unix socket. Putting that in a sidecar keeps it out of the
+application, which is why this works for software you did not write.
 
 ```yaml
 services:
   # Fetches this app's attested certificate and exits.
   tls-init:
-    # Pinned deliberately, and it does not need bumping with tapp-server: v0.4.0 is
-    # the floor (the version that introduced GetAppTlsCert), not a lockstep. A v0.4.0
-    # sidecar talks to a later server fine. Avoid :latest — this container is what
-    # hands your application its private key, and it should not change underneath you.
+    # Pin a version, never :latest — this container hands your app its private key.
+    # v0.4.0 is a floor, not a lockstep: it talks to any later tapp-server.
     image: us-central1-docker.pkg.dev/g-devops/zg-tapp/tls-init:v0.4.0
     command:
       - --server=/run/tapp/tapp.sock
@@ -34,11 +32,7 @@ services:
       - --out-cert=/certs/tls.crt
     volumes:
       - /run/tapp/tapp.sock:/run/tapp/tapp.sock   # the only contact with tapp
-      # A path under /run, which is tmpfs: the private key stays in RAM and never
-      # reaches a disk. See "Keep the key off the disk" — this is not a hardening
-      # option, it is the difference between the platform's claim about private
-      # keys holding and not.
-      - /run/my-app-certs:/certs
+      - /run/my-app-certs:/certs                  # /run is tmpfs — see Rules
 
   web:
     image: nginx:1.27-alpine            # unmodified
@@ -70,9 +64,8 @@ An older `tapp-server` answers `Unimplemented`, which is easy to misread as a br
 ### Or build the sidecar yourself
 
 The image is `debian:bookworm-slim` with `tapp-cli` copied in — seventeen lines, at
-[`docker/tls-init/Dockerfile`](../docker/tls-init/Dockerfile). For a container that handles
-your application's private key, building it from a Dockerfile you have read is a stronger
-position than trusting one somebody published:
+[`docker/tls-init/Dockerfile`](../docker/tls-init/Dockerfile). It is unsigned, so for a
+container that handles your private key, building it yourself is the better option:
 
 ```bash
 cp target/release/tapp-cli docker/tls-init/
@@ -81,55 +74,31 @@ docker build -t tls-init:local docker/tls-init/
 
 Nothing in the recipe depends on where the image comes from.
 
-## Keep the key off the disk
+## Rules
 
-The platform's claim is that an application's private key cannot be extracted, including by
-whoever deployed it. Writing that key to a persistent disk gives it away, and the obvious
-compose does exactly that: a **named volume lands on `/data`, which is plain ext4 and not
-encrypted.** The cryptpilot devices protect the root filesystem, not `/data`. The key sits
-there in plaintext at mode 0600 — proof against another user on the box, and no use at all
-against anyone who can read the disk or take a snapshot of it.
-
-Bind-mounting a path under **`/run`** is the fix, because `/run` is tmpfs. The key exists only
-in memory, which on this platform is memory the TEE protects, and it is gone at reboot — which
-is exactly right for a `local` key that gets re-derived at the next boot anyway. Docker creates
-the directory for you.
+**Share the certificate through a path under `/run`, and nowhere else.**
 
 ```yaml
-    volumes:
       - /run/<app-id>-certs:/certs                    # in the sidecar
       - /run/<app-id>-certs:/etc/nginx/certs:ro       # in the application
 ```
 
-**A tmpfs-backed named volume does not work, though it looks like it should.** Declaring
+`/run` is tmpfs, so the key stays in memory the TEE protects. A Docker named volume would put
+it in `/data`, which is plain unencrypted ext4 — readable by anyone who can snapshot the disk,
+and the end of the platform's guarantee that an application's private key cannot be extracted.
+A tmpfs-backed named volume (`driver_opts: {type: tmpfs}`) is not a substitute: each container
+gets its own, so the application finds an empty directory.
 
-```yaml
-volumes:
-  certs:
-    driver_opts: { type: tmpfs, device: tmpfs }
-```
+**Keep `condition: service_completed_successfully`.** It is what makes the application wait for
+the certificate instead of starting without one.
 
-gives each container its own tmpfs rather than a shared one. The sidecar writes into its copy,
-exits, that mount disappears, and the application starts against an empty directory:
+**Let the sidecar run on every start.** It re-fetches, which is required: a `local` key is
+re-derived at each boot, so a cached certificate stops matching the attestation.
 
-```
-[emerg] cannot load certificate "/etc/nginx/certs/tls.crt": ... No such file or directory
-```
+**Match `--app-id` to the app's real id.** The certificate is derived per app; another id
+yields a key that is attested for something else.
 
-Which is why the recipe bind-mounts a real path on a filesystem that already is tmpfs, rather
-than asking Docker for one.
-
-## Three more things that will bite
-
-**`condition: service_completed_successfully` is not optional.** Without it the web container
-starts while `/certs` is still empty and dies on a missing file, then restarts into the same
-race. The dependency is what makes the ordering real.
-
-**Open the TLS port.** The compose `ports:` entry is not the whole story on a cloud host; the
-firewall has to allow it too. Easy to miss, because everything looks healthy from inside.
-
-**`--app-id` must match the app's real id.** The certificate is derived per app, and asking for
-a different id yields a key that is attested — for something else.
+**Open the TLS port in the cloud firewall too,** not only in `ports:`.
 
 ## How a client verifies
 
