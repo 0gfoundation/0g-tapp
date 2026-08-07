@@ -53,6 +53,55 @@ pub struct ClaimedRuntimeConfig {
     pub kbs_node_urls: Vec<String>,
     /// Empty means "not claimed" — fall back to config.toml, which is the pre-baked mode.
     pub tls_key_source: String,
+    /// The verifier this tapp believes about KMS node identity, and the sha256 of that
+    /// verifier's TLS public key. Claim-time or `UpdateTrustAnchors`; deliberately not in
+    /// config.toml, for the same reason as the owner — a field there lives in the CVM image,
+    /// so one image per verifier deployment and one set of reference values each.
+    ///
+    /// Empty means KMS node identity cannot be checked. That is a real state, not a
+    /// degraded-but-fine one: it is the difference between "checked and passed" and "not
+    /// checked", and callers must not conflate them.
+    pub scan_url: String,
+    pub scan_public_key: String,
+}
+
+/// Reject anything that is not a usable (url, pin) pair, or accept "both empty" as
+/// "leave alone".
+///
+/// Validated here, at the boundary where a human typed it, rather than at connect time
+/// deep inside the KMS client: a malformed pin discovered on the first key fetch of a
+/// production app is a much worse place to find out.
+fn validate_scan_anchor(url: &str, pin: &str) -> Result<Option<(String, String)>, String> {
+    if url.is_empty() && pin.is_empty() {
+        return Ok(None);
+    }
+    if url.is_empty() || pin.is_empty() {
+        return Err(
+            "scan_url and scan_public_key must be given together: a URL without a pin is an \
+             unauthenticated channel carrying a verdict, and a pin without a URL names nothing"
+                .to_string(),
+        );
+    }
+    // A pinned key delivered over plaintext proves nothing — anyone on the path replaces
+    // the whole response, pin check included, because there is no channel to bind it to.
+    if !url.starts_with("https://") {
+        return Err(format!(
+            "scan_url must be https (got {:?}): pinning a key on a plaintext channel proves \
+             nothing",
+            url
+        ));
+    }
+    let hex_part = pin.strip_prefix("0x").unwrap_or(pin);
+    if hex_part.len() != 64 || !hex_part.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!(
+            "scan_public_key must be a 32-byte sha256 in hex, got {} hex chars",
+            hex_part.len()
+        ));
+    }
+    Ok(Some((
+        url.to_string(),
+        format!("0x{}", hex_part.to_lowercase()),
+    )))
 }
 
 pub struct TappServiceImpl {
@@ -329,6 +378,10 @@ impl TappServiceImpl {
             chain_contract_address: config.chain.as_ref().map(|c| c.contract_address.clone()).unwrap_or_default(),
             kbs_node_urls: config.kbs.as_ref().map(|k| k.node_urls.clone()).unwrap_or_default(),
             tls_key_source: config.server.tls_key_source.as_str().to_string(),
+            // No static counterpart on purpose: these are claimed, never baked into the
+            // image. See ClaimedRuntimeConfig.
+            scan_url: String::new(),
+            scan_public_key: String::new(),
         }));
 
         info!("All TAPP service components initialized successfully");
@@ -1002,6 +1055,9 @@ impl TappService for TappServiceImpl {
         } else {
             self.config.chain.as_ref().map(|c| c.contract_address.clone()).unwrap_or_default()
         };
+        // Trust anchors have no config.toml fallback by design — see ClaimedRuntimeConfig.
+        let scan_url = runtime.scan_url.clone();
+        let scan_public_key = runtime.scan_public_key.clone();
         drop(runtime);
 
         let chain_config = if !live_chain_rpc.is_empty() || !live_chain_contract.is_empty() {
@@ -1021,6 +1077,8 @@ impl TappService for TappServiceImpl {
             kbs: kbs_config,
             kbs_enabled,
             chain: chain_config,
+            scan_url,
+            scan_public_key,
         };
 
         Ok(Response::new(GetTappInfoResponse {
@@ -1252,6 +1310,17 @@ impl TappService for TappServiceImpl {
             }
         };
 
+        // Same reasoning as tls_key_source: reject rather than fall back, because a
+        // half-configured trust anchor is not a lesser configuration, it is a wrong one.
+        let scan = match validate_scan_anchor(&req.scan_url, &req.scan_public_key) {
+            Ok(v) => v,
+            Err(e) => {
+                pm.rollback_claim().await;
+                return Err(Status::invalid_argument(e));
+            }
+        };
+        let (scan_url, scan_public_key) = scan.unwrap_or_default();
+
         // Extend runtime measurement — includes the full config so verifiers
         // see owner + chain + kbs in one event. On failure the claim is rolled
         // back so the tapp stays claimable.
@@ -1263,6 +1332,8 @@ impl TappService for TappServiceImpl {
             "chain_contract_address": req.chain_contract_address,
             "kbs_node_urls": req.kbs_node_urls,
             "tls_key_source": tls_key_source.as_str(),
+            "scan_url": scan_url,
+            "scan_public_key": scan_public_key,
             "timestamp": timestamp
         })
         .to_string();
@@ -1288,6 +1359,8 @@ impl TappService for TappServiceImpl {
             chain_contract_address: req.chain_contract_address.clone(),
             kbs_node_urls: req.kbs_node_urls.clone(),
             tls_key_source: tls_key_source.as_str().to_string(),
+            scan_url,
+            scan_public_key,
         };
 
         // Initialize or replace KMS client with the claimed kbs_node_urls.
@@ -1320,6 +1393,110 @@ impl TappService for TappServiceImpl {
             success: true,
             message: format!("Tapp config claimed by {}", owner),
             owner_address: owner,
+            timestamp,
+        }))
+    }
+
+    async fn update_trust_anchors(
+        &self,
+        request: Request<UpdateTrustAnchorsRequest>,
+    ) -> Result<Response<UpdateTrustAnchorsResponse>, Status> {
+        info!("Calling UpdateTrustAnchors");
+        let req = request.into_inner();
+
+        let scan = validate_scan_anchor(&req.scan_url, &req.scan_public_key)
+            .map_err(Status::invalid_argument)?;
+
+        // Refuse a call that would do nothing rather than emitting a measurement event
+        // saying nothing changed. An empty request is a mistake — most likely a caller
+        // that meant to clear something and cannot, since empty means "leave alone".
+        if scan.is_none() && req.kbs_node_urls.is_empty() {
+            return Err(Status::invalid_argument(
+                "nothing to update: give --kbs-urls, or --scan-url with --scan-pubkey",
+            ));
+        }
+
+        // Compute the resulting state before touching anything, so the event and the
+        // applied config cannot disagree, and so a measurement failure leaves the tapp
+        // exactly as it was.
+        let resulting = {
+            let current = self.claimed_runtime_config.read().await;
+            let (scan_url, scan_public_key) = match &scan {
+                Some((u, p)) => (u.clone(), p.clone()),
+                None => (current.scan_url.clone(), current.scan_public_key.clone()),
+            };
+            let kbs_node_urls = if req.kbs_node_urls.is_empty() {
+                current.kbs_node_urls.clone()
+            } else {
+                req.kbs_node_urls.clone()
+            };
+            ClaimedRuntimeConfig {
+                chain_rpc_url: current.chain_rpc_url.clone(),
+                chain_contract_address: current.chain_contract_address.clone(),
+                tls_key_source: current.tls_key_source.clone(),
+                kbs_node_urls,
+                scan_url,
+                scan_public_key,
+            }
+        };
+
+        // The event carries the resulting anchors in full, not the delta. That is what lets
+        // a verifier read the newest event of this kind and stop, instead of replaying every
+        // update since boot to work out the current state.
+        let timestamp = utils::current_timestamp();
+        let measurement_data = serde_json::json!({
+            "operation": measurement_service::OPERATION_NAME_UPDATE_TRUST_ANCHORS,
+            "kbs_node_urls": resulting.kbs_node_urls,
+            "scan_url": resulting.scan_url,
+            "scan_public_key": resulting.scan_public_key,
+            "timestamp": timestamp
+        })
+        .to_string();
+
+        // Measure first, apply second. An unmeasured change to a trust anchor is the one
+        // outcome that must not happen: it is the property that makes these mutable at all.
+        self.measurement_service
+            .extend_measurement(
+                measurement_service::OPERATION_NAME_UPDATE_TRUST_ANCHORS,
+                &measurement_data,
+            )
+            .await
+            .map_err(|e| {
+                Status::internal(format!(
+                    "Failed to extend measurement for trust anchor update, nothing applied: {}",
+                    e
+                ))
+            })?;
+
+        let kbs_changed = !req.kbs_node_urls.is_empty();
+        *self.claimed_runtime_config.write().await = resulting.clone();
+
+        // Replace the KMS client so the new cluster takes effect on the next request
+        // rather than at the next restart.
+        if kbs_changed {
+            info!(
+                nodes = resulting.kbs_node_urls.len(),
+                "Replacing KMS client from UpdateTrustAnchors"
+            );
+            *self.kms_client.write().await = Some(kms_client::KmsClient::new(
+                resulting.kbs_node_urls.clone(),
+                &Default::default(),
+            ));
+        }
+
+        info!(
+            kbs_nodes = resulting.kbs_node_urls.len(),
+            scan_url = %resulting.scan_url,
+            event = "TRUST_ANCHORS_UPDATED",
+            "Trust anchors updated and measurement extended"
+        );
+
+        Ok(Response::new(UpdateTrustAnchorsResponse {
+            success: true,
+            message: "Trust anchors updated".to_string(),
+            kbs_node_urls: resulting.kbs_node_urls,
+            scan_url: resulting.scan_url,
+            scan_public_key: resulting.scan_public_key,
             timestamp,
         }))
     }
@@ -2047,6 +2224,56 @@ pub fn init_tracing(config: &config::LoggingConfig) -> TappResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const PIN: &str = "0x8745d897b66f77d711afa62f282b6b540236e72c3d5d1a2b1e18875f1fc33298";
+
+    #[test]
+    fn both_anchor_fields_empty_means_leave_alone() {
+        assert_eq!(validate_scan_anchor("", ""), Ok(None));
+    }
+
+    #[test]
+    fn a_url_without_a_pin_is_refused_rather_than_accepted_unauthenticated() {
+        // The failure this prevents: an operator sets only the URL, the channel is then
+        // unauthenticated, and the verdict it carries is rewritable by anyone on the path
+        // — while the config reads as though a verifier is configured.
+        assert!(validate_scan_anchor("https://scan.example", "").is_err());
+        assert!(validate_scan_anchor("", PIN).is_err());
+    }
+
+    #[test]
+    fn plaintext_is_refused_because_a_pin_needs_a_channel_to_bind_to() {
+        assert!(validate_scan_anchor("http://scan.example", PIN).is_err());
+    }
+
+    #[test]
+    fn a_pin_that_is_not_a_sha256_is_refused_rather_than_truncated() {
+        for bad in ["0xdeadbeef", "not-hex-at-all", &"0x".to_string()] {
+            assert!(
+                validate_scan_anchor("https://scan.example", bad).is_err(),
+                "accepted {:?}",
+                bad
+            );
+        }
+        // 64 hex chars but one non-hex character — length alone is not enough.
+        let almost = format!("0x{}z", &PIN[2..65]);
+        assert!(validate_scan_anchor("https://scan.example", &almost).is_err());
+    }
+
+    #[test]
+    fn an_accepted_pin_is_normalised_so_comparisons_cannot_miss_on_case_or_prefix() {
+        let upper = format!("0X{}", PIN[2..].to_uppercase());
+        let bare = &PIN[2..];
+        let expected = Some(("https://scan.example".to_string(), PIN.to_string()));
+        assert_eq!(validate_scan_anchor("https://scan.example", bare), Ok(expected.clone()));
+        // A "0X" prefix is not stripped by strip_prefix("0x"), so it lands in the hex part
+        // and is rejected on length — documented here so the behaviour is deliberate.
+        assert!(validate_scan_anchor("https://scan.example", &upper).is_err());
+        assert_eq!(
+            validate_scan_anchor("https://scan.example", &PIN.to_uppercase().replace("0X", "0x")),
+            Ok(expected)
+        );
+    }
 
     #[test]
     fn test_prune_old_log_files() {

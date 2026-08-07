@@ -8,7 +8,8 @@ use tapp_common::proto::{
     GetSecretResourceRequest,
     GetServiceLogsRequest, GetServiceStatusRequest, GetTappInfoRequest, GetTaskStatusRequest,
     ListAppsRequest, ListWhitelistRequest, MountFile, PruneImagesRequest, RemoveFromWhitelistRequest,
-    StartAppRequest, StartServiceRequest, StopAppRequest, StopServiceRequest, WithdrawBalanceRequest,
+    StartAppRequest, StartServiceRequest, StopAppRequest, StopServiceRequest,
+    UpdateTrustAnchorsRequest, WithdrawBalanceRequest,
 };
 use tonic::{metadata::MetadataValue, Request};
 
@@ -319,6 +320,40 @@ enum Commands {
         ///          on chain and the cluster reachable.
         #[arg(long)]
         tls_key_source: Option<String>,
+
+        /// Verifier to believe about KMS node identity, e.g. https://scan.example:9090.
+        /// Must be https and must come with --scan-pubkey. Changeable later with
+        /// update-trust-anchors.
+        #[arg(long)]
+        scan_url: Option<String>,
+
+        /// sha256 of that verifier's own TLS public key (`0x…`, 32 bytes) — the pin that
+        /// makes the channel to it worth anything. Read it off `verify-app`'s "tls key"
+        /// line for the verifier's app.
+        #[arg(long)]
+        scan_pubkey: Option<String>,
+    },
+
+    /// Change which KMS cluster this tapp fetches key material from, and which verifier
+    /// it believes about that cluster's identity.
+    ///
+    /// Owner only. Every call is extended into the runtime measurement carrying the
+    /// resulting anchors in full, so where a node was ever pointed cannot be hidden —
+    /// which is what makes these safe to change at runtime at all.
+    ///
+    /// Omitted values are left alone; there is no way to clear one.
+    UpdateTrustAnchors {
+        /// Replacement KMS cluster, comma-separated. Replaces the set wholesale.
+        #[arg(long)]
+        kbs_urls: Option<String>,
+
+        /// Verifier URL (https). Must be given together with --scan-pubkey.
+        #[arg(long)]
+        scan_url: Option<String>,
+
+        /// sha256 of the verifier's TLS public key (`0x…`).
+        #[arg(long)]
+        scan_pubkey: Option<String>,
     },
 
     AddToWhitelist {
@@ -711,22 +746,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             chain_contract,
             kbs_urls,
             tls_key_source,
+            scan_url,
+            scan_pubkey,
         } => {
             let private_key = require_private_key(&cli.private_key)?;
-            let kbs_node_urls: Vec<String> = kbs_urls
-                .unwrap_or_default()
-                .split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(String::from)
-                .collect();
             claim_config(
                 &cli.server,
                 private_key,
                 chain_rpc_url.unwrap_or_default(),
                 chain_contract.unwrap_or_default(),
-                kbs_node_urls,
+                split_urls(kbs_urls),
                 tls_key_source,
+                scan_url.unwrap_or_default(),
+                scan_pubkey.unwrap_or_default(),
+            )
+            .await?;
+        }
+        Commands::UpdateTrustAnchors {
+            kbs_urls,
+            scan_url,
+            scan_pubkey,
+        } => {
+            let private_key = require_private_key(&cli.private_key)?;
+            update_trust_anchors(
+                &cli.server,
+                private_key,
+                split_urls(kbs_urls),
+                scan_url.unwrap_or_default(),
+                scan_pubkey.unwrap_or_default(),
             )
             .await?;
         }
@@ -1402,6 +1449,53 @@ async fn get_app_info(server: &str, app_id: String) -> Result<(), Box<dyn std::e
 ///
 /// An empty value means the app has no TLS key yet, which is not a failure — most apps
 /// have never asked for one.
+/// Which KMS cluster the node draws key material from, and which verifier it believes
+/// about that cluster's identity.
+///
+/// Reported, never judged: choosing a verifier is the operator's call. What the reader is
+/// owed is that the choice is visible and that its history is not hidden — so a node that
+/// has been re-pointed says so, and a node with no verifier says *that* rather than
+/// staying silent, because "cannot check KMS node identity" reads far too much like
+/// "checked and fine" when it is simply absent from the output.
+///
+/// Nothing printed at all means the event log has no config event, which is a third state
+/// again: a pre-0.4 image, or a node that was never claimed.
+fn print_trust_anchors(
+    anchors: Option<&tapp_common::verify::TrustAnchors>,
+    indent: &str,
+    label_width: usize,
+) {
+    let Some(a) = anchors else { return };
+    let pad = " ".repeat(label_width + 2);
+
+    if a.scan_url.is_empty() {
+        println!(
+            "{}{:<w$}: none — KMS node identity is not checked on this node",
+            indent,
+            "verifier",
+            w = label_width
+        );
+    } else {
+        println!(
+            "{}{:<w$}: {}",
+            indent,
+            "verifier",
+            a.scan_url,
+            w = label_width
+        );
+        println!("{}{}pinned {}", indent, pad, a.scan_public_key);
+    }
+    if a.revisions > 0 {
+        println!(
+            "{}{}revised {} time{} since the claim — every change is in the event log above",
+            indent,
+            pad,
+            a.revisions,
+            if a.revisions == 1 { "" } else { "s" }
+        );
+    }
+}
+
 fn print_tls_binding(tls_public_key: &str, indent: &str, label_width: usize) {
     if tls_public_key.is_empty() {
         return;
@@ -1495,6 +1589,7 @@ async fn verify_app_cmd(
         if let Some(owner) = &d.claimed_owner {
             println!("  owner       : {}  (from claim_config event; no chain comparison in direct mode)", owner);
         }
+        print_trust_anchors(d.trust_anchors.as_ref(), "  ", 12);
         if !d.compose_hash.is_empty() {
             println!("  compose     : {}", d.compose_hash);
         }
@@ -1550,6 +1645,7 @@ async fn verify_app_cmd(
         } else {
             println!("    owner      : ? no claim_config event in eventlog");
         }
+        print_trust_anchors(n.trust_anchors.as_ref(), "    ", 11);
         if show_boot {
             if let Some(l) = boot_chain_line(n.boot_executables, show_boot) {
                 println!("    {}", l);
@@ -2010,6 +2106,73 @@ async fn stop_service(
     Ok(())
 }
 
+/// Split a comma-separated `--*-urls` value. Shared so claim-config and
+/// update-trust-anchors cannot disagree on whitespace or trailing commas.
+fn split_urls(arg: Option<String>) -> Vec<String> {
+    arg.unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect()
+}
+
+async fn update_trust_anchors(
+    server: &str,
+    private_key: String,
+    kbs_node_urls: Vec<String>,
+    scan_url: String,
+    scan_public_key: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut client = create_client(server).await?;
+
+    let mut request = Request::new(UpdateTrustAnchorsRequest {
+        kbs_node_urls,
+        scan_url,
+        scan_public_key,
+    });
+    add_signature_metadata(&mut request, &private_key, "UpdateTrustAnchors")?;
+
+    let result = match client.update_trust_anchors(request).await {
+        Ok(r) => r.into_inner(),
+        // A server that predates this RPC answers Unimplemented, whose default rendering is
+        // a raw Status dump that says nothing about why. Name the actual cause: this is the
+        // one failure here that is about the server's age rather than the request.
+        Err(status) if status.code() == tonic::Code::Unimplemented => {
+            eprintln!(
+                "✗ this server has no UpdateTrustAnchors — it predates the RPC.\n  \
+                 Trust anchors are fixed at claim time there: re-claim after a VM reboot, \
+                 or upgrade tapp-server."
+            );
+            std::process::exit(1);
+        }
+        Err(e) => return Err(e.into()),
+    };
+    if !result.success {
+        eprintln!("✗ {}", result.message);
+        std::process::exit(1);
+    }
+
+    // Print the resulting anchors rather than what was asked for: omitted fields are left
+    // alone, so the request is not the state.
+    println!("✓ Trust anchors updated (measured — this change is in the event log)");
+    println!(
+        "  KMS:      {}",
+        if result.kbs_node_urls.is_empty() {
+            "(none)".to_string()
+        } else {
+            result.kbs_node_urls.join(", ")
+        }
+    );
+    if result.scan_url.is_empty() {
+        println!("  Verifier: (none) — KMS node identity cannot be checked");
+    } else {
+        println!("  Verifier: {}", result.scan_url);
+        println!("  Pinned:   {}", result.scan_public_key);
+    }
+    Ok(())
+}
+
 async fn claim_config(
     server: &str,
     private_key: String,
@@ -2017,6 +2180,8 @@ async fn claim_config(
     chain_contract_address: String,
     kbs_node_urls: Vec<String>,
     tls_key_source: Option<String>,
+    scan_url: String,
+    scan_public_key: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use ethers::signers::Signer;
 
@@ -2033,6 +2198,8 @@ async fn claim_config(
         chain_contract_address: chain_contract_address.clone(),
         kbs_node_urls: kbs_node_urls.clone(),
         tls_key_source: tls_key_source.clone().unwrap_or_default(),
+        scan_url: scan_url.clone(),
+        scan_public_key: scan_public_key.clone(),
     });
     add_signature_metadata(&mut request, &private_key, "ClaimConfig")?;
 
@@ -2057,6 +2224,10 @@ async fn claim_config(
     }
     if !kbs_node_urls.is_empty() {
         println!("  KBS:      {}", kbs_node_urls.join(", "));
+    }
+    if !scan_url.is_empty() {
+        println!("  Verifier: {}", scan_url);
+        println!("  Pinned:   {}", scan_public_key);
     }
 
     if result.owner_address != my_address {
@@ -2322,6 +2493,18 @@ async fn get_tapp_info(server: &str) -> Result<(), Box<dyn std::error::Error>> {
                     println!("  {}", url);
                 }
             }
+        }
+
+        // Printed even when unset: "no verifier" means KMS node identity is not checked,
+        // and a silent omission would read as though it were.
+        println!("\nVerifier (trust anchor for KMS node identity):");
+        if config.scan_url.is_empty() {
+            println!("  none — KMS node identity is not checked");
+            println!("  set it with: claim-config --scan-url … --scan-pubkey …");
+            println!("           or: update-trust-anchors --scan-url … --scan-pubkey …");
+        } else {
+            println!("  URL:    {}", config.scan_url);
+            println!("  Pinned: {}", config.scan_public_key);
         }
     }
 

@@ -43,6 +43,10 @@ pub struct NodeVerdict {
     ///   Some(Err(addr)) = found but mismatches (addr is what the event says)
     ///   None            = no claim_config event found in event log
     pub owner_claim: Option<Result<String, String>>,
+    /// Trust anchors in force per the event log. Reported rather than judged: which verifier
+    /// a node believes is the operator's decision, but it is measured, so it is auditable —
+    /// and a node with none configured cannot check KMS node identity at all.
+    pub trust_anchors: Option<TrustAnchors>,
     pub note: String,
 }
 
@@ -383,6 +387,108 @@ fn eventlog_claim_config_owner(cc_eventlog_b64: &str) -> Result<Option<String>> 
     }
 }
 
+/// Every `tapp.0g.com <operation> <json>` event with the given operation, in log order.
+///
+/// (The TCG walk here is a fourth copy of the same loop. Left duplicated rather than
+/// refactoring three working parsers as a side effect of adding a feature.)
+fn eventlog_tapp_events(cc_eventlog_b64: &str, operation: &str) -> Result<Vec<serde_json::Value>> {
+    let log = B64.decode(cc_eventlog_b64).map_err(|e| anyhow!("eventlog b64: {}", e))?;
+    let u32le = |b: &[u8]| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize;
+    let prefix = format!("tapp.0g.com {} ", operation);
+
+    let mut out = Vec::new();
+    let mut o = 8 + 20;
+    if o + 4 > log.len() {
+        return Ok(out);
+    }
+    let ds = u32le(&log[o..o + 4]);
+    o += 4 + ds;
+
+    while o + 12 <= log.len() {
+        o += 4;
+        let et = u32le(&log[o..o + 4]);
+        o += 4;
+        let cnt = u32le(&log[o..o + 4]);
+        o += 4;
+        for _ in 0..cnt {
+            if o + 2 > log.len() {
+                return Ok(out);
+            }
+            let alg = u16::from_le_bytes([log[o], log[o + 1]]);
+            o += 2 + alg_size(alg);
+        }
+        if o + 4 > log.len() {
+            break;
+        }
+        let dl = u32le(&log[o..o + 4]);
+        o += 4;
+        if o + dl > log.len() {
+            break;
+        }
+        let data = &log[o..o + dl];
+        o += dl;
+
+        if et == 0x6 && dl >= 8 {
+            let tsz = u32le(&data[4..8]);
+            if 8 + tsz <= data.len() {
+                if let Ok(text) = std::str::from_utf8(&data[8..8 + tsz]) {
+                    if let Some(payload) = text.strip_prefix(prefix.as_str()) {
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(payload) {
+                            out.push(v);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Which KMS cluster the node fetches key material from, and which verifier it believes
+/// about that cluster's identity — as the event log currently stands.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct TrustAnchors {
+    pub kbs_node_urls: Vec<String>,
+    pub scan_url: String,
+    pub scan_public_key: String,
+    /// How many times the anchors were revised after the claim. Not a fault on its own —
+    /// a verifier restart legitimately forces one — but it is history a reader is entitled
+    /// to see, and the reason these events carry the resulting state rather than a delta.
+    pub revisions: usize,
+}
+
+/// The anchors in force, read from the newest event that sets them.
+///
+/// `update_trust_anchors` events carry the resulting state in full, so the newest one is
+/// the answer outright with no replay. Falling back to `claim_config` covers a node whose
+/// anchors were never revised. Both are taken newest-first because these are deliberately
+/// mutable: earlier events are history, not conflicts — unlike the owner, which cannot
+/// change and where disagreement is a finding.
+fn eventlog_trust_anchors(cc_eventlog_b64: &str) -> Result<Option<TrustAnchors>> {
+    let updates = eventlog_tapp_events(cc_eventlog_b64, "update_trust_anchors")?;
+    let revisions = updates.len();
+    let source = match updates.last() {
+        Some(v) => v.clone(),
+        None => match eventlog_tapp_events(cc_eventlog_b64, "claim_config")?.last() {
+            Some(v) => v.clone(),
+            None => return Ok(None),
+        },
+    };
+    Ok(Some(TrustAnchors {
+        kbs_node_urls: source["kbs_node_urls"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|u| u.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        scan_url: source["scan_url"].as_str().unwrap_or("").to_string(),
+        scan_public_key: source["scan_public_key"].as_str().unwrap_or("").to_string(),
+        revisions,
+    }))
+}
+
 fn json_str_map(v: &serde_json::Value) -> HashMap<String, String> {
     let mut m = HashMap::new();
     if let Some(obj) = v.as_object() {
@@ -411,6 +517,21 @@ pub struct AsVerdict {
     pub boot_measurements: Vec<(String, String)>,
 }
 
+/// A bare `host:port` means plaintext, which is what the shared AS speaks today. An endpoint
+/// that names its own scheme is passed through, so `https://as.example:50004` works the day
+/// the AS terminates TLS without anything here changing.
+///
+/// Plaintext is a real exposure and not one this side can close: the verdict is an assertion
+/// with no internal proof — unlike the evidence it is about, which authenticates itself — so
+/// anyone on the path can rewrite it and report any node as affirming. See 0g-tapp#99.
+fn as_grpc_url(as_endpoint: &str) -> String {
+    if as_endpoint.contains("://") {
+        as_endpoint.to_string()
+    } else {
+        format!("http://{}", as_endpoint)
+    }
+}
+
 /// Submit evidence to CoCo-AS (gRPC). `policy_ids` selects the policy to enforce; pass an
 /// empty slice to use the AS default policy (which does NOT check our boot chain).
 async fn verify_with_as(
@@ -418,7 +539,7 @@ async fn verify_with_as(
     raw_evidence: &[u8],
     policy_ids: &[String],
 ) -> Result<AsVerdict> {
-    let mut client = AttestationServiceClient::connect(format!("http://{}", as_endpoint))
+    let mut client = AttestationServiceClient::connect(as_grpc_url(as_endpoint))
         .await
         .map_err(|e| anyhow!("connect AS {}: {}", as_endpoint, e))?;
     let req = AttestationRequest {
@@ -503,6 +624,8 @@ pub struct DirectVerdict {
     pub images: Vec<String>,
     /// Owner address from claim_config event (if present). No chain comparison in direct mode.
     pub claimed_owner: Option<String>,
+    /// Trust anchors in force per the event log — see NodeVerdict.
+    pub trust_anchors: Option<TrustAnchors>,
     pub note: String,
 }
 
@@ -524,6 +647,7 @@ pub async fn verify_node_direct(
         compose_hash: String::new(),
         images: Vec::new(),
         claimed_owner: None,
+        trust_anchors: None,
         note: String::new(),
     };
 
@@ -565,6 +689,10 @@ pub async fn verify_node_direct(
     match eventlog_claim_config_owner(cc_b64) {
         Ok(owner) => v.claimed_owner = owner,
         Err(e) => v.note = format!("{}claim_config: {}", v.note, e),
+    }
+
+    if let Ok(anchors) = eventlog_trust_anchors(cc_b64) {
+        v.trust_anchors = anchors;
     }
 
     Ok(v)
@@ -611,6 +739,7 @@ pub async fn verify_app(
             boot_executables: None,
             boot_measurements: Vec::new(),
             owner_claim: None,
+            trust_anchors: None,
             note: String::new(),
         };
 
@@ -698,6 +827,10 @@ pub async fn verify_app(
             Err(e) => v.note = format!("{}claim_config: {}", v.note, e),
         }
 
+        if let Ok(anchors) = eventlog_trust_anchors(cc_b64) {
+            v.trust_anchors = anchors;
+        }
+
         nodes.push(v);
     }
 
@@ -712,6 +845,129 @@ mod tests {
     use super::*;
 
     const SIGNER: [u8; 20] = [0x11; 20];
+
+    #[test]
+    fn a_bare_host_port_as_endpoint_stays_plaintext() {
+        assert_eq!(as_grpc_url("1.2.3.4:50004"), "http://1.2.3.4:50004");
+    }
+
+    #[test]
+    fn an_as_endpoint_that_names_its_scheme_is_not_downgraded() {
+        // The bug this guards: prefixing unconditionally produced
+        // "http://https://as.example:50004", so an operator who supplied a TLS
+        // endpoint silently got plaintext or a connect error rather than TLS.
+        assert_eq!(
+            as_grpc_url("https://as.example:50004"),
+            "https://as.example:50004"
+        );
+        assert_eq!(
+            as_grpc_url("http://as.example:50004"),
+            "http://as.example:50004"
+        );
+    }
+
+    /// A TCG2 event log carrying the given `tapp.0g.com <op> <json>` events, in order.
+    fn tcg_log(events: &[(&str, &str)]) -> String {
+        let mut log = Vec::new();
+        // SpecID header: the parser skips 8 + 20 bytes then a length-prefixed blob.
+        log.extend_from_slice(&0u32.to_le_bytes()); // pcrIndex
+        log.extend_from_slice(&3u32.to_le_bytes()); // EV_NO_ACTION
+        log.extend_from_slice(&[0u8; 20]); // SHA1 digest
+        let spec = b"Spec ID Event03\0";
+        log.extend_from_slice(&(spec.len() as u32).to_le_bytes());
+        log.extend_from_slice(spec);
+
+        for (op, json) in events {
+            let text = format!("tapp.0g.com {} {}", op, json);
+            let mut data = Vec::new();
+            data.extend_from_slice(&0u32.to_le_bytes()); // tagId
+            data.extend_from_slice(&(text.len() as u32).to_le_bytes());
+            data.extend_from_slice(text.as_bytes());
+
+            log.extend_from_slice(&4u32.to_le_bytes()); // pcrIndex
+            log.extend_from_slice(&6u32.to_le_bytes()); // EV_EVENT_TAG
+            log.extend_from_slice(&1u32.to_le_bytes()); // one digest
+            log.extend_from_slice(&0xcu16.to_le_bytes()); // SHA-384
+            log.extend_from_slice(&[0u8; 48]);
+            log.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            log.extend_from_slice(&data);
+        }
+        B64.encode(log)
+    }
+
+    fn anchors_event(scan: &str, kbs: &[&str]) -> String {
+        serde_json::json!({
+            "kbs_node_urls": kbs,
+            "scan_url": scan,
+            "scan_public_key": format!("0x{}", "ab".repeat(32)),
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn a_node_with_no_config_events_reports_no_anchors() {
+        assert_eq!(eventlog_trust_anchors(&tcg_log(&[])).unwrap(), None);
+    }
+
+    #[test]
+    fn anchors_come_from_the_claim_when_never_revised() {
+        let log = tcg_log(&[(
+            "claim_config",
+            &anchors_event("https://scan.a", &["http://kms-1:9090"]),
+        )]);
+        let a = eventlog_trust_anchors(&log).unwrap().unwrap();
+        assert_eq!(a.scan_url, "https://scan.a");
+        assert_eq!(a.kbs_node_urls, vec!["http://kms-1:9090"]);
+        assert_eq!(a.revisions, 0);
+    }
+
+    #[test]
+    fn the_newest_revision_wins_and_the_older_ones_are_counted_not_lost() {
+        // The property under test: these are deliberately mutable, so an earlier value is
+        // history rather than a conflict — but the count must still surface, because "this
+        // node was re-pointed three times" is exactly what an auditor needs to notice.
+        let log = tcg_log(&[
+            ("claim_config", &anchors_event("https://scan.a", &["http://kms-1:9090"])),
+            ("update_trust_anchors", &anchors_event("https://scan.b", &["http://kms-2:9090"])),
+            ("update_trust_anchors", &anchors_event("https://scan.c", &["http://kms-3:9090"])),
+        ]);
+        let a = eventlog_trust_anchors(&log).unwrap().unwrap();
+        assert_eq!(a.scan_url, "https://scan.c");
+        assert_eq!(a.kbs_node_urls, vec!["http://kms-3:9090"]);
+        assert_eq!(a.revisions, 2);
+    }
+
+    #[test]
+    fn a_second_claim_config_does_not_look_like_a_revision() {
+        // Pre-baked mode re-claims on a process restart, so two claim_config events are
+        // normal. Counting those as revisions would cry wolf on every restart.
+        let log = tcg_log(&[
+            ("claim_config", &anchors_event("https://scan.a", &["http://kms-1:9090"])),
+            ("claim_config", &anchors_event("https://scan.a", &["http://kms-1:9090"])),
+        ]);
+        let a = eventlog_trust_anchors(&log).unwrap().unwrap();
+        assert_eq!(a.revisions, 0);
+        assert_eq!(a.scan_url, "https://scan.a");
+    }
+
+    #[test]
+    fn other_tapp_events_are_not_mistaken_for_config() {
+        let log = tcg_log(&[
+            ("start_app", r#"{"app_id":"x","result":"success"}"#),
+            ("get_app_secret_key", r#"{"app_id":"x"}"#),
+        ]);
+        assert_eq!(eventlog_trust_anchors(&log).unwrap(), None);
+    }
+
+    #[test]
+    fn a_claim_that_configured_no_verifier_reports_empty_rather_than_absent() {
+        // "No verifier configured" and "no config event at all" are different states and a
+        // caller must not read one as the other: the first means identity cannot be checked.
+        let log = tcg_log(&[("claim_config", r#"{"owner":"0xabc","kbs_node_urls":[]}"#)]);
+        let a = eventlog_trust_anchors(&log).unwrap().unwrap();
+        assert!(a.scan_url.is_empty());
+        assert!(a.kbs_node_urls.is_empty());
+    }
 
     /// Smallest thing `quote_report_data` will parse: v4 header (48 bytes) followed by a
     /// 584-byte body whose last 64 bytes are report_data.

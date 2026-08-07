@@ -272,6 +272,10 @@ fn classify(method_name: &str) -> Option<MethodPermission> {
         // Owner-only methods
         "StartApp"
         | "StopApp"
+        // Whoever can change this decides which verifier the node believes, and hence
+        // which KMS key it will accept. Owner authority is the right level — the owner
+        // can already start arbitrary apps — but it must not be reachable unsigned.
+        | "UpdateTrustAnchors"
         | "AddToWhitelist"
         | "RemoveFromWhitelist"
         | "ListWhitelist"
