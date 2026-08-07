@@ -1,7 +1,7 @@
 ---
 name: 0g-tapp-cli
 description: Use this skill when the user wants to deploy, manage, or troubleshoot applications on a 0G Tapp (Trusted Application Platform) server using tapp-cli. Covers start/stop apps, on-chain registration, registry login, check task status, view logs, and manage docker compose deployments across multiple remote TEE servers.
-version: 1.5.0
+version: 1.6.0
 author: 0G Labs
 tags: [0g, tapp, tee, docker, deployment, cli, onchain]
 ---
@@ -39,7 +39,11 @@ tapp-cli -s <server> -k 0x<key> start-app -f docker-compose.yaml --app-id <id>  
 tapp-cli -s <server> -k 0x<key> start-app -f <compose> --app-id <id> \
   --register-onchain --rpc-url <rpc> --contract 0x<reg> --stake-wei 1000000000000000000
   # ↑ idempotent register-BEFORE-start: pulls+measures first, tx confirms, THEN containers start.
-  #   not registered→registerApp; registered but this node's signer missing→addNode; signer present→skip.
+  #   not registered→registerApp; signer already a node→skip; signer absent + exactly ONE other
+  #   node→updateNode REPLACING it (a restart re-derives the signer, so the on-chain one is a
+  #   dead instance); signer absent + several others→addNode, since which one died is unknowable
+  #   — pass --old-signer 0x<addr> to say. A stated --old-signer that is not a node is an ERROR,
+  #   never a silent fallback to addNode.
   #   Requires a server with measure_only support; older servers → CLI aborts ("Server did not return measurements").
 tapp-cli -s <server> -k 0x<key> get-task-status --task-id <task-id>
 tapp-cli -s <server> -k 0x<key> stop-app --app-id <id>
@@ -84,6 +88,24 @@ tapp-cli -s <server> -k 0x<key> claim-config \
 - First-come-first-served, exactly once per boot. CLI verifies result end-to-end.
 - `--chain-*`, `--kbs-urls` and `--tls-key-source` optional if already baked into config.toml.
 - `--tls-key-source local|kms` (v0.4.0+, default `local`) — decides whether app TLS keys survive a restart, see App TLS certificates above. Must be decided at claim time; `kms` on a node with no KMS/chain config will fail when a cert is requested.
+- `--scan-url https://… --scan-pubkey 0x…` (v0.5.0+) — which verifier this node believes about KMS node identity, and its pinned key. Both or neither. See Trust anchors below.
+
+### Trust anchors — which KMS cluster, and which verifier (v0.5.0+)
+
+```bash
+tapp-cli -s <server> -k 0x<key> update-trust-anchors \
+  --kbs-urls "https://kms-1:9443,https://kms-2:9443" \
+  --scan-url https://scan.example --scan-pubkey 0x<sha256 of its TLS key>
+```
+
+Owner-only, and **every call is extended into the runtime measurement** carrying the resulting anchors in full — so where a node was ever pointed cannot be hidden. That is what makes these safe to change at runtime; mutable-and-unmeasured would be worse than fixed.
+
+- **Omitted values are left alone**; there is no way to clear one. An empty request is refused rather than measured as a no-op.
+- `--scan-url` must be https and must come with `--scan-pubkey`: a URL without a pin is an unauthenticated channel carrying a verdict, which is worse than no verifier at all.
+- **Why it exists**: a verifier serves TLS with a `local` key, re-derived every boot, so one verifier restart invalidates the pin on *every* tapp at once. Fixed-at-claim would mean re-claiming the fleet.
+- `verify-app` prints the anchors in force and how many times they were revised; `get-tapp-info` prints them even when unset, because "no verifier" means KMS node identity is **not checked** — not that it was checked and passed.
+
+**What the node then does** (v0.5.0+): before fetching key material it pins the verifier against `--scan-pubkey`, asks it for the KMS app's attested keys, and pins the KMS node against that set. No path degrades to unverified — if the verifier is unreachable and nothing is cached, it refuses. A pin mismatch triggers one refresh (a rebooted node has legitimately re-derived its key) then rejects.
 - After VM reboot the server is UNCLAIMED again and must be claimed again.
 
 ### Server health & whitelist
@@ -130,6 +152,8 @@ The point is the binding, not the issuer: `public_key_sha256` is committed to by
 
 Pick at claim time with `claim-config --tls-key-source local|kms`, or `tls_key_source` under `[server]` in config.toml. `kms` additionally needs the app registered on chain and the cluster reachable.
 
+**To make an app actually serve HTTPS**, don't hand-roll it — `docs/APP_TLS.md` has a copyable compose using the `tls-init` sidecar, which fetches the cert into a shared volume and exits so an unmodified nginx/envoy just reads two PEM files. Three things bite people: `depends_on: {condition: service_completed_successfully}` is mandatory (else the app starts before the cert exists), the cert must live in a named volume (a `local` key is re-derived every boot), and the TLS port needs opening in the cloud firewall as well as in `ports:`.
+
 ### Waiting for async tasks
 `start-app`/`stop-app` return a task-id and run async. Poll until done — do NOT chain `sleep`s (blocked); use an until-loop:
 ```bash
@@ -149,6 +173,7 @@ register-onchain    --app-id <id> --rpc-url <rpc> --contract 0x<reg> --stake-wei
 update-onchain      --app-id <id> --rpc-url <rpc> --contract 0x<reg>                                   # re-fetch hashes after redeploy
 add-node-onchain    --app-id <id> --rpc-url <rpc> --contract 0x<reg> --stake-wei <wei>                 # -s = new node
 update-node-onchain --app-id <id> --rpc-url <rpc> --contract 0x<reg> [--old-signer 0x..] [--new-signer 0x..] [--tee-url ..]
+update-trust-anchors --kbs-urls <urls> --scan-url https://.. --scan-pubkey 0x..   # v0.5.0+, owner-only, measured
 remove-node-onchain --app-id <id> --rpc-url <rpc> --contract 0x<reg>                                   # -s = node to remove; starts 1-day stake lock
 withdraw            --rpc-url <rpc> --contract 0x<reg>                                   # after lock elapses; uses -k key to identify caller
 withdraw-balance    --app-id <id> --rpc-url <rpc> --contract 0x<reg>                        # withdraw app balance to owner

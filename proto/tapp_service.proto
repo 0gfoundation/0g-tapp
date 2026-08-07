@@ -110,6 +110,22 @@ service TappService {
   //   Pre-baked: owner/chain/kbs in config.toml → claimed automatically at startup.
   //   Dynamic:   image ships empty; first ClaimConfig call configures everything.
   rpc ClaimConfig(ClaimConfigRequest) returns (ClaimConfigResponse);
+
+  // Replace the trust anchors this tapp uses — which KMS cluster it fetches key
+  // material from, and which verifier it believes about that cluster's identity.
+  //
+  // ClaimConfig fixes these for the life of a boot, which does not survive contact
+  // with reality: the verifier's TLS key is re-derived on every one of ITS boots, so
+  // a single verifier restart would otherwise invalidate the pin on every tapp at
+  // once and require re-claiming the fleet.
+  //
+  // Owner only, and every call is extended into the runtime measurement carrying the
+  // resulting state in full. The measurement is what makes mutability safe rather
+  // than a regression: the event log is append-only, so pointing a node at a
+  // counterfeit verifier for five minutes leaves a permanent record anyone reading
+  // the evidence can see. Mutable-and-unmeasured would be strictly worse than fixed.
+  rpc UpdateTrustAnchors(UpdateTrustAnchorsRequest)
+      returns (UpdateTrustAnchorsResponse);
 }
 
 enum LogLevel {
@@ -411,6 +427,11 @@ message TappConfigInfo {
   KbsConfigInfo kbs = 4;   // Null if KBS is not configured
   bool kbs_enabled = 5;
   ChainConfigInfo chain = 6;  // Null if chain is not configured
+
+  // Live trust anchors (see UpdateTrustAnchors). Empty when none is configured, which
+  // means KMS node identities cannot be checked — not that they are checked and pass.
+  string scan_url = 7;
+  string scan_public_key = 8;
 }
 
 message GetTappInfoResponse {
@@ -714,6 +735,12 @@ message ClaimConfigRequest {
   // which matters, because it decides whether the attested public key survives a
   // restart.
   string tls_key_source = 4;
+
+  // Optional: the verifier this tapp believes, and the key that proves it is talking
+  // to that verifier and not to something answering in its place. Both or neither —
+  // see UpdateTrustAnchorsRequest, which can change them later.
+  string scan_url = 5;
+  string scan_public_key = 6;
 }
 
 message ClaimConfigResponse {
@@ -721,4 +748,35 @@ message ClaimConfigResponse {
   string message = 2;
   string owner_address = 3;  // The claimed owner address (normalized)
   int64 timestamp = 4;       // Claim timestamp
+}
+
+message UpdateTrustAnchorsRequest {
+  // Empty = leave unchanged. Replaces the cluster wholesale rather than merging,
+  // because a set of nodes is what is being trusted, not each URL independently.
+  repeated string kbs_node_urls = 1;
+
+  // The verifier to ask about a KMS node's attested TLS key, and the sha256 of that
+  // verifier's own TLS SubjectPublicKeyInfo (`0x…`, 32 bytes).
+  //
+  // These move together and are validated together. A URL without a pin is an
+  // unauthenticated channel carrying an assertion, which is worse than having no
+  // verifier configured at all — the answer would be trusted and is rewritable by
+  // anyone on the path. A pin without a URL names nothing. `scan_url` must be
+  // https for the same reason: a pinned key over plaintext proves nothing.
+  //
+  // Both empty = leave unchanged.
+  string scan_url = 2;
+  string scan_public_key = 3;
+}
+
+message UpdateTrustAnchorsResponse {
+  bool success = 1;
+  string message = 2;
+
+  // The resulting anchors, so a caller confirms what took effect rather than
+  // assuming its request was applied verbatim.
+  repeated string kbs_node_urls = 3;
+  string scan_url = 4;
+  string scan_public_key = 5;
+  int64 timestamp = 6;
 }

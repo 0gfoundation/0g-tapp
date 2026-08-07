@@ -166,6 +166,8 @@ Evidence from servers before v0.4.0 has no `runtime_data` field and a `report_da
 
 `GetAppTlsCert` hands an application the two files a TLS server wants — `key_pem` and `cert_pem` (P-256) — plus a `csr_pem` for reissuing elsewhere and `public_key_sha256`. The certificate is self-signed unless `ca_url` is configured.
 
+**To actually serve HTTPS from an app, see [`docs/APP_TLS.md`](docs/APP_TLS.md)** — a copyable compose file that works with an unmodified `nginx` or `envoy`. A sidecar (the `tls-init` sidecar) fetches the certificate into a shared volume and exits, so the application reads two ordinary PEM files and never speaks gRPC.
+
 What makes it trustworthy is the binding, not the issuer: `public_key_sha256` is the value `report_data` commits to, so a client compares the key it was offered during the handshake against attested evidence. A self-signed certificate is not weaker for a client that performs that check — the issuer matters only to clients that will not, such as browsers driving off a system trust store. That is the one thing a CA adds.
 
 `[server].tls_key_source` decides where the private key comes from, and the two options trade the same property in opposite directions:
@@ -313,9 +315,62 @@ tapp-cli -s http://<tapp>:50051 -k 0x<your-key> claim-config
 tapp-cli -s http://<tapp>:50051 -k 0x<your-key> claim-config \
   --chain-rpc-url https://evmrpc-testnet.0g.ai \
   --chain-contract 0x<TappRegistry> \
-  --kbs-urls "http://kms-1:9091,http://kms-2:9091" \
-  --tls-key-source kms
+  --kbs-urls "https://kms-1:9443,https://kms-2:9443" \
+  --tls-key-source kms \
+  --scan-url https://scan.example \
+  --scan-pubkey 0x<sha256 of the verifier's TLS key>
 ```
+
+### Trust anchors
+
+Which KMS cluster a tapp draws key material from, and which verifier it believes about that
+cluster's identity, can be changed after the claim — owner-only, and every change is extended
+into the runtime measurement carrying the resulting anchors in full:
+
+```bash
+tapp-cli -s http://<tapp>:50051 -k 0x<owner-key> update-trust-anchors \
+  --kbs-urls "https://kms-1:9443,https://kms-2:9443" \
+  --scan-url https://scan.example --scan-pubkey 0x<sha256>
+```
+
+Mutable because a verifier serves TLS with a `local` key, re-derived at every one of its boots:
+fixing the pin at claim time would mean one verifier restart invalidates every tapp at once and
+the fleet has to be re-claimed. Measured because the event log is append-only, so a node that was
+ever pointed at a counterfeit verifier cannot hide it — that is what makes runtime mutability
+acceptable rather than a regression.
+
+Omitted values are left alone. `--scan-url` must be https and must come with `--scan-pubkey`: a
+URL without a pin is an unauthenticated channel carrying a verdict, which is worse than having no
+verifier configured, because the answer would be trusted and is rewritable by anyone on the path.
+
+### KMS node identity is verified
+
+Before fetching key material the server pins the verifier against `--scan-pubkey`, asks it which
+TLS keys the KMS app's nodes currently attest, and pins the KMS node against that set. The
+certificates are self-signed and that is correct: what is checked is the public key the node's
+attestation committed to, not an issuer — so this **replaces** certificate-authority validation
+rather than adding to it.
+
+The same check with ordinary tools, which is the point of publishing the set in curl's format:
+
+```bash
+curl -k --pinnedpubkey "$(curl -sk https://scan.example/api/apps/0g-kms/cert)" \
+     https://<kms-node>:9443/peers
+```
+
+`-k` and `--pinnedpubkey` go together: `-k` turns off the CA check that a self-signed certificate
+can never pass, leaving the pin as the real one. Either alone is useless — `-k` verifies nothing,
+and `--pinnedpubkey` on its own stops at the CA error.
+
+**No path degrades to unverified.** The set is cached so the verifier is not a hard dependency of
+every fetch, but with no cache and no answer the server refuses rather than connecting blind:
+falling back would let an attacker disable the check by taking the verifier offline. A pin
+mismatch triggers one refresh — a node that rebooted has legitimately re-derived its key — and
+then rejects.
+
+Configure no verifier and the check does not happen, which is logged loudly at startup. That is
+the weaker mode, kept possible because a tapp that has never been told which verifier to believe
+cannot invent one.
 
 - **First-come-first-served, exactly once per boot**: the request signer becomes
   the owner; later claims fail with the current owner. The CLI verifies the

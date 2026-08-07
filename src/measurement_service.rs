@@ -18,6 +18,10 @@ pub const OPERATION_NAME_DOCKER_LOGOUT: &str = "docker_logout";
 pub const OPERATION_NAME_STOP_SERVICE: &str = "stop_service";
 pub const OPERATION_NAME_START_SERVICE: &str = "start_service";
 pub const OPERATION_NAME_CLAIM_CONFIG: &str = "claim_config";
+/// Each change to which KMS cluster / verifier this tapp trusts. Separate from
+/// `claim_config` so a verifier can tell the original claim from a later revision, and
+/// carries the resulting state in full so the newest event alone is the current answer.
+pub const OPERATION_NAME_UPDATE_TRUST_ANCHORS: &str = "update_trust_anchors";
 pub const OPERATION_NAME_GET_SECRET_RESOURCE: &str = "get_secret_resource";
 
 pub struct MeasurementService {
