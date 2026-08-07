@@ -1324,13 +1324,28 @@ impl TappService for TappServiceImpl {
         // Extend runtime measurement — includes the full config so verifiers
         // see owner + chain + kbs in one event. On failure the claim is rolled
         // back so the tapp stays claimable.
+        // The cluster the node will actually use, not just what this request named: the KMS
+        // client is only replaced when the request supplies urls, so a claim that supplies
+        // none leaves the node serving from config.toml. Recording the request verbatim
+        // measured `kbs_node_urls: []` on a node using four of them — an event log stating
+        // something false about the node it describes. Same fix as UpdateTrustAnchors.
+        let effective_kbs = if req.kbs_node_urls.is_empty() {
+            self.config
+                .kbs
+                .as_ref()
+                .map(|k| k.node_urls.clone())
+                .unwrap_or_default()
+        } else {
+            req.kbs_node_urls.clone()
+        };
+
         let timestamp = utils::current_timestamp();
         let measurement_data = serde_json::json!({
             "operation": measurement_service::OPERATION_NAME_CLAIM_CONFIG,
             "owner": owner,
             "chain_rpc_url": req.chain_rpc_url,
             "chain_contract_address": req.chain_contract_address,
-            "kbs_node_urls": req.kbs_node_urls,
+            "kbs_node_urls": effective_kbs,
             "tls_key_source": tls_key_source.as_str(),
             "scan_url": scan_url,
             "scan_public_key": scan_public_key,
@@ -1357,7 +1372,7 @@ impl TappService for TappServiceImpl {
         *self.claimed_runtime_config.write().await = ClaimedRuntimeConfig {
             chain_rpc_url: req.chain_rpc_url.clone(),
             chain_contract_address: req.chain_contract_address.clone(),
-            kbs_node_urls: req.kbs_node_urls.clone(),
+            kbs_node_urls: effective_kbs,
             tls_key_source: tls_key_source.as_str().to_string(),
             scan_url,
             scan_public_key,
@@ -1425,10 +1440,22 @@ impl TappService for TappServiceImpl {
                 Some((u, p)) => (u.clone(), p.clone()),
                 None => (current.scan_url.clone(), current.scan_public_key.clone()),
             };
-            let kbs_node_urls = if req.kbs_node_urls.is_empty() {
+            // Fall back to config.toml exactly as GetTappInfo does. Reading only the claimed
+            // value would measure `kbs_node_urls: []` on a node that is really using four
+            // nodes from config.toml — an event log stating something false about the node
+            // it describes, which is worse than not recording it. Found on a live node:
+            // the claim had supplied no --kbs-urls, so the runtime value was empty while
+            // the server was serving requests from the baked-in cluster the whole time.
+            let kbs_node_urls = if !req.kbs_node_urls.is_empty() {
+                req.kbs_node_urls.clone()
+            } else if !current.kbs_node_urls.is_empty() {
                 current.kbs_node_urls.clone()
             } else {
-                req.kbs_node_urls.clone()
+                self.config
+                    .kbs
+                    .as_ref()
+                    .map(|k| k.node_urls.clone())
+                    .unwrap_or_default()
             };
             ClaimedRuntimeConfig {
                 chain_rpc_url: current.chain_rpc_url.clone(),

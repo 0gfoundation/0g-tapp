@@ -2146,7 +2146,13 @@ async fn update_trust_anchors(
             );
             std::process::exit(1);
         }
-        Err(e) => return Err(e.into()),
+        // Every refusal here is a sentence written for the person who typed the command —
+        // which the default rendering buries inside a Status debug dump alongside the gRPC
+        // headers. Print the sentence.
+        Err(status) => {
+            eprintln!("✗ {}", status.message());
+            std::process::exit(1);
+        }
     };
     if !result.success {
         eprintln!("✗ {}", result.message);
