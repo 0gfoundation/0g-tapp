@@ -25,7 +25,7 @@ services:
     # the floor (the version that introduced GetAppTlsCert), not a lockstep. A v0.4.0
     # sidecar talks to a later server fine. Avoid :latest — this container is what
     # hands your application its private key, and it should not change underneath you.
-    image: <registry>/tls-init:v0.4.0
+    image: us-central1-docker.pkg.dev/g-devops/zg-tapp/tls-init:v0.4.0
     command:
       - --server=/run/tapp/tapp.sock
       - get-app-tls-cert
