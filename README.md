@@ -166,6 +166,8 @@ Evidence from servers before v0.4.0 has no `runtime_data` field and a `report_da
 
 `GetAppTlsCert` hands an application the two files a TLS server wants — `key_pem` and `cert_pem` (P-256) — plus a `csr_pem` for reissuing elsewhere and `public_key_sha256`. The certificate is self-signed unless `ca_url` is configured.
 
+**To actually serve HTTPS from an app, see [`docs/APP_TLS.md`](docs/APP_TLS.md)** — a copyable compose file that works with an unmodified `nginx` or `envoy`. A sidecar (the `tls-init` sidecar) fetches the certificate into a shared volume and exits, so the application reads two ordinary PEM files and never speaks gRPC.
+
 What makes it trustworthy is the binding, not the issuer: `public_key_sha256` is the value `report_data` commits to, so a client compares the key it was offered during the handshake against attested evidence. A self-signed certificate is not weaker for a client that performs that check — the issuer matters only to clients that will not, such as browsers driving off a system trust store. That is the one thing a CA adds.
 
 `[server].tls_key_source` decides where the private key comes from, and the two options trade the same property in opposite directions:

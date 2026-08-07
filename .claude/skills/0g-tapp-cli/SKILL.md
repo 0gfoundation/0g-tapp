@@ -130,6 +130,8 @@ The point is the binding, not the issuer: `public_key_sha256` is committed to by
 
 Pick at claim time with `claim-config --tls-key-source local|kms`, or `tls_key_source` under `[server]` in config.toml. `kms` additionally needs the app registered on chain and the cluster reachable.
 
+**To make an app actually serve HTTPS**, don't hand-roll it — `docs/APP_TLS.md` has a copyable compose using the `tls-init` sidecar, which fetches the cert into a shared volume and exits so an unmodified nginx/envoy just reads two PEM files. Three things bite people: `depends_on: {condition: service_completed_successfully}` is mandatory (else the app starts before the cert exists), the cert must live in a named volume (a `local` key is re-derived every boot), and the TLS port needs opening in the cloud firewall as well as in `ports:`.
+
 ### Waiting for async tasks
 `start-app`/`stop-app` return a task-id and run async. Poll until done — do NOT chain `sleep`s (blocked); use an until-loop:
 ```bash
