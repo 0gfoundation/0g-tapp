@@ -109,11 +109,19 @@ enum Commands {
         #[arg(short, long)]
         app_id: String,
 
-        /// Idempotently ensure the app is registered on-chain BEFORE it starts:
-        /// not registered -> registerApp; registered but this node's signer is
-        /// not in the node list -> addNode; signer already a node -> skip.
-        /// Images are pulled and measured first; containers only start after
-        /// the transaction is confirmed.
+        /// Idempotently ensure the app is registered on-chain BEFORE it starts.
+        /// Images are pulled and measured first; containers only start after the
+        /// transaction is confirmed.
+        ///
+        /// What it does depends on what the chain already says:
+        ///   not registered                  -> registerApp
+        ///   this node's signer already a node -> nothing
+        ///   signer absent, one other node   -> updateNode, replacing it
+        ///   signer absent, several others   -> addNode (which one died is not
+        ///                                     knowable here; say so with --old-signer)
+        ///
+        /// The replace case is the common one: a restart re-derives the signer, so
+        /// the address on chain belongs to an instance that no longer exists.
         #[arg(long, requires_all = ["rpc_url", "contract", "stake_wei"])]
         register_onchain: bool,
 
@@ -128,6 +136,13 @@ enum Commands {
         /// Stake in wei for registerApp/addNode, >= minStakeAmount (with --register-onchain)
         #[arg(long)]
         stake_wei: Option<u128>,
+
+        /// The on-chain signer this node replaces, for an app with several nodes where
+        /// it cannot be inferred. Errors if the address is not currently a node — an
+        /// explicit choice that misses is a mistake worth stopping for, not a reason to
+        /// quietly add a node the operator never asked for.
+        #[arg(long, requires = "register_onchain")]
+        old_signer: Option<String>,
     },
 
     /// Stop a running application
@@ -658,6 +673,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             rpc_url,
             contract,
             stake_wei,
+            old_signer,
         } => {
             let private_key = require_private_key(&cli.private_key)?;
             if register_onchain {
@@ -670,6 +686,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     contract.unwrap(),
                     stake_wei.unwrap(),
                     &private_key,
+                    old_signer.as_deref(),
                 )
                 .await?;
             }
@@ -1193,6 +1210,7 @@ async fn ensure_registered_onchain(
     contract: String,
     stake_wei: u128,
     private_key: &str,
+    old_signer: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use ethers::signers::Signer;
     use ethers::types::{Address, U256};
@@ -1278,7 +1296,14 @@ async fn ensure_registered_onchain(
         // this replaces is not knowable from here, and guessing moves someone else's stake.
         // Then adding is the safe reading, and an operator who meant to replace can say so
         // with update-node-onchain --old-signer.
-        match node_being_replaced(&rpc_url, &contract, app_id, signer).await {
+        let stated = match old_signer {
+            Some(s) => Some(
+                s.parse::<Address>()
+                    .map_err(|e| format!("--old-signer is not an address: {}", e))?,
+            ),
+            None => None,
+        };
+        match node_being_replaced(&rpc_url, &contract, app_id, signer, stated).await {
             Ok(Some(old)) => {
                 let tx = onchain::update_node(
                     &params,
@@ -1297,9 +1322,15 @@ async fn ensure_registered_onchain(
                 return Ok(());
             }
             Ok(None) => {}
+            // Falling through to addNode is the safe reading of "I could not work out which
+            // node this replaces" — but it is the wrong reading of "you told me which, and it
+            // was not one". The first is the tool declining to guess; the second is the
+            // operator's instruction failing, and carrying on would register a node they were
+            // specifically trying not to create.
+            Err(e) if stated.is_some() => return Err(e),
             Err(e) => {
                 println!("ℹ️  {}", e);
-                println!("   Adding this node instead; use update-node-onchain --old-signer to replace one.");
+                println!("   Adding this node instead; pass --old-signer to replace one instead.");
             }
         }
 
@@ -2903,19 +2934,57 @@ async fn node_being_replaced(
     contract: &str,
     app_id: &str,
     new_signer: ethers::types::Address,
+    stated: Option<ethers::types::Address>,
 ) -> Result<Option<ethers::types::Address>, Box<dyn std::error::Error>> {
     let nodes = tapp_common::onchain::get_node_list(rpc_url, contract, app_id).await?;
-    pick_replaced_node(&nodes, new_signer, app_id).map_err(Into::into)
+    pick_replaced_node(&nodes, new_signer, app_id, stated).map_err(Into::into)
 }
 
 /// The rule, kept apart from fetching so it can be tested: of the nodes on chain, which one
 /// is this signer replacing?
+///
+/// `stated` is the caller's own answer. It settles the case inference cannot — several nodes,
+/// where guessing would move someone else's stake — and is checked rather than trusted: an
+/// address that is not currently a node is refused. That is the whole value of asking. A
+/// mistyped or already-replaced signer would otherwise fall through to adding a node the
+/// operator never asked for, which is exactly the outcome they used the flag to avoid.
 fn pick_replaced_node(
     nodes: &[ethers::types::Address],
     new_signer: ethers::types::Address,
     app_id: &str,
+    stated: Option<ethers::types::Address>,
 ) -> Result<Option<ethers::types::Address>, String> {
     let others: Vec<_> = nodes.iter().copied().filter(|n| *n != new_signer).collect();
+
+    if let Some(old) = stated {
+        if old == new_signer {
+            return Err(format!(
+                "--old-signer 0x{:x} is this node's current signer; there is nothing to replace",
+                old
+            ));
+        }
+        if !others.contains(&old) {
+            return Err(format!(
+                "--old-signer 0x{:x} is not a node of app {}{}",
+                old,
+                app_id,
+                if others.is_empty() {
+                    " (it has no other nodes)".to_string()
+                } else {
+                    format!(
+                        " (its nodes are {})",
+                        others
+                            .iter()
+                            .map(|a| format!("0x{:x}", a))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                }
+            ));
+        }
+        return Ok(Some(old));
+    }
+
     match others.len() {
         0 => Ok(None),
         1 => Ok(Some(others[0])),
@@ -2961,19 +3030,27 @@ async fn update_node_onchain(
     // server for it would return the new signer and updateNode would revert with "old node
     // not found": the only case where the default worked was the one where nothing needed
     // changing.
-    let old_signer_addr = match old_signer_arg {
-        Some(addr) => Address::from_str(addr.trim_start_matches("0x"))
-            .map_err(|_| format!("Invalid old signer address: {}", addr))?,
-        None => match node_being_replaced(&rpc_url, &contract, &app_id, new_signer).await? {
-            Some(old) => old,
-            None => {
-                println!(
-                    "✓ Nothing to update: 0x{:x} is already the only node on chain for {}",
-                    new_signer, app_id
-                );
-                return Ok(());
-            }
-        },
+    let stated = match old_signer_arg {
+        Some(addr) => Some(
+            Address::from_str(addr.trim_start_matches("0x"))
+                .map_err(|_| format!("Invalid old signer address: {}", addr))?,
+        ),
+        None => None,
+    };
+    // Both the stated and the inferred address go through the same check. A stated one used
+    // to be taken on trust and only found wrong when the contract reverted with "old node not
+    // found" — a paid-for round trip to learn something the node list already said.
+    let old_signer_addr = match node_being_replaced(&rpc_url, &contract, &app_id, new_signer, stated)
+        .await?
+    {
+        Some(old) => old,
+        None => {
+            println!(
+                "✓ Nothing to update: 0x{:x} is already the only node on chain for {}",
+                new_signer, app_id
+            );
+            return Ok(());
+        }
     };
 
     // refresh this node's compose/volumes from its server; store as a per-node override
@@ -3232,33 +3309,38 @@ mod replaced_node {
         Address::from([b; 20])
     }
 
+    /// Inference, i.e. no --old-signer.
+    fn infer(
+        nodes: &[Address],
+        new_signer: Address,
+    ) -> Result<Option<Address>, String> {
+        pick_replaced_node(nodes, new_signer, "app", None)
+    }
+
     #[test]
     fn one_other_node_is_the_one_being_replaced() {
         // The restart case: the chain holds the address of an instance that no longer exists,
         // and only the chain still knows it. Nothing to guess, so no flag should be needed.
-        assert_eq!(
-            pick_replaced_node(&[a(1)], a(2), "app").unwrap(),
-            Some(a(1))
-        );
+        assert_eq!(infer(&[a(1)], a(2)).unwrap(), Some(a(1)));
     }
 
     #[test]
     fn a_signer_already_registered_alone_replaces_nothing() {
         // Not an error: re-running after a successful update should be quiet, not fail.
-        assert_eq!(pick_replaced_node(&[a(2)], a(2), "app").unwrap(), None);
+        assert_eq!(infer(&[a(2)], a(2)).unwrap(), None);
     }
 
     #[test]
     fn no_nodes_at_all_replaces_nothing() {
         // A registered app whose only node was removed. Adding is the right move.
-        assert_eq!(pick_replaced_node(&[], a(2), "app").unwrap(), None);
+        assert_eq!(infer(&[], a(2)).unwrap(), None);
     }
 
     #[test]
     fn several_other_nodes_refuse_to_guess() {
         // Which of them died is not knowable here — they share an app and may share a teeUrl.
         // Guessing would move the wrong node's stake, so the operator is asked instead.
-        let e = pick_replaced_node(&[a(1), a(3)], a(2), "app").unwrap_err();
+        let e = infer(&[a(1), a(3)], a(2)).unwrap_err();
         assert!(e.contains("--old-signer"), "got: {}", e);
         assert!(e.contains("2 other nodes"), "got: {}", e);
     }
@@ -3267,7 +3349,45 @@ mod replaced_node {
     fn the_signer_itself_is_never_counted_as_a_candidate() {
         // Present among several: still two others, and it must not be offered as its own
         // predecessor.
-        let e = pick_replaced_node(&[a(1), a(2), a(3)], a(2), "app").unwrap_err();
+        let e = infer(&[a(1), a(2), a(3)], a(2)).unwrap_err();
         assert!(!e.contains(&format!("0x{:x}", a(2))), "got: {}", e);
+    }
+
+    #[test]
+    fn a_stated_signer_settles_the_case_inference_will_not_touch() {
+        // The reason the flag exists: several nodes, so inference refuses — but the operator
+        // knows which one died and says so.
+        assert_eq!(
+            pick_replaced_node(&[a(1), a(3)], a(2), "app", Some(a(3))).unwrap(),
+            Some(a(3))
+        );
+    }
+
+    #[test]
+    fn a_stated_signer_that_is_not_a_node_is_refused_not_ignored() {
+        // The failure this prevents: a mistyped or already-replaced address falling through
+        // to addNode, registering the extra node the flag was used to avoid.
+        let e = pick_replaced_node(&[a(1), a(3)], a(2), "app", Some(a(9))).unwrap_err();
+        assert!(e.contains("not a node"), "got: {}", e);
+        // The error names what IS there, so the operator can correct it without another call.
+        assert!(e.contains(&format!("0x{:x}", a(1))), "got: {}", e);
+        assert!(e.contains(&format!("0x{:x}", a(3))), "got: {}", e);
+    }
+
+    #[test]
+    fn stating_the_current_signer_is_refused_rather_than_treated_as_a_no_op() {
+        // Self-replacement is not a valid updateNode, and silently doing nothing would let a
+        // wrong command look like it worked.
+        let e = pick_replaced_node(&[a(1), a(2)], a(2), "app", Some(a(2))).unwrap_err();
+        assert!(e.contains("nothing to replace"), "got: {}", e);
+    }
+
+    #[test]
+    fn a_stated_signer_overrides_inference_rather_than_agreeing_with_it() {
+        // One other node, so inference would have picked a(1) unprompted. An operator who
+        // names a different address must not be silently overruled — they are refused, since
+        // a(5) is not a node, rather than quietly getting a(1).
+        assert_eq!(infer(&[a(1)], a(2)).unwrap(), Some(a(1)));
+        assert!(pick_replaced_node(&[a(1)], a(2), "app", Some(a(5))).is_err());
     }
 }
