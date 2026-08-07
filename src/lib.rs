@@ -15,6 +15,7 @@ pub mod boot;
 pub mod config;
 pub mod measurement_service;
 pub mod nonce_manager;
+pub mod pinned_tls;
 pub mod permission;
 pub mod service_monitor;
 pub mod signature_auth;
@@ -102,6 +103,41 @@ fn validate_scan_anchor(url: &str, pin: &str) -> Result<Option<(String, String)>
         url.to_string(),
         format!("0x{}", hex_part.to_lowercase()),
     )))
+}
+
+/// The KMS app id whose attested keys are the ones to accept.
+///
+/// Fixed rather than configurable: it names the cluster this tapp fetches key material
+/// from, and a node that could be pointed at a different app's keys would be pointed at
+/// a different cluster's, which is the substitution being prevented.
+const KMS_APP_ID: &str = "0g-kms";
+
+/// Build a KMS client that verifies node identity when a verifier is configured.
+///
+/// Unconfigured, it behaves exactly as before — unverified. That is the weaker mode and
+/// is logged as such: a tapp that has never been told which verifier to believe cannot
+/// invent one, and refusing to start would strand every existing node.
+fn kms_client_with_anchor(
+    node_urls: Vec<String>,
+    retry: &config::RetryConfig,
+    scan_url: &str,
+    scan_pubkey: &str,
+) -> kms_client::KmsClient {
+    let c = kms_client::KmsClient::new(node_urls, retry);
+    if scan_url.is_empty() || scan_pubkey.is_empty() {
+        tracing::warn!(
+            event = "KMS_UNVERIFIED",
+            "No verifier configured — KMS node identity will NOT be checked. Set one with \
+             claim-config --scan-url/--scan-pubkey or update-trust-anchors."
+        );
+        return c;
+    }
+    info!(scan = %scan_url, "KMS nodes will be verified against attested keys");
+    c.with_verifier(
+        scan_url.to_string(),
+        scan_pubkey.to_string(),
+        KMS_APP_ID.to_string(),
+    )
 }
 
 pub struct TappServiceImpl {
@@ -1077,8 +1113,8 @@ impl TappService for TappServiceImpl {
             kbs: kbs_config,
             kbs_enabled,
             chain: chain_config,
-            scan_url,
-            scan_public_key,
+            scan_url: scan_url.clone(),
+            scan_public_key: scan_public_key.clone(),
         };
 
         Ok(Response::new(GetTappInfoResponse {
@@ -1374,8 +1410,8 @@ impl TappService for TappServiceImpl {
             chain_contract_address: req.chain_contract_address.clone(),
             kbs_node_urls: effective_kbs,
             tls_key_source: tls_key_source.as_str().to_string(),
-            scan_url,
-            scan_public_key,
+            scan_url: scan_url.clone(),
+            scan_public_key: scan_public_key.clone(),
         };
 
         // Initialize or replace KMS client with the claimed kbs_node_urls.
@@ -1387,8 +1423,12 @@ impl TappService for TappServiceImpl {
                 nodes = req.kbs_node_urls.len(),
                 "Initializing KMS client from ClaimConfig"
             );
-            *self.kms_client.write().await =
-                Some(kms_client::KmsClient::new(req.kbs_node_urls.clone(), &Default::default()));
+            *self.kms_client.write().await = Some(kms_client_with_anchor(
+                req.kbs_node_urls.clone(),
+                &Default::default(),
+                &scan_url,
+                &scan_public_key,
+            ));
         }
 
         // Persist so a process restart within this boot cannot reopen the claim.
@@ -1500,14 +1540,20 @@ impl TappService for TappServiceImpl {
 
         // Replace the KMS client so the new cluster takes effect on the next request
         // rather than at the next restart.
-        if kbs_changed {
+        // Rebuilt when EITHER anchor moved. Rebuilding only for the cluster would leave
+        // a node that changed verifier still checking against the old one until it
+        // restarted — a trust anchor that has visibly been replaced but is not yet in use.
+        if kbs_changed || scan.is_some() {
             info!(
                 nodes = resulting.kbs_node_urls.len(),
+                scan = %resulting.scan_url,
                 "Replacing KMS client from UpdateTrustAnchors"
             );
-            *self.kms_client.write().await = Some(kms_client::KmsClient::new(
+            *self.kms_client.write().await = Some(kms_client_with_anchor(
                 resulting.kbs_node_urls.clone(),
                 &Default::default(),
+                &resulting.scan_url,
+                &resulting.scan_public_key,
             ));
         }
 

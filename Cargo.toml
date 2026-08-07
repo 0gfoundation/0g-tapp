@@ -63,6 +63,10 @@ ecies = { version = "0.2", features = ["std"] }
 # Config 4: curve25519 (x25519) + XChaCha20-Poly1305 (Pure Rust)
 # ecies = { version = "0.2", default-features = false, features = ["x25519", "xchacha20"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# Needed to REPLACE certificate-authority validation rather than add to it: the peers
+# here are TEEs presenting self-signed certificates, and what vouches for them is the
+# attestation that commits to their public key, not an issuer. See kms_client::pinned.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 x25519-dalek = { version = "2.0", features = ["static_secrets"] }
 
 # Ethereum transaction support
@@ -113,6 +117,7 @@ hyper = "1.0"
 rcgen = { version = "0.13", default-features = false, features = ["pem", "ring"] }
 p256 = { version = "0.13", features = ["pkcs8", "ecdsa"] }
 rustls-pki-types = "1"
+x509-parser = "0.18.1"
 
 [build-dependencies]
 tonic-build = "0.12"
