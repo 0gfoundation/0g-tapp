@@ -15,7 +15,7 @@
 # Usage:
 #   ./register-shared-as.sh <cloud> <boot_format> <version> <env> [owner] [as-endpoint]
 #     owner       optional: OWNER_ADDRESS (0x...); omit for canonical mode
-#     as-endpoint default 35.253.66.70:50004
+#     as-endpoint default https://35.253.66.70:50004 (https:// selects TLS; host:port stays plaintext)
 #
 # Env:
 #   AS_WRITE_KEY  optional: bearer key for a gated AS (issue #82). The hosted deployment
@@ -39,10 +39,10 @@ ENV="${4:?$U}"
 _ARG5="${5:-}"
 if printf '%s' "$_ARG5" | grep -qE '^(0[xX])?[0-9a-fA-F]{40}$'; then
   OWNER="$(printf '%s' "$_ARG5" | sed 's/^0[xX]//' | tr 'A-Z' 'a-z')"
-  AS="${6:-35.253.66.70:50004}"
+  AS="${6:-https://35.253.66.70:50004}"
 else
   OWNER=""
-  AS="${_ARG5:-35.253.66.70:50004}"
+  AS="${_ARG5:-https://35.253.66.70:50004}"
 fi
 
 if [ -n "$OWNER" ]; then
@@ -117,7 +117,16 @@ if [ -n "${AS_WRITE_KEY:-}" ]; then
 fi
 # ${AUTH[@]+"${AUTH[@]}"}: expands to nothing when AUTH is empty, and does not trip
 # `set -u` on bash < 4.4 (macOS ships 3.2, where a bare "${AUTH[@]}" is an unbound variable).
-grpcurl -plaintext ${AUTH[@]+"${AUTH[@]}"} -import-path "$PROTO_DIR" -proto attestation.proto -d @ \
+# The shared AS serves TLS with a self-signed, attested certificate, so -insecure is
+# required: no CA will ever vouch for it. That leaves this call unauthenticated, which is
+# acceptable only because SetAttestationPolicy is already gated on a bearer key the AS
+# checks — the transport is not what authorises the write. A local plaintext AS still
+# works: pass it as host:port and TLS is skipped entirely.
+TLS=(-plaintext)
+AS_SHOWN="$AS"          # keep the scheme for the hint printed at the end
+case "$AS" in https://*) TLS=(-insecure); AS="${AS#https://}" ;; esac
+
+grpcurl "${TLS[@]}" ${AUTH[@]+"${AUTH[@]}"} -import-path "$PROTO_DIR" -proto attestation.proto -d @ \
   "$AS" attestation.AttestationService/SetAttestationPolicy < "$TMP"
 echo "registered policy ${POLICY_ID} (as ${POLICY_ID}_cpu) on ${AS}"
-echo "verify with: tapp-cli verify-app --app-id <id> --as-endpoint ${AS} --policy-ids ${POLICY_ID}"
+echo "verify with: tapp-cli verify-app --app-id <id> --as-endpoint ${AS_SHOWN} --policy-ids ${POLICY_ID}"
