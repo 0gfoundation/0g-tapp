@@ -492,7 +492,8 @@ tapp-cli verify-app \
   --rpc-url https://evmrpc-testnet.0g.ai \
   --contract 0x<TappRegistry> \
   --policy-ids 0g-tapp-<cloud>-<boot_format>-<version>-<env>
-  # --as-endpoint host:port   # CoCo-AS gRPC endpoint, default 34.171.164.181:50004
+  # --as-endpoint https://host:port  # CoCo-AS gRPC; TLS now, so give the scheme
+  # --as-pubkey 0x<sha256>           # pin the AS's attested TLS key
 
 # direct mode (single node, not yet registered): prints attested values verbatim
 tapp-cli -s http://<tapp>:50051 verify-app --app-id my-app

@@ -7,7 +7,7 @@ license = "Apache-2.0"
 
 [package]
 name = "tapp-server"
-version = "0.5.0"
+version = "0.5.1"
 edition.workspace = true
 authors = ["TDX TAPP Developers"]
 description = "TDX Trusted Application Platform Service - Rust Implementation"

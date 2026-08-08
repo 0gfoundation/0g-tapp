@@ -15,7 +15,7 @@
 # Usage:
 #   ./register-shared-as.sh <cloud> <boot_format> <version> <env> [owner] [as-endpoint]
 #     owner       optional: OWNER_ADDRESS (0x...); omit for canonical mode
-#     as-endpoint default 34.171.164.181:50004
+#     as-endpoint default 35.253.66.70:50004
 #
 # Env:
 #   AS_WRITE_KEY  optional: bearer key for a gated AS (issue #82). The hosted deployment
@@ -39,10 +39,10 @@ ENV="${4:?$U}"
 _ARG5="${5:-}"
 if printf '%s' "$_ARG5" | grep -qE '^(0[xX])?[0-9a-fA-F]{40}$'; then
   OWNER="$(printf '%s' "$_ARG5" | sed 's/^0[xX]//' | tr 'A-Z' 'a-z')"
-  AS="${6:-34.171.164.181:50004}"
+  AS="${6:-35.253.66.70:50004}"
 else
   OWNER=""
-  AS="${_ARG5:-34.171.164.181:50004}"
+  AS="${_ARG5:-35.253.66.70:50004}"
 fi
 
 if [ -n "$OWNER" ]; then

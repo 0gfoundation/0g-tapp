@@ -60,7 +60,7 @@ the policy** at registration time and registered under a per-release/env id:
 
 ```bash
 ./verifier/register-shared-as.sh v0.1.0 dev            # → policy id 0g-tapp-v0.1.0-dev
-./verifier/register-shared-as.sh v0.1.0 dev 34.171.164.181:50004
+./verifier/register-shared-as.sh v0.1.0 dev 35.253.66.70:50004
 # gated AS (issue #82): the write needs a key; reads (AttestationEvaluate /
 # GetAttestationChallenge) stay open. Unset = unchanged, and an ungated AS ignores the header.
 AS_WRITE_KEY=<key> ./verifier/register-shared-as.sh v0.1.0 dev
@@ -72,7 +72,7 @@ Then evaluate (the AS appends the `_cpu` device-class suffix internally):
 
 ```bash
 tapp-cli verify-app --app-id <id> \
-  --as-endpoint 34.171.164.181:50004 \
+  --as-endpoint 35.253.66.70:50004 \
   --policy-ids 0g-tapp-v0.1.0-dev
 # executables==3 in the EAR token's cpu submod means the boot chain matched
 ```

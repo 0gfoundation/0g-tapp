@@ -115,7 +115,7 @@ jobs:
       ALIYUN_REGION: ${{ vars.ALIYUN_REGION || 'ap-southeast-1' }}
       ALIYUN_ECS_ROLE: ${{ vars.ALIYUN_ECS_ROLE || '0g-confidential-disk-oss' }}
       OSS_BUCKET: ${{ vars.OSS_BUCKET || '0g-confidential-disk' }}
-      AS_ENDPOINT: ${{ vars.AS_ENDPOINT || '34.171.164.181:50004' }}
+      AS_ENDPOINT: ${{ vars.AS_ENDPOINT || '35.253.66.70:50004' }}
       CRYPTPILOT_REF: ${{ vars.CRYPTPILOT_REF || '57d751259211c0b72fe22c855d95786865c7d84c' }}   # fork feat/0g-cvm = 0.8.0 + #128 + #130 (ci/setup-toolchain.sh)
       BASE_IMAGE_URL: ${{ vars.BASE_IMAGE_URL }}                # cached Stage-0 base (gs://, file://, or abs path)
       LIBGUESTFS_BACKEND: direct

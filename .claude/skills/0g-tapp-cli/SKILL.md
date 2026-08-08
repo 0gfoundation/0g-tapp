@@ -1,7 +1,7 @@
 ---
 name: 0g-tapp-cli
 description: Use this skill when the user wants to deploy, manage, or troubleshoot applications on a 0G Tapp (Trusted Application Platform) server using tapp-cli. Covers start/stop apps, on-chain registration, registry login, check task status, view logs, and manage docker compose deployments across multiple remote TEE servers.
-version: 1.6.0
+version: 1.7.0
 author: 0G Labs
 tags: [0g, tapp, tee, docker, deployment, cli, onchain]
 ---
@@ -68,7 +68,8 @@ tapp-cli -s <server> -k 0x<key> docker-logout                    # logout from D
 - **Whichever axis has NO reference, the measured values are printed verbatim**: no `--contract` → owner/compose/images as attested; no `--policy-ids` → boot-chain component digests in reference-value JSON (`{"measurement.<comp>.SHA-384": [...]}`), directly diffable against `verifier/reference-values/<cloud>/<boot_format>/<version>/<env>.json`.
 - **`tls key : <sha256>  (sha256 of the public key, attested)`** (v0.4.0+) appears in both modes when the app has a TLS key, followed by the `openssl s_client | … | openssl dgst -sha256` one-liner for comparing it against a live endpoint. Line absent = no TLS key derived, which is normal, not a failure.
 - Output line: `boot-chain : ✓ (executables=3, matches policy reference)` = matched; `✗ (executables=33, ...)` = did not match; `?` = policy set no executables claim. (`executables` is the AR4SI claim: **3** = approved boot chain, **33** = unrecognized.)
-- **`--as-endpoint <host:port>`** picks the Attestation Service (default `34.171.164.181:50004`, the shared AS). Point it at a self-hosted local AS (e.g. `127.0.0.1:50004`, see the `verifier/0g-tapp-verifier` submodule) to use RVPS-backed reference values.
+- **`--as-endpoint`** picks the Attestation Service (default `https://35.253.66.70:50004`). **It speaks TLS now**, and a bare `host:port` still means plaintext — so an endpoint that moved to TLS must be given with its scheme or the connection fails as an h2 protocol error.
+- **`--as-pubkey 0x<sha256>`** pins the AS's TLS key. The AS is a TEE with a self-signed certificate, so this **replaces** CA validation rather than adding to it. Without it the connection is encrypted but unauthenticated — anyone on the path can hand back any verdict — and that is reported rather than refused. Current value: `0x7b13d132…`, the same key scan serves, since both are the same tapp app. Point it at a self-hosted local AS (e.g. `127.0.0.1:50004`, see the `verifier/0g-tapp-verifier` submodule) to use RVPS-backed reference values.
 - **Policy ids** — two formats depending on build mode:
   - **canonical** (v0.3.0+): `0g-tapp-<cloud>-<boot_format>-<version>-<env>` (e.g. `0g-tapp-gcp-grub-v0.3.0-dev`). Reference values at `verifier/reference-values/<cloud>/<boot_format>/<version>/<env>.json`.
   - **custom** (per-owner): `0g-tapp-<cloud>-<boot_format>-<version>-<env>-<owner>`. Reference values at `.../env/<owner>.json`.
@@ -253,7 +254,7 @@ app_id
  │         getNodeList → [signerAddress...]; getNode(app,signer) → teeUrl
  └─ per node:
      ├─② get-evidence(teeUrl, app_id)            fetch evidence
-     ├─③ AS verify quote sig + TCB  (CoCo-AS gRPC 34.171.164.181:50004)
+     ├─③ AS verify quote sig + TCB  (CoCo-AS gRPC 35.253.66.70:50004)
      └─④ reconcile evidence ↔ chain (signer / compose / volumes / image / boot-chain)
 ```
 Trust = chain says "app should run C/I, node signer=S at teeUrl=U" + attestation proves "U is really running C/I and its TEE identity is S".
@@ -279,7 +280,7 @@ tapp-cli -s <teeUrl> get-evidence --app-id <APP_ID> --nonce $(openssl rand -hex 
 - **`--nonce <hex>`** (≤64 bytes) is a challenge echoed back inside `runtime_data`. Evidence is self-authenticating but undated, so without a nonce a cached quote is indistinguishable from a fresh one. The CLI prints `challenge : echoed` / `NOT echoed`. Pre-0.4.0 servers print `ignored — this server predates the nonce field`.
 - Pre-0.4.0 evidence has **no `runtime_data` field** and `report_data` is the 20-byte signer, left-aligned and zero-padded. Both readings are supported (`tapp-common/src/verify.rs`); a missing field is reported as "server predates the challenge field", not as a signer mismatch.
 
-**③ Verify quote sig + TCB** — submit to **CoCo-AS gRPC `34.171.164.181:50004`** `attestation.AttestationService/AttestationEvaluate`, `evidence` = `base64url(no-pad)` of the raw (hex-decoded) evidence. Returns a JWT/EAR token.
+**③ Verify quote sig + TCB** — submit to **CoCo-AS gRPC `35.253.66.70:50004`** `attestation.AttestationService/AttestationEvaluate`, `evidence` = `base64url(no-pad)` of the raw (hex-decoded) evidence. Returns a JWT/EAR token.
 - The AS request's `runtime_data` field is separate from ours: leaving it empty means "don't check the binding yourself, just verify the quote signature chain + TCB and parse `report_data` into claims". Handing it the bytes from the evidence makes the AS check `report_data == sha512(bytes)` too — the verify step below does that recomputation locally either way.
 - ⚠️ **Use AS `:50004`, NOT KBS `:8080`** — KBS `/kbs/v0/attest` is RCAR key-release and requires `report_data==hash(nonce,pubkey)`, so it 401s on signer-bound evidence.
 - Pass: `submods.cpu0.ear.status == affirming` and `tdx.tcb_status == UpToDate`. `OutOfDate` TCB → `contraindicated` (quote is real but platform firmware/microcode stale — a real finding, not a verify failure).

@@ -143,11 +143,6 @@ struct KmsResponse {
     encrypted_secret: String, // hex-encoded ECIES ciphertext
 }
 
-/// Read a verifier's `/cert` body into sha256 hex hashes.
-///
-/// The body is what `curl --pinnedpubkey` takes: `sha256//<base64>` entries separated by
-/// `;`, several of them when the app's nodes hold a key each — which is the normal state
-/// for a `local` key source, and the KMS cluster's only option.
 #[cfg(test)]
 mod pin_tests {
     use super::*;
@@ -194,6 +189,17 @@ mod pin_tests {
     }
 }
 
+/// An HTTP client that will talk only to peers holding one of `expected`.
+///
+/// Here rather than beside the verifier because tapp-common has no reqwest; the trust
+/// decision itself is shared, only this wrapper is not.
+fn pinned_client(expected: impl IntoIterator<Item = String>) -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .use_preconfigured_tls(crate::pinned_tls::client_config(expected))
+        .build()
+        .map_err(|e| anyhow!("build pinned client: {}", e))
+}
+
 /// The innermost error, where reqwest puts the TLS failure.
 fn root_cause(e: &reqwest::Error) -> String {
     let mut src: &dyn std::error::Error = e;
@@ -214,6 +220,11 @@ fn is_pin_failure(e: &reqwest::Error) -> bool {
     root_cause(e).contains("is not among the")
 }
 
+/// Read a verifier's `/cert` body into sha256 hex hashes.
+///
+/// The body is what `curl --pinnedpubkey` takes: `sha256//<base64>` entries separated by
+/// `;`, several of them when the app's nodes hold a key each — which is the normal state
+/// for a `local` key source, and the KMS cluster's only option.
 fn parse_pin_list(body: &str) -> Vec<String> {
     use base64::Engine;
     body.trim()
@@ -317,8 +328,7 @@ impl KmsClient {
             // Pinned to the verifier's own attested key. Without this the whole exercise
             // is circular: an attacker on this hop rewrites the very set that is supposed
             // to catch him.
-            match crate::pinned_tls::client(std::iter::once(p.scan_pubkey.clone()))
-                .map_err(|e| anyhow!("{}", e))
+            match pinned_client(std::iter::once(p.scan_pubkey.clone()))
             {
                 Ok(c) => match c.get(&url).send().await {
                     Ok(resp) if resp.status().is_success() => match resp.text().await {
@@ -362,7 +372,7 @@ impl KmsClient {
             return Ok(self.http.clone());
         }
         let keys = self.acceptable_keys(force_refresh).await?;
-        crate::pinned_tls::client(keys).map_err(|e| anyhow!("{}", e))
+        pinned_client(keys)
     }
 
     /// Request the encrypted secret from the KMS cluster.

@@ -15,7 +15,7 @@ pub mod boot;
 pub mod config;
 pub mod measurement_service;
 pub mod nonce_manager;
-pub mod pinned_tls;
+pub use tapp_common::pinned_tls;
 pub mod permission;
 pub mod service_monitor;
 pub mod signature_auth;

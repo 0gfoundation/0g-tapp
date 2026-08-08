@@ -181,8 +181,17 @@ enum Commands {
         #[arg(long)]
         contract: Option<String>,
         /// CoCo Attestation Service gRPC endpoint (host:port)
-        #[arg(long, default_value = "34.171.164.181:50004")]
+        #[arg(long, default_value = "https://35.253.66.70:50004")]
         as_endpoint: String,
+
+        /// sha256 of the AS's TLS public key (`0x…`), for a TLS endpoint.
+        ///
+        /// The AS is a TEE serving a self-signed certificate, so this REPLACES
+        /// certificate-authority validation rather than adding to it. Without it the
+        /// connection is encrypted but unauthenticated — anyone on the path can return any
+        /// verdict — and the output says so rather than refusing to run.
+        #[arg(long)]
+        as_pubkey: Option<String>,
         /// AS policy id to enforce (enables boot-chain check). Empty = AS default
         /// policy (no boot-chain check). E.g. --policy-ids 0g-tapp-v0.1.0-dev
         #[arg(long)]
@@ -702,8 +711,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::GetAppInfo { app_id } => {
             get_app_info(&cli.server, app_id).await?;
         }
-        Commands::VerifyApp { app_id, rpc_url, contract, as_endpoint, policy_ids } => {
-            verify_app_cmd(&cli.server, &app_id, rpc_url, contract, &as_endpoint, &policy_ids).await?;
+        Commands::VerifyApp { app_id, rpc_url, contract, as_endpoint, as_pubkey, policy_ids } => {
+            verify_app_cmd(&cli.server, &app_id, rpc_url, contract, &as_endpoint, as_pubkey.as_deref(), &policy_ids).await?;
         }
         Commands::ListApps => {
             list_apps(&cli.server).await?;
@@ -1596,6 +1605,7 @@ async fn verify_app_cmd(
     rpc_url: Option<String>,
     contract: Option<String>,
     as_endpoint: &str,
+    as_pubkey: Option<&str>,
     policy_ids: &[String],
 ) -> Result<(), Box<dyn std::error::Error>> {
     // boot-chain line is meaningful only when WE selected a policy (otherwise the AS
@@ -1603,7 +1613,7 @@ async fn verify_app_cmd(
     let show_boot = !policy_ids.is_empty();
     // Direct mode: no --contract → verify the single --server node without chain reconciliation.
     if contract.is_none() {
-        let d = tapp_common::verify::verify_node_direct(server, app_id, as_endpoint, policy_ids).await?;
+        let d = tapp_common::verify::verify_node_direct(server, app_id, as_endpoint, as_pubkey, policy_ids).await?;
         let quote_ok = d.ear_status == "affirming";
         println!("Verifying app: {}  (direct mode — no on-chain reconciliation)", app_id);
         println!("  server      : {}", d.server);
@@ -1638,7 +1648,7 @@ async fn verify_app_cmd(
     // Chain mode.
     let rpc_url = rpc_url.ok_or("chain mode requires --rpc-url (or omit --contract for direct mode)")?;
     let contract = contract.unwrap();
-    let verdict = tapp_common::verify::verify_app(&rpc_url, &contract, app_id, as_endpoint, policy_ids).await?;
+    let verdict = tapp_common::verify::verify_app(&rpc_url, &contract, app_id, as_endpoint, as_pubkey, policy_ids).await?;
 
     let yn = |b: bool| if b { "✓" } else { "✗" };
     println!("Verifying app: {}  ({} node(s))", verdict.app_id, verdict.nodes.len());

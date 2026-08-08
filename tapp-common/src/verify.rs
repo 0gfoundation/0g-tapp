@@ -532,16 +532,47 @@ fn as_grpc_url(as_endpoint: &str) -> String {
     }
 }
 
+/// Connect to the AS, using TLS when the endpoint asks for it.
+///
+/// A TLS AS is a TEE serving a self-signed certificate, so certificate-authority validation
+/// is replaced by pinning its attested key — the same decision, and the same code, as for a
+/// KMS node. Passing `as_pubkey` is what makes the verdict worth anything: without it the
+/// connection is encrypted but unauthenticated, and whoever is on the path can return any
+/// verdict they like. Callers that supply nothing are told so rather than being refused,
+/// since a tool that reports "unverified" is more useful than one that will not run.
+async fn connect_as(
+    as_endpoint: &str,
+    as_pubkey: Option<&str>,
+) -> Result<AttestationServiceClient<tonic::transport::Channel>> {
+    let url = as_grpc_url(as_endpoint);
+    if !url.starts_with("https://") {
+        return AttestationServiceClient::connect(url)
+            .await
+            .map_err(|e| anyhow!("connect AS {}: {}", as_endpoint, e));
+    }
+
+    // Empty means encrypted-but-unauthenticated, which the caller is told about rather
+    // than refused for — a diagnostic tool that reports "unverified" beats one that will
+    // not run. Nothing that fetches key material may take this branch.
+    let expected: Vec<String> = as_pubkey
+        .filter(|k| !k.is_empty())
+        .map(|k| vec![k.to_string()])
+        .unwrap_or_default();
+    let channel = crate::pinned_tls::grpc_channel(&url, expected)
+        .await
+        .map_err(|e| anyhow!("{}", e))?;
+    Ok(AttestationServiceClient::new(channel))
+}
+
 /// Submit evidence to CoCo-AS (gRPC). `policy_ids` selects the policy to enforce; pass an
 /// empty slice to use the AS default policy (which does NOT check our boot chain).
 async fn verify_with_as(
     as_endpoint: &str,
+    as_pubkey: Option<&str>,
     raw_evidence: &[u8],
     policy_ids: &[String],
 ) -> Result<AsVerdict> {
-    let mut client = AttestationServiceClient::connect(as_grpc_url(as_endpoint))
-        .await
-        .map_err(|e| anyhow!("connect AS {}: {}", as_endpoint, e))?;
+    let mut client = connect_as(as_endpoint, as_pubkey).await?;
     let req = AttestationRequest {
         verification_requests: vec![IndividualAttestationRequest {
             tee: "tdx".to_string(),
@@ -633,6 +664,7 @@ pub async fn verify_node_direct(
     server: &str,
     app_id: &str,
     as_endpoint: &str,
+    as_pubkey: Option<&str>,
     policy_ids: &[String],
 ) -> Result<DirectVerdict> {
     let mut v = DirectVerdict {
@@ -664,7 +696,7 @@ pub async fn verify_node_direct(
     v.tls_public_key = attested.tls_public_key.clone();
     v.note = attested.note.clone();
 
-    match verify_with_as(as_endpoint, &raw, policy_ids).await {
+    match verify_with_as(as_endpoint, as_pubkey, &raw, policy_ids).await {
         Ok(av) => {
             v.ear_status = av.ear_status;
             v.tcb_status = av.tcb_status;
@@ -705,6 +737,7 @@ pub async fn verify_app(
     contract: &str,
     app_id: &str,
     as_endpoint: &str,
+    as_pubkey: Option<&str>,
     policy_ids: &[String],
 ) -> Result<AppVerdict> {
     let signers = onchain::get_node_list(rpc_url, contract, app_id).await?;
@@ -784,7 +817,7 @@ pub async fn verify_app(
         v.note = attested.note.clone();
 
         // ③ AS quote verification
-        match verify_with_as(as_endpoint, &raw, policy_ids).await {
+        match verify_with_as(as_endpoint, as_pubkey, &raw, policy_ids).await {
             Ok(av) => {
                 v.ear_status = av.ear_status;
                 v.tcb_status = av.tcb_status;
