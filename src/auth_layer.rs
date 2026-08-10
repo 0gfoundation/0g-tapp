@@ -256,8 +256,11 @@ fn get_method_permission(method_name: &str) -> MethodPermission {
 fn classify(method_name: &str) -> Option<MethodPermission> {
     Some(match method_name {
         // Nothing to protect — the answer is public either way.
+        // GetAppCsr is here rather than beside GetAppTlsCert deliberately: a signing
+        // request publishes a public key and a name, which the certificate it becomes
+        // would publish anyway. It is the private key that makes the other one local.
         "GetEvidence" | "GetAppKey" | "GetAppInfo" | "ListApps" | "GetTaskStatus"
-        | "GetServiceStatus" | "GetTappInfo" => MethodPermission::Public,
+        | "GetServiceStatus" | "GetTappInfo" | "GetAppCsr" => MethodPermission::Public,
 
         // Hand over key material. Socket only.
         "GetAppSecretKey" | "GetSecretResource" | "GetAppTlsCert" => {

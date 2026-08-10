@@ -217,7 +217,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 use std::os::unix::fs::PermissionsExt;
                 if let Ok(metadata) = std::fs::metadata(parent) {
                     let mut perms = metadata.permissions();
-                    perms.set_mode(0o700);
+                    // 0750, not the 0700 this used to force. A directory a non-root process
+                    // cannot traverse makes the socket's own mode irrelevant — it could be
+                    // 0666 and still be unreachable — so tightening here silently undid any
+                    // attempt to let a hardened container connect. It also contradicted the
+                    // systemd unit, which creates this directory 0755 with a comment saying
+                    // app containers bind-mount it.
+                    perms.set_mode(0o750);
                     std::fs::set_permissions(parent, perms)?;
                 }
             }
@@ -225,15 +231,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let uds = UnixListener::bind(socket_path)?;
 
-        // Set restrictive permissions on the socket (owner read/write only)
+        // Who may open the socket. The mode is not the security boundary — anything the
+        // socket is mounted into can read every app's key material, so the mount is — but
+        // it decides who else on the host can reach it. 0600 made that "only root", which
+        // forced every consumer to run its container as root and give up real hardening
+        // for no gain. See config::unix_socket_mode.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
+            let mode = u32::from_str_radix(config.server.unix_socket_mode.trim_start_matches("0o"), 8)
+                .map_err(|_| {
+                    format!(
+                        "server.unix_socket_mode must be octal like \"0660\", got {:?}",
+                        config.server.unix_socket_mode
+                    )
+                })?;
             if let Ok(metadata) = std::fs::metadata(socket_path) {
                 let mut perms = metadata.permissions();
-                perms.set_mode(0o600);
+                perms.set_mode(mode);
                 std::fs::set_permissions(socket_path, perms)?;
             }
+            if let Some(gid) = config.server.unix_socket_gid {
+                // Only the group changes; the owner stays root so the server keeps
+                // exclusive write of the path itself.
+                let c_path = std::ffi::CString::new(socket_path.as_os_str().as_encoded_bytes())
+                    .map_err(|e| format!("socket path: {e}"))?;
+                // SAFETY: a valid NUL-terminated path and real ids; chown reports failure
+                // through its return value rather than by any effect on this process.
+                let rc = unsafe { libc::chown(c_path.as_ptr(), u32::MAX, gid) };
+                if rc != 0 {
+                    return Err(format!(
+                        "cannot set socket group to {}: {}",
+                        gid,
+                        std::io::Error::last_os_error()
+                    )
+                    .into());
+                }
+            }
+            info!(
+                socket_path = %socket_path.display(),
+                mode = %format!("{:04o}", mode & 0o7777),
+                gid = ?config.server.unix_socket_gid,
+                "Socket permissions applied"
+            );
         }
 
         info!(

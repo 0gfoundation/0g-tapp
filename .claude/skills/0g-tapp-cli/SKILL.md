@@ -1,7 +1,7 @@
 ---
 name: 0g-tapp-cli
 description: Use this skill when the user wants to deploy, manage, or troubleshoot applications on a 0G Tapp (Trusted Application Platform) server using tapp-cli. Covers start/stop apps, on-chain registration, registry login, check task status, view logs, and manage docker compose deployments across multiple remote TEE servers.
-version: 1.7.0
+version: 1.8.0
 author: 0G Labs
 tags: [0g, tapp, tee, docker, deployment, cli, onchain]
 ---
@@ -54,6 +54,7 @@ tapp-cli -s <server> -k 0x<key> get-app-info --app-id <id>        # compose/volu
 tapp-cli -s <server> list-apps                                   # list all apps on this server (no key needed)
 tapp-cli -s <server> -k 0x<key> get-app-logs --app-id <id> --service <name> -n 100  # app's docker compose logs
 tapp-cli -s <server> get-app-key --app-id <id> [--x25519]         # TEE-derived app PUBLIC key (ethereum addr; --x25519 also prints the X25519 pubkey)
+tapp-cli -s <server> get-app-csr --app-id <id> --domain api.example.com --out my.csr  # v0.6.0+, PUBLIC (TCP, no key)
 tapp-cli -s <server> verify-app --app-id <id> [--policy-ids <id>]                    # direct: AS-verify this node's evidence+quote, show attested values (no chain)
 tapp-cli verify-app --app-id <id> --rpc-url <rpc> --contract 0x<reg> [--policy-ids <id>]  # chain: verify all nodes + reconcile vs on-chain
 tapp-cli -s <server> -k 0x<key> get-tapp-info                     # server version + Owner Address (no key needed)
@@ -66,6 +67,7 @@ tapp-cli -s <server> -k 0x<key> docker-logout                    # logout from D
 - **`--contract`+`--rpc-url` = dynamic references** (on-chain): reconciles runtime events vs the registry → `reconcile : signer✓ compose✓ volumes✓ image✓ owner✓`. The **owner** check (v0.3.0+) compares the `claim_config` event's owner against the on-chain app owner (`✗` = hijacked/mismatched → Result ❌; `?` = no claim_config event, pre-0.3 image).
 - **`--policy-ids <id>` = static references** (AS boot-chain check: shim/grub/kernel/initrd/kernel_cmdline or uki vs the image's reference values).
 - **Whichever axis has NO reference, the measured values are printed verbatim**: no `--contract` → owner/compose/images as attested; no `--policy-ids` → boot-chain component digests in reference-value JSON (`{"measurement.<comp>.SHA-384": [...]}`), directly diffable against `verifier/reference-values/<cloud>/<boot_format>/<version>/<env>.json`.
+- **`kms : <urls>`** (v0.6.0+) lists the KMS cluster the node draws key material from, one per line, with a warning on any plaintext `http://` entry (those nodes' identity cannot be checked). `none configured` means exactly that — not that it was checked.
 - **`tls key : <sha256>  (sha256 of the public key, attested)`** (v0.4.0+) appears in both modes when the app has a TLS key, followed by the `openssl s_client | … | openssl dgst -sha256` one-liner for comparing it against a live endpoint. Line absent = no TLS key derived, which is normal, not a failure.
 - Output line: `boot-chain : ✓ (executables=3, matches policy reference)` = matched; `✗ (executables=33, ...)` = did not match; `?` = policy set no executables claim. (`executables` is the AR4SI claim: **3** = approved boot chain, **33** = unrecognized.)
 - **`--as-endpoint`** picks the Attestation Service (default `https://35.253.66.70:50004`). **It speaks TLS now**, and a bare `host:port` still means plaintext — so an endpoint that moved to TLS must be given with its scheme or the connection fails as an h2 protocol error.
@@ -152,6 +154,8 @@ The point is the binding, not the issuer: `public_key_sha256` is committed to by
 | `kms` | from `(app_id, "tls")` at the KMS | yes, and identical on every node | "some TEE of this app" |
 
 Pick at claim time with `claim-config --tls-key-source local|kms`, or `tls_key_source` under `[server]` in config.toml. `kms` additionally needs the app registered on chain and the cluster reachable.
+
+**Certificate from a public CA** (v0.6.0+): `get-app-csr` returns a signing request for a domain you choose. Unlike `get-app-tls-cert` it is **public** — a CSR carries only a public key, a name, and a proof of possession, all of which the certificate publishes anyway — so it works over TCP with no socket and no key. **The app need not exist yet**: the key derives from the app id, so the certificate can be issued before anything is deployed. Feed it to any ACME client in CSR mode (`lego --csr my.csr --http`), then serve the issued cert with the key the sidecar fetches. Requires `kms` in practice — a `local` key changes every boot and each reboot means another issuance, which Let's Encrypt's rate limits refuse.
 
 **To make an app actually serve HTTPS**, don't hand-roll it — `docs/APP_TLS.md` has a copyable compose using the `tls-init` sidecar, which fetches the cert into a shared volume and exits so an unmodified nginx/envoy just reads two PEM files. Three things bite people: `depends_on: {condition: service_completed_successfully}` is mandatory (else the app starts before the cert exists), the cert must live in a named volume (a `local` key is re-derived every boot), and the TLS port needs opening in the cloud firewall as well as in `ports:`.
 

@@ -166,6 +166,8 @@ Evidence from servers before v0.4.0 has no `runtime_data` field and a `report_da
 
 `GetAppTlsCert` hands an application the two files a TLS server wants — `key_pem` and `cert_pem` (P-256) — plus a `csr_pem` for reissuing elsewhere and `public_key_sha256`. The certificate is self-signed unless `ca_url` is configured.
 
+`GetAppCsr` returns a signing request for a domain of your choosing, so a public CA can certify the same key. It is **public** — a signing request carries a public key, a name and a proof of possession, all of which the resulting certificate publishes anyway — so it needs neither the socket nor a key, and the app need not exist yet. The two certificates are not alternatives: one key can carry both, and then a browser checking the CA's name and a verifier checking the attested key both pass on the same endpoint.
+
 **To actually serve HTTPS from an app, see [`docs/APP_TLS.md`](docs/APP_TLS.md)** — a copyable compose file that works with an unmodified `nginx` or `envoy`. A sidecar (the `tls-init` sidecar) fetches the certificate into a shared volume and exits, so the application reads two ordinary PEM files and never speaks gRPC.
 
 What makes it trustworthy is the binding, not the issuer: `public_key_sha256` is the value `report_data` commits to, so a client compares the key it was offered during the handshake against attested evidence. A self-signed certificate is not weaker for a client that performs that check — the issuer matters only to clients that will not, such as browsers driving off a system trust store. That is the one thing a CA adds.
@@ -256,6 +258,15 @@ bind_address = "0.0.0.0:50051"
 # Recommended. Listened on IN ADDITION to bind_address, and the only transport that
 # serves key material (GetAppSecretKey / GetSecretResource / GetAppTlsCert).
 unix_socket_path = "/run/tapp/tapp.sock"
+
+# Who may open it. 0600 admitted only root, which forced every app that fetches key
+# material to run its container as root and give up real hardening for nothing — the
+# socket's protection was never the file mode, since anything it is mounted into can
+# read every app's keys. A container now keeps a non-root user and adds this group:
+#   user: appuser
+#   group_add: ["0"]
+unix_socket_mode = "0660"
+# unix_socket_gid = 1000      # a dedicated group instead of root
 
 # Where app TLS private keys come from: "local" (default, bound to this instance,
 # changes every boot) or "kms" (stable across restarts and shared by every node of

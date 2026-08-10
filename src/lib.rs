@@ -234,7 +234,30 @@ impl TappServiceImpl {
         if let Some(id) = self.tls_identities.lock().await.get(app_id) {
             return Ok(id.clone());
         }
+        let (source, secret) = self.tls_key_material(app_id).await?;
 
+        let ca_url = self.config.server.ca_url.clone();
+        let id = Arc::new(
+            tls_cert::build(app_id, &secret, source.as_str(), ca_url.as_deref())
+                .await
+                .map_err(|e| Status::internal(format!("{}", e)))?,
+        );
+        self.tls_identities
+            .lock()
+            .await
+            .insert(app_id.to_string(), id.clone());
+        Ok(id)
+    }
+
+    /// The app's TLS key material and where it came from.
+    ///
+    /// Split out so a signing request is built from the same bytes as the certificate. Two
+    /// derivations reached by two routes would be a place for the certified key and the
+    /// attested key to drift apart, which is the one thing this must not do.
+    async fn tls_key_material(
+        &self,
+        app_id: &str,
+    ) -> Result<(config::TlsKeySource, Vec<u8>), Status> {
         // Claimed value wins over the pre-baked one, same as chain and KBS config.
         let source = match self
             .claimed_runtime_config
@@ -281,18 +304,7 @@ impl TappServiceImpl {
                 secret
             }
         };
-
-        let ca_url = self.config.server.ca_url.clone();
-        let id = Arc::new(
-            tls_cert::build(app_id, &secret, source.as_str(), ca_url.as_deref())
-                .await
-                .map_err(|e| Status::internal(format!("{}", e)))?,
-        );
-        self.tls_identities
-            .lock()
-            .await
-            .insert(app_id.to_string(), id.clone());
-        Ok(id)
+        Ok((source, secret))
     }
 
     /// The TLS public key hash to put in `report_data`, if one has been derived.
@@ -942,6 +954,30 @@ impl TappService for TappServiceImpl {
                 Err(e.into())
             }
         }
+    }
+
+    async fn get_app_csr(
+        &self,
+        request: Request<GetAppCsrRequest>,
+    ) -> Result<Response<GetAppCsrResponse>, Status> {
+        let req = request.into_inner();
+        info!(app_id = %req.app_id, domain = %req.domain, "Calling GetAppCsr");
+
+        // Reuses the cached identity, so the request is signed by exactly the key the app
+        // serves and the quote commits to — deriving separately here would open a gap
+        // between what gets certified and what gets attested.
+        let identity = self.tls_identity(&req.app_id).await?;
+        let (_, secret) = self.tls_key_material(&req.app_id).await?;
+        let csr = tls_cert::signing_request(&secret, &req.domain)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+
+        Ok(Response::new(GetAppCsrResponse {
+            success: true,
+            message: format!("signing request for {}", req.domain),
+            csr_pem: csr,
+            public_key_sha256: format!("0x{}", identity.public_key_sha256),
+            key_source: identity.key_source.to_string(),
+        }))
     }
 
     async fn get_app_info(

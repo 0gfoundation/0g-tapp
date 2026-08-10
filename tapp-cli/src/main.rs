@@ -4,7 +4,7 @@ use tapp_common::proto::{
     tapp_service_client::TappServiceClient, AddToWhitelistRequest, ClaimConfigRequest,
     DockerLoginRequest,
     DockerLogoutRequest, GetAppContainerStatusRequest, GetAppInfoRequest, GetAppKeyRequest,
-    GetAppLogsRequest, GetAppSecretKeyRequest, GetAppTlsCertRequest, GetEvidenceRequest,
+    GetAppLogsRequest, GetAppSecretKeyRequest, GetAppCsrRequest, GetAppTlsCertRequest, GetEvidenceRequest,
     GetSecretResourceRequest,
     GetServiceLogsRequest, GetServiceStatusRequest, GetTappInfoRequest, GetTaskStatusRequest,
     ListAppsRequest, ListWhitelistRequest, MountFile, PruneImagesRequest, RemoveFromWhitelistRequest,
@@ -243,6 +243,29 @@ enum Commands {
         /// Use X25519 key pair
         #[arg(long)]
         x25519: bool,
+    },
+
+    /// A certificate signing request for a name you choose, to hand to a CA.
+    ///
+    /// Public: a signing request publishes a public key and a name, both of which the
+    /// resulting certificate would publish anyway. Unlike get-app-tls-cert it hands over
+    /// no private key, so it works over TCP and needs no socket.
+    ///
+    /// The key is the one the app already serves and the attestation already commits to, so
+    /// a certificate issued from this satisfies both checks: a browser matches the name the
+    /// CA vouched for, a verifier matches the attested key.
+    GetAppCsr {
+        /// Application ID
+        #[arg(short, long)]
+        app_id: String,
+
+        /// The name to request, e.g. api.example.com
+        #[arg(long)]
+        domain: String,
+
+        /// Write the request here instead of printing it
+        #[arg(long)]
+        out: Option<String>,
     },
 
     /// Get the app's TLS key and certificate (local access only)
@@ -734,6 +757,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::GetAppKey { app_id, x25519 } => {
             get_app_key(&cli.server, app_id, x25519).await?;
+        }
+        Commands::GetAppCsr { app_id, domain, out } => {
+            get_app_csr(&cli.server, app_id, domain, out).await?;
         }
         Commands::GetAppTlsCert {
             app_id,
@@ -1525,6 +1551,37 @@ fn print_trust_anchors(
         );
         println!("{}{}pinned {}", indent, pad, a.scan_public_key);
     }
+    // The cluster this node draws key material from. Parsed all along and never shown,
+    // which left an operator able to read back WHICH VERIFIER a node trusts but not which
+    // KMS it takes keys from — and a wrong cluster there is silent: keys still arrive,
+    // just from somewhere else.
+    if a.kbs_node_urls.is_empty() {
+        println!(
+            "{}{:<w$}: none configured",
+            indent,
+            "kms",
+            w = label_width
+        );
+    } else {
+        println!(
+            "{}{:<w$}: {}",
+            indent,
+            "kms",
+            a.kbs_node_urls[0],
+            w = label_width
+        );
+        for u in &a.kbs_node_urls[1..] {
+            println!("{}{}{}", indent, pad, u);
+        }
+        // Plaintext here means the node cannot check which KMS answered, whatever pin it
+        // holds — there is no handshake to bind one to. Worth saying where it is read.
+        if a.kbs_node_urls.iter().any(|u| u.starts_with("http://")) {
+            println!(
+                "{}{}⚠️  plaintext — KMS node identity cannot be checked on those",
+                indent, pad
+            );
+        }
+    }
     if a.revisions > 0 {
         println!(
             "{}{}revised {} time{} since the claim — every change is in the event log above",
@@ -1919,6 +1976,48 @@ async fn get_app_key(
 /// server at the two paths. Printing exists for looking at what a node holds; the key is
 /// written with owner-only permissions so a shell redirect cannot quietly leave it
 /// world-readable.
+async fn get_app_csr(
+    server: &str,
+    app_id: String,
+    domain: String,
+    out: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut client = create_client(server).await?;
+    let result = client
+        .get_app_csr(Request::new(GetAppCsrRequest {
+            app_id: app_id.clone(),
+            domain: domain.clone(),
+        }))
+        .await?
+        .into_inner();
+    if !result.success {
+        eprintln!("✗ {}", result.message);
+        std::process::exit(1);
+    }
+
+    println!("✓ Signing request for {}", domain);
+    println!("  Public key sha256: {}", result.public_key_sha256);
+    println!("  Key source       : {}", result.key_source);
+    if result.key_source == "local" {
+        // Worth saying before an ACME order is placed rather than after: a local key is
+        // re-derived at every boot, so the certificate a CA issues stops matching the key
+        // as soon as the node restarts, and renewing on every reboot runs into rate limits.
+        println!("  ⚠️  A local key changes on every restart, so a CA-issued certificate for it");
+        println!("      is void after a reboot. Claim with --tls-key-source kms for one that lasts.");
+    }
+    println!(
+        "  The certificate this becomes will carry the key above — the same one the\n           attestation commits to, so pinning and the CA's name both hold."
+    );
+    match out {
+        Some(path) => {
+            std::fs::write(&path, &result.csr_pem)?;
+            println!("  Request → {}", path);
+        }
+        None => println!("\n{}", result.csr_pem),
+    }
+    Ok(())
+}
+
 async fn get_app_tls_cert(
     server: &str,
     app_id: String,
