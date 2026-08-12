@@ -1474,23 +1474,25 @@ impl TappService for TappServiceImpl {
         *self.claimed_runtime_config.write().await = ClaimedRuntimeConfig {
             chain_rpc_url: req.chain_rpc_url.clone(),
             chain_contract_address: req.chain_contract_address.clone(),
-            kbs_node_urls: effective_kbs,
+            kbs_node_urls: effective_kbs.clone(),
             tls_key_source: tls_key_source.as_str().to_string(),
             scan_url: scan_url.clone(),
             scan_public_key: scan_public_key.clone(),
         };
 
-        // Initialize or replace KMS client with the claimed kbs_node_urls.
-        // Always overwrite: config.toml may have [kbs] with empty node_urls=[],
-        // which creates a KmsClient stub that would fail on every request. Replace
-        // whenever the claim provides non-empty urls.
-        if !req.kbs_node_urls.is_empty() {
+        // Initialize or replace KMS client whenever the claim changed anything it
+        // is built from: the node set OR the trust anchor. The anchor case is the
+        // one that used to be dropped — with [kbs] baked into config.toml and only
+        // --scan-url/--scan-pubkey claimed, the running client kept connecting
+        // UNVERIFIED while the measured claim (and get-tapp-info) said otherwise.
+        if !effective_kbs.is_empty() && (!req.kbs_node_urls.is_empty() || !scan_url.is_empty()) {
             info!(
-                nodes = req.kbs_node_urls.len(),
+                nodes = effective_kbs.len(),
+                anchored = !scan_url.is_empty(),
                 "Initializing KMS client from ClaimConfig"
             );
             *self.kms_client.write().await = Some(kms_client_with_anchor(
-                req.kbs_node_urls.clone(),
+                effective_kbs.clone(),
                 &Default::default(),
                 &scan_url,
                 &scan_public_key,
