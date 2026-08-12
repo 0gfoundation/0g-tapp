@@ -7,7 +7,7 @@ license = "Apache-2.0"
 
 [package]
 name = "tapp-server"
-version = "0.5.0"
+version = "0.6.0"
 edition.workspace = true
 authors = ["TDX TAPP Developers"]
 description = "TDX Trusted Application Platform Service - Rust Implementation"
@@ -66,6 +66,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # Needed to REPLACE certificate-authority validation rather than add to it: the peers
 # here are TEEs presenting self-signed certificates, and what vouches for them is the
 # attestation that commits to their public key, not an issuer. See kms_client::pinned.
+libc = "0.2"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 x25519-dalek = { version = "2.0", features = ["static_secrets"] }
 

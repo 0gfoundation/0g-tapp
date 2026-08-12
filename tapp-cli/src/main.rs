@@ -4,7 +4,7 @@ use tapp_common::proto::{
     tapp_service_client::TappServiceClient, AddToWhitelistRequest, ClaimConfigRequest,
     DockerLoginRequest,
     DockerLogoutRequest, GetAppContainerStatusRequest, GetAppInfoRequest, GetAppKeyRequest,
-    GetAppLogsRequest, GetAppSecretKeyRequest, GetAppTlsCertRequest, GetEvidenceRequest,
+    GetAppLogsRequest, GetAppSecretKeyRequest, GetAppCsrRequest, GetAppTlsCertRequest, GetEvidenceRequest,
     GetSecretResourceRequest,
     GetServiceLogsRequest, GetServiceStatusRequest, GetTappInfoRequest, GetTaskStatusRequest,
     ListAppsRequest, ListWhitelistRequest, MountFile, PruneImagesRequest, RemoveFromWhitelistRequest,
@@ -181,8 +181,17 @@ enum Commands {
         #[arg(long)]
         contract: Option<String>,
         /// CoCo Attestation Service gRPC endpoint (host:port)
-        #[arg(long, default_value = "34.171.164.181:50004")]
+        #[arg(long, default_value = "https://35.253.66.70:50004")]
         as_endpoint: String,
+
+        /// sha256 of the AS's TLS public key (`0x…`), for a TLS endpoint.
+        ///
+        /// The AS is a TEE serving a self-signed certificate, so this REPLACES
+        /// certificate-authority validation rather than adding to it. Without it the
+        /// connection is encrypted but unauthenticated — anyone on the path can return any
+        /// verdict — and the output says so rather than refusing to run.
+        #[arg(long)]
+        as_pubkey: Option<String>,
         /// AS policy id to enforce (enables boot-chain check). Empty = AS default
         /// policy (no boot-chain check). E.g. --policy-ids 0g-tapp-v0.1.0-dev
         #[arg(long)]
@@ -234,6 +243,29 @@ enum Commands {
         /// Use X25519 key pair
         #[arg(long)]
         x25519: bool,
+    },
+
+    /// A certificate signing request for a name you choose, to hand to a CA.
+    ///
+    /// Public: a signing request publishes a public key and a name, both of which the
+    /// resulting certificate would publish anyway. Unlike get-app-tls-cert it hands over
+    /// no private key, so it works over TCP and needs no socket.
+    ///
+    /// The key is the one the app already serves and the attestation already commits to, so
+    /// a certificate issued from this satisfies both checks: a browser matches the name the
+    /// CA vouched for, a verifier matches the attested key.
+    GetAppCsr {
+        /// Application ID
+        #[arg(short, long)]
+        app_id: String,
+
+        /// The name to request, e.g. api.example.com
+        #[arg(long)]
+        domain: String,
+
+        /// Write the request here instead of printing it
+        #[arg(long)]
+        out: Option<String>,
     },
 
     /// Get the app's TLS key and certificate (local access only)
@@ -702,8 +734,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::GetAppInfo { app_id } => {
             get_app_info(&cli.server, app_id).await?;
         }
-        Commands::VerifyApp { app_id, rpc_url, contract, as_endpoint, policy_ids } => {
-            verify_app_cmd(&cli.server, &app_id, rpc_url, contract, &as_endpoint, &policy_ids).await?;
+        Commands::VerifyApp { app_id, rpc_url, contract, as_endpoint, as_pubkey, policy_ids } => {
+            verify_app_cmd(&cli.server, &app_id, rpc_url, contract, &as_endpoint, as_pubkey.as_deref(), &policy_ids).await?;
         }
         Commands::ListApps => {
             list_apps(&cli.server).await?;
@@ -725,6 +757,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::GetAppKey { app_id, x25519 } => {
             get_app_key(&cli.server, app_id, x25519).await?;
+        }
+        Commands::GetAppCsr { app_id, domain, out } => {
+            get_app_csr(&cli.server, app_id, domain, out).await?;
         }
         Commands::GetAppTlsCert {
             app_id,
@@ -1516,6 +1551,37 @@ fn print_trust_anchors(
         );
         println!("{}{}pinned {}", indent, pad, a.scan_public_key);
     }
+    // The cluster this node draws key material from. Parsed all along and never shown,
+    // which left an operator able to read back WHICH VERIFIER a node trusts but not which
+    // KMS it takes keys from — and a wrong cluster there is silent: keys still arrive,
+    // just from somewhere else.
+    if a.kbs_node_urls.is_empty() {
+        println!(
+            "{}{:<w$}: none configured",
+            indent,
+            "kms",
+            w = label_width
+        );
+    } else {
+        println!(
+            "{}{:<w$}: {}",
+            indent,
+            "kms",
+            a.kbs_node_urls[0],
+            w = label_width
+        );
+        for u in &a.kbs_node_urls[1..] {
+            println!("{}{}{}", indent, pad, u);
+        }
+        // Plaintext here means the node cannot check which KMS answered, whatever pin it
+        // holds — there is no handshake to bind one to. Worth saying where it is read.
+        if a.kbs_node_urls.iter().any(|u| u.starts_with("http://")) {
+            println!(
+                "{}{}⚠️  plaintext — KMS node identity cannot be checked on those",
+                indent, pad
+            );
+        }
+    }
     if a.revisions > 0 {
         println!(
             "{}{}revised {} time{} since the claim — every change is in the event log above",
@@ -1596,6 +1662,7 @@ async fn verify_app_cmd(
     rpc_url: Option<String>,
     contract: Option<String>,
     as_endpoint: &str,
+    as_pubkey: Option<&str>,
     policy_ids: &[String],
 ) -> Result<(), Box<dyn std::error::Error>> {
     // boot-chain line is meaningful only when WE selected a policy (otherwise the AS
@@ -1603,7 +1670,7 @@ async fn verify_app_cmd(
     let show_boot = !policy_ids.is_empty();
     // Direct mode: no --contract → verify the single --server node without chain reconciliation.
     if contract.is_none() {
-        let d = tapp_common::verify::verify_node_direct(server, app_id, as_endpoint, policy_ids).await?;
+        let d = tapp_common::verify::verify_node_direct(server, app_id, as_endpoint, as_pubkey, policy_ids).await?;
         let quote_ok = d.ear_status == "affirming";
         println!("Verifying app: {}  (direct mode — no on-chain reconciliation)", app_id);
         println!("  server      : {}", d.server);
@@ -1638,7 +1705,7 @@ async fn verify_app_cmd(
     // Chain mode.
     let rpc_url = rpc_url.ok_or("chain mode requires --rpc-url (or omit --contract for direct mode)")?;
     let contract = contract.unwrap();
-    let verdict = tapp_common::verify::verify_app(&rpc_url, &contract, app_id, as_endpoint, policy_ids).await?;
+    let verdict = tapp_common::verify::verify_app(&rpc_url, &contract, app_id, as_endpoint, as_pubkey, policy_ids).await?;
 
     let yn = |b: bool| if b { "✓" } else { "✗" };
     println!("Verifying app: {}  ({} node(s))", verdict.app_id, verdict.nodes.len());
@@ -1909,6 +1976,48 @@ async fn get_app_key(
 /// server at the two paths. Printing exists for looking at what a node holds; the key is
 /// written with owner-only permissions so a shell redirect cannot quietly leave it
 /// world-readable.
+async fn get_app_csr(
+    server: &str,
+    app_id: String,
+    domain: String,
+    out: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut client = create_client(server).await?;
+    let result = client
+        .get_app_csr(Request::new(GetAppCsrRequest {
+            app_id: app_id.clone(),
+            domain: domain.clone(),
+        }))
+        .await?
+        .into_inner();
+    if !result.success {
+        eprintln!("✗ {}", result.message);
+        std::process::exit(1);
+    }
+
+    println!("✓ Signing request for {}", domain);
+    println!("  Public key sha256: {}", result.public_key_sha256);
+    println!("  Key source       : {}", result.key_source);
+    if result.key_source == "local" {
+        // Worth saying before an ACME order is placed rather than after: a local key is
+        // re-derived at every boot, so the certificate a CA issues stops matching the key
+        // as soon as the node restarts, and renewing on every reboot runs into rate limits.
+        println!("  ⚠️  A local key changes on every restart, so a CA-issued certificate for it");
+        println!("      is void after a reboot. Claim with --tls-key-source kms for one that lasts.");
+    }
+    println!(
+        "  The certificate this becomes will carry the key above — the same one the\n           attestation commits to, so pinning and the CA's name both hold."
+    );
+    match out {
+        Some(path) => {
+            std::fs::write(&path, &result.csr_pem)?;
+            println!("  Request → {}", path);
+        }
+        None => println!("\n{}", result.csr_pem),
+    }
+    Ok(())
+}
+
 async fn get_app_tls_cert(
     server: &str,
     app_id: String,

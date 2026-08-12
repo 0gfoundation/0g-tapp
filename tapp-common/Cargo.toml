@@ -11,13 +11,13 @@ path = "src/lib.rs"
 
 [dependencies]
 # gRPC
-tonic = "0.12"
+tonic = { version = "0.12", features = ["tls"] }
 prost = "0.13"
 tower = "0.4"
 http = "1.0"
 
 # Async runtime (Mutex etc.)
-tokio = { version = "1.0", features = ["sync"] }
+tokio = { version = "1.0", features = ["sync", "net"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -27,6 +27,14 @@ base64 = "0.22"
 
 # Cryptography
 sha2 = "0.10"
+# Replace certificate-authority validation with attested-key pinning — the peers are
+# TEEs presenting self-signed certificates. See pinned_tls.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+x509-parser = "0.18.1"
+# tonic 0.12's ClientTlsConfig cannot take a rustls config (0.13 added that), so TLS is
+# done through connect_with_connector — see pinned_tls::grpc_channel.
+hyper-util = { version = "0.1", features = ["tokio"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 sha3 = "0.10"
 hex = "0.4"
 k256 = { version = "0.13", features = ["ecdsa", "std"] }

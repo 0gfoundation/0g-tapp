@@ -32,6 +32,23 @@ service TappService {
   // response, which decides whether the public key survives a restart.
   rpc GetAppTlsCert(GetAppTlsCertRequest) returns (GetAppTlsCertResponse);
 
+  // A certificate signing request for a name of the caller's choosing, signed by the
+  // app's TLS key.
+  //
+  // Public on purpose. A signing request carries a public key, a name, and a signature
+  // proving the requester holds the private half — nothing the certificate it becomes
+  // would not also publish. GetAppTlsCert stays socket-only because it hands over the
+  // private key; this hands over none, and gating it would put an operator with shell
+  // access between an app and its own certificate renewal for no gain.
+  //
+  // Why a request rather than the certificate GetAppTlsCert already returns: that one is
+  // issued for <app-id>.tapp.0g.ai, and a public CA validates the names in the request
+  // against the ones being ordered. Reusing it would fail every time. The key is the same
+  // either way, which is what matters — a certificate issued from this carries the public
+  // key the attestation already commits to, so a browser matching the CA's name and a
+  // verifier matching the attested key both pass, reading different fields.
+  rpc GetAppCsr(GetAppCsrRequest) returns (GetAppCsrResponse);
+
   // Get application information
   rpc GetAppInfo(GetAppInfoRequest) returns (GetAppInfoResponse);
 
@@ -325,6 +342,30 @@ message GetAppTlsCertResponse {
   // bound to this instance and changes when it restarts, "kms" is stable and shared by
   // every node of the app.
   string key_source = 8;
+}
+
+message GetAppCsrRequest {
+  string app_id = 1;
+
+  // The name to request, e.g. "api.example.com". Required: there is no useful default,
+  // since the point of asking is that the caller wants a name this service did not choose.
+  string domain = 2;
+}
+
+message GetAppCsrResponse {
+  bool success = 1;
+  string message = 2;
+  string csr_pem = 3;
+
+  // sha256 of the SubjectPublicKeyInfo, hex. The same value the quote's report_data
+  // commits to, returned so a caller can confirm the request carries the attested key
+  // before paying a CA to certify it.
+  string public_key_sha256 = 4;
+
+  // "local" or "kms" — whether this key survives a restart. A CA-issued certificate for a
+  // local key is void the moment the node reboots, which matters before starting an ACME
+  // order against a rate limit.
+  string key_source = 5;
 }
 
 // Get App Secret Key Messages (local access only)

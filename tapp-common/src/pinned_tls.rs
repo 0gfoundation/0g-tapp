@@ -134,17 +134,134 @@ impl ServerCertVerifier for PinnedKeys {
     }
 }
 
-/// An HTTP client that will talk only to peers holding one of `expected`.
-pub fn client(expected: impl IntoIterator<Item = String>) -> Result<reqwest::Client, String> {
-    let verifier = Arc::new(PinnedKeys::new(expected));
-    let tls = rustls::ClientConfig::builder()
+/// A rustls config that accepts only peers holding one of `expected`.
+///
+/// Shared by the HTTP client below and by gRPC, so both hops decide trust the same way
+/// and cannot drift into two conventions.
+pub fn client_config(expected: impl IntoIterator<Item = String>) -> rustls::ClientConfig {
+    rustls::ClientConfig::builder()
         .dangerous()
-        .with_custom_certificate_verifier(verifier)
-        .with_no_client_auth();
-    reqwest::Client::builder()
-        .use_preconfigured_tls(tls)
-        .build()
-        .map_err(|e| format!("build pinned client: {e}"))
+        .with_custom_certificate_verifier(Arc::new(PinnedKeys::new(expected)))
+        .with_no_client_auth()
+}
+
+/// Encryption without authentication: any certificate is accepted.
+///
+/// Provided for the one case where refusing is worse than proceeding — a diagnostic tool
+/// asked to reach a TLS endpoint whose attested key the operator has not supplied. It is
+/// **not** a fallback for anything that fetches key material, where an attacker able to
+/// suppress the expected value would otherwise be able to switch the check off. Every caller
+/// must say so in its output; a silent use of this is a bug.
+pub fn accept_any_config() -> rustls::ClientConfig {
+    #[derive(Debug)]
+    struct AcceptAny(Arc<rustls::crypto::CryptoProvider>);
+
+    impl ServerCertVerifier for AcceptAny {
+        fn verify_server_cert(
+            &self,
+            _: &CertificateDer<'_>,
+            _: &[CertificateDer<'_>],
+            _: &ServerName<'_>,
+            _: &[u8],
+            _: UnixTime,
+        ) -> Result<ServerCertVerified, TlsError> {
+            Ok(ServerCertVerified::assertion())
+        }
+        fn verify_tls12_signature(
+            &self,
+            m: &[u8],
+            c: &CertificateDer<'_>,
+            d: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, TlsError> {
+            rustls::crypto::verify_tls12_signature(m, c, d, &self.0.signature_verification_algorithms)
+        }
+        fn verify_tls13_signature(
+            &self,
+            m: &[u8],
+            c: &CertificateDer<'_>,
+            d: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, TlsError> {
+            rustls::crypto::verify_tls13_signature(m, c, d, &self.0.signature_verification_algorithms)
+        }
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            self.0.signature_verification_algorithms.supported_schemes()
+        }
+    }
+
+    rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AcceptAny(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))))
+        .with_no_client_auth()
+}
+
+/// A gRPC channel to `url` whose peer must present one of `expected`; an empty `expected`
+/// means encryption without authentication.
+///
+/// Built through `connect_with_connector` because tonic 0.12's `ClientTlsConfig` has no way
+/// to accept a rustls config — the ability to inject one arrived in 0.13. Doing the TLS here
+/// is not a workaround for its own sake: it is what lets gRPC and HTTP reach the same trust
+/// decision through the same verifier instead of two that can drift apart.
+pub async fn grpc_channel(
+    url: &str,
+    expected: Vec<String>,
+) -> Result<tonic::transport::Channel, String> {
+    use std::sync::Arc;
+    use tokio_rustls::TlsConnector;
+    use tonic::transport::Endpoint;
+
+    let uri: http::Uri = url.parse().map_err(|e| format!("bad endpoint {url}: {e}"))?;
+    let host = uri.host().ok_or("endpoint has no host")?.to_string();
+    let port = uri.port_u16().unwrap_or(443);
+    let mut config = if expected.is_empty() {
+        accept_any_config()
+    } else {
+        client_config(expected)
+    };
+    // gRPC is HTTP/2, and a server that is not told so during the handshake may negotiate
+    // HTTP/1.1 or refuse outright. tonic sets this itself when it owns the TLS setup; doing
+    // it here is the price of owning the setup instead.
+    config.alpn_protocols = vec![b"h2".to_vec()];
+    let config = Arc::new(config);
+
+    // The TLS is done in the connector below, so tonic must not try to do its own on top
+    // — an https scheme makes it want to, and the two layers collide. The scheme here only
+    // selects tonic's behaviour; what actually goes over the wire is the connector's.
+    let plain = url.replacen("https://", "http://", 1);
+    Endpoint::from_shared(plain)
+        .map_err(|e| format!("endpoint: {e}"))?
+        .connect_with_connector(tower::service_fn(move |_| {
+            let (host, config) = (host.clone(), config.clone());
+            async move {
+                let tcp = tokio::net::TcpStream::connect((host.as_str(), port)).await?;
+                // The name is required by the API and ignored by the verifier: what
+                // identifies the peer here is its key, and these certificates carry a name
+                // their issuer — themselves — chose.
+                let name = rustls::pki_types::ServerName::try_from(host.clone())
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+                let tls = TlsConnector::from(config).connect(name, tcp).await?;
+                Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(tls))
+            }
+        }))
+        .await
+        .map_err(|e| {
+            // tonic flattens the connector's error into "transport error", which reads as
+            // a network fault. A pin failure is the opposite of that — the peer answered,
+            // and what it presented is not what the attestation vouches for. Sending an
+            // operator to check connectivity instead would waste the whole diagnosis.
+            let mut src: &dyn std::error::Error = &e;
+            let mut deepest = e.to_string();
+            while let Some(next) = src.source() {
+                deepest = next.to_string();
+                src = next;
+            }
+            if deepest.contains("is not among the") {
+                format!("{url}: {deepest}")
+            } else {
+                format!("connect {url}: {e}")
+            }
+        })
 }
 
 #[cfg(test)]

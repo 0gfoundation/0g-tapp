@@ -16,7 +16,7 @@
   │
   └─ 对每个节点 signer:
       ├─② get-evidence(teeUrl, app_id)        取 evidence
-      ├─③ 验 quote 签名 + TCB  (CoCo-AS gRPC 34.171.164.181:50004, 见 §③)
+      ├─③ 验 quote 签名 + TCB  (CoCo-AS gRPC 35.253.66.70:50004, 见 §③)
       └─④ 对账 evidence ↔ 链上:
             report_data == sha512(runtime_data 原样字节)，且 runtime_data.signer == signerAddress
             start_app 事件 compose_hash == 链上 composeHash
@@ -160,7 +160,7 @@ open('/tmp/as_req.json','w').write(json.dumps(req))
 # 需要 trustee 的 protos/attestation.proto 在本地
 subprocess.run(
   "grpcurl -plaintext -import-path . -proto attestation.proto -d @ "
-  "34.171.164.181:50004 attestation.AttestationService/AttestationEvaluate < /tmp/as_req.json",
+  "35.253.66.70:50004 attestation.AttestationService/AttestationEvaluate < /tmp/as_req.json",
   shell=True)
 ```
 
@@ -389,7 +389,7 @@ openssl s_client -connect HOST:PORT </dev/null 2>/dev/null \
    getNodeList → [0x6C30D1E9392eaF67DAB66c4962249DE821CD335f]
    getNode     → teeUrl http://47.84.230.10:50051   stake 1 0G
 ② 取证: get-evidence @ 47.84.230.10  (老阿里云镜像: MRTD 060000…, cryptpilot FDE, 旧 grub)   ✅
-③ AS 验签 @ 34.171.164.181:50004 (AttestationEvaluate): 返回 token, quote 签名✅, report_data 解出=0x6C30…335f
+③ AS 验签 @ 35.253.66.70:50004 (AttestationEvaluate): 返回 token, quote 签名✅, report_data 解出=0x6C30…335f
         但 tcb_status=OutOfDate (INTEL-SA-01036 等 8 条) → ear.status=contraindicated  ⚠️ 平台 TCB 过期
 ④ 对账:
    node signer  0x6C30…335f      == AS report_data 前20字节            ✅
@@ -408,7 +408,7 @@ openssl s_client -connect HOST:PORT </dev/null 2>/dev/null \
 
 1. 链上 `getAppInfo` / `getNodeList` / `getNode` 读注册信息 + 各节点 teeUrl。
 2. 对每个节点：按 teeUrl `get-evidence --app-id <id> --nonce <随机 hex>`。
-3. 验 quote 签名 + TCB：提交 **CoCo-AS gRPC `34.171.164.181:50004`** `AttestationEvaluate`（AS 请求的 `runtime_data` 留空），看 `ear.status==affirming` 且 `tcb_status==UpToDate`（**别用 8080 KBS，那是 RCAR 密钥分发，会 401**）。
+3. 验 quote 签名 + TCB：提交 **CoCo-AS gRPC `35.253.66.70:50004`** `AttestationEvaluate`（AS 请求的 `runtime_data` 留空），看 `ear.status==affirming` 且 `tcb_status==UpToDate`（**别用 8080 KBS，那是 RCAR 密钥分发，会 401**）。
 4. 对账：
    - 先验 `report_data == sha512(evidence.runtime_data 原样字节)`，再读 `runtime_data.signer` == 链上 signerAddress（别手搓 quote 偏移；老 evidence 无此字段则退回前 20 字节读法）；
    - 传了 nonce 就查 `runtime_data.nonce` 是否回显（区分新鲜 quote 与缓存 quote）；

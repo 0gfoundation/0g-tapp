@@ -125,6 +125,31 @@ pub struct ServerConfig {
     #[serde(default)]
     pub unix_socket_path: Option<PathBuf>,
 
+    /// Permission bits on the socket, as an octal string like `"0660"`.
+    ///
+    /// `0600` — the original value — meant only root could open it, so every application
+    /// that fetches key material had to run its container as root. That is a poor trade:
+    /// an image that drops privileges is giving up real hardening to satisfy a file mode,
+    /// and it does not buy anything, because the socket's protection was never the file
+    /// mode. Anything the socket is bind-mounted into can read every app's key material,
+    /// so **the mount is the boundary** and the mode only decides who on the host may also
+    /// reach it.
+    ///
+    /// `0660` is the default: a container keeps a non-root uid and adds the socket's group
+    /// with `group_add`, which is exactly the hardening the old value forced people to
+    /// abandon. `0666` opens it to every user on the host and is a deliberate choice, not
+    /// a default.
+    #[serde(default = "default_socket_mode")]
+    pub unix_socket_mode: String,
+
+    /// Group that owns the socket. Unset leaves it root-owned, which pairs with
+    /// `group_add: ["0"]` on the container — a non-root user in the root *group*.
+    ///
+    /// Set it to a dedicated gid when a node runs containers that should not share a group
+    /// with anything else on the host; the containers then use that gid instead.
+    #[serde(default)]
+    pub unix_socket_gid: Option<u32>,
+
     /// Maximum number of concurrent connections
     #[serde(default = "default_max_connections")]
     pub max_connections: usize,
@@ -230,6 +255,12 @@ pub struct RetryConfig {
 }
 
 // Default value functions
+/// 0660, not 0600: see `unix_socket_mode`. A string because TOML has no octal literal,
+/// and `0600` written as a TOML integer is six hundred.
+fn default_socket_mode() -> String {
+    "0660".to_string()
+}
+
 fn default_bind_address() -> String {
     "0.0.0.0:50051".to_string()
 }
@@ -305,6 +336,8 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             bind_address: default_bind_address(),
+            unix_socket_mode: default_socket_mode(),
+            unix_socket_gid: None,
             unix_socket_path: None,
             max_connections: default_max_connections(),
             request_timeout_seconds: default_request_timeout(),
@@ -348,3 +381,46 @@ impl Default for LoggingConfig {
 }
 
 impl TappConfig {}
+
+#[cfg(test)]
+mod socket_mode {
+    use super::*;
+
+    /// The parse main.rs performs, kept here so the config that documents it also tests it.
+    fn parse(mode: &str) -> Result<u32, ()> {
+        u32::from_str_radix(mode.trim_start_matches("0o"), 8).map_err(|_| ())
+    }
+
+    #[test]
+    fn the_default_lets_a_non_root_container_in_via_its_group() {
+        // The whole point of the change: 0600 admitted only root, so every consumer had to
+        // run as root. 0660 admits a process whose group matches, which a container gets
+        // with group_add while keeping a non-root user.
+        assert_eq!(parse(&default_socket_mode()).unwrap(), 0o660);
+    }
+
+    #[test]
+    fn a_mode_is_read_as_octal_not_decimal() {
+        // "0660" read as decimal is 660, which is 0o1224 — group-writable, world-nothing,
+        // and with a stray setgid-adjacent bit. It would half-work, which is worse than
+        // failing, so the radix is not incidental.
+        assert_eq!(parse("0660").unwrap(), 0o660);
+        assert_eq!(parse("0600").unwrap(), 0o600);
+        assert_eq!(parse("0666").unwrap(), 0o666);
+        assert_ne!(parse("0660").unwrap(), 660);
+    }
+
+    #[test]
+    fn the_rust_style_prefix_is_accepted_too() {
+        assert_eq!(parse("0o660").unwrap(), 0o660);
+    }
+
+    #[test]
+    fn a_mode_that_is_not_octal_is_refused_rather_than_guessed() {
+        // Refusing beats defaulting: a typo that silently became 0600 would reintroduce
+        // the very problem this setting exists to fix, and nothing would say so.
+        for bad in ["rw-rw----", "0o", "", "0899", "abc"] {
+            assert!(parse(bad).is_err(), "accepted {:?}", bad);
+        }
+    }
+}

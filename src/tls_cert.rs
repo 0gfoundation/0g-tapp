@@ -68,6 +68,76 @@ pub fn dns_name(app_id: &str) -> String {
     format!("{}.{}", app_id, NAME_SUFFIX)
 }
 
+/// The app's TLS key pair, from the derived secret.
+///
+/// Shared so the certificate and any signing request are provably the same key — deriving
+/// it twice by two routes would be a place for them to diverge.
+fn key_pair_from(secret: &[u8]) -> TappResult<rcgen::KeyPair> {
+    // A derived secret is uniform bytes; P-256 wants a scalar in range, which from_slice
+    // enforces. Rejecting is correct rather than reducing: a secret that does not map to a
+    // valid key means the derivation changed shape, and quietly mangling it would produce
+    // a key nobody can reproduce.
+    let secret_key = p256::SecretKey::from_slice(secret)
+        .map_err(|e| fail(format!("derived secret is not a valid P-256 key: {}", e)))?;
+    let pkcs8 = secret_key
+        .to_pkcs8_der()
+        .map_err(|e| fail(format!("encode private key: {}", e)))?;
+    rcgen::KeyPair::from_pkcs8_der_and_sign_algo(
+        &rustls_pki_types::PrivatePkcs8KeyDer::from(pkcs8.as_bytes()),
+        &rcgen::PKCS_ECDSA_P256_SHA256,
+    )
+    .map_err(|e| fail(format!("load key pair: {}", e)))
+}
+
+/// A certificate signing request for `domain`, signed by the app's own TLS key.
+///
+/// Separate from `build` because the two answer different questions. `build` produces the
+/// identity the app serves — a certificate for `<app-id>.tapp.0g.ai`, which is what a
+/// verifier checks against the attestation and needs no authority behind it. This produces
+/// something to hand to an authority that will vouch for a name it recognises, and the name
+/// is therefore the caller's to choose.
+///
+/// **The key is the same one.** That is the entire point: a certificate the CA issues from
+/// this request carries the public key the attestation already commits to, so both checks
+/// pass at once — a browser matches the name the CA vouched for, a verifier matches the key
+/// the TEE vouched for, and they read different fields without interfering.
+///
+/// Nothing secret leaves: a signing request is a public key, a name, and a signature proving
+/// the requester holds the private half. Publishing one gives away nothing the eventual
+/// certificate would not.
+pub fn signing_request(secret: &[u8], domain: &str) -> TappResult<String> {
+    if domain.is_empty() {
+        return Err(fail("domain must not be empty"));
+    }
+    // rcgen rejects a malformed name later and less clearly; refusing here keeps the error
+    // next to the input that caused it.
+    if domain.starts_with('.')
+        || domain.ends_with('.')
+        || domain.contains("..")
+        || !domain
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '*')
+    {
+        return Err(fail(format!("not a usable domain name: {:?}", domain)));
+    }
+
+    let key_pair = key_pair_from(secret)?;
+    let mut params = rcgen::CertificateParams::new(vec![domain.to_string()])
+        .map_err(|e| fail(format!("certificate params: {}", e)))?;
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, domain.to_string());
+    params.extended_key_usages = vec![
+        rcgen::ExtendedKeyUsagePurpose::ServerAuth,
+        rcgen::ExtendedKeyUsagePurpose::ClientAuth,
+    ];
+    params
+        .serialize_request(&key_pair)
+        .map_err(|e| fail(format!("build signing request: {}", e)))?
+        .pem()
+        .map_err(|e| fail(format!("encode signing request: {}", e)))
+}
+
 /// sha256 of a DER-encoded SubjectPublicKeyInfo, hex.
 ///
 /// The public key rather than the whole certificate: the key is what the TEE holds and
@@ -102,21 +172,7 @@ pub async fn build(
     key_source: &'static str,
     ca_url: Option<&str>,
 ) -> TappResult<TlsIdentity> {
-    // A derived secret is uniform bytes; P-256 wants a scalar in range, which from_slice
-    // enforces. Rejecting is correct rather than reducing: a secret that does not map to a
-    // valid key means the derivation changed shape, and quietly mangling it would produce
-    // a key nobody can reproduce.
-    let secret_key = p256::SecretKey::from_slice(secret)
-        .map_err(|e| fail(format!("derived secret is not a valid P-256 key: {}", e)))?;
-    let pkcs8 = secret_key
-        .to_pkcs8_der()
-        .map_err(|e| fail(format!("encode private key: {}", e)))?;
-
-    let key_pair = rcgen::KeyPair::from_pkcs8_der_and_sign_algo(
-        &rustls_pki_types::PrivatePkcs8KeyDer::from(pkcs8.as_bytes()),
-        &rcgen::PKCS_ECDSA_P256_SHA256,
-    )
-    .map_err(|e| fail(format!("load key pair: {}", e)))?;
+    let key_pair = key_pair_from(secret)?;
     let public_key_sha256 = public_key_sha256_hex(&key_pair.public_key_der());
 
     let name = dns_name(app_id);
@@ -226,6 +282,56 @@ mod tests {
         assert!(id.cert_pem.contains("BEGIN CERTIFICATE"));
         assert!(id.csr_pem.contains("BEGIN CERTIFICATE REQUEST"));
         assert!(id.key_pem.contains("BEGIN PRIVATE KEY"));
+    }
+
+    #[test]
+    fn a_signing_request_carries_the_name_that_was_asked_for() {
+        // The whole reason this exists: the built-in certificate is issued for
+        // <app-id>.tapp.0g.ai, and a public CA validates the request's names against the
+        // order — so a request that cannot name the caller's domain is unusable there.
+        let csr = signing_request(&[7u8; 32], "api.example.com").unwrap();
+        assert!(csr.contains("BEGIN CERTIFICATE REQUEST"));
+
+        // Decode the PEM body rather than pulling in a parser: the name appears verbatim
+        // in the DER, so finding it there is enough to show it reached the request.
+        let b64: String = csr
+            .lines()
+            .filter(|l| !l.starts_with("-----"))
+            .collect::<Vec<_>>()
+            .join("");
+        let der = base64::decode(b64.trim()).unwrap();
+        let text = String::from_utf8_lossy(&der);
+        assert!(text.contains("api.example.com"), "name missing from request");
+        assert!(
+            !text.contains("tapp.0g.ai"),
+            "the built-in name leaked into a request asked for another"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_signing_request_uses_the_same_key_as_the_certificate() {
+        // If these could differ, a CA would certify a key the attestation does not commit
+        // to, and both checks would pass separately while describing different endpoints.
+        let id = build("app", &SECRET, "local", None).await.unwrap();
+        let kp = key_pair_from(&SECRET).unwrap();
+        assert_eq!(
+            public_key_sha256_hex(&kp.public_key_der()),
+            id.public_key_sha256
+        );
+        assert!(signing_request(&SECRET, "other.example.com")
+            .unwrap()
+            .contains("BEGIN CERTIFICATE REQUEST"));
+    }
+
+    #[test]
+    fn a_domain_that_is_not_one_is_refused_rather_than_encoded() {
+        for bad in ["", ".leading", "trailing.", "a..b", "has space", "semi;colon"] {
+            assert!(
+                signing_request(&[7u8; 32], bad).is_err(),
+                "accepted {:?}",
+                bad
+            );
+        }
     }
 
     #[tokio::test]

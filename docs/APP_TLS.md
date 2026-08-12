@@ -9,6 +9,14 @@ This document is the recipe. It works with an unmodified `nginx`, `envoy`, or an
 that can be pointed at a key file and a certificate file — the application never learns that
 tapp exists.
 
+There are two ways to get the certificate, and they are not alternatives — the same key can
+carry both, so one endpoint satisfies a verifier and a browser at once:
+
+| | the certificate | who accepts it |
+|---|---|---|
+| **self-signed** (below) | issued by the node, for `<app-id>.tapp.0g.ai` | anything checking the key against the attestation — no CA needed |
+| **[public CA](#a-certificate-from-a-public-ca)** | issued by Let's Encrypt or your own CA, for a name you choose | browsers and anything else driving off a trust store |
+
 ## The shape
 
 The application does not fetch its own certificate. A sidecar does, writes two PEM files into
@@ -153,42 +161,91 @@ catches up ([0g-kms#11](https://github.com/0gfoundation/0g-kms/issues/11)).
 > The cost, which such a service has to plan for: its public key changes on every restart, so
 > anything pinning it must look the pin up rather than hold a configured copy.
 
-## Binding a domain name
+## A certificate from a public CA
 
-Nothing above involves a domain. If you need one — because browsers must accept the
-certificate — the rule is **change the name, keep the key**. The certificate may be reissued
-for any name you control; what must not change is the public key, because that is what the
-attestation commits to.
+Everything above serves a self-signed certificate, which is right for a client that checks the
+attested key and wrong for one that checks a trust store. Browsers are the second kind. The two
+are not alternatives to choose between: **the same key can carry both**, and then one endpoint
+satisfies a browser and a verifier at once.
 
-The certificate and the `csr_pem` in the response both carry a fixed name, `<app-id>.tapp.0g.ai`.
-So:
+The rule is **change the name, keep the key**. A certificate may be issued for any name you
+control; the public key must not change, because that is what the attestation commits to.
 
-- **Your own CA** — use `csr_pem` as it is, or set `ca_url` in `config.toml` and let
-  `GetAppTlsCert` return a CA-signed certificate directly. A CA you run does not care what
-  name the request asks for.
-- **A public CA (Let's Encrypt)** — `csr_pem` is *not* usable: ACME requires the CSR's names to
-  match the order, and yours will not be `<app-id>.tapp.0g.ai`. Build a new request from the
-  same key instead:
+`GetAppCsr` produces the signing request, and unlike `GetAppTlsCert` it is **public** — a
+signing request publishes a public key, a name, and a signature proving possession of the
+private half, all of which the resulting certificate publishes anyway. It works over TCP, needs
+no socket, and needs no key:
 
-  ```bash
-  openssl req -new -key tls.key -subj "/CN=api.example.com" \
-    -addext "subjectAltName=DNS:api.example.com" -out my.csr
-  ```
+```bash
+tapp-cli -s http://<node>:50051 get-app-csr \
+  --app-id my-app --domain api.example.com --out my.csr
+```
 
-  Same `tls.key` means the same public key, so the issued certificate satisfies both checks at
-  once: a browser matches the name the CA vouched for, and a verifier matches the key the
-  attestation vouched for. They read different fields and do not interfere.
+**The app does not have to exist yet.** The key is derived from the app id, so a signing request
+can be obtained — and a certificate issued — before anything is deployed. That ordering is what
+makes this workable: the certificate is ready before the container that needs it starts.
 
-**This effectively requires `kms`.** A `local` key is re-derived every boot, so a CA-issued
-certificate is void the moment the node restarts and would need reissuing each time — which
-Let's Encrypt's rate limits will not tolerate.
+Take `my.csr` to any ACME client in CSR mode. With [lego](https://github.com/go-acme/lego):
 
-The two layers are independent and the second is optional:
+```bash
+lego --accept-tos --email you@example.com \
+     --csr my.csr --http --http.port :80 run
+```
 
-| | what it binds | what the client must do |
-|---|---|---|
-| evidence | the TLS public key to a TEE — no CA involved | compare the two hashes itself |
-| a CA | a name to that same key | nothing; the trust store handles it |
+Note what is *not* in the output directory: a private key. An ACME client in CSR mode signs the
+request you gave it and never generates or sees a key, which is the property that lets a TEE
+hold one a CA will still certify.
+
+Then serve the issued certificate with the key the sidecar fetches:
+
+```yaml
+  web:
+    volumes:
+      - /run/my-app-certs:/certs:ro                       # tls.key, from the sidecar
+      - ./fullchain.pem:/etc/nginx/fullchain.pem:ro       # from the CA, uploaded with the compose
+```
+
+```nginx
+ssl_certificate     /etc/nginx/fullchain.pem;   # the CA's
+ssl_certificate_key /certs/tls.key;             # the TEE's
+```
+
+The certificate is public, so shipping it in the compose directory is fine — `start-app`
+uploads it like any other mounted file. Renewal needs `nginx -s reload`, not a restart.
+
+That nginx starts at all is itself a check: a certificate and key that did not match would be
+refused outright.
+
+### This wants `kms`
+
+A `local` key is re-derived on every boot, so a CA-issued certificate stops matching the moment
+the node restarts, and every reboot means another issuance — which Let's Encrypt's rate limits
+(five per week for a set of names) will not tolerate. It is not impossible with a private CA
+that can reissue unattended, but a public CA effectively requires `kms`.
+
+### Anyone can request one, and it does not matter
+
+`GetAppCsr` is public, so anyone can obtain a request carrying your app's public key for a
+domain *they* control, and have a CA sign it. The result is useless to them: a certificate only
+serves TLS in the hands of whoever holds the private key, and completing a handshake requires
+signing with it.
+
+Nor does it affect anyone reaching your domain. A certificate is presented by the server you
+connected to, not looked up in a directory, so theirs never reaches a client that DNS sent to
+you. The one real consequence is noise in Certificate Transparency logs — an entry binding your
+key to a domain you do not run. CT is an after-the-fact record that no client consults during a
+handshake, so it misleads a human reading logs and nothing else.
+
+**One implementation warning follows from this.** Their certificate does carry your attested
+key, so a "verifier" that fetches a certificate and compares its public key *without requiring
+the handshake to succeed* would accept it. What stops the attack is that they cannot complete
+the handshake. So the comparison must be part of a completed connection:
+
+| how it is checked | safe |
+|---|---|
+| `curl --pinnedpubkey` — returns only on a completed handshake | yes |
+| a rustls verifier — runs during the handshake, which also verifies the signature | yes |
+| fetch a certificate, hash its key, compare, ignore whether the handshake finished | **no** |
 
 ## Getting the certificate some other way
 
@@ -200,3 +257,7 @@ trust.
 If an application would rather call the RPC itself than use the sidecar, the response carries
 `key_pem`, `cert_pem`, `csr_pem`, `public_key_sha256` and `key_source`; see
 `proto/tapp_service.proto`.
+
+The `csr_pem` in that response is fixed to `<app-id>.tapp.0g.ai`, which a public CA will refuse
+because ACME requires the request's names to match the order. Use `GetAppCsr` for a name of your
+own — it is public, so it does not drag the socket into certificate renewal.
