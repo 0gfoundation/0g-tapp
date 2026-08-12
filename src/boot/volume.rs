@@ -50,9 +50,22 @@ fn err(reason: String) -> DockerError {
     }
 }
 
+/// The admin tools used here live in sbin, which the tapp-server service unit
+/// deliberately leaves out of PATH. Resolve against the standard locations and
+/// fall back to PATH, so this works under the unit, in tests, and across distros.
+fn resolve(program: &str) -> String {
+    for dir in ["/usr/sbin", "/sbin", "/usr/local/sbin"] {
+        let candidate = format!("{dir}/{program}");
+        if std::path::Path::new(&candidate).exists() {
+            return candidate;
+        }
+    }
+    program.to_string()
+}
+
 /// Run a command, optionally writing `stdin` to it, and fail loudly with stderr.
 async fn run(program: &str, args: &[&str], stdin: Option<&[u8]>) -> TappResult<Vec<u8>> {
-    let mut cmd = Command::new(program);
+    let mut cmd = Command::new(resolve(program));
     cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
     if stdin.is_some() {
         cmd.stdin(Stdio::piped());
@@ -85,7 +98,7 @@ async fn run(program: &str, args: &[&str], stdin: Option<&[u8]>) -> TappResult<V
 }
 
 async fn quiet_success(program: &str, args: &[&str]) -> bool {
-    Command::new(program)
+    Command::new(resolve(program))
         .args(args)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -212,6 +225,20 @@ pub async fn ensure_mounted(app_id: &str, key: &[u8]) -> TappResult<()> {
 
     run("mount", &[&mapper_str, &mount_point_str], None).await?;
     info!(app_id, mount = %mount_point_str, "encrypted volume mounted");
+    Ok(())
+}
+
+/// Detach the app's data mount point if it is mounted, so the app directory can
+/// be removed (stop_app deletes it). Deliberately does NOT close the LUKS
+/// mapping: the volume stays open per the lifecycle above, and the next start
+/// simply remounts it.
+pub async fn unmount(app_id: &str) -> TappResult<()> {
+    let mount_point = super::manager::DockerComposeManager::get_app_dir(app_id).join("data");
+    let mount_point_str = mount_point.to_string_lossy().to_string();
+    if quiet_success("mountpoint", &["-q", &mount_point_str]).await {
+        run("umount", &[&mount_point_str], None).await?;
+        info!(app_id, "encrypted volume unmounted (mapping stays open)");
+    }
     Ok(())
 }
 

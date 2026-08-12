@@ -772,7 +772,12 @@ enable_eventlog = true
         // Mark measurement as success or failure based on result
         let final_measurement = match &result {
             Ok(_) => {
-                // 1. Remove app directory
+                // 1. Remove app directory. The encrypted volume mounted at
+                // <app_dir>/data must detach first or the removal hits EBUSY —
+                // only the mount point is released; the LUKS mapping (and the
+                // key in the kernel) stays open, and the volume's data lives in
+                // the image file on /data, untouched. The next start remounts.
+                volume::unmount(app_id).await?;
                 let app_dir = DockerComposeManager::get_app_dir(app_id);
                 if app_dir.exists() {
                     tokio::fs::remove_dir_all(&app_dir).await.map_err(|e| {
