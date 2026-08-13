@@ -1,15 +1,14 @@
 //! Compose-file checks for data placement and container privilege.
 //!
-//! The encrypted per-app volume only protects what lands under `./data`, so a
-//! compose file can silently opt out of it — a named volume writes to docker's
-//! shared data-root, an absolute bind mount writes anywhere on the host. Neither
-//! is caught by anything else: docker accepts both happily. This lint makes the
-//! escape visible.
+//! The encrypted per-app volume protects what lands under `./data` — which,
+//! since compose_override.rs redirects them, includes plainly-declared named
+//! volumes. What this lint flags is everything that still escapes: bind mounts
+//! outside the app directory, volumes the user configured to live elsewhere
+//! (`external`, a driver), anonymous volumes, plus the two privilege escapes
+//! (docker.sock, privileged) that hand the app the whole machine.
 //!
-//! Warning-only for now: existing apps (and nearly every database example on the
-//! internet) use named volumes, so rejection starts as a migration signal, not a
-//! gate. Tightening to refusal is a one-line change at the call site once the
-//! fleet has moved.
+//! Warning-only for now: rejection starts as a migration signal, not a gate.
+//! Tightening to refusal is a one-line change at the call site.
 
 /// Human-readable violations found in a compose file. Empty means clean.
 /// Unparseable YAML yields no findings — compose itself will reject it with a
@@ -25,6 +24,7 @@ pub fn lint_compose(compose_content: &str) -> Vec<String> {
         Some(m) => m,
         None => return findings,
     };
+    let redirected = super::compose_override::redirectable_volumes(compose_content);
 
     for (name, service) in services {
         let service_name = name.as_str().unwrap_or("?");
@@ -45,7 +45,7 @@ pub fn lint_compose(compose_content: &str) -> Vec<String> {
             None => continue,
         };
         for vol in volumes {
-            if let Some(finding) = check_volume(service_name, vol) {
+            if let Some(finding) = check_volume(service_name, vol, &redirected) {
                 findings.push(finding);
             }
         }
@@ -54,7 +54,9 @@ pub fn lint_compose(compose_content: &str) -> Vec<String> {
 }
 
 /// One volume entry, in either compose syntax. Returns a finding or None.
-fn check_volume(service: &str, vol: &serde_yaml::Value) -> Option<String> {
+/// `redirected` is the set of named volumes compose_override.rs sends into the
+/// encrypted volume — using one of those is the blessed path, not a finding.
+fn check_volume(service: &str, vol: &serde_yaml::Value, redirected: &[String]) -> Option<String> {
     // Long syntax: {type: bind|volume|tmpfs, source: ..., target: ...}
     if let Some(map) = vol.as_mapping() {
         let vol_type = map
@@ -63,11 +65,13 @@ fn check_volume(service: &str, vol: &serde_yaml::Value) -> Option<String> {
             .unwrap_or("volume");
         return match vol_type {
             "tmpfs" => None, // RAM only, nothing persists
-            "volume" => Some(format!(
-                "service '{service}': named volume stores data in docker's shared \
-                 data-root, OUTSIDE the app's encrypted volume — use a './data/...' \
-                 bind mount instead"
-            )),
+            "volume" => {
+                let source = map
+                    .get(serde_yaml::Value::from("source"))
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("");
+                named_volume_finding(service, source, redirected)
+            }
             "bind" => {
                 let source = map
                     .get(serde_yaml::Value::from("source"))
@@ -98,12 +102,23 @@ fn check_volume(service: &str, vol: &serde_yaml::Value) -> Option<String> {
              cannot verify it stays inside the app directory"
         ))
     } else {
-        Some(format!(
-            "service '{service}': named volume '{source}' stores data in docker's \
-             shared data-root, OUTSIDE the app's encrypted volume — use a \
-             './data/...' bind mount instead"
-        ))
+        named_volume_finding(service, source, redirected)
     }
+}
+
+/// A named volume is fine exactly when the override redirects it. One that is
+/// not redirected was either configured by the user to live elsewhere
+/// (external, a driver — a deliberate escape worth pointing at) or never
+/// declared (compose itself will refuse it, but say why here too).
+fn named_volume_finding(service: &str, source: &str, redirected: &[String]) -> Option<String> {
+    if redirected.iter().any(|r| r == source) {
+        return None;
+    }
+    Some(format!(
+        "service '{service}': named volume '{source}' is configured to live outside \
+         the app's encrypted volume (external / custom driver / undeclared) — its \
+         data is NOT encrypted at rest"
+    ))
 }
 
 fn check_bind_source(service: &str, source: &str) -> Option<String> {
@@ -147,15 +162,31 @@ mod tests {
     }
 
     #[test]
-    fn named_volume_is_flagged_in_both_syntaxes() {
-        let short = lint("services:\n  db:\n    volumes:\n      - pgdata:/var/lib/postgresql/data\n");
-        assert_eq!(short.len(), 1);
-        assert!(short[0].contains("named volume"));
+    fn a_declared_named_volume_is_clean_because_the_override_redirects_it() {
+        let short = lint(
+            "services:\n  db:\n    volumes:\n      - pgdata:/var/lib/postgresql/data\nvolumes:\n  pgdata:\n",
+        );
+        assert!(short.is_empty(), "redirected volume must not be flagged: {short:?}");
 
         let long = lint(
-            "services:\n  db:\n    volumes:\n      - type: volume\n        source: pgdata\n        target: /var/lib/postgresql/data\n",
+            "services:\n  db:\n    volumes:\n      - type: volume\n        source: pgdata\n        target: /var/lib/postgresql/data\nvolumes:\n  pgdata:\n",
         );
-        assert_eq!(long.len(), 1, "long syntax must be caught too: {long:?}");
+        assert!(long.is_empty(), "long syntax too: {long:?}");
+    }
+
+    #[test]
+    fn an_unredirectable_named_volume_is_flagged() {
+        // external: true is a user choice to live outside — visible, not rewritten.
+        let external = lint(
+            "services:\n  db:\n    volumes:\n      - pgdata:/var/lib/postgresql/data\nvolumes:\n  pgdata:\n    external: true\n",
+        );
+        assert_eq!(external.len(), 1);
+        assert!(external[0].contains("NOT encrypted"));
+
+        // Undeclared: compose refuses it anyway, but the reason shows here too.
+        let undeclared =
+            lint("services:\n  db:\n    volumes:\n      - pgdata:/var/lib/postgresql/data\n");
+        assert_eq!(undeclared.len(), 1, "{undeclared:?}");
     }
 
     #[test]

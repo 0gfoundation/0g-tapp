@@ -1,4 +1,5 @@
 pub mod compose_lint;
+pub mod compose_override;
 pub mod manager;
 pub mod measurement;
 pub mod volume;
