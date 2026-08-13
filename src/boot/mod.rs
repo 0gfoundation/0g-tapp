@@ -544,6 +544,14 @@ enable_eventlog = true
         // Validate request
         self.validate_request(&request)?;
 
+        // Warn-only (see compose_lint): logged here AND returned in the response,
+        // because a warning only the server log sees protects nobody — the person
+        // who wrote the compose is on the other end of this RPC.
+        let compose_warnings = compose_lint::lint_compose(&request.compose_content);
+        for finding in &compose_warnings {
+            warn!(app_id = %request.app_id, "compose lint: {finding}");
+        }
+
         // Create a new task
         let task = self.task_manager.create_task().await;
         let task_id = task.id.clone();
@@ -573,6 +581,7 @@ enable_eventlog = true
             message: format!("Task created successfully. Use task_id to check status."),
             task_id: task_id,
             timestamp: crate::utils::current_timestamp(),
+            compose_warnings,
         })
     }
 
@@ -688,12 +697,6 @@ enable_eventlog = true
                 reason: format!("Invalid app ID format: {}", request.app_id),
             }
             .into());
-        }
-
-        // Warn-only for now (see compose_lint): existing apps use named volumes,
-        // so this is a migration signal before it becomes a gate.
-        for finding in compose_lint::lint_compose(&request.compose_content) {
-            warn!(app_id = %request.app_id, "compose lint: {finding}");
         }
 
         Ok(())
