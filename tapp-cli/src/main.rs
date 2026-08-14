@@ -1161,6 +1161,21 @@ async fn send_start_app(
     if !result.success {
         return Err(format!("StartApp request failed: {}", result.message).into());
     }
+
+    // Data-placement and privilege warnings from the server's compose lint.
+    // The app still starts — but this is the one moment the compose author is
+    // listening, so say it here rather than only in a server log they never see.
+    if !result.compose_warnings.is_empty() {
+        eprintln!("\n⚠ compose warnings (app starts anyway):");
+        for w in &result.compose_warnings {
+            eprintln!("  - {w}");
+        }
+        eprintln!(
+            "  To persist data encrypted: use a named volume (auto-redirected into the\n\
+             \x20 app's encrypted volume) or a bind mount under ./data/. Other relative\n\
+             \x20 paths live in RAM and vanish on reboot; absolute paths are plaintext.\n"
+        );
+    }
     Ok(result.task_id)
 }
 

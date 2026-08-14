@@ -13,6 +13,7 @@
 - **On-chain Registration**: Register apps and TEE nodes on TappRegistry smart contract
 - **KMS Integration**: Fetch hardware-independent app secrets from a KMS cluster (decrypted locally within the TEE)
 - **Attested TLS**: Hand an app a TLS certificate whose public key is committed to by the attestation evidence, so a client can tie the connection it made to the TEE it verified
+- **Encrypted app data volumes**: Every app's persistent data lives in its own LUKS volume, keyed per-app by the KMS — encrypted at rest, isolated between apps, and portable across hosts and reboots
 
 ## Getting Started
 
@@ -87,6 +88,45 @@ export TAPP_OWNER_PRIVATE_KEY="0x..."
 2. Files referenced in volume mounts (e.g., `./config.yml:/app/config.yml`) are automatically uploaded. Paths that escape the compose directory (e.g., `../shared/config.yml`) are rejected with a clear error — copy such files into the compose directory and use a `./` path.
 3. Returns a task ID for tracking deployment progress
 4. The application deployment is cryptographically measured and extended to TEE runtime measurements
+
+#### Where app data lives (encrypted volumes)
+
+Each app gets its **own encrypted volume**: a LUKS2 image on the persistent data
+disk, opened with a passphrase the KMS cluster derives per app (under the `fde`
+material namespace) and mounted at the app's `data/` directory before its
+containers start. The key is stored nowhere — any node registered on-chain for
+the app re-derives the same key on demand, which is what lets data survive
+reboots (a reboot wipes the kernel's key and locks the volume) and move between
+hosts (copy the image file; the destination node derives the same key).
+
+What the compose file writes decides what protects it:
+
+| compose writes to | where it lives | encrypted | survives reboot |
+|---|---|---|---|
+| named volume (plainly declared) | auto-redirected into the encrypted volume | ✅ | ✅ |
+| `./data/...` bind mount | encrypted volume, explicit path | ✅ | ✅ |
+| other `./...` relative paths | RAM rootfs — fine for configs, wrong for state | – (never on disk) | ❌ |
+| absolute paths | host disk, plaintext (warned) | ❌ | ✅ |
+| `external:` / custom-driver volumes | wherever the user configured (warned) | ❌ | depends |
+
+The first row is the important one: the standard compose idiom
+(`pgdata:/var/lib/postgresql/data` plus a top-level `volumes: pgdata:`) is
+encrypted **with no changes** — the server generates a
+`docker-compose.override.yml` redirecting the volume into the encrypted mount.
+The user's compose runs verbatim and its measured hash is untouched. Uploading
+your own override file disables the redirect (loudly).
+
+`start-app` returns any lint findings (data placed where the volume cannot
+protect it, `docker.sock` mounts, `privileged`) and the CLI prints them; the
+app still starts. On a KMS-configured node the start **fails** when the volume
+key cannot be fetched — an app never silently runs on a plaintext directory.
+The usual cause is ordering: the node must be registered on-chain for the app
+first, which `start-app --register-onchain` handles.
+
+`stop-app` stops containers and leaves the volume open (the key lives in
+TEE-protected kernel memory; a closed volume would protect nothing an open one
+doesn't). To migrate existing plaintext data in: `stop-app`, copy the data into
+the still-mounted `data/` directory, `start-app`.
 
 #### Stopping an Application
 

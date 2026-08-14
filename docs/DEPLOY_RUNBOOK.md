@@ -66,6 +66,8 @@ PROVIDER_KEY=0x<owner-key> go run ./cmd/provider register --app-id <appId> --url
 - **`cast send` gas 太低被拒**：默认 tip 1 wei < 最低 2 gwei，手动加 `--legacy --gas-price 3000000000`。tapp-cli 的 onchain 子命令自己处理 gas，无需此参。
 - **私有 registry 临时 token 寿命短**：docker-login 后很快过期，拉镜像 `unauthorized` 就重新登录。
 - **部分云主机 docker 无 DNS**：解析不了 `docker.io`，公共镜像拉不下来，需在主机配 docker DNS（`/etc/docker/daemon.json` 的 `"dns"`）。
+- **FDE（≥0.7.0）：`fde_volume_key - KMS refused the volume key` 拒绝启动**：配了 KMS 的节点起 app 前要先拿盘钥匙，三种原因——app 还没在链上注册到这个节点（用 `--register-onchain`，顺序它管）；KMS 信任锚没配（`update-trust-anchors --scan-url --scan-pubkey`，或 claim-config 时一并给）；KMS 集群真挂了。**不会**静默降级明文启动，这是设计。
+- **FDE：数据放哪要看 compose 写法**：named volume 自动进加密卷（零改动）；`./data/` 显式进；其他 `./` 相对路径在 RAM 上重启即失；绝对路径明文（start-app 会打印警告）。详见 README "Where app data lives"。
 
 ---
 

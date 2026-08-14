@@ -1,7 +1,7 @@
 ---
 name: 0g-tapp-cli
 description: Use this skill when the user wants to deploy, manage, or troubleshoot applications on a 0G Tapp (Trusted Application Platform) server using tapp-cli. Covers start/stop apps, on-chain registration, registry login, check task status, view logs, and manage docker compose deployments across multiple remote TEE servers.
-version: 1.8.0
+version: 1.9.0
 author: 0G Labs
 tags: [0g, tapp, tee, docker, deployment, cli, onchain]
 ---
@@ -232,6 +232,24 @@ Scans `volumes:` and uploads sources starting with `./` (files or dirs, recursiv
 3. **Private-registry images need login** on EACH server. The aliyun `cr_temp_user` tokens are **very short-lived** — `unauthorized: authentication required` on pull means re-`docker-login` with a fresh token. Token is account-wide (works on any server until it expires).
 4. **App already running** → `stop-app` before re-deploy.
 
+### Data volumes & encryption (FDE servers, 0g-tapp#107+)
+
+Each app gets its **own encrypted volume** (LUKS; key derived per-app by the KMS cluster under the `fde` namespace, stored nowhere), mounted at `<app_dir>/data` before containers start. Where data lands decides what protects it:
+
+| compose writes to | where it lives | encrypted | survives reboot |
+|---|---|---|---|
+| named volume (`pgdata:`, plainly declared) | **auto-redirected into the encrypted volume** | ✅ | ✅ |
+| `./data/...` bind mount | encrypted volume (explicit path control) | ✅ | ✅ |
+| other `./xxx` relative paths | RAM rootfs — fine for configs, **data-loss trap for state** | – (never on disk) | ❌ |
+| absolute paths (`/data/...`) | host disk, plaintext | ❌ | ✅ |
+| `external:`/custom-driver volumes | wherever the user configured — NOT redirected | ❌ | depends |
+
+- The standard internet compose (`pgdata:/var/lib/postgresql/data` + top-level `volumes: pgdata:`) is encrypted **with zero changes** — the server generates a `docker-compose.override.yml` redirecting it. Don't upload your own override file, it disables the redirect (loudly).
+- `start-app` prints **⚠ compose warnings** from the server's lint (data placement, `docker.sock`, `privileged`). The app starts anyway — but relay these to the user, they're the only notice.
+- **KMS gate**: on a KMS-configured server, start **fails** if the volume key can't be fetched — no silent plaintext downgrade. The app must be registered on-chain first (`--register-onchain` handles ordering), and the server must trust a verifier for the KMS's self-signed TLS (`update-trust-anchors --scan-url --scan-pubkey`, or `claim-config` with those flags). No KMS configured at all → plaintext dir + warning.
+- `stop-app` leaves the volume open (key stays in the kernel); a CVM reboot locks everything; data survives because a registered node re-derives the same key. Volume file: `/data/tapp/volumes/<app_id>.img` (sparse — apparent size = whole disk, real usage = real writes).
+- Migration of plaintext data into the volume: `stop-app` → copy into `<app_dir>/data/` (volume stays mounted) → `start-app`.
+
 ## Troubleshooting — common errors
 
 | Symptom | Cause / fix |
@@ -244,6 +262,7 @@ Scans `volumes:` and uploads sources starting with `./` (files or dirs, recursiv
 | `lookup registry-1.docker.io ... connection refused` | that host's docker has no DNS → fix `/etc/docker/daemon.json` `"dns"` then restart docker |
 | on-chain `imageHashes` empty `[]` / `Image Hash: {}` | tapp-server bug: old binary parses `docker compose images --format json` (a JSON array) line-by-line as NDJSON → 0 images. **Server-side**: only fixed by deploying the current tapp-server build (array parsing). prune/re-register won't help. Confirm via `get-app-info`. |
 | `app already exists` (register) | app-id taken globally; use add-node/update-node |
+| `fde_volume_key - KMS refused the volume key` | app not registered on-chain for THIS node's signer (`start-app --register-onchain`), or KMS trust anchor missing (`update-trust-anchors --scan-url --scan-pubkey`), or the KMS cluster is actually down |
 | `gas tip cap ... below minimum` (cast send) | add `--legacy --gas-price 3000000000` |
 
 ## Remote Attestation — verify a node by `app_id`

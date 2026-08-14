@@ -1,8 +1,18 @@
+pub mod compose_lint;
+pub mod compose_override;
 pub mod manager;
 pub mod measurement;
+pub mod volume;
 
 pub use manager::{AppStatus, ContainerStatus, DockerComposeManager, MountFile, PruneImagesResult};
 pub use measurement::{AppMeasurement, ComposeMeasurement, HashAlgorithm};
+
+/// Deferred fetch of an app's volume passphrase, built by the RPC layer (which
+/// owns the KMS client) and awaited inside the start task (so a slow KMS round
+/// trip delays the task, never the StartApp RPC). `None` = this node has no KMS
+/// configured, and the app runs on a plain directory.
+pub type VolumeKeyFut =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, String>> + Send>>;
 
 use crate::error::{DockerError, TappError, TappResult};
 use crate::measurement_service::MeasurementService;
@@ -126,7 +136,13 @@ enable_eventlog = true
     }
 
     /// Internal method to handle the actual app start logic
-    async fn _start_app(&self, request: StartAppRequest, deployer: String, task_id: String) {
+    async fn _start_app(
+        &self,
+        request: StartAppRequest,
+        deployer: String,
+        task_id: String,
+        volume_key: Option<VolumeKeyFut>,
+    ) {
         let app_id = request.app_id.clone();
 
         // Check if app already exists
@@ -234,6 +250,40 @@ enable_eventlog = true
                 )
                 .await;
             return;
+        }
+
+        // Encrypted data volume first, so `./data` is already the encrypted
+        // mount when files are staged and containers start. Strict on failure:
+        // starting the app on a plain directory instead would be a silent
+        // downgrade the owner cannot see.
+        match volume_key {
+            Some(key_fut) => {
+                let mounted = async {
+                    let key = key_fut.await.map_err(|e| {
+                        TappError::from(DockerError::ContainerOperationFailed {
+                            operation: "fde_volume_key".to_string(),
+                            reason: format!(
+                                "KMS refused the volume key: {e} — the app's data volume \
+                                 cannot be opened. Is this node registered on-chain for \
+                                 the app (start-app --register-onchain)?"
+                            ),
+                        })
+                    })?;
+                    volume::ensure_mounted(&app_id, &key).await
+                }
+                .await;
+                if let Err(e) = mounted {
+                    tracing::error!(app_id = %app_id, error = %e, "Failed to mount encrypted volume");
+                    self.task_manager.mark_failed(&task_id, format!("{e}")).await;
+                    return;
+                }
+            }
+            None => {
+                warn!(
+                    app_id = %app_id,
+                    "No KMS configured on this node — app data is NOT encrypted at rest"
+                );
+            }
         }
 
         // Try to start the application
@@ -489,9 +539,18 @@ enable_eventlog = true
         self: std::sync::Arc<Self>,
         request: StartAppRequest,
         deployer: String, // EVM address from signature authentication
+        volume_key: Option<VolumeKeyFut>,
     ) -> TappResult<StartAppResponse> {
         // Validate request
         self.validate_request(&request)?;
+
+        // Warn-only (see compose_lint): logged here AND returned in the response,
+        // because a warning only the server log sees protects nobody — the person
+        // who wrote the compose is on the other end of this RPC.
+        let compose_warnings = compose_lint::lint_compose(&request.compose_content);
+        for finding in &compose_warnings {
+            warn!(app_id = %request.app_id, "compose lint: {finding}");
+        }
 
         // Create a new task
         let task = self.task_manager.create_task().await;
@@ -512,7 +571,9 @@ enable_eventlog = true
 
         // Spawn background task
         tokio::spawn(async move {
-            service._start_app(request, deployer, task_id_clone).await;
+            service
+                ._start_app(request, deployer, task_id_clone, volume_key)
+                .await;
         });
 
         Ok(StartAppResponse {
@@ -520,6 +581,7 @@ enable_eventlog = true
             message: format!("Task created successfully. Use task_id to check status."),
             task_id: task_id,
             timestamp: crate::utils::current_timestamp(),
+            compose_warnings,
         })
     }
 
@@ -714,7 +776,12 @@ enable_eventlog = true
         // Mark measurement as success or failure based on result
         let final_measurement = match &result {
             Ok(_) => {
-                // 1. Remove app directory
+                // 1. Remove app directory. The encrypted volume mounted at
+                // <app_dir>/data must detach first or the removal hits EBUSY —
+                // only the mount point is released; the LUKS mapping (and the
+                // key in the kernel) stays open, and the volume's data lives in
+                // the image file on /data, untouched. The next start remounts.
+                volume::unmount(app_id).await?;
                 let app_dir = DockerComposeManager::get_app_dir(app_id);
                 if app_dir.exists() {
                     tokio::fs::remove_dir_all(&app_dir).await.map_err(|e| {
