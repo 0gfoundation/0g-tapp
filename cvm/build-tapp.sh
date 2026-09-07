@@ -138,6 +138,54 @@ NoNewPrivileges=true
 WantedBy=multi-user.target
 EOF
 
+# ---- built-in daemon TLS front (tapp-front) ----
+# Encrypts remote access to the gRPC port: TLS on :50052, self-signed cert generated
+# fresh each boot into /run (tmpfs — the key never persists), proxied to 127.0.0.1:50051.
+# Encryption only, no identity claim: clients connect with `tapp-cli --insecure`. The
+# front's integrity needs no separate attestation — it is part of the measured image,
+# so any app evidence from this node already covers it.
+cat > "$TMPD/tapp-front.service" <<'EOF'
+[Unit]
+Description=TAPP daemon TLS front (nginx, :50052 -> 127.0.0.1:50051)
+After=network.target tapp-server.service
+
+[Service]
+Type=simple
+RuntimeDirectory=tapp-front
+RuntimeDirectoryMode=0700
+ExecStartPre=/usr/bin/openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 \
+  -keyout /run/tapp-front/key.pem -out /run/tapp-front/cert.pem \
+  -days 3650 -nodes -subj /CN=tapp-front
+ExecStart=/usr/sbin/nginx -c /etc/tapp/front.conf -g "daemon off;"
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+cat > "$TMPD/front.conf" <<'EOF'
+# Standalone nginx config for the daemon TLS front (loaded with -c, so the stock
+# /etc/nginx tree and its port-80 default server are never in play).
+pid /run/tapp-front/nginx.pid;
+error_log stderr warn;
+events {}
+http {
+    access_log off;
+    server {
+        # `listen ... http2` (not `http2 on;`): noble ships nginx 1.24, pre-1.25 syntax.
+        listen 50052 ssl http2;
+        ssl_certificate     /run/tapp-front/cert.pem;
+        ssl_certificate_key /run/tapp-front/key.pem;
+        # start-app uploads compose + mount files in one message; don't cap it at
+        # nginx's 1m default. Long-poll RPCs (logs) need the longer read timeout.
+        client_max_body_size 100m;
+        grpc_read_timeout 300s;
+        location / { grpc_pass grpc://127.0.0.1:50051; }
+    }
+}
+EOF
+
 # legacy baked owner: only emit the line when OWNER_ADDRESS was provided
 OWNER_LINE=""
 [ -n "$OWNER_ADDRESS" ] && OWNER_LINE="owner_address = \"$OWNER_ADDRESS\""
@@ -152,6 +200,11 @@ format = "pretty"
 file_path = "/data/log/tapp/"
 
 [server]
+# Explicit: tapp-server ≥0.7.1 defaults to loopback. A node must stay reachable
+# on TCP — teeUrl points here, and evidence fetching (scan, verify-app) and the
+# remote claim/bring-up flow all depend on it. The port stays plaintext; key
+# material is socket-only, and remote encryption is a reverse proxy's job.
+bind_address = "0.0.0.0:50051"
 # Serve the gRPC service on this Unix domain socket in addition to TCP.
 # App containers bind-mount this file and set their tapp socket path to it.
 unix_socket_path = "/run/tapp/tapp.sock"
@@ -202,9 +255,13 @@ if [ -n "${DOCKER_VERSION:-}" ]; then
 else
   DOCKER_PKGS="docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin"
 fi
-apt-get install -y libtdx-attest $DOCKER_PKGS
+apt-get install -y libtdx-attest nginx-core $DOCKER_PKGS
+# nginx is driven solely by tapp-front.service with its own config; the stock unit
+# (port-80 default server) must never run.
+systemctl disable --now nginx || true
+systemctl mask nginx || true
 mkdir -p /var/log/tapp
-systemctl enable docker tapp-server
+systemctl enable docker tapp-server tapp-front
 
 # br_netfilter: container bridge networking with iptables -- and Docker 28's icc=false bridges (used
 # by the 0g-sandbox runner) -- hard-require /proc/sys/net/bridge/bridge-nf-call-iptables, which only
@@ -493,8 +550,10 @@ virt-customize -a "$IN" \
   --upload "$TMPD/tapp-server":/usr/local/bin/tapp-server \
   --chmod 0755:/usr/local/bin/tapp-server \
   --upload "$TMPD/tapp-server.service":/etc/systemd/system/tapp-server.service \
+  --upload "$TMPD/tapp-front.service":/etc/systemd/system/tapp-front.service \
   --mkdir /etc/tapp \
   --upload "$TMPD/config.toml":/etc/tapp/config.toml \
+  --upload "$TMPD/front.conf":/etc/tapp/front.conf \
   --mkdir /etc/systemd/resolved.conf.d \
   --upload "$TMPD/99-fallback-dns.conf":/etc/systemd/resolved.conf.d/99-fallback-dns.conf \
   --run "$TMPD/provision-base.sh"

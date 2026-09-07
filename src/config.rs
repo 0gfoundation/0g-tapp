@@ -110,7 +110,9 @@ impl TlsKeySource {
 /// Server configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
-    /// Bind address for gRPC server (used when unix_socket_path is not set)
+    /// Bind address for the plaintext gRPC listener. Defaults to loopback; for
+    /// remote access put a TLS-terminating reverse proxy in front rather than
+    /// exposing this port, or set 0.0.0.0 explicitly to accept remote plaintext.
     #[serde(default = "default_bind_address")]
     pub bind_address: String,
 
@@ -262,7 +264,10 @@ fn default_socket_mode() -> String {
 }
 
 fn default_bind_address() -> String {
-    "0.0.0.0:50051".to_string()
+    // Loopback by default: the gRPC port is plaintext, so exposing it beyond the
+    // host is an explicit choice (set bind_address = "0.0.0.0:50051"), normally
+    // made by putting a TLS-terminating proxy in front instead.
+    "127.0.0.1:50051".to_string()
 }
 
 fn default_max_connections() -> usize {

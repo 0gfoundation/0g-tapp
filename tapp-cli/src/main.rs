@@ -13,9 +13,15 @@ use tapp_common::proto::{
 };
 use tonic::{metadata::MetadataValue, Request};
 
+/// Whether --insecure was passed: https connections skip certificate validation.
+/// A global because `server` is threaded through every command as a bare &str and
+/// this flag travels with it everywhere.
+static INSECURE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
 /// Create a gRPC client from a server address.
 /// Supports:
-/// - TCP: `http://host:port`
+/// - TCP: `http://host:port` (plaintext) or `https://host:port` (TLS; the certificate
+///   is validated against the system CA roots unless --insecure is given)
 /// - Unix socket: `/path/to/socket` or `unix:///path/to/socket`
 async fn create_client(
     server: &str,
@@ -45,7 +51,17 @@ async fn create_client(
             }))
             .await?;
         TappServiceClient::new(channel)
+    } else if server.starts_with("https://") && *INSECURE.get().unwrap_or(&false) {
+        // Encryption without authentication: any certificate is accepted. An empty
+        // pin set is that mode's spelling in pinned_tls (same channel verify-app
+        // uses toward an AS it has no pin for).
+        let channel = tapp_common::pinned_tls::grpc_channel(server, Vec::new())
+            .await
+            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+        TappServiceClient::new(channel)
     } else {
+        // http:// stays plaintext; https:// gets TLS with system-CA validation
+        // (tonic's tls-roots feature keys off the URL scheme).
         TappServiceClient::connect(server.to_string()).await?
     };
 
@@ -82,9 +98,14 @@ async fn warn_if_incompatible(mut client: TappServiceClient<tonic::transport::Ch
 #[command(about = "TAPP Service CLI - Interact with TAPP gRPC server", long_about = None)]
 #[command(version)]
 struct Cli {
-    /// gRPC server address (TCP: http://host:port, Unix: /path/to/socket or unix:///path)
+    /// gRPC server address (TCP: http://host:port or https://host:port, Unix: /path/to/socket or unix:///path)
     #[arg(short, long, default_value = "http://127.0.0.1:50051", global = true)]
     server: String,
+
+    /// Skip TLS certificate validation on https:// servers (encrypted but
+    /// unauthenticated, like curl -k). For self-signed certificates.
+    #[arg(long, global = true)]
+    insecure: bool,
 
     /// Private key for authentication (can also use TAPP_PRIVATE_KEY env var)
     #[arg(short = 'k', long, global = true)]
@@ -689,6 +710,7 @@ enum Commands {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut cli = Cli::parse();
+    let _ = INSECURE.set(cli.insecure);
 
     // Handle environment variables for private_key if not provided
     if cli.private_key.is_none() {
