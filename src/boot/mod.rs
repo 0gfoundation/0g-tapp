@@ -643,17 +643,12 @@ enable_eventlog = true
         signer_eth_address: &[u8],
         tls_public_key: Option<String>,
     ) -> TappResult<GetEvidenceResponse> {
-        // Get app_id from request
+        // Get app_id from request. EMPTY IS VALID: it asks for the node's own
+        // evidence — the common signer plus the :50052 TLS key hash — which is
+        // what exists before any app does, and what a client pins the management
+        // channel against. Only a non-empty app_id must name a deployed app.
         let app_id = request.app_id;
-        if app_id.is_empty() {
-            return Err(TappError::InvalidParameter {
-                field: "app_id".to_string(),
-                reason: "app_id cannot be empty".to_string(),
-            });
-        }
-
-        // Ensure app exists
-        {
+        if !app_id.is_empty() {
             let app_info_lock = self.app_info.lock().await;
             if !app_info_lock.contains_key(&app_id) {
                 return Err(TappError::InvalidParameter {

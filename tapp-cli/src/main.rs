@@ -286,8 +286,10 @@ enum Commands {
 
     /// Get attestation evidence for an application
     GetEvidence {
-        /// Application ID
-        #[arg(short, long)]
+        /// Application ID. Omit (server ≥0.8.0) for the NODE's own evidence:
+        /// the common signer plus the :50052 TLS key hash — fetch it, verify the
+        /// quote, and the tls_public_key inside is a trustworthy --tls-pin.
+        #[arg(short, long, default_value = "")]
         app_id: String,
 
         /// Challenge, hex, up to 64 bytes. The server echoes it into report_data, which

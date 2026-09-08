@@ -78,6 +78,10 @@ tapp-cli -s <teeUrl> get-evidence --app-id <APP_ID> --nonce $(openssl rand -hex 
 ```
 
 - signer 不持久化：tapp server 重启会重新派生、地址变；链上要用 `update-node-onchain` 同步。
+- **节点级证据（≥0.8.0）**：`--app-id` 省略（空）返回**节点本身**的证据——signer 是节点的
+  common signer（每次启动生成，所有 app signer 由它派生），`runtime_data.tls_public_key`
+  是 :50052 管理口 TLS key 的 SPKI sha256。用途：验完 quote 后拿它做 `--tls-pin`，
+  管理通道即可防主动中间人，且不需要任何带外分发。验证流程与 app 证据完全相同。
 
 ### `report_data` 的结构（v0.4.0+）
 

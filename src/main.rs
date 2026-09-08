@@ -184,6 +184,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let layer = ServiceBuilder::new().layer(auth_layer).into_inner();
 
+    // The node's TLS identity, derived from the common signer and registered under
+    // the empty app_id BEFORE the service is consumed — GetEvidence with no app_id
+    // then reports its key hash, which is what makes the :50052 listener pinnable
+    // against attested evidence.
+    let node_tls = service
+        .ensure_node_tls_identity()
+        .await
+        .map_err(|e| format!("node TLS identity: {e}"))?;
+
     let grpc = TappServiceServer::new(service);
 
     // Always serve TCP on bind_address. When unix_socket_path is set, ADDITIONALLY
@@ -217,8 +226,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let tls_listener = tokio::net::TcpListener::bind(tls_addr)
             .await
             .map_err(|e| format!("cannot bind tls listener {tls_addr}: {e}"))?;
-        let (cert_pem, key_pem) = tapp_server::tls_cert::boot_identity()?;
-        let identity = tonic::transport::Identity::from_pem(cert_pem, key_pem);
+        // Derived from the common signer, not random: GetEvidence (no app_id)
+        // attests this key's hash, so clients can bootstrap a pin from evidence.
+        let identity =
+            tonic::transport::Identity::from_pem(&node_tls.cert_pem, &node_tls.key_pem);
         let tls_server = Server::builder()
             .tls_config(tonic::transport::ServerTlsConfig::new().identity(identity))
             .map_err(|e| format!("tls config: {e}"))?

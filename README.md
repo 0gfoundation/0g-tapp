@@ -327,12 +327,13 @@ Create a `config.toml` file:
 # become readable on the network path.
 bind_address = "127.0.0.1:50051"
 
-# The same gRPC service behind TLS (self-signed cert, regenerated in memory on
-# every start). Remote clients use `tapp-cli -s https://<host>:50052 --insecure`
-# — encrypted but unauthenticated: this defeats passive observers, while an
-# active on-path attacker can still terminate and relay. Pin the peer with
-# `--tls-pin` or use a CA-issued front when that matters; node identity for
-# third parties comes from attestation either way. Set to "" to disable.
+# The same gRPC service behind TLS. The key derives from the node's COMMON
+# signer (per boot), and `get-evidence` with no app_id returns node evidence
+# whose runtime_data.tls_public_key is this key's SPKI sha256 — so a client can
+# bootstrap a pin from attested evidence over any channel:
+#   tapp-cli -s https://<host>:50052 --insecure get-evidence   # verify quote,
+#   tapp-cli -s https://<host>:50052 --tls-pin 0x<tls_public_key> …
+# `--insecure` alone encrypts but defeats passive observers only. "" disables.
 tls_bind_address = "0.0.0.0:50052"
 
 # Recommended. Listened on IN ADDITION to bind_address, and the only transport that

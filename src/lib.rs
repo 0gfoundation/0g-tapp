@@ -317,6 +317,33 @@ impl TappServiceImpl {
         Ok((source, secret))
     }
 
+    /// The node's own TLS identity: key derived from the COMMON signer (always
+    /// local — it must exist before any claim, chain, or KMS is reachable),
+    /// cached under the empty app_id so `GetEvidence` with no app_id reports its
+    /// public key hash in report_data. That binding is what lets a client pin
+    /// the :50052 management channel against attested evidence.
+    pub async fn ensure_node_tls_identity(&self) -> Result<Arc<tls_cert::TlsIdentity>, Status> {
+        if let Some(id) = self.tls_identities.lock().await.get("") {
+            return Ok(id.clone());
+        }
+        let common_key = self
+            .app_key_service
+            .get_private_key("")
+            .await
+            .map_err(|e| Status::internal(format!("common signer: {}", e)))?;
+        let secret = tls_cert::derive_from_signer(&common_key);
+        let id = Arc::new(
+            tls_cert::build("", &secret, "local", None)
+                .await
+                .map_err(|e| Status::internal(format!("{}", e)))?,
+        );
+        self.tls_identities
+            .lock()
+            .await
+            .insert(String::new(), id.clone());
+        Ok(id)
+    }
+
     /// The TLS public key hash to put in `report_data`, if one has been derived.
     ///
     /// Absent means no TLS key exists yet for this app — not that one is being withheld.
