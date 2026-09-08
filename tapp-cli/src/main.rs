@@ -13,9 +13,36 @@ use tapp_common::proto::{
 };
 use tonic::{metadata::MetadataValue, Request};
 
+/// Whether --insecure was passed: https connections skip certificate validation.
+/// A global because `server` is threaded through every command as a bare &str and
+/// this flag travels with it everywhere.
+static INSECURE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// --tls-pin, normalized to lowercase hex: the server's SPKI sha256 to require.
+static TLS_PIN: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
+/// Accept the pin as `sha256//<base64>` (what scan's /cert and curl use) or as
+/// hex (with or without 0x), normalize to the lowercase hex pinned_tls expects.
+fn parse_pin(raw: &str) -> Result<String, String> {
+    use base64::Engine;
+    let hex_pin = if let Some(b64) = raw.strip_prefix("sha256//") {
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .map_err(|e| format!("--tls-pin: bad base64 after sha256//: {e}"))?;
+        hex::encode(bytes)
+    } else {
+        raw.trim_start_matches("0x").to_ascii_lowercase()
+    };
+    if hex_pin.len() != 64 || !hex_pin.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("--tls-pin must be a 32-byte SPKI sha256 (hex or sha256//base64)".into());
+    }
+    Ok(hex_pin)
+}
+
 /// Create a gRPC client from a server address.
 /// Supports:
-/// - TCP: `http://host:port`
+/// - TCP: `http://host:port` (plaintext) or `https://host:port` (TLS; the certificate
+///   is validated against the system CA roots unless --insecure is given)
 /// - Unix socket: `/path/to/socket` or `unix:///path/to/socket`
 async fn create_client(
     server: &str,
@@ -45,7 +72,29 @@ async fn create_client(
             }))
             .await?;
         TappServiceClient::new(channel)
+    } else if server.starts_with("https://")
+        && TLS_PIN.get().map(|p| p.is_some()).unwrap_or(false)
+    {
+        // Pinned: the peer must hold the key whose SPKI sha256 was given. This is
+        // what defeats an ACTIVE on-path attacker — --insecure below only defeats
+        // passive observers.
+        let pin = TLS_PIN.get().unwrap().clone().unwrap();
+        let channel = tapp_common::pinned_tls::grpc_channel(server, vec![pin])
+            .await
+            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+        TappServiceClient::new(channel)
+    } else if server.starts_with("https://") && *INSECURE.get().unwrap_or(&false) {
+        // Encryption without authentication: any certificate is accepted (same
+        // channel verify-app uses toward an AS it has no pin for). Defeats
+        // passive sniffing only — an active man-in-the-middle can terminate and
+        // relay. Use --tls-pin or a CA-issued certificate when that matters.
+        let channel = tapp_common::pinned_tls::grpc_channel(server, Vec::new())
+            .await
+            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+        TappServiceClient::new(channel)
     } else {
+        // http:// stays plaintext; https:// gets TLS with system-CA validation
+        // (tonic's tls-roots feature keys off the URL scheme).
         TappServiceClient::connect(server.to_string()).await?
     };
 
@@ -82,9 +131,22 @@ async fn warn_if_incompatible(mut client: TappServiceClient<tonic::transport::Ch
 #[command(about = "TAPP Service CLI - Interact with TAPP gRPC server", long_about = None)]
 #[command(version)]
 struct Cli {
-    /// gRPC server address (TCP: http://host:port, Unix: /path/to/socket or unix:///path)
+    /// gRPC server address (TCP: http://host:port or https://host:port, Unix: /path/to/socket or unix:///path)
     #[arg(short, long, default_value = "http://127.0.0.1:50051", global = true)]
     server: String,
+
+    /// Skip TLS certificate validation on https:// servers (encrypted but
+    /// unauthenticated, like curl -k). Defeats passive observers only — an
+    /// active on-path attacker can still intercept. Use --tls-pin when that
+    /// matters. For self-signed certificates.
+    #[arg(long, global = true)]
+    insecure: bool,
+
+    /// Require the https:// server's TLS key to match this SPKI sha256
+    /// (hex or sha256//base64, like curl --pinnedpubkey). Pins the peer:
+    /// defeats active man-in-the-middle, no CA involved.
+    #[arg(long, global = true)]
+    tls_pin: Option<String>,
 
     /// Private key for authentication (can also use TAPP_PRIVATE_KEY env var)
     #[arg(short = 'k', long, global = true)]
@@ -224,8 +286,10 @@ enum Commands {
 
     /// Get attestation evidence for an application
     GetEvidence {
-        /// Application ID
-        #[arg(short, long)]
+        /// Application ID. Omit (server ≥0.8.0) for the NODE's own evidence:
+        /// the common signer plus the :50052 TLS key hash — fetch it, verify the
+        /// quote, and the tls_public_key inside is a trustworthy --tls-pin.
+        #[arg(short, long, default_value = "")]
         app_id: String,
 
         /// Challenge, hex, up to 64 bytes. The server echoes it into report_data, which
@@ -689,6 +753,15 @@ enum Commands {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut cli = Cli::parse();
+    let _ = INSECURE.set(cli.insecure);
+    let pin = match cli.tls_pin.as_deref().map(parse_pin).transpose() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(2);
+        }
+    };
+    let _ = TLS_PIN.set(pin);
 
     // Handle environment variables for private_key if not provided
     if cli.private_key.is_none() {

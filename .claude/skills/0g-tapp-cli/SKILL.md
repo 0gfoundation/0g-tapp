@@ -1,7 +1,7 @@
 ---
 name: 0g-tapp-cli
 description: Use this skill when the user wants to deploy, manage, or troubleshoot applications on a 0G Tapp (Trusted Application Platform) server using tapp-cli. Covers start/stop apps, on-chain registration, registry login, check task status, view logs, and manage docker compose deployments across multiple remote TEE servers.
-version: 1.9.0
+version: 1.11.0
 author: 0G Labs
 tags: [0g, tapp, tee, docker, deployment, cli, onchain]
 ---
@@ -14,8 +14,15 @@ Deploy and manage containerized applications on 0G Tapp TEE servers using `tapp-
 
 - **tapp-cli binary**: `/usr/local/bin/tapp-cli`
 - **Server**: `-s <url>` (e.g. `http://<host>:50051`). There are MANY tapp servers; always pass `-s` explicitly.
+  - `https://` works too (tapp-cli ≥0.8.0): certificate checked against system CAs; add `--insecure` (long-only — `-k` is taken) for a self-signed cert, which encrypts but does not authenticate.
+  - tapp-server ≥0.8.0 serves a **native TLS listener on :50052** (`[server] tls_bind_address`, per-boot in-memory self-signed cert): `https://<host>:50052 --insecure` is the encrypted management path from first boot. Prefer it over plaintext :50051 for anything remote — docker-login sends a registry token, start-app sends env/mount secrets. IP or domain in the URL both work (the cert is never read).
+  - Honest limits: `--insecure` defeats **passive observers only** — an active on-path attacker can terminate TLS and relay, and (since request signatures cover method+timestamp, not the body: 0g-tapp#112) even rewrite request contents under a valid authorization. When that matters, pin the peer with `--tls-pin <SPKI sha256, hex or sha256//base64>`.
+  - **Getting a trustworthy pin needs no out-of-band channel** (server ≥0.8.0): the node has a **common signer** (generated per boot; every app signer derives from it), the :50052 TLS key derives from it too, and `get-evidence` **without --app-id** returns the node's own evidence whose `runtime_data.tls_public_key` is that key's SPKI sha256 — Intel-signed, so it survives a hostile channel. Flow: `get-evidence` (any channel) → verify the quote → `--tls-pin 0x<tls_public_key>` for all management calls. A MITM can relay evidence but cannot forge the key inside it, and its own cert then fails the pin.
+  - Two limits of that bootstrap: (1) it proves "a genuine TDX node with this measurement", **not** "the node at this address" — an attacker running their own genuine node could redirect you to it; it defends interception, not redirection (on-chain anchoring of the common signer is the follow-up). (2) The pin is **boot-scoped**: a node reboot rotates the common signer and the TLS key with it, so a stale pin fails closed — re-fetch evidence after any reboot.
+  - tapp-server ≥0.7.1 defaults `bind_address` to **loopback** when the config omits it. CVM images bake an explicit `0.0.0.0:50051` (teeUrl/evidence fetching and remote claim need it), so image nodes are unaffected — the loopback default bites hand-rolled configs. "Connection refused from outside, works on the host" means the config omits `bind_address`.
 - **Auth**: private key via `-k` flag or `TAPP_PRIVATE_KEY` env var. Read-only commands (`get-tapp-info`, `get-service-status`, `get-app-info`, `get-app-key`, `get-evidence`, `list-apps`, `verify-app` direct mode) work without `-k`; owner-only commands require it.
 - **TappRegistry (testnet)**: proxy `0x2Ce80374318B1d7Fb3345724457a182E0ad165c9`, RPC `https://evmrpc-testnet.0g.ai`, chainId `16602`. See `contract/CONTRACTS.md`.
+- **TappRegistry (mainnet)**: proxy `0x54874F536301c993922Dd95097e3902e7FBfe612`, RPC `https://evmrpc.0g.ai`, chainId `16661`. Min stake **10 OG**, withdraw lock 7 days. Upgrades go through a 1-day TimelockController (`0xD070792b1dB64F858ACE3E5443f2d21c0edE0BAc`) — see `contract/CONTRACTS.md`.
   - An older deployment `0x95a0BF4148b30F6F8D86870534c51df46Da5511c` is **superseded** — no `version()`, and `getNode` returns 3 fields instead of 5. Some long-lived apps (testnet sandbox provider / attestor) are still registered there, so you may still have to query it; just don't put anything new on it. Tell them apart with `cast call <proxy> "version()(string)"` — `"0.1.0"` = current, revert = old.
 - **Short flags**: `-s` = `--server` and `-k` = `--private-key` (both global). The earlier `-s` collision is **fixed** — the formerly-clashing subcommand flags (`--stake-wei`, `--service`, `--service-name`, `--signature`, `--chain-id`) are long-only now, so `-s` always means `--server`.
 
@@ -249,6 +256,7 @@ Each app gets its **own encrypted volume** (LUKS; key derived per-app by the KMS
 - **KMS gate**: on a KMS-configured server, start **fails** if the volume key can't be fetched — no silent plaintext downgrade. The app must be registered on-chain first (`--register-onchain` handles ordering), and the server must trust a verifier for the KMS's self-signed TLS (`update-trust-anchors --scan-url --scan-pubkey`, or `claim-config` with those flags). No KMS configured at all → plaintext dir + warning.
 - `stop-app` leaves the volume open (key stays in the kernel); a CVM reboot locks everything; data survives because a registered node re-derives the same key. Volume file: `/data/tapp/volumes/<app_id>.img` (sparse — apparent size = whole disk, real usage = real writes).
 - Migration of plaintext data into the volume: `stop-app` → copy into `<app_dir>/data/` (volume stays mounted) → `start-app`.
+- **Per-app data mode** (server ≥0.8.0): compose top-level `x-tapp: {data: encrypted|plain|ram|scratch}` (absent = encrypted). `plain` = persistent plaintext dir on /data — for self-protecting data, canonically the KMS's own sealed share (breaks the KMS↔FDE bootstrap circle). `ram` = TEE-secret, gone on reboot, eats RAM. `scratch` = LUKS keyed from the app signer per boot — disk-sized secret cache, auto-wiped+recreated when the key rotates. The declaration rides the compose → hashed on-chain, third-party visible. Switching modes never migrates data (old volume/dir left in place, app starts empty). Typo → start-app refused with `x-tapp.data must be one of…`.
 
 ## Troubleshooting — common errors
 

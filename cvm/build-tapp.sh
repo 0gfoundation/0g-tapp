@@ -138,6 +138,10 @@ NoNewPrivileges=true
 WantedBy=multi-user.target
 EOF
 
+# NOTE: remote management encryption is served by tapp-server itself (>=0.8.0):
+# a TLS listener on :50052 with a per-boot in-memory self-signed cert
+# (config [server] tls_bind_address). No proxy is baked into the image.
+
 # legacy baked owner: only emit the line when OWNER_ADDRESS was provided
 OWNER_LINE=""
 [ -n "$OWNER_ADDRESS" ] && OWNER_LINE="owner_address = \"$OWNER_ADDRESS\""
@@ -152,6 +156,11 @@ format = "pretty"
 file_path = "/data/log/tapp/"
 
 [server]
+# Explicit: tapp-server ≥0.7.1 defaults to loopback. A node must stay reachable
+# on TCP — teeUrl points here, and evidence fetching (scan, verify-app) and the
+# remote claim/bring-up flow all depend on it. The port stays plaintext; key
+# material is socket-only, and remote encryption is a reverse proxy's job.
+bind_address = "0.0.0.0:50051"
 # Serve the gRPC service on this Unix domain socket in addition to TCP.
 # App containers bind-mount this file and set their tapp socket path to it.
 unix_socket_path = "/run/tapp/tapp.sock"

@@ -110,9 +110,19 @@ impl TlsKeySource {
 /// Server configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
-    /// Bind address for gRPC server (used when unix_socket_path is not set)
+    /// Bind address for the plaintext gRPC listener. Defaults to loopback; for
+    /// remote access put a TLS-terminating reverse proxy in front rather than
+    /// exposing this port, or set 0.0.0.0 explicitly to accept remote plaintext.
     #[serde(default = "default_bind_address")]
     pub bind_address: String,
+
+    /// TLS gRPC listener: the same service behind a self-signed certificate
+    /// generated fresh (in memory) on every start. Encryption without
+    /// authentication — clients connect with `tapp-cli --insecure`; node
+    /// identity is established by attestation, not this certificate. Empty
+    /// string disables the listener.
+    #[serde(default = "default_tls_bind_address")]
+    pub tls_bind_address: String,
 
     /// Unix socket path for gRPC server. When set, the server listens on this
     /// Unix domain socket IN ADDITION TO the TCP `bind_address` (not instead of it),
@@ -262,7 +272,14 @@ fn default_socket_mode() -> String {
 }
 
 fn default_bind_address() -> String {
-    "0.0.0.0:50051".to_string()
+    // Loopback by default: the gRPC port is plaintext, so exposing it beyond the
+    // host is an explicit choice (set bind_address = "0.0.0.0:50051"), normally
+    // made by putting a TLS-terminating proxy in front instead.
+    "127.0.0.1:50051".to_string()
+}
+
+fn default_tls_bind_address() -> String {
+    "0.0.0.0:50052".to_string()
 }
 
 fn default_max_connections() -> usize {
@@ -336,6 +353,7 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             bind_address: default_bind_address(),
+            tls_bind_address: default_tls_bind_address(),
             unix_socket_mode: default_socket_mode(),
             unix_socket_gid: None,
             unix_socket_path: None,

@@ -33,6 +33,66 @@ fn image_path(app_id: &str) -> PathBuf {
     PathBuf::from(VOLUME_DIR).join(format!("{app_id}.img"))
 }
 
+/// Where plain-mode data directories live: persistent, unencrypted — the disk
+/// holder can read them, which is exactly what `data: plain` consents to.
+const PLAIN_DIR: &str = "/data/tapp/plain";
+
+/// Scratch volumes: LUKS on /data keyed by a per-boot key that lives only in
+/// /run (tmpfs). Reboot loses the key; the unopenable volume is wiped and
+/// recreated. Disk-sized, TEE-secret, boot-scoped.
+const SCRATCH_KEY_PATH: &str = "/run/tapp/scratch.key";
+
+fn scratch_image_path(app_id: &str) -> PathBuf {
+    PathBuf::from(VOLUME_DIR).join(format!("{app_id}.scratch.img"))
+}
+
+fn scratch_mapper_name(app_id: &str) -> String {
+    format!("tapp-scratch-{app_id}")
+}
+
+/// How an app wants its `./data` directory provided, declared in its compose
+/// under the top-level `x-tapp: {data: ...}` extension (compose ignores `x-`
+/// keys). The declaration is part of the compose content, so it is hashed,
+/// registered on-chain and measured like everything else about the app.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DataMode {
+    /// LUKS volume on /data, key derived by the KMS. Persistent + secret. Default.
+    Encrypted,
+    /// Plain directory on /data. Persistent, readable by whoever holds the disk —
+    /// for data that protects itself (a TEE-sealed share) or is public anyway.
+    Plain,
+    /// Plain directory on the RAM rootfs. Secret (TEE memory) but gone on reboot
+    /// and counted against RAM.
+    Ram,
+    /// LUKS volume on /data with a per-boot key. Secret and disk-sized, gone on
+    /// reboot (the key evaporates with /run; the volume is then recreated).
+    Scratch,
+}
+
+/// Read the app's declared data mode out of its compose. Absent → Encrypted.
+/// An unknown value is refused loudly: silently falling back to Encrypted would
+/// give the app a different storage lifetime than its compose claims.
+pub fn data_mode(compose: &str) -> Result<DataMode, String> {
+    let doc: serde_yaml::Value = match serde_yaml::from_str(compose) {
+        Ok(v) => v,
+        // Unparseable compose fails later, with a better error than this one.
+        Err(_) => return Ok(DataMode::Encrypted),
+    };
+    let Some(mode) = doc.get("x-tapp").and_then(|t| t.get("data")) else {
+        return Ok(DataMode::Encrypted);
+    };
+    match mode.as_str() {
+        Some("encrypted") => Ok(DataMode::Encrypted),
+        Some("plain") => Ok(DataMode::Plain),
+        Some("ram") => Ok(DataMode::Ram),
+        Some("scratch") => Ok(DataMode::Scratch),
+        other => Err(format!(
+            "x-tapp.data must be one of encrypted|plain|ram|scratch, got {:?}",
+            other.unwrap_or("<non-string>")
+        )),
+    }
+}
+
 /// Device-mapper name for an app's open volume. app_id is [A-Za-z0-9_-] (see
 /// utils::validate_app_id), so no escaping is needed.
 fn mapper_name(app_id: &str) -> String {
@@ -139,6 +199,10 @@ fn nix_statvfs(path: &str) -> TappResult<u64> {
 /// (crash between format and mkfs, an already-mounted leftover from a previous
 /// tapp-server process) is repaired on the next call rather than wedging the app.
 pub async fn ensure_mounted(app_id: &str, key: &[u8]) -> TappResult<()> {
+    ensure_luks(app_id, &image_path(app_id), &mapper_name(app_id), key).await
+}
+
+async fn ensure_luks(app_id: &str, img: &PathBuf, mapper: &str, key: &[u8]) -> TappResult<()> {
     let mount_point = super::manager::DockerComposeManager::get_app_dir(app_id).join("data");
     tokio::fs::create_dir_all(&mount_point)
         .await
@@ -153,7 +217,6 @@ pub async fn ensure_mounted(app_id: &str, key: &[u8]) -> TappResult<()> {
     tokio::fs::create_dir_all(VOLUME_DIR)
         .await
         .map_err(|e| err(format!("failed to create {VOLUME_DIR}: {e}")))?;
-    let img = image_path(app_id);
     let img_str = img.to_string_lossy().to_string();
 
     if !img.exists() {
@@ -205,16 +268,16 @@ pub async fn ensure_mounted(app_id: &str, key: &[u8]) -> TappResult<()> {
         info!(app_id, "LUKS-formatted volume image");
     }
 
-    let mapper = mapper_path(app_id);
-    if !mapper.exists() {
+    let mapper_dev = PathBuf::from("/dev/mapper").join(mapper);
+    if !mapper_dev.exists() {
         run(
             "cryptsetup",
-            &["open", "--key-file", "-", &loop_dev, &mapper_name(app_id)],
+            &["open", "--key-file", "-", &loop_dev, mapper],
             Some(key_hex.as_bytes()),
         )
         .await?;
     }
-    let mapper_str = mapper.to_string_lossy().to_string();
+    let mapper_str = mapper_dev.to_string_lossy().to_string();
 
     // blkid exits non-zero when it finds no signature — i.e. a freshly formatted
     // (or mkfs-interrupted) volume that still needs a filesystem.
@@ -225,6 +288,178 @@ pub async fn ensure_mounted(app_id: &str, key: &[u8]) -> TappResult<()> {
 
     run("mount", &[&mapper_str, &mount_point_str], None).await?;
     info!(app_id, mount = %mount_point_str, "encrypted volume mounted");
+    Ok(())
+}
+
+/// The LUKS passphrase for an app's scratch volume, derived from the app's
+/// signer. Domain-separated and one-way, same reasoning as
+/// `tls_cert::derive_from_signer`. The signer re-derives on restart, which IS
+/// the scratch lifetime: a new signer cannot open the old volume, and
+/// `ensure_scratch` then wipes and recreates it. No state is stored anywhere.
+pub fn scratch_key_from_signer(signer_private_key: &[u8]) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b"tapp-scratch-v1");
+    h.update(signer_private_key);
+    h.finalize().to_vec()
+}
+
+/// Open (creating if necessary) the app's scratch volume: LUKS on /data, keyed
+/// per boot. A volume this key cannot open is the expected corpse of a previous
+/// boot and is wiped and recreated — but ONLY on a proven key mismatch. Every
+/// other failure (mount EBUSY, ENOSPC, tooling errors) propagates and stays
+/// retryable: wiping on those would destroy a volume that was merely busy, and
+/// wiping while its mapper is still open would leave the app running on a
+/// deleted backing file.
+pub async fn ensure_scratch(app_id: &str, key: &[u8]) -> TappResult<()> {
+    let img = scratch_image_path(app_id);
+    let mapper = scratch_mapper_name(app_id);
+
+    // An open mapper means a key already unlocked this volume during this boot;
+    // the stale-key question does not arise. Only a closed LUKS image gets the
+    // key test.
+    let mapper_open = PathBuf::from("/dev/mapper").join(&mapper).exists();
+    if !mapper_open && img.exists() {
+        let img_str = img.to_string_lossy().to_string();
+        // Reuse a crash-leftover attachment, as ensure_luks does.
+        let existing = run("losetup", &["-j", &img_str], None).await?;
+        let existing = String::from_utf8_lossy(&existing);
+        let loop_dev = match existing.split(':').next().filter(|s| !s.is_empty()) {
+            Some(dev) => dev.trim().to_string(),
+            None => {
+                let out = run("losetup", &["--find", "--show", &img_str], None).await?;
+                String::from_utf8_lossy(&out).trim().to_string()
+            }
+        };
+        let key_hex = hex::encode(key);
+        let is_luks = quiet_success("cryptsetup", &["isLuks", &loop_dev]).await;
+        let stale = if !is_luks {
+            true // interrupted format: nothing readable to preserve
+        } else {
+            // Exact gate: cryptsetup exit code 2 means "no key available with
+            // this passphrase" — the one condition that licenses a wipe. Any
+            // other failure (tooling, IO) propagates and stays retryable.
+            let status = {
+                let mut cmd = Command::new(resolve("cryptsetup"));
+                cmd.args(["open", "--test-passphrase", "--key-file", "-", &loop_dev])
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null());
+                let mut child = cmd
+                    .spawn()
+                    .map_err(|e| err(format!("failed to spawn cryptsetup: {e}")))?;
+                let mut handle = child.stdin.take().expect("stdin was piped");
+                handle
+                    .write_all(key_hex.as_bytes())
+                    .await
+                    .map_err(|e| err(format!("failed to write cryptsetup stdin: {e}")))?;
+                drop(handle);
+                child
+                    .wait()
+                    .await
+                    .map_err(|e| err(format!("failed to wait for cryptsetup: {e}")))?
+            };
+            match status.code() {
+                Some(0) => false,
+                Some(2) => true,
+                other => {
+                    return Err(err(format!(
+                        "cryptsetup --test-passphrase failed with exit {:?} — not a key \
+                         mismatch, refusing to wipe; retry the start",
+                        other
+                    ))
+                    .into())
+                }
+            }
+        };
+        // Tear down completely — detach first, unlink second — then recreate below.
+        if stale {
+            tracing::warn!(
+                app_id,
+                "scratch volume not openable with this boot's key — wiping and recreating"
+            );
+            run("losetup", &["-d", &loop_dev], None).await?;
+            tokio::fs::remove_file(&img)
+                .await
+                .map_err(|e| err(format!("failed to remove stale scratch image: {e}")))?;
+        }
+    }
+
+    ensure_luks(app_id, &img, &mapper, key).await
+}
+
+/// Point `<app_dir>/data` at a plain, persistent directory on /data. The app
+/// declared `data: plain`: readable by whoever holds the disk, survives reboots
+/// — and, like the encrypted image files, `/data/tapp/plain/<app_id>` is left
+/// in place forever after stop-app, so the data is there for a later start.
+pub async fn ensure_plain(app_id: &str) -> TappResult<()> {
+    let target = PathBuf::from(PLAIN_DIR).join(app_id);
+    let app_dir = super::manager::DockerComposeManager::get_app_dir(app_id);
+    link_data_dir(&app_dir.join("data"), &target).await?;
+    info!(app_id, target = %target.display(), "plain persistent data directory linked");
+    Ok(())
+}
+
+/// Make `link` a symlink to `target` (created if missing), replacing only what
+/// can be replaced without losing data: a stale symlink, an EMPTY directory, or
+/// a stray file. A non-empty directory is refused — it is data under another
+/// mode, and shadowing it silently would look like data loss.
+async fn link_data_dir(link: &std::path::Path, target: &std::path::Path) -> TappResult<()> {
+    tokio::fs::create_dir_all(target)
+        .await
+        .map_err(|e| err(format!("failed to create {}: {e}", target.display())))?;
+    if let Some(parent) = link.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| err(format!("failed to create {}: {e}", parent.display())))?;
+    }
+    match tokio::fs::symlink_metadata(&link).await {
+        Ok(md) if md.file_type().is_symlink() => {
+            if tokio::fs::read_link(&link).await.ok().as_deref() == Some(target) {
+                return Ok(());
+            }
+            tokio::fs::remove_file(&link)
+                .await
+                .map_err(|e| err(format!("failed to replace stale data symlink: {e}")))?;
+        }
+        Ok(md) if md.is_dir() => {
+            tokio::fs::remove_dir(&link).await.map_err(|e| {
+                err(format!(
+                    "{} exists and is not empty — it holds data from another data \
+                     mode; move it aside before switching to plain: {e}",
+                    link.display()
+                ))
+            })?;
+        }
+        Ok(_) => {
+            tokio::fs::remove_file(&link)
+                .await
+                .map_err(|e| err(format!("failed to remove stray data file: {e}")))?;
+        }
+        Err(_) => {}
+    }
+    tokio::fs::symlink(target, link)
+        .await
+        .map_err(|e| err(format!("failed to symlink {}: {e}", link.display())))?;
+    Ok(())
+}
+
+/// Provide `<app_dir>/data` as a plain directory on the RAM rootfs: secret (TEE
+/// memory), gone on reboot, counted against RAM. Chosen via `data: ram`, and
+/// also the downgrade target when encryption was expected but no KMS is
+/// configured (the caller logs that distinction).
+pub async fn ensure_ram(app_id: &str) -> TappResult<()> {
+    let link = super::manager::DockerComposeManager::get_app_dir(app_id).join("data");
+    if let Ok(md) = tokio::fs::symlink_metadata(&link).await {
+        if md.file_type().is_symlink() {
+            tokio::fs::remove_file(&link)
+                .await
+                .map_err(|e| err(format!("failed to remove stale data symlink: {e}")))?;
+        }
+    }
+    tokio::fs::create_dir_all(&link)
+        .await
+        .map_err(|e| err(format!("failed to create {}: {e}", link.display())))?;
     Ok(())
 }
 
@@ -245,6 +480,88 @@ pub async fn unmount(app_id: &str) -> TappResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn data_mode_defaults_to_encrypted_and_rejects_unknown_values() {
+        // No declaration, no x-tapp at all → encrypted.
+        assert_eq!(data_mode("services: {}").unwrap(), DataMode::Encrypted);
+        // Unrelated x-tapp keys don't disturb the default.
+        assert_eq!(
+            data_mode("x-tapp: {other: 1}\nservices: {}").unwrap(),
+            DataMode::Encrypted
+        );
+        for (decl, want) in [
+            ("encrypted", DataMode::Encrypted),
+            ("plain", DataMode::Plain),
+            ("ram", DataMode::Ram),
+            ("scratch", DataMode::Scratch),
+        ] {
+            let compose = format!("x-tapp:\n  data: {decl}\nservices: {{}}");
+            assert_eq!(data_mode(&compose).unwrap(), want, "mode {decl}");
+        }
+        // A typo must be refused, not silently mapped to some mode: the compose
+        // is the on-chain claim of the app's storage semantics.
+        assert!(data_mode("x-tapp: {data: palin}\nservices: {}").is_err());
+        assert!(data_mode("x-tapp: {data: 3}\nservices: {}").is_err());
+        // Broken YAML is not this check's problem; it fails later with a better error.
+        assert_eq!(data_mode(": : :").unwrap(), DataMode::Encrypted);
+    }
+
+    /// All link_data_dir branches, with plain tempdirs — no root, no cryptsetup.
+    #[tokio::test]
+    async fn link_data_dir_replaces_only_what_loses_nothing() {
+        let tmp = std::env::temp_dir().join(format!("tapp-link-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let target = tmp.join("target");
+        let other = tmp.join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        let link = tmp.join("app").join("data");
+
+        // Fresh: parent + target created, symlink laid down. Then idempotent.
+        link_data_dir(&link, &target).await.expect("fresh link");
+        assert_eq!(std::fs::read_link(&link).unwrap(), target);
+        link_data_dir(&link, &target).await.expect("idempotent");
+
+        // Stale symlink (points elsewhere): replaced.
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&other, &link).unwrap();
+        link_data_dir(&link, &target).await.expect("stale symlink replaced");
+        assert_eq!(std::fs::read_link(&link).unwrap(), target);
+
+        // Empty directory (leftover ram mode): replaced.
+        std::fs::remove_file(&link).unwrap();
+        std::fs::create_dir(&link).unwrap();
+        link_data_dir(&link, &target).await.expect("empty dir replaced");
+        assert_eq!(std::fs::read_link(&link).unwrap(), target);
+
+        // Stray file: replaced.
+        std::fs::remove_file(&link).unwrap();
+        std::fs::write(&link, "stray").unwrap();
+        link_data_dir(&link, &target).await.expect("stray file replaced");
+        assert_eq!(std::fs::read_link(&link).unwrap(), target);
+
+        // Non-empty directory: REFUSED, contents untouched.
+        std::fs::remove_file(&link).unwrap();
+        std::fs::create_dir(&link).unwrap();
+        std::fs::write(link.join("keep.txt"), "precious").unwrap();
+        let refused = link_data_dir(&link, &target).await;
+        assert!(refused.is_err(), "non-empty dir must be refused");
+        assert_eq!(
+            std::fs::read_to_string(link.join("keep.txt")).unwrap(),
+            "precious"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn scratch_key_is_domain_separated_from_the_signer_and_tls() {
+        let signer = b"a fixed 32-byte test key .......";
+        let scratch = scratch_key_from_signer(signer);
+        assert_eq!(scratch.len(), 32);
+        assert_ne!(scratch.as_slice(), signer.as_slice());
+        assert_ne!(scratch, crate::tls_cert::derive_from_signer(signer));
+    }
 
     #[test]
     fn fde_material_is_valid_hex_and_spells_fde() {
@@ -313,6 +630,49 @@ mod tests {
                 let _ = run("losetup", &["-d", dev.trim()], None).await;
             }
         }
+    }
+
+    /// Scratch lifecycle: a volume the key cannot open is wiped and recreated,
+    /// never reported as an error — that is the whole contract of `scratch`.
+    /// Same environment needs as the test above (root + cryptsetup + loop):
+    ///
+    ///   cargo test --lib -- --ignored boot::volume
+    #[tokio::test]
+    #[ignore]
+    async fn ensure_scratch_wipes_when_the_key_changed() {
+        let app_id = "scratch-e2e-test";
+        let boot1_key = scratch_key_from_signer(b"signer of the first boot .......");
+        let data_dir =
+            crate::boot::manager::DockerComposeManager::get_app_dir(app_id).join("data");
+        let probe = data_dir.join("probe.txt");
+
+        ensure_scratch(app_id, &boot1_key).await.expect("first ensure");
+        std::fs::write(&probe, "scratch data").expect("write probe");
+        // Idempotent while mounted.
+        ensure_scratch(app_id, &boot1_key).await.expect("idempotent ensure");
+        assert_eq!(std::fs::read_to_string(&probe).unwrap(), "scratch data");
+
+        // "Reboot": unmount, close the mapping, detach the loop device. The next
+        // boot derives a different signer, hence a different key.
+        let mp = data_dir.to_string_lossy().to_string();
+        run("umount", &[&mp], None).await.expect("umount");
+        run("cryptsetup", &["close", &scratch_mapper_name(app_id)], None)
+            .await
+            .expect("close");
+        let img = scratch_image_path(app_id).to_string_lossy().to_string();
+        let attached = run("losetup", &["-j", &img], None).await.unwrap();
+        if let Some(dev) = String::from_utf8_lossy(&attached).split(':').next() {
+            if !dev.is_empty() {
+                run("losetup", &["-d", dev.trim()], None).await.expect("detach");
+            }
+        }
+
+        let boot2_key = scratch_key_from_signer(b"signer of the second boot ......");
+        ensure_scratch(app_id, &boot2_key)
+            .await
+            .expect("new key must wipe and recreate, not fail");
+        assert!(!probe.exists(), "old boot's scratch data must be gone");
+        std::fs::write(&probe, "new boot").expect("recreated volume must be writable");
     }
 
     #[test]

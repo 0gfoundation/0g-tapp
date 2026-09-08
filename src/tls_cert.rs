@@ -65,6 +65,10 @@ fn fail(reason: impl Into<String>) -> crate::error::TappError {
 
 /// The name this app's certificate is issued for.
 pub fn dns_name(app_id: &str) -> String {
+    // The empty app_id is the node itself (common signer): bare suffix, no leading dot.
+    if app_id.is_empty() {
+        return NAME_SUFFIX.to_string();
+    }
     format!("{}.{}", app_id, NAME_SUFFIX)
 }
 
