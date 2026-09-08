@@ -116,6 +116,14 @@ pub struct ServerConfig {
     #[serde(default = "default_bind_address")]
     pub bind_address: String,
 
+    /// TLS gRPC listener: the same service behind a self-signed certificate
+    /// generated fresh (in memory) on every start. Encryption without
+    /// authentication — clients connect with `tapp-cli --insecure`; node
+    /// identity is established by attestation, not this certificate. Empty
+    /// string disables the listener.
+    #[serde(default = "default_tls_bind_address")]
+    pub tls_bind_address: String,
+
     /// Unix socket path for gRPC server. When set, the server listens on this
     /// Unix domain socket IN ADDITION TO the TCP `bind_address` (not instead of it),
     /// so remote clients keep using TCP while same-host clients can use the socket.
@@ -270,6 +278,10 @@ fn default_bind_address() -> String {
     "127.0.0.1:50051".to_string()
 }
 
+fn default_tls_bind_address() -> String {
+    "0.0.0.0:50052".to_string()
+}
+
 fn default_max_connections() -> usize {
     1000
 }
@@ -341,6 +353,7 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             bind_address: default_bind_address(),
+            tls_bind_address: default_tls_bind_address(),
             unix_socket_mode: default_socket_mode(),
             unix_socket_gid: None,
             unix_socket_path: None,

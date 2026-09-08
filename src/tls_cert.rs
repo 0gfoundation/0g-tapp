@@ -147,6 +147,27 @@ pub fn public_key_sha256_hex(spki_der: &[u8]) -> String {
     hex::encode(Sha256::digest(spki_der))
 }
 
+/// A fresh self-signed identity for the daemon's own TLS listener, generated in
+/// memory on every start and stored nowhere. Encryption without authentication:
+/// clients connect with `--insecure` and never read the certificate, so the
+/// subject is a placeholder — the node does not know its own address anyway.
+/// Verification of the node happens through attestation, not through this cert.
+pub fn boot_identity() -> TappResult<(String, String)> {
+    let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
+        .map_err(|e| fail(format!("generate boot TLS key: {}", e)))?;
+    let mut params = rcgen::CertificateParams::new(vec!["tapp".to_string()])
+        .map_err(|e| fail(format!("certificate params: {}", e)))?;
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "tapp".to_string());
+    let (y, m, d) = SELF_SIGNED_NOT_AFTER;
+    params.not_after = rcgen::date_time_ymd(y, m, d);
+    let cert = params
+        .self_signed(&key_pair)
+        .map_err(|e| fail(format!("self-sign boot cert: {}", e)))?;
+    Ok((cert.pem(), key_pair.serialize_pem()))
+}
+
 /// The TLS key belonging to an app signer, for the local (no-KMS) source.
 ///
 /// Hashed with a domain separator rather than used directly: the signer is a secp256k1

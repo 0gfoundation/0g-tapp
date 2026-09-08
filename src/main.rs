@@ -202,6 +202,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .add_service(grpc.clone())
         .serve(addr);
 
+    // TLS listener: same service, same auth, behind a per-boot self-signed cert
+    // (in memory only). Remote management connects here (`tapp-cli --insecure`)
+    // so start-app payloads and registry tokens never cross the network readable.
+    if !config.server.tls_bind_address.is_empty() {
+        let tls_addr: SocketAddr = config.server.tls_bind_address.parse().map_err(|e| {
+            format!(
+                "Invalid tls bind address '{}': {}",
+                config.server.tls_bind_address, e
+            )
+        })?;
+        let (cert_pem, key_pem) = tapp_server::tls_cert::boot_identity()?;
+        let identity = tonic::transport::Identity::from_pem(cert_pem, key_pem);
+        let tls_server = Server::builder()
+            .tls_config(tonic::transport::ServerTlsConfig::new().identity(identity))
+            .map_err(|e| format!("tls config: {e}"))?
+            .layer(layer.clone())
+            .add_service(grpc.clone())
+            .serve(tls_addr);
+        info!("🔐 TAPP gRPC TLS listener on {} (self-signed, per-boot)", tls_addr);
+        tokio::spawn(async move {
+            if let Err(e) = tls_server.await {
+                error!("Server error (tls): {}", e);
+                std::process::exit(1);
+            }
+        });
+    }
+
     if let Some(ref socket_path) = config.server.unix_socket_path {
         // Clean up stale socket file from a previous run
         if socket_path.exists() {

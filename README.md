@@ -321,13 +321,17 @@ Create a `config.toml` file:
 
 ```toml
 [server]
-# Default is loopback (127.0.0.1:50051) — the gRPC port is plaintext. For remote
-# access, terminate TLS in a reverse proxy in front and keep this on loopback;
-# tapp-cli connects to the proxy with `-s https://<domain>` (add --insecure for a
-# self-signed certificate). CVM images bake such a front on :50052 (see
-# cvm/README.md). Setting 0.0.0.0 exposes remote *plaintext*: start-app payloads
-# (compose, env, mounted files) become readable on the network path.
+# Default is loopback (127.0.0.1:50051) — this port is plaintext. Remote
+# management goes through the TLS listener below instead. Setting 0.0.0.0 here
+# exposes remote *plaintext*: start-app payloads (compose, env, mounted files)
+# become readable on the network path.
 bind_address = "127.0.0.1:50051"
+
+# The same gRPC service behind TLS (self-signed cert, regenerated in memory on
+# every start). Remote clients use `tapp-cli -s https://<host>:50052 --insecure`
+# — encrypted but unauthenticated; node identity comes from attestation, not
+# this certificate. Set to "" to disable.
+tls_bind_address = "0.0.0.0:50052"
 
 # Recommended. Listened on IN ADDITION to bind_address, and the only transport that
 # serves key material (GetAppSecretKey / GetSecretResource / GetAppTlsCert).
