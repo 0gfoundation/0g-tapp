@@ -155,6 +155,30 @@ impl DockerComposeManager {
         fs::write(&compose_path, compose_content).await?;
 
         Self::store_mount_files(&base_path, mount_files).await?;
+
+        // Redirect named volumes into the encrypted data volume (see
+        // compose_override.rs). Written AFTER the mount files so a user-uploaded
+        // override cannot silently displace it — but if one was uploaded, honour
+        // it and skip: overwriting a file the user explicitly sent is worse.
+        let override_path = base_path.join("docker-compose.override.yml");
+        let user_sent_override = mount_files
+            .iter()
+            .any(|f| f.source_path.trim_start_matches("./") == "docker-compose.override.yml");
+        if user_sent_override {
+            warn!(
+                app_id,
+                "user supplied docker-compose.override.yml — named volumes will NOT be \
+                 redirected into the encrypted volume"
+            );
+        } else {
+            match super::compose_override::generate(compose_content, &base_path) {
+                Some(content) => fs::write(&override_path, content).await?,
+                // Stale override from a previous compose version must not linger.
+                None => {
+                    let _ = fs::remove_file(&override_path).await;
+                }
+            }
+        }
         Ok(base_path)
     }
 
@@ -172,7 +196,7 @@ impl DockerComposeManager {
         info!(app_id = %app_id, "📥 Pulling images (measure-only, containers not started)");
         let output = Command::new("docker")
             .current_dir(&base_path)
-            .args(["compose", "-f", "docker-compose.yml", "pull"])
+            .args(["compose", "pull"])
             .output()
             .await
             .map_err(|e| DockerError::ContainerOperationFailed {
@@ -239,7 +263,7 @@ impl DockerComposeManager {
     ) -> TappResult<Vec<(String, String)>> {
         let output = Command::new("docker")
             .current_dir(base_path)
-            .args(["compose", "-f", "docker-compose.yml", "config", "--format", "json"])
+            .args(["compose", "config", "--format", "json"])
             .output()
             .await
             .map_err(|e| DockerError::ContainerOperationFailed {
@@ -286,12 +310,27 @@ impl DockerComposeManager {
         // 1-2. store compose file and mount files
         let base_path = Self::stage_app_files(app_id, compose_content, mount_files).await?;
 
-        // 3. start compose with real-time output
+        // Bind targets for redirected named volumes must exist before `up` —
+        // docker refuses a `type: none` bind whose device is missing. Created
+        // here (not in staging) so they land inside the encrypted volume, which
+        // is mounted by the time deploy runs but not during measure-only pulls.
+        for name in super::compose_override::redirectable_volumes(compose_content) {
+            let dir = base_path.join("data/volumes").join(&name);
+            fs::create_dir_all(&dir).await.map_err(|e| {
+                DockerError::VolumeMeasurementFailed {
+                    path: format!("Failed to create volume dir {}: {e}", dir.display()),
+                }
+            })?;
+        }
+
+        // 3. start compose with real-time output. No explicit -f: compose then
+        // auto-loads docker-compose.yml AND docker-compose.override.yml from the
+        // cwd — an explicit -f would silently drop the override.
         info!(app_id = %app_id, "🚀 Starting docker compose up");
 
         let mut child = Command::new("docker")
             .current_dir(&base_path)
-            .args(["compose", "-f", "docker-compose.yml", "up", "-d"])
+            .args(["compose", "up", "-d"])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()

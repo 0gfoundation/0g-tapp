@@ -13,6 +13,7 @@
 - **On-chain Registration**: Register apps and TEE nodes on TappRegistry smart contract
 - **KMS Integration**: Fetch hardware-independent app secrets from a KMS cluster (decrypted locally within the TEE)
 - **Attested TLS**: Hand an app a TLS certificate whose public key is committed to by the attestation evidence, so a client can tie the connection it made to the TEE it verified
+- **Encrypted app data volumes**: Every app's persistent data lives in its own LUKS volume, keyed per-app by the KMS — encrypted at rest, isolated between apps, and portable across hosts and reboots
 
 ## Getting Started
 
@@ -87,6 +88,73 @@ export TAPP_OWNER_PRIVATE_KEY="0x..."
 2. Files referenced in volume mounts (e.g., `./config.yml:/app/config.yml`) are automatically uploaded. Paths that escape the compose directory (e.g., `../shared/config.yml`) are rejected with a clear error — copy such files into the compose directory and use a `./` path.
 3. Returns a task ID for tracking deployment progress
 4. The application deployment is cryptographically measured and extended to TEE runtime measurements
+
+#### Where app data lives (encrypted volumes)
+
+Each app gets its **own encrypted volume**: a LUKS2 image on the persistent data
+disk, opened with a passphrase the KMS cluster derives per app (under the `fde`
+material namespace) and mounted at the app's `data/` directory before its
+containers start. The key is stored nowhere — any node registered on-chain for
+the app re-derives the same key on demand, which is what lets data survive
+reboots (a reboot wipes the kernel's key and locks the volume) and move between
+hosts (copy the image file; the destination node derives the same key).
+
+What the compose file writes decides what protects it:
+
+| compose writes to | where it lives | encrypted | survives reboot |
+|---|---|---|---|
+| named volume (plainly declared) | auto-redirected into the encrypted volume | ✅ | ✅ |
+| `./data/...` bind mount | encrypted volume, explicit path | ✅ | ✅ |
+| other `./...` relative paths | RAM rootfs — fine for configs, wrong for state | – (never on disk) | ❌ |
+| absolute paths | host disk, plaintext (warned) | ❌ | ✅ |
+| `external:` / custom-driver volumes | wherever the user configured (warned) | ❌ | depends |
+
+The first row is the important one: the standard compose idiom
+(`pgdata:/var/lib/postgresql/data` plus a top-level `volumes: pgdata:`) is
+encrypted **with no changes** — the server generates a
+`docker-compose.override.yml` redirecting the volume into the encrypted mount.
+The user's compose runs verbatim and its measured hash is untouched. Uploading
+your own override file disables the redirect (loudly).
+
+`start-app` returns any lint findings (data placed where the volume cannot
+protect it, `docker.sock` mounts, `privileged`) and the CLI prints them; the
+app still starts. On a KMS-configured node the start **fails** when the volume
+key cannot be fetched — an app never silently runs on a plaintext directory.
+The usual cause is ordering: the node must be registered on-chain for the app
+first, which `start-app --register-onchain` handles.
+
+`stop-app` stops containers and leaves the volume open (the key lives in
+TEE-protected kernel memory; a closed volume would protect nothing an open one
+doesn't). To migrate existing plaintext data in: `stop-app`, copy the data into
+the still-mounted `data/` directory, `start-app`.
+
+##### Choosing a different data mode (`x-tapp.data`, ≥0.8.0)
+
+The encrypted volume is the default, not the only shape. An app declares its
+`data/` mode at the top level of its compose (`x-` keys are ignored by docker,
+and the declaration is part of the compose content — hashed, registered
+on-chain and measured like everything else):
+
+```yaml
+x-tapp:
+  data: plain   # encrypted (default) | plain | ram | scratch
+services: ...
+```
+
+| mode | lives on | who can read it | after a reboot |
+|---|---|---|---|
+| `encrypted` (default) | data disk, LUKS, KMS key | TEE only | **still there** |
+| `plain` | data disk, plaintext | whoever holds the disk | still there |
+| `ram` | RAM rootfs | TEE only | gone |
+| `scratch` | data disk, LUKS, per-boot key | TEE only | gone (key dies with the signer; volume is wiped and recreated) |
+
+`plain` is for data that protects itself — the KMS's own TEE-sealed share is
+the canonical case (and what breaks the KMS↔FDE bootstrap circle: a KMS node
+cannot fetch its volume key from a cluster that hasn't formed yet). `scratch`
+is disk-sized secret cache: too big for RAM, no need to outlive the boot.
+Switching modes does **not** migrate data — the old volume or directory stays
+where it was, and the app starts on an empty one; move data by hand. A typo'd
+mode is refused at `start-app`, never silently mapped.
 
 #### Stopping an Application
 
@@ -253,7 +321,20 @@ Create a `config.toml` file:
 
 ```toml
 [server]
-bind_address = "0.0.0.0:50051"
+# Default is loopback (127.0.0.1:50051) — this port is plaintext. Remote
+# management goes through the TLS listener below instead. Setting 0.0.0.0 here
+# exposes remote *plaintext*: start-app payloads (compose, env, mounted files)
+# become readable on the network path.
+bind_address = "127.0.0.1:50051"
+
+# The same gRPC service behind TLS. The key derives from the node's COMMON
+# signer (per boot), and `get-evidence` with no app_id returns node evidence
+# whose runtime_data.tls_public_key is this key's SPKI sha256 — so a client can
+# bootstrap a pin from attested evidence over any channel:
+#   tapp-cli -s https://<host>:50052 --insecure get-evidence   # verify quote,
+#   tapp-cli -s https://<host>:50052 --tls-pin 0x<tls_public_key> …
+# `--insecure` alone encrypts but defeats passive observers only. "" disables.
+tls_bind_address = "0.0.0.0:50052"
 
 # Recommended. Listened on IN ADDITION to bind_address, and the only transport that
 # serves key material (GetAppSecretKey / GetSecretResource / GetAppTlsCert).

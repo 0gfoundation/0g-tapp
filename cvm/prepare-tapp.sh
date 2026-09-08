@@ -55,8 +55,21 @@ fi
 # --- [1/4] kernel (CLOUD-specific): gcp swaps in its tuned kernel + fix A; others keep generic ---
 if [ "$CLOUD" = gcp ]; then
   if [ "$INSTALL_KERNEL" = 1 ]; then
-    echo "==> [1/4] installing gcp kernel (virt-customize)"
-    vc_args=(-a "$WORK" --install linux-image-gcp,linux-modules-extra-gcp)
+    echo "==> [1/4] installing newest COMPLETE gcp kernel (virt-customize)"
+    # Not the bare linux-image-gcp meta: it can race ahead of the archive — 2026-09-07
+    # it pulled the 7.0.0-1011 image while linux-modules-extra-7.0.0-1011-gcp was not
+    # published yet, and cryptpilot-convert needs modules-extra for zram. Same fix as
+    # the generic branch below: newest versioned gcp kernel that HAS its modules-extra.
+    vc_args=(-a "$WORK" --run-command '
+      set -e
+      apt-get update
+      v=$(apt-cache pkgnames linux-modules-extra- \
+          | grep -E "^linux-modules-extra-[0-9]+\.[0-9]+\.[0-9]+-[0-9]+-gcp$" \
+          | sed "s/^linux-modules-extra-//" | sort -V | tail -1)
+      [ -n "$v" ] || { echo "ERROR: no gcp kernel with modules-extra found"; exit 1; }
+      echo "installing kernel $v"
+      DEBIAN_FRONTEND=noninteractive apt-get install -y "linux-image-$v" "linux-modules-extra-$v"
+    ')
     [ -n "$PURGE_KERNEL" ] && vc_args+=(--run-command "apt-get autoremove --purge $PURGE_KERNEL -y || true")
     vc_args+=(--run-command 'update-grub')
     virt-customize "${vc_args[@]}"

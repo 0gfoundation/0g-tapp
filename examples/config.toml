@@ -7,7 +7,13 @@ format = "json" # Log format: "json" or "pretty"
 # max_log_files = 7  # Rotated daily files to keep; oldest deleted (default: 7)
 
 [server]
-bind_address = "0.0.0.0:50051"
+# Default is loopback — this port is plaintext. 0.0.0.0 accepts remote
+# plaintext (start-app payloads readable on the path); remote management
+# should use the TLS listener below instead.
+bind_address = "127.0.0.1:50051"
+# Same service behind TLS (per-boot in-memory self-signed cert). Remote clients:
+# tapp-cli -s https://<host>:50052 --insecure. "" disables.
+tls_bind_address = "0.0.0.0:50052"
 # Unix socket path — when set, the server listens on this Unix domain socket
 # IN ADDITION TO the TCP bind_address above (not instead of it), so remote clients
 # keep using TCP while same-host clients use the socket. Recommended for local key

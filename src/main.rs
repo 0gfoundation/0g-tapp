@@ -184,6 +184,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let layer = ServiceBuilder::new().layer(auth_layer).into_inner();
 
+    // The node's TLS identity, derived from the common signer and registered under
+    // the empty app_id BEFORE the service is consumed — GetEvidence with no app_id
+    // then reports its key hash, which is what makes the :50052 listener pinnable
+    // against attested evidence.
+    let node_tls = service
+        .ensure_node_tls_identity()
+        .await
+        .map_err(|e| format!("node TLS identity: {e}"))?;
+
     let grpc = TappServiceServer::new(service);
 
     // Always serve TCP on bind_address. When unix_socket_path is set, ADDITIONALLY
@@ -201,6 +210,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .layer(layer.clone())
         .add_service(grpc.clone())
         .serve(addr);
+
+    // TLS listener: same service, same auth, behind a per-boot self-signed cert
+    // (in memory only). Remote management connects here (`tapp-cli --insecure`)
+    // so start-app payloads and registry tokens never cross the network readable.
+    // The port is bound HERE, synchronously: a taken :50052 must fail startup
+    // with a clear error, not detonate later inside a spawned task.
+    if !config.server.tls_bind_address.is_empty() {
+        let tls_addr: SocketAddr = config.server.tls_bind_address.parse().map_err(|e| {
+            format!(
+                "Invalid tls bind address '{}': {}",
+                config.server.tls_bind_address, e
+            )
+        })?;
+        let tls_listener = tokio::net::TcpListener::bind(tls_addr)
+            .await
+            .map_err(|e| format!("cannot bind tls listener {tls_addr}: {e}"))?;
+        // Derived from the common signer, not random: GetEvidence (no app_id)
+        // attests this key's hash, so clients can bootstrap a pin from evidence.
+        let identity =
+            tonic::transport::Identity::from_pem(&node_tls.cert_pem, &node_tls.key_pem);
+        let tls_server = Server::builder()
+            .tls_config(tonic::transport::ServerTlsConfig::new().identity(identity))
+            .map_err(|e| format!("tls config: {e}"))?
+            .layer(layer.clone())
+            .add_service(grpc.clone())
+            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(tls_listener));
+        info!("🔐 TAPP gRPC TLS listener on {} (self-signed, per-boot)", tls_addr);
+        tokio::spawn(async move {
+            if let Err(e) = tls_server.await {
+                error!("Server error (tls): {}", e);
+                std::process::exit(1);
+            }
+        });
+    }
 
     if let Some(ref socket_path) = config.server.unix_socket_path {
         // Clean up stale socket file from a previous run

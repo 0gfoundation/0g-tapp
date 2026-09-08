@@ -196,6 +196,11 @@ message StartAppResponse {
   string message = 2;
   string task_id = 3;   // Async task identifier for tracking progress
   int64 timestamp = 4;  // Timestamp of the start request
+  // Compose lint findings: data placed where the encrypted volume cannot
+  // protect it, and privilege escapes. Warnings, not errors — the start
+  // proceeds; these exist so the person who wrote the compose SEES them
+  // (a warning only in the server log protects nobody).
+  repeated string compose_warnings = 5;
 }
 
 // Stop App Messages

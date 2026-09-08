@@ -1,8 +1,33 @@
+pub mod compose_lint;
+pub mod compose_override;
 pub mod manager;
 pub mod measurement;
+pub mod volume;
 
 pub use manager::{AppStatus, ContainerStatus, DockerComposeManager, MountFile, PruneImagesResult};
 pub use measurement::{AppMeasurement, ComposeMeasurement, HashAlgorithm};
+
+/// Deferred fetch of a volume passphrase, built by the RPC layer (which owns
+/// the KMS client and the app key service) and awaited inside the start task
+/// (so a slow derivation delays the task, never the StartApp RPC).
+pub type VolumeKeyFut =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, String>> + Send>>;
+
+/// How this start provides the app's `./data`, resolved by the RPC layer from
+/// the compose's declared `x-tapp.data` mode plus what the node can actually do.
+pub enum DataPlan {
+    /// LUKS on /data, key from the KMS (mode `encrypted` on a KMS node).
+    Encrypted(VolumeKeyFut),
+    /// Plain persistent directory on /data (mode `plain`).
+    Plain,
+    /// LUKS on /data keyed from the app signer, wiped when unopenable (mode `scratch`).
+    Scratch(VolumeKeyFut),
+    /// Plain directory on the RAM rootfs (mode `ram`).
+    Ram,
+    /// Mode `encrypted` on a node with no KMS: the historical loud downgrade —
+    /// same storage as Ram, plus the warning the owner needs to see.
+    RamDowngraded,
+}
 
 use crate::error::{DockerError, TappError, TappResult};
 use crate::measurement_service::MeasurementService;
@@ -126,7 +151,13 @@ enable_eventlog = true
     }
 
     /// Internal method to handle the actual app start logic
-    async fn _start_app(&self, request: StartAppRequest, deployer: String, task_id: String) {
+    async fn _start_app(
+        &self,
+        request: StartAppRequest,
+        deployer: String,
+        task_id: String,
+        data_plan: DataPlan,
+    ) {
         let app_id = request.app_id.clone();
 
         // Check if app already exists
@@ -233,6 +264,52 @@ enable_eventlog = true
                     },
                 )
                 .await;
+            return;
+        }
+
+        // Data directory first, so `./data` is already in its declared mode when
+        // files are staged and containers start. Strict on failure: starting the
+        // app on the wrong storage would be a silent downgrade the owner cannot see.
+        let provisioned = match data_plan {
+            DataPlan::Encrypted(key_fut) => async {
+                let key = key_fut.await.map_err(|e| {
+                    TappError::from(DockerError::ContainerOperationFailed {
+                        operation: "fde_volume_key".to_string(),
+                        reason: format!(
+                            "KMS refused the volume key: {e} — the app's data volume \
+                             cannot be opened. Is this node registered on-chain for \
+                             the app (start-app --register-onchain)? Apps that must \
+                             start without the KMS can declare x-tapp.data: plain|ram|scratch."
+                        ),
+                    })
+                })?;
+                volume::ensure_mounted(&app_id, &key).await
+            }
+            .await,
+            DataPlan::Scratch(key_fut) => async {
+                let key = key_fut.await.map_err(|e| {
+                    TappError::from(DockerError::ContainerOperationFailed {
+                        operation: "scratch_volume_key".to_string(),
+                        reason: format!("failed to derive the scratch key: {e}"),
+                    })
+                })?;
+                volume::ensure_scratch(&app_id, &key).await
+            }
+            .await,
+            DataPlan::Plain => volume::ensure_plain(&app_id).await,
+            DataPlan::Ram => volume::ensure_ram(&app_id).await,
+            DataPlan::RamDowngraded => {
+                warn!(
+                    app_id = %app_id,
+                    "No KMS configured on this node — app data is NOT encrypted at rest \
+                     and does NOT survive a reboot"
+                );
+                volume::ensure_ram(&app_id).await
+            }
+        };
+        if let Err(e) = provisioned {
+            tracing::error!(app_id = %app_id, error = %e, "Failed to provision app data directory");
+            self.task_manager.mark_failed(&task_id, format!("{e}")).await;
             return;
         }
 
@@ -489,9 +566,18 @@ enable_eventlog = true
         self: std::sync::Arc<Self>,
         request: StartAppRequest,
         deployer: String, // EVM address from signature authentication
+        data_plan: DataPlan,
     ) -> TappResult<StartAppResponse> {
         // Validate request
         self.validate_request(&request)?;
+
+        // Warn-only (see compose_lint): logged here AND returned in the response,
+        // because a warning only the server log sees protects nobody — the person
+        // who wrote the compose is on the other end of this RPC.
+        let compose_warnings = compose_lint::lint_compose(&request.compose_content);
+        for finding in &compose_warnings {
+            warn!(app_id = %request.app_id, "compose lint: {finding}");
+        }
 
         // Create a new task
         let task = self.task_manager.create_task().await;
@@ -512,7 +598,9 @@ enable_eventlog = true
 
         // Spawn background task
         tokio::spawn(async move {
-            service._start_app(request, deployer, task_id_clone).await;
+            service
+                ._start_app(request, deployer, task_id_clone, data_plan)
+                .await;
         });
 
         Ok(StartAppResponse {
@@ -520,6 +608,7 @@ enable_eventlog = true
             message: format!("Task created successfully. Use task_id to check status."),
             task_id: task_id,
             timestamp: crate::utils::current_timestamp(),
+            compose_warnings,
         })
     }
 
@@ -554,17 +643,12 @@ enable_eventlog = true
         signer_eth_address: &[u8],
         tls_public_key: Option<String>,
     ) -> TappResult<GetEvidenceResponse> {
-        // Get app_id from request
+        // Get app_id from request. EMPTY IS VALID: it asks for the node's own
+        // evidence — the common signer plus the :50052 TLS key hash — which is
+        // what exists before any app does, and what a client pins the management
+        // channel against. Only a non-empty app_id must name a deployed app.
         let app_id = request.app_id;
-        if app_id.is_empty() {
-            return Err(TappError::InvalidParameter {
-                field: "app_id".to_string(),
-                reason: "app_id cannot be empty".to_string(),
-            });
-        }
-
-        // Ensure app exists
-        {
+        if !app_id.is_empty() {
             let app_info_lock = self.app_info.lock().await;
             if !app_info_lock.contains_key(&app_id) {
                 return Err(TappError::InvalidParameter {
@@ -714,7 +798,12 @@ enable_eventlog = true
         // Mark measurement as success or failure based on result
         let final_measurement = match &result {
             Ok(_) => {
-                // 1. Remove app directory
+                // 1. Remove app directory. The encrypted volume mounted at
+                // <app_dir>/data must detach first or the removal hits EBUSY —
+                // only the mount point is released; the LUKS mapping (and the
+                // key in the kernel) stays open, and the volume's data lives in
+                // the image file on /data, untouched. The next start remounts.
+                volume::unmount(app_id).await?;
                 let app_dir = DockerComposeManager::get_app_dir(app_id);
                 if app_dir.exists() {
                     tokio::fs::remove_dir_all(&app_dir).await.map_err(|e| {

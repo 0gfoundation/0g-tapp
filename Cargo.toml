@@ -7,7 +7,7 @@ license = "Apache-2.0"
 
 [package]
 name = "tapp-server"
-version = "0.6.0"
+version = "0.8.0"
 edition.workspace = true
 authors = ["TDX TAPP Developers"]
 description = "TDX Trusted Application Platform Service - Rust Implementation"
@@ -16,7 +16,7 @@ default-run = "tapp-server"
 
 [dependencies]
 # gRPC and async runtime
-tonic = "0.12"
+tonic = { version = "0.12", features = ["tls"] }
 prost = "0.13"
 tokio = { version = "1.0", features = [
     "macros",

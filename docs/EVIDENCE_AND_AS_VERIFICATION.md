@@ -1,54 +1,54 @@
-# 按 App ID 验证 tapp 节点（链上 → 取证 → 验签 → 对账）
+# Verifying a tapp node by App ID (on-chain → fetch evidence → verify signature → reconcile)
 
-> **现在已内置到 CLI**：直接用 `tapp-cli verify-app --app-id <X> --rpc-url <RPC> --contract <Registry>`；
-> 未注册上链时用直连模式 `tapp-cli -s <server> verify-app --app-id <X>`。本文档描述它内部做的事 +
-> 等价的手搓 `cast`/`grpcurl` 流程（`docs/verify_app.py` 是同逻辑的脚本参考；CLI 实现见 `src/verify.rs`）。
+> **This is now built into the CLI**: just run `tapp-cli verify-app --app-id <X> --rpc-url <RPC> --contract <Registry>`;
+> for apps not yet registered on-chain, use direct mode `tapp-cli -s <server> verify-app --app-id <X>`. This document describes what it does internally, plus
+> the equivalent hand-rolled `cast`/`grpcurl` flow (`docs/verify_app.py` is a script reference with the same logic; the CLI implementation is in `src/verify.rs`).
 
-**验证器的唯一输入是 `app_id`。** 其余全自动：从链上读该 app 的注册信息和节点列表 →
-顺着每个节点链上记录的 `teeUrl` 取 evidence → 验 quote 签名/TCB → 把 evidence 里的度量与身份跟链上逐项对账。
+**The verifier's only input is `app_id`.** Everything else is automatic: read the app's registration info and node list from the chain →
+fetch evidence from the `teeUrl` recorded on-chain for each node → verify the quote signature/TCB → reconcile the measurements and identity in the evidence against the chain, item by item.
 
 ```
-输入: app_id
+Input: app_id
   │
-  ├─① 链上 getAppInfo(app_id)        → composeHash / volumesHash / imageHashes / owner
-  │   链上 getNodeList(app_id)       → [signerAddress...]  (该 app 的所有节点)
-  │   链上 getNode(app_id, signer)   → teeUrl              (每个节点去哪取证)
+  ├─① on-chain getAppInfo(app_id)        → composeHash / volumesHash / imageHashes / owner
+  │   on-chain getNodeList(app_id)       → [signerAddress...]  (all nodes of this app)
+  │   on-chain getNode(app_id, signer)   → teeUrl              (where to fetch evidence for each node)
   │
-  └─ 对每个节点 signer:
-      ├─② get-evidence(teeUrl, app_id)        取 evidence
-      ├─③ 验 quote 签名 + TCB  (CoCo-AS gRPC 35.253.66.70:50004, 见 §③)
-      └─④ 对账 evidence ↔ 链上:
-            report_data == sha512(runtime_data 原样字节)，且 runtime_data.signer == signerAddress
-            start_app 事件 compose_hash == 链上 composeHash
-            start_app 事件 volumes_hash == 链上 volumesHash
-            start_app 事件 image_hash  == 链上 imageHashes
-            (+ MRTD/shim/grub/kernel/initrd/cmdline == AS 参考值)
+  └─ For each node signer:
+      ├─② get-evidence(teeUrl, app_id)        fetch evidence
+      ├─③ verify quote signature + TCB  (CoCo-AS gRPC 35.253.66.70:50004, see §③)
+      └─④ reconcile evidence ↔ chain:
+            report_data == sha512(runtime_data as-is bytes), and runtime_data.signer == signerAddress
+            start_app event compose_hash == on-chain composeHash
+            start_app event volumes_hash == on-chain volumesHash
+            start_app event image_hash  == on-chain imageHashes
+            (+ MRTD/shim/grub/kernel/initrd/cmdline == AS reference values)
 ```
 
-链上的信任语义：**「app 该跑 composeHash=C、镜像=I；节点 signer=S 在 teeUrl=U」**。
-attestation 证明：**「U 这台 TEE 正在跑 C/I，且其 TEE 派生身份就是 S」** → 信任成立。
+The trust semantics of the chain: **"the app should run composeHash=C with images=I; node signer=S is at teeUrl=U"**.
+Attestation proves: **"the TEE at U is actually running C/I, and its TEE-derived identity is S"** → trust is established.
 
-合约（0G testnet）：`TappRegistry` proxy `0x2Ce80374318B1d7Fb3345724457a182E0ad165c9`，RPC `https://evmrpc-testnet.0g.ai`。
+Contract (0G testnet): `TappRegistry` proxy `0x2Ce80374318B1d7Fb3345724457a182E0ad165c9`, RPC `https://evmrpc-testnet.0g.ai`.
 
 ---
 
-## ① 链上读注册信息
+## ① Reading registration info from the chain
 
-合约 getter（`contract/src/TappRegistry.sol`）。`tapp-cli` 只有写链命令，读用 `cast call` / ethers / web3 直接 eth_call：
+Contract getters (`contract/src/TappRegistry.sol`). `tapp-cli` only has chain-write commands; for reads use `cast call` / ethers / web3 to do a direct eth_call:
 
-| getter | 返回 | 字段 |
+| getter | returns | fields |
 |---|---|---|
-| `getAppInfo(string)` | `AppInfo` | `composeHash`、`volumesHash`、`imageHashes[]`、`owner`、`registeredAt` |
-| `getNodeList(string)` | `address[]` | 该 app 所有节点的 **signerAddress** |
-| `getNode(string,address)` | `NodeInfo` | `teeUrl`（取证地址）、`addedAt`、`stakeAmount`、`composeHash`、`volumesHash` |
+| `getAppInfo(string)` | `AppInfo` | `composeHash`, `volumesHash`, `imageHashes[]`, `owner`, `registeredAt` |
+| `getNodeList(string)` | `address[]` | the **signerAddress** of every node of this app |
+| `getNode(string,address)` | `NodeInfo` | `teeUrl` (evidence endpoint), `addedAt`, `stakeAmount`, `composeHash`, `volumesHash` |
 
-设计上：**app 级**存共享代码身份（compose/volumes/image）；**node 级**按 signerAddress 存各节点 `teeUrl`，
-并可选覆盖 `composeHash`/`volumesHash`（节点级配置不同时用）。`getNode` 返回的是该节点的**有效值**：
-自己有覆盖就用覆盖，否则解析成 app 级默认值。`imageHashes` 永远是共享的。
+By design: the **app level** stores the shared code identity (compose/volumes/image); the **node level**, keyed by signerAddress, stores each node's `teeUrl`
+and may optionally override `composeHash`/`volumesHash` (used when node-level configuration differs). `getNode` returns the node's **effective values**:
+its own overrides if present, otherwise resolved to the app-level defaults. `imageHashes` is always shared.
 
-> ⚠️ `getNode` 在**当前** registry 上是 5 个字段。旧部署（`0x95a0…511c`，已弃用）只有 3 个，
-> 用错 arity 会 decode 报错或静默截断。用 `cast call <proxy> "version()(string)"` 分辨：
-> 当前的返回 `"0.1.0"`，旧的直接 revert。见 `contract/CONTRACTS.md`。
+> ⚠️ `getNode` on the **current** registry has 5 fields. The old deployment (`0x95a0…511c`, deprecated) has only 3;
+> using the wrong arity yields a decode error or silent truncation. Distinguish them with `cast call <proxy> "version()(string)"`:
+> the current one returns `"0.1.0"`, the old one simply reverts. See `contract/CONTRACTS.md`.
 
 ```bash
 C=0x2Ce80374318B1d7Fb3345724457a182E0ad165c9 ; R=https://evmrpc-testnet.0g.ai
@@ -57,70 +57,77 @@ cast call "$C" "getNodeList(string)(address[])" "$APP_ID" --rpc-url "$R"
 cast call "$C" "getNode(string,address)((string,uint256,uint256,bytes,bytes))" "$APP_ID" "$SIGNER" --rpc-url "$R"
 ```
 
-### 链上 hash 的编码（对账时必须按此还原）— `src/onchain.rs:103`
+### Encoding of on-chain hashes (must be reconstructed exactly like this when reconciling) — `src/onchain.rs:103`
 
-| 字段 | 编码 |
+| field | encoding |
 |---|---|
-| `composeHash` | 原始 48 字节 SHA-384 |
-| `volumesHash` | 排序后每条 `key + ':' + raw(digest) + '\n'` 拼接。digest 是**原始字节**（非 hex 串），**每条带尾 `\n`** |
-| `imageHashes[]` | 数组，每个 service 一个 `sha256:<hex>` 的 **ascii** 字节串（无换行）|
+| `composeHash` | raw 48-byte SHA-384 |
+| `volumesHash` | sorted, then each entry `key + ':' + raw(digest) + '\n'` concatenated. The digest is **raw bytes** (not a hex string), and **each entry ends with `\n`** |
+| `imageHashes[]` | array, one `sha256:<hex>` **ascii** byte string per service (no newline) |
 
-> evidence 的 `start_app` 事件里 `volumes_hash` 是 `{"key":"<hexdigest>"}`，对账时要按上面规则重建成
-> `key:` + `bytes.fromhex(hexdigest)` + `\n` 再跟链上 `volumesHash` 比对。
+> In the evidence's `start_app` event, `volumes_hash` is `{"key":"<hexdigest>"}`; when reconciling, rebuild it per the rule above as
+> `key:` + `bytes.fromhex(hexdigest)` + `\n` and then compare against the on-chain `volumesHash`.
 
 ---
 
-## ② 取 Evidence（用链上的 teeUrl）
+## ② Fetching evidence (using the on-chain teeUrl)
 
 ```bash
 tapp-cli -s <teeUrl> get-evidence --app-id <APP_ID> --nonce $(openssl rand -hex 16) 2>&1 \
   | grep -o 'Evidence (hex): [0-9a-f]*' | sed 's/Evidence (hex): //' > ev.hex
 ```
 
-- signer 不持久化：tapp server 重启会重新派生、地址变；链上要用 `update-node-onchain` 同步。
+- The signer is not persisted: when the tapp server restarts, it re-derives and the address changes; use `update-node-onchain` to sync the chain.
+- **Node-level evidence (≥0.8.0)**: omitting `--app-id` (empty) returns evidence for **the node itself** — the signer is the node's
+  common signer (generated at every boot; all app signers are derived from it), and `runtime_data.tls_public_key`
+  is the SPKI sha256 of the :50052 management-port TLS key. Purpose: after verifying the quote, use it as `--tls-pin`
+  so the management channel resists an active man-in-the-middle, without requiring any out-of-band distribution. The verification flow is identical to app evidence.
+  Two boundaries: it proves "a genuine TDX node", not "the node at the address you dialed" — it prevents interception, not
+  redirection to the attacker's own genuine node (anchoring the common signer on-chain is future work); and the pin rotates on every reboot
+  (common signer changes → TLS key changes), so an old pin fails closed and evidence must be re-fetched after a reboot.
 
-### `report_data` 的结构（v0.4.0+）
+### Structure of `report_data` (v0.4.0+)
 
-以前 `report_data` 就是 20 字节 signer 地址左对齐补零——quote 自带身份，但没有可扩展的余地
-（20 字节 + 32 字节绑定 + 一个 challenge 已经超过 64 字节）。现在：
+Previously `report_data` was simply the 20-byte signer address, left-aligned and zero-padded — the quote carried the identity, but there was no room to extend
+(20 bytes + a 32-byte binding + one challenge already exceeds 64 bytes). Now:
 
 ```
 report_data = sha512(runtime_data)
 ```
 
-`runtime_data` 是一个小 JSON 对象，作为 evidence 的**第三个字段**跟 `quote` / `cc_eventlog` 一起返回
-（base64）。定义见 `tapp-common/src/report_data.rs`：
+`runtime_data` is a small JSON object, returned as the **third field** of the evidence alongside `quote` / `cc_eventlog`
+(base64). Definition in `tapp-common/src/report_data.rs`:
 
 ```json
 {"nonce":"0x…","signer":"0x…","tls_public_key":"0x…"}
 ```
 
-| 字段 | 含义 |
+| field | meaning |
 |---|---|
-| `nonce` | 调用方给的 challenge（`--nonce`，≤64 字节），原样回显 |
-| `signer` | 该 app 的 TEE 派生 signer EVM 地址（20 字节），即链上注册的身份 |
-| `tls_public_key` | 该 app TLS 公钥（SubjectPublicKeyInfo）的 sha256；app 没申请过 TLS key 时不存在 |
+| `nonce` | the caller-supplied challenge (`--nonce`, ≤64 bytes), echoed back verbatim |
+| `signer` | the app's TEE-derived signer EVM address (20 bytes), i.e. the identity registered on-chain |
+| `tls_public_key` | sha256 of the app's TLS public key (SubjectPublicKeyInfo); absent if the app has never requested a TLS key |
 
-两条必须记住的规则：
+Two rules that must be remembered:
 
-1. **空字段是「不出现」，不是 `""`。** 这样某字段没用到时，加字段前后产生的 evidence 字节完全一致。
-2. **验证方按收到的原样字节做 hash，绝不重新序列化。** 没有「规范形式」需要两边约定，也就没有漂移的空间。
-   `RuntimeData` 结构体只是用来读字段的，不是编码器。
+1. **An empty field is "absent", not `""`.** This way, when a field is unused, the evidence bytes are byte-for-byte identical before and after the field was added.
+2. **The verifier hashes the bytes exactly as received and never re-serializes.** There is no "canonical form" both sides must agree on, and therefore no room for drift.
+   The `RuntimeData` struct is only for reading fields, not an encoder.
 
-为什么是 sha512：TDX 的 `report_data` 正好 64 字节，sha512 刚好填满；这也是 CoCo-AS 拿到 `runtime_data`
-自己校验绑定时期望的算法。
+Why sha512: TDX's `report_data` is exactly 64 bytes and sha512 fills it exactly; it is also the algorithm CoCo-AS expects when it is handed `runtime_data`
+and verifies the binding itself.
 
-**代价**：光有 quote 已经不能说出自己的 signer 了，必须带上这个结构。evidence 一直是
-`{quote, cc_eventlog}` 的 JSON，所以这只是同一个对象多一个字段，系统里没有任何地方在传裸 quote。
+**Cost**: the quote alone can no longer state its own signer — this structure must accompany it. Evidence has always been the
+`{quote, cc_eventlog}` JSON, so this is just one more field on the same object; nowhere in the system is a bare quote passed around.
 
-**兼容**：0.4.0 之前的 evidence 没有 `runtime_data` 字段，`report_data` 就是旧的 20 字节 signer。
-两种读法都支持（`tapp-common/src/verify.rs`）；字段缺失会报「server predates the challenge field」，
-而不是报 signer 不匹配。
+**Compatibility**: evidence from before 0.4.0 has no `runtime_data` field, and `report_data` is the old 20-byte signer.
+Both readings are supported (`tapp-common/src/verify.rs`); a missing field reports "server predates the challenge field"
+rather than a signer mismatch.
 
-### nonce：证据是自证的，但没有时间
+### nonce: evidence is self-attesting, but has no notion of time
 
-quote 里没有任何东西说明它是什么时候生成的，所以一份缓存的 quote 和一份新鲜的 quote 在密码学上
-无法区分。调用方每次请求给一个随机值，就能区分：
+Nothing in the quote says when it was generated, so a cached quote and a fresh quote are cryptographically
+indistinguishable. If the caller supplies a random value on each request, they become distinguishable:
 
 ```
 $ tapp-cli -s <teeUrl> get-evidence --app-id <APP_ID> --nonce 0a1b2c3d…
@@ -129,27 +136,27 @@ $ tapp-cli -s <teeUrl> get-evidence --app-id <APP_ID> --nonce 0a1b2c3d…
   challenge   : echoed — this quote was produced for this request
 ```
 
-- 必须**随机**，不能是计数器或时钟。
-- 给缓存结果服务很多读者的场景（如 scan）就不传 nonce——它本来也没法代表任何单个读者。
-- 老服务端会打印 `challenge : ignored — this server predates the nonce field`。
+- It must be **random** — not a counter or a clock.
+- For scenarios serving cached results to many readers (e.g. scan), don't pass a nonce — it couldn't represent any individual reader anyway.
+- Older servers print `challenge : ignored — this server predates the nonce field`.
 
 ---
 
-## ③ 验 quote 签名 + TCB（CoCo-AS gRPC `50004`）
+## ③ Verifying the quote signature + TCB (CoCo-AS gRPC `50004`)
 
-trustee 的 docker-compose 起三个服务：**KBS `8080`**、**AS（coco-as-grpc）`50004`**、RVPS `50003`。
-**验 evidence 的正主是 AS 的 `50004`，不是 KBS 的 `8080`。**（KBS 的 `/kbs/v0/attest` 是 RCAR 密钥分发，
-要求 `report_data==hash(nonce,pubkey)`，对 signer 绑定的 evidence 一律 401，**不要用它验签**。）
+trustee's docker-compose starts three services: **KBS `8080`**, **AS (coco-as-grpc) `50004`**, RVPS `50003`.
+**The one that actually verifies evidence is the AS on `50004`, not the KBS on `8080`.** (The KBS's `/kbs/v0/attest` is RCAR key distribution;
+it requires `report_data==hash(nonce,pubkey)` and returns 401 for any signer-bound evidence — **do not use it for signature verification**.)
 
-AS 服务：`attestation.AttestationService/AttestationEvaluate`（proto 见 trustee `protos/attestation.proto`）。
-`evidence` = `base64url(no-pad)` 的**原始 evidence 字节**（即 hex 解码后的 `{cc_eventlog,quote,runtime_data}`）。
+AS service: `attestation.AttestationService/AttestationEvaluate` (proto in trustee `protos/attestation.proto`).
+`evidence` = `base64url(no-pad)` of the **raw evidence bytes** (i.e. the hex-decoded `{cc_eventlog,quote,runtime_data}`).
 
-⚠️ 注意区分两个同名的东西：AS **请求里**的 `runtime_data` 字段，和 evidence **内部**的 `runtime_data` 字段。
+⚠️ Be careful to distinguish two things with the same name: the `runtime_data` field **in the AS request**, and the `runtime_data` field **inside** the evidence.
 
-- AS 请求的 `runtime_data` **留空** → AS 不校验绑定，只验 quote 签名链(PCK→Intel 根)+TCB，并把
-  `report_data` 解析进 claims。§④ 会在本地自己重算 `sha512` 校验绑定，所以留空是够的。
-- 也可以把 evidence 里那份 `runtime_data` 的字节传给 AS，让 AS 顺手校验 `report_data == sha512(bytes)`。
-  两条路的结论一样，别两边都不做。
+- Leave the AS request's `runtime_data` **empty** → the AS does not check the binding; it only verifies the quote signature chain (PCK→Intel root) + TCB, and parses
+  `report_data` into the claims. §④ recomputes `sha512` locally to verify the binding itself, so leaving it empty is sufficient.
+- Alternatively, pass the bytes of the evidence's own `runtime_data` to the AS and let the AS check `report_data == sha512(bytes)` for you.
+  Both paths reach the same conclusion — just don't skip it on both sides.
 
 ```python
 import binascii, base64, json, subprocess
@@ -157,79 +164,79 @@ raw = binascii.unhexlify(open('ev.hex').read().strip())
 req = {"verification_requests": [
         {"tee": "tdx", "evidence": base64.urlsafe_b64encode(raw).rstrip(b'=').decode()}]}
 open('/tmp/as_req.json','w').write(json.dumps(req))
-# 需要 trustee 的 protos/attestation.proto 在本地
+# requires trustee's protos/attestation.proto locally
 subprocess.run(
   "grpcurl -plaintext -import-path . -proto attestation.proto -d @ "
   "35.253.66.70:50004 attestation.AttestationService/AttestationEvaluate < /tmp/as_req.json",
   shell=True)
 ```
 
-返回 `attestation_token`（JWT / EAR 格式）。解开 payload 看 `submods.cpu0`：
+Returns an `attestation_token` (JWT / EAR format). Decode the payload and look at `submods.cpu0`:
 
-| claim | 含义 |
+| claim | meaning |
 |---|---|
-| `ear.status` | 总判定：`affirming` 通过 / `warning` / `contraindicated` 不通过 |
-| `ear.trustworthiness-vector` | 各维度分值：`2`=affirming，`32–95`=warning，`≥96`=contraindicated |
+| `ear.status` | overall verdict: `affirming` pass / `warning` / `contraindicated` fail |
+| `ear.trustworthiness-vector` | per-dimension scores: `2`=affirming, `32–95`=warning, `≥96`=contraindicated |
 | `tdx.tcb_status` | `UpToDate` / `OutOfDate` / … |
-| `tdx.advisory_ids` | 命中的 Intel 安全公告（`INTEL-SA-xxxxx`）|
-| `tdx.quote.report_data` / `mr_td` / `rtmr_*` | AS 解析出的度量，可直接用于 §④ 对账 |
+| `tdx.advisory_ids` | matched Intel security advisories (`INTEL-SA-xxxxx`) |
+| `tdx.quote.report_data` / `mr_td` / `rtmr_*` | measurements parsed by the AS, directly usable for the §④ reconciliation |
 
-> 判定要点：`ear.status == affirming` 才算 quote 可信。`OutOfDate` TCB 会导致 `hardware` 维度
-> ≥96 → `contraindicated`（quote 是真的，但平台固件/微码过期，需升级 TCB）。
+> Verdict essentials: only `ear.status == affirming` means the quote is trusted. An `OutOfDate` TCB drives the `hardware` dimension
+> to ≥96 → `contraindicated` (the quote is genuine, but the platform firmware/microcode is outdated and the TCB needs upgrading).
 
 ---
 
-## ④ 解析 evidence + 对账
+## ④ Parsing the evidence + reconciling
 
-evidence(hex) 解码后 = `{ cc_eventlog: <base64>, gpu_evidence: null, quote: <base64>, runtime_data: <base64> }`
-（`runtime_data` 是 v0.4.0+ 才有，见 §②）。
+Decoded evidence(hex) = `{ cc_eventlog: <base64>, gpu_evidence: null, quote: <base64>, runtime_data: <base64> }`
+(`runtime_data` only exists from v0.4.0+, see §②).
 
-### 校验 report_data 绑定 + 取 signer（v0.4.0+）
+### Verify the report_data binding + read the signer (v0.4.0+)
 
 ```python
-rd_bytes = base64.b64decode(j["runtime_data"])          # 原样字节, 不要 loads 再 dumps
-assert bytes.fromhex(report_data) == hashlib.sha512(rd_bytes).digest()   # 绑定成立
+rd_bytes = base64.b64decode(j["runtime_data"])          # as-is bytes, do NOT loads then dumps
+assert bytes.fromhex(report_data) == hashlib.sha512(rd_bytes).digest()   # binding holds
 rd = json.loads(rd_bytes)
 signer_ok  = rd["signer"].lower() == onchain_signer.lower()
-nonce_ok   = rd.get("nonce","").lower() == "0x" + my_nonce.hex()          # 传了 nonce 才查
-tls_pubkey = rd.get("tls_public_key")                                     # 可能不存在
+nonce_ok   = rd.get("nonce","").lower() == "0x" + my_nonce.hex()          # only check if a nonce was sent
+tls_pubkey = rd.get("tls_public_key")                                     # may be absent
 ```
 
-先验绑定、再读字段——顺序反了就等于信任一段没被 quote 覆盖的 JSON。
+Verify the binding first, then read the fields — doing it in the reverse order amounts to trusting a piece of JSON not covered by the quote.
 
-老 evidence（无 `runtime_data`）走旧读法：`report_data` 前 20 字节 == signerAddress。
+Old evidence (no `runtime_data`) uses the legacy reading: the first 20 bytes of `report_data` == signerAddress.
 
-### Quote 度量 / report_data —— 直接取自 §③ 的 AS 解析结果
+### Quote measurements / report_data — taken directly from the AS parse result in §③
 
-**不要手搓 quote 字节偏移取度量。** TD body 的字段内部偏移是固定的，但 **body 在 quote 里的起始偏移随 quote version 变**：
-v4 header = 48 字节、**v5 header = 54 字节**。硬编 `q[48:]` 在 v5 quote 上会整体错位 6 字节，把 RTMR3 末尾误当成 report_data 前缀——这是个真实踩过的坑（见 `VERIFIER_AGENT_GUIDANCE.md`）。
+**Do not hand-roll quote byte offsets to extract measurements.** The field offsets inside the TD body are fixed, but **the body's starting offset within the quote varies with the quote version**:
+v4 header = 48 bytes, **v5 header = 54 bytes**. Hardcoding `q[48:]` on a v5 quote shifts everything by 6 bytes, mistaking the tail of RTMR3 for the prefix of report_data — this is a pit that has actually been fallen into (see `VERIFIER_AGENT_GUIDANCE.md`).
 
-AS（§③）已按版本正确对齐并解析好，直接读 token 的 `submods.cpu0.ear.veraison.annotated-evidence.tdx.quote.body`：
+The AS (§③) has already aligned and parsed correctly per version; just read the token's `submods.cpu0.ear.veraison.annotated-evidence.tdx.quote.body`:
 
 ```python
 qb = claims["submods"]["cpu0"]["ear.veraison.annotated-evidence"]["tdx"]["quote"]["body"]
-report_data = qb["report_data"]   # v0.4.0+: sha512(runtime_data); 老版本: 前20字节=signer
+report_data = qb["report_data"]   # v0.4.0+: sha512(runtime_data); older versions: first 20 bytes = signer
 mrtd        = qb["mr_td"]
 rtmr3       = qb["rtmr_3"]
 ```
 
-| 字段 | 含义 |
+| field | meaning |
 |---|---|
-| MRTD (`mr_td`) | TD 初始内存度量（固件/虚机镜像）；同款镜像多台相同 |
-| RTMR0/1/2 | 固件配置 / 引导(shim·grub) / OS(grub 命令·内核·initrd) |
-| RTMR3 | 运行时：cryptpilot FDE（老镜像）+ tapp 操作 |
-| `report_data` | v0.4.0+：`sha512(runtime_data)`，signer 从 `runtime_data.signer` 读。老版本：signer 在**偏移 0**（前 20 字节）其余补零。**RTMR(非 report_data)绝不能当 signer** |
+| MRTD (`mr_td`) | TD initial memory measurement (firmware/VM image); identical across machines with the same image |
+| RTMR0/1/2 | firmware config / boot (shim·grub) / OS (grub commands·kernel·initrd) |
+| RTMR3 | runtime: cryptpilot FDE (old images) + tapp operations |
+| `report_data` | v0.4.0+: `sha512(runtime_data)`, signer read from `runtime_data.signer`. Older versions: signer at **offset 0** (first 20 bytes), rest zero-padded. **An RTMR (anything that isn't report_data) must never be treated as the signer** |
 
-> 取 signer 的稳妥做法：先按上面校验 `report_data == sha512(runtime_data 原样字节)`，再读
-> `runtime_data.signer` 跟链上 `signerAddress` 比。老 evidence 才退回「取 `report_data` 前 20 字节，
-> 并把链上 `signerAddress` 当作**子串去搜索**」——既不写死 quote 偏移，也以链上值为锚。
-> （非要离线手搓时，必须按 `quote[0:2]` 的 version 决定 header 长度：v4→48、v5→54，再 `body[520:584]` 取 report_data。）
+> The safe way to obtain the signer: first verify `report_data == sha512(runtime_data as-is bytes)` per the above, then read
+> `runtime_data.signer` and compare with the on-chain `signerAddress`. Only for old evidence fall back to "take the first 20 bytes of `report_data`,
+> and **search** for the on-chain `signerAddress` as a substring" — this neither hardcodes quote offsets nor loses the chain value as the anchor.
+> (If you absolutely must parse offline by hand, the header length must be decided by the version in `quote[0:2]`: v4→48, v5→54, then take report_data at `body[520:584]`.)
 
-### cc_eventlog（TCG2，全程 SHA-384）
+### cc_eventlog (TCG2, SHA-384 throughout)
 
 ```python
 log = base64.b64decode(j['cc_eventlog']); ALG = {4:20, 0xb:32, 0xc:48, 0xd:64}
-o = 0; o += 8; o += 20; ds, = struct.unpack_from('<I', log, o); o += 4 + ds   # 跳过 SpecID
+o = 0; o += 8; o += 20; ds, = struct.unpack_from('<I', log, o); o += 4 + ds   # skip SpecID
 while o + 12 <= len(log):
     pcr, et = struct.unpack_from('<II', log, o); o += 8
     cnt,    = struct.unpack_from('<I', log, o);  o += 4
@@ -239,71 +246,71 @@ while o + 12 <= len(log):
         if alg == 0xc: d384 = log[o:o+ALG[alg]].hex()
         o += ALG.get(alg, 48)
     dl, = struct.unpack_from('<I', log, o); o += 4; data = log[o:o+dl]; o += dl
-    if et == 0x6 and dl >= 8:                                  # EV_EVENT_TAG: 前8字节是tag头
+    if et == 0x6 and dl >= 8:                                  # EV_EVENT_TAG: first 8 bytes are the tag header
         text = data[8:8 + struct.unpack_from('<I', data, 4)[0]].decode('utf-8','replace')
         # text = "<domain> <operation/key> <value>"
 ```
 
-### 度量匹配规则（对 AS 参考值）
+### Measurement matching rules (against AS reference values)
 
-| 字段 | 匹配方式 | 备注 |
+| field | match mode | notes |
 |---|---|---|
-| MRTD / shim / grub / kernel | 精确 | 同镜像相同 |
-| initrd | 精确 | **每台可能不同**，各匹配各自参考值 |
-| kernel_cmdline | **OR** | 见下 |
-| report_data 绑定 | = `sha512(runtime_data)` | 先验绑定再读字段 |
-| `runtime_data.signer` | = 链上 signerAddress | 见上 |
-| `runtime_data.nonce` | = 本次请求发的 challenge | 只在传了 `--nonce` 时查 |
-| `runtime_data.tls_public_key` | = 握手拿到证书公钥的 sha256 | 可能不存在（app 没申请 TLS key）|
-| compose / volumes / image hash | = 链上对应字段 | 见 §① 编码规则 |
+| MRTD / shim / grub / kernel | exact | identical for the same image |
+| initrd | exact | **may differ per machine**; each matches its own reference value |
+| kernel_cmdline | **OR** | see below |
+| report_data binding | = `sha512(runtime_data)` | verify the binding before reading fields |
+| `runtime_data.signer` | = on-chain signerAddress | see above |
+| `runtime_data.nonce` | = the challenge sent with this request | only checked if `--nonce` was passed |
+| `runtime_data.tls_public_key` | = sha256 of the certificate public key obtained in the handshake | may be absent (app never requested a TLS key) |
+| compose / volumes / image hash | = corresponding on-chain field | see §① encoding rules |
 
-**kernel_cmdline 有两条参考值（新/旧 grub），命中其一即通过：**
+**kernel_cmdline has two reference values (new/old grub); matching either one passes:**
 
-| | 内核路径写法 | 实例 digest |
+| | kernel path spelling | example digest |
 |---|---|---|
-| 新 grub | `/vmlinuz-<ver> root=… ip=dhcp`（相对 `$root`）| `7dd3d3d1…` |
-| 旧 grub | `(hd0,gptN)/boot/vmlinuz-<ver> root=… …`（grub 设备全路径）| `bad43ebbd…`（GCP 6.17 内核例）|
+| new grub | `/vmlinuz-<ver> root=… ip=dhcp` (relative to `$root`) | `7dd3d3d1…` |
+| old grub | `(hd0,gptN)/boot/vmlinuz-<ver> root=… …` (full grub device path) | `bad43ebbd…` (GCP 6.17 kernel example) |
 
-两者内核与参数完全相同，差别仅是内核路径文字表示 → 哈希不同。
-digest = `SHA384(cmdline字符串)`（去掉 eventlog 里 `kernel_cmdline: ` 前缀、不含结尾 null）。
-> 实测：GCP 镜像（新 grub）只产生 `/vmlinuz` 形式；老阿里云镜像（旧 grub）产生 `(hd0,gpt3)/boot/vmlinuz` 形式。
+The kernel and parameters are exactly the same in both; the only difference is the textual spelling of the kernel path → different hashes.
+digest = `SHA384(cmdline string)` (with the `kernel_cmdline: ` prefix from the eventlog removed, and without the trailing null).
+> Observed in practice: GCP images (new grub) only produce the `/vmlinuz` form; old Aliyun images (old grub) produce the `(hd0,gpt3)/boot/vmlinuz` form.
 
 ---
 
-## RTMR3 运行时事件（对账数据来源）
+## RTMR3 runtime events (the data source for reconciliation)
 
-RTMR3 的 `EV_EVENT_TAG` 是运行时度量，统一格式 `<domain> <key/operation> <value>`，按 domain 分两类：
+RTMR3's `EV_EVENT_TAG` entries are runtime measurements in the uniform format `<domain> <key/operation> <value>`, split into two classes by domain:
 
-### cryptpilot（老阿里云镜像，全盘加密 FDE）
+### cryptpilot (old Aliyun images, full-disk encryption FDE)
 
-domain `cryptpilot.alibabacloud.com`，initrd 阶段产生，排在 tapp 事件之前。
-**仅用 cryptpilot 的老镜像有**；新 GCP 镜像没有这几条。
+domain `cryptpilot.alibabacloud.com`, produced during the initrd stage, ordered before the tapp events.
+**Only old images that use cryptpilot have these**; new GCP images do not.
 
-| key | value | 含义 |
+| key | value | meaning |
 |---|---|---|
-| `load_config` | `<SHA-384>` | cryptpilot 配置度量 |
-| `fde_rootfs_hash` | `<hash>` | 全盘加密 rootfs 哈希 |
-| `initrd_switch_root` | `{}` | initrd 切根标记 |
+| `load_config` | `<SHA-384>` | cryptpilot configuration measurement |
+| `fde_rootfs_hash` | `<hash>` | full-disk-encrypted rootfs hash |
+| `initrd_switch_root` | `{}` | initrd switch-root marker |
 
-### tapp 操作
+### tapp operations
 
-domain `tapp.0g.com`，由 `start_app`/`stop_app`/`start_service`/`get_app_secret_key`/`docker_login` 触发
-（代码 `extend_measurement()` → AA `extend_runtime_measurement`）：
+domain `tapp.0g.com`, triggered by `start_app`/`stop_app`/`start_service`/`get_app_secret_key`/`docker_login`
+(code: `extend_measurement()` → AA `extend_runtime_measurement`):
 
 ```
 tapp.0g.com <operation> {"app_id","operation","result","error",
   "compose_hash","volumes_hash","image_hash","deployer","timestamp"}
 ```
 
-- 对账取**最后一条 `result:"success"` 且 `compose_hash` == 链上 composeHash 的 `start_app`**。
-- 成功和失败都记录（失败：`result:"failed"` + error 文本 + `image_hash:{}` 空）。
-- `docker_login` 记 `registry/username/signer/timestamp`（不含密码）。
-- 规律：每次会话第一条运行时事件落 `pcrIndex=1`，之后落 `pcrIndex=4`。
+- For reconciliation, take **the last `start_app` with `result:"success"` and `compose_hash` == the on-chain composeHash**.
+- Both success and failure are recorded (failure: `result:"failed"` + error text + empty `image_hash:{}`).
+- `docker_login` records `registry/username/signer/timestamp` (no password).
+- Pattern: the first runtime event of each session lands on `pcrIndex=1`; subsequent ones land on `pcrIndex=4`.
 
-### claim_config（运行时认领 owner+配置,canonical 镜像必查）
+### claim_config (runtime claiming of owner+config; mandatory check for canonical images)
 
-canonical 镜像不烧 owner/chain/kbs(黄金参考值全网一套,路径 `<env>.json` 无 owner 层),
-**整个运行时配置从静态度量搬进了运行时事件日志**:
+Canonical images do not bake in owner/chain/kbs (one set of golden reference values network-wide, at path `<env>.json` with no owner layer),
+so **the entire runtime configuration moved from static measurements into the runtime event log**:
 
 ```
 tapp.0g.com claim_config {"owner":"0x<owner>","chain_rpc_url":"…",
@@ -311,37 +318,37 @@ tapp.0g.com claim_config {"owner":"0x<owner>","chain_rpc_url":"…",
   "operation":"claim_config","timestamp":<ts>}
 ```
 
-对账规则(在 §④ 增加一步):
+Reconciliation rules (add one step to §④):
 
-1. 事件日志里**必须存在 `claim_config` 事件**(无 → 节点无主或走了度量外路径,拒绝);
-2. 若有多条(如 config 模式跨进程重启),**所有 `claim_config` 的 `owner` 必须一致**;
-3. `owner` == 链上该节点注册的 owner(不一致 → owner 被抢注或注册不符,拒绝);
-4. `chain_contract_address` / `kbs_node_urls` 供审计:节点当时认领的是哪个合约、哪个 KMS 集群。
+1. A **`claim_config` event must exist** in the event log (none → the node is ownerless or took an unmeasured path; reject);
+2. If there are multiple (e.g. config mode restarting across processes), **the `owner` of all `claim_config` events must be identical**;
+3. `owner` == the owner registered on-chain for this node (mismatch → the owner was squatted or the registration does not match; reject);
+4. `chain_contract_address` / `kbs_node_urls` are for audit: which contract and which KMS cluster the node claimed at the time.
 
-claim 事件由启动后的首次认领产生(ClaimConfig RPC 的动态模式,或 config.toml 预制模式启动自动认领),
-每次 VM 重启 RTMR 清零、重新认领、重新度量——owner 与 quote 始终同生命周期。
+The claim event is produced by the first claim after boot (dynamic mode via the ClaimConfig RPC, or automatic claiming at startup in config.toml preset mode).
+On every VM reboot the RTMRs are zeroed, the claim happens again, and it is measured again — the owner and the quote always share a lifecycle.
 
-**`tapp-cli verify-app` 已自动执行本节规则**(v0.3.0+):chain 模式下 reconcile 行输出
-`owner✓/✗/?`(✓=claim_config owner==链上 owner;✗=不一致,Result ❌;?=无 claim_config 事件,
-0.3 之前的镜像)。另外无 `--policy-ids` 时,boot-chain 组件度量按参考值 JSON 格式原样打印,
-可直接与 `verifier/reference-values/…/<env>.json` diff。
+**`tapp-cli verify-app` already performs the rules in this section automatically** (v0.3.0+): in chain mode the reconcile line prints
+`owner✓/✗/?` (✓ = claim_config owner == on-chain owner; ✗ = mismatch, Result ❌; ? = no claim_config event,
+images predating 0.3). Also, without `--policy-ids`, the boot-chain component measurements are printed verbatim in the reference-value JSON format,
+so they can be diffed directly against `verifier/reference-values/…/<env>.json`.
 
 ---
 
-## TLS：把「验过的 TEE」和「我正在通话的端点」连起来（v0.4.0+）
+## TLS: connecting "the verified TEE" to "the endpoint I am talking to" (v0.4.0+)
 
-上面 ①②③④ 证明的是「链上这个 app 的这个节点，确实在真 TEE 里跑着注册的代码」。但一个客户端
-真正要的是「**我现在这条 TLS 连接的对端**就是那个节点」——这中间需要一根绳子，就是
-`runtime_data.tls_public_key`。
+What ①②③④ above prove is "this node of this on-chain app is really running the registered code inside a genuine TEE". But what a client
+actually needs is "**the peer of the TLS connection I have right now** is that node" — the rope tying these together is
+`runtime_data.tls_public_key`.
 
 ```
-①②③④  →  这台 TEE 可信，且它的 TLS 公钥 sha256 = H
-握手    →  对端证书里的公钥 sha256 = H'
-H == H' →  这条连接的对端就是那台 TEE
+①②③④  →  this TEE is trusted, and the sha256 of its TLS public key = H
+handshake →  sha256 of the public key in the peer's certificate = H'
+H == H' →  the peer of this connection is that TEE
 ```
 
-app 用 `get-app-tls-cert`（socket-only）拿到 `key_pem` / `cert_pem` 直接起 HTTPS，不需要自己做任何
-密码学工作。客户端侧只需要一条命令算出 `H'`：
+The app obtains `key_pem` / `cert_pem` via `get-app-tls-cert` (socket-only) and serves HTTPS directly, without doing any
+cryptographic work itself. On the client side, one command computes `H'`:
 
 ```bash
 openssl s_client -connect HOST:PORT </dev/null 2>/dev/null \
@@ -349,69 +356,69 @@ openssl s_client -connect HOST:PORT </dev/null 2>/dev/null \
   | openssl dgst -sha256
 ```
 
-`tapp-cli verify-app` 会把 `H` 和这条命令一起打出来（`tls key : <sha256>`），所以对账是肉眼一步。
+`tapp-cli verify-app` prints `H` along with that command (`tls key : <sha256>`), so the reconciliation is a single eyeball step.
 
-**两层信任，第二层是可选的：**
+**Two trust layers; the second is optional:**
 
-| | 谁绑定了什么 | 客户端要做什么 |
+| | who binds what | what the client has to do |
 |---|---|---|
-| 第一层（evidence） | 证据把 TLS 公钥绑到一个 TEE 上，**不需要 CA** | 自己比 `H` 和 `H'` |
-| 第二层（CA） | CA 把一个域名绑到同一把公钥上 | 什么都不做，系统信任库自动通过 |
+| Layer 1 (evidence) | the evidence binds the TLS public key to a TEE — **no CA needed** | compare `H` and `H'` itself |
+| Layer 2 (CA) | a CA binds a domain name to the same public key | nothing — the system trust store passes it automatically |
 
-自签证书在第一层里**不比 CA 签的弱**——被检查的是公钥而不是签发者。CA（`ca_url`）只是为了让
-不做这个检查的客户端（浏览器、任何走系统信任库的东西）也能接受同一张证书。
+In layer 1, a self-signed certificate is **no weaker than a CA-signed one** — what is checked is the public key, not the issuer. The CA (`ca_url`) exists only so that
+clients that don't perform this check (browsers, anything using the system trust store) also accept the same certificate.
 
-**公钥能不能 pin，取决于 key source**（`config.toml` 的 `[server].tls_key_source`，或
-`claim-config --tls-key-source`）：
+**Whether the public key can be pinned depends on the key source** (`[server].tls_key_source` in `config.toml`, or
+`claim-config --tls-key-source`):
 
-| | 从哪派生 | 重启后还一样吗 | 证据说的话 |
+| | derived from | same after a restart? | what the evidence says |
 |---|---|---|---|
-| `local`（默认）| 本 CVM 的 signer | **不一样**——signer 每次开机重新派生 | 「就是这一个 TEE 实例」（最强）|
-| `kms` | KMS 按 `(app_id, "tls")` 派生 | 一样，且该 app 每个节点都相同 | 「这个 app 的某个 TEE」|
+| `local` (default) | this CVM's signer | **no** — the signer is re-derived on every boot | "this exact TEE instance" (strongest) |
+| `kms` | KMS derives from `(app_id, "tls")` | yes, and identical on every node of the app | "some TEE of this app" |
 
-要 pin、要 CT 监控、要 ACME 续签，就得用 `kms`——`local` 每次重启换公钥，这些全部破功。反过来
-`local` 不依赖 KMS 和链上注册，首次开机就能用。默认 `local` 是因为它永远能用，稳定性是有需要时
-才 opt-in 的东西。
+If you want pinning, CT monitoring, or ACME renewal, you must use `kms` — `local` changes the public key on every restart, breaking all of those. Conversely,
+`local` depends on neither the KMS nor on-chain registration and works from first boot. `local` is the default because it always works; stability is something you
+opt into when you need it.
 
 ---
 
-## 实测走查：`0g-agentic-id-attestor`（严格照本文档端到端跑过）
+## Live walkthrough: `0g-agentic-id-attestor` (run end-to-end strictly per this document)
 
-> 这次走查跑在 **0.4.0 之前**的节点上，所以 ④ 里 signer 是按旧读法（`report_data` 前 20 字节）取的，
-> evidence 里没有 `runtime_data`。0.4.0+ 的节点改成先验 `sha512` 绑定再读 `runtime_data.signer`，
-> 其余步骤不变。
+> This walkthrough ran on a node **older than 0.4.0**, so in ④ the signer was read the legacy way (first 20 bytes of `report_data`)
+> and the evidence contained no `runtime_data`. On 0.4.0+ nodes, first verify the `sha512` binding then read `runtime_data.signer`;
+> all other steps are unchanged.
 
-输入 `app_id = 0g-agentic-id-attestor`，全自动（脚本见 §附）：
+Input `app_id = 0g-agentic-id-attestor`, fully automatic (script in the appendix §):
 
 ```
-① 链上:
+① on-chain:
    getAppInfo  → composeHash 740e9c57…2751d8 / volumesHash .env:<digest>\n / imageHashes[sha256:b7aaa6…, sha256:4b7183ac…]
    getNodeList → [0x6C30D1E9392eaF67DAB66c4962249DE821CD335f]
    getNode     → teeUrl http://47.84.230.10:50051   stake 1 0G
-② 取证: get-evidence @ 47.84.230.10  (老阿里云镜像: MRTD 060000…, cryptpilot FDE, 旧 grub)   ✅
-③ AS 验签 @ 35.253.66.70:50004 (AttestationEvaluate): 返回 token, quote 签名✅, report_data 解出=0x6C30…335f
-        但 tcb_status=OutOfDate (INTEL-SA-01036 等 8 条) → ear.status=contraindicated  ⚠️ 平台 TCB 过期
-④ 对账:
-   node signer  0x6C30…335f      == AS report_data 前20字节            ✅
+② fetch evidence: get-evidence @ 47.84.230.10  (old Aliyun image: MRTD 060000…, cryptpilot FDE, old grub)   ✅
+③ AS verification @ 35.253.66.70:50004 (AttestationEvaluate): token returned, quote signature✅, report_data parsed = 0x6C30…335f
+        but tcb_status=OutOfDate (INTEL-SA-01036 and 7 more) → ear.status=contraindicated  ⚠️ platform TCB outdated
+④ reconcile:
+   node signer  0x6C30…335f      == first 20 bytes of AS report_data   ✅
    composeHash  740e9c57…2751d8   == start_app(ts 1781099341).compose ✅
-   volumesHash  .env:<digest>\n   == start_app.volumes_hash (重建)    ✅
+   volumesHash  .env:<digest>\n   == start_app.volumes_hash (rebuilt)  ✅
    imageHashes  sha256:b7aaa6…/4b7183ac… == start_app.image_hash       ✅
 ```
 
-**节点判定**：身份 + 代码度量对账**全部通过**（①②④）；AS 验签**接口可用、quote 真实**，但该节点
-**TCB 过期**导致 `contraindicated`（③）——属真实安全发现（需升级平台固件/微码），非验证失败。
-①②③④ 均已端到端实测跑通。
+**Node verdict**: identity + code measurement reconciliation **all passed** (①②④); AS verification: **endpoint reachable, quote genuine**, but this node's
+**TCB is outdated**, causing `contraindicated` (③) — a genuine security finding (platform firmware/microcode needs upgrading), not a verification failure.
+①②③④ have all been run end-to-end on real hardware.
 
 ---
 
-## 速查 checklist（输入 = app_id）
+## Quick checklist (input = app_id)
 
-1. 链上 `getAppInfo` / `getNodeList` / `getNode` 读注册信息 + 各节点 teeUrl。
-2. 对每个节点：按 teeUrl `get-evidence --app-id <id> --nonce <随机 hex>`。
-3. 验 quote 签名 + TCB：提交 **CoCo-AS gRPC `35.253.66.70:50004`** `AttestationEvaluate`（AS 请求的 `runtime_data` 留空），看 `ear.status==affirming` 且 `tcb_status==UpToDate`（**别用 8080 KBS，那是 RCAR 密钥分发，会 401**）。
-4. 对账：
-   - 先验 `report_data == sha512(evidence.runtime_data 原样字节)`，再读 `runtime_data.signer` == 链上 signerAddress（别手搓 quote 偏移；老 evidence 无此字段则退回前 20 字节读法）；
-   - 传了 nonce 就查 `runtime_data.nonce` 是否回显（区分新鲜 quote 与缓存 quote）；
-   - `runtime_data.tls_public_key`（若有）== 握手拿到证书公钥的 sha256；
-   - compose/volumes/image hash==链上（按 §① 编码）；MRTD/启动链==AS 参考值（cmdline OR）。
-5. RTMR3 识别 cryptpilot（老镜像）+ 取最后一条成功 start_app 做 compose/image/volumes 对账 + `claim_config` 的 owner 对账。
+1. Read registration info + each node's teeUrl from the chain: `getAppInfo` / `getNodeList` / `getNode`.
+2. For each node: `get-evidence --app-id <id> --nonce <random hex>` at its teeUrl.
+3. Verify quote signature + TCB: submit `AttestationEvaluate` to **CoCo-AS gRPC `35.253.66.70:50004`** (leave the AS request's `runtime_data` empty); check `ear.status==affirming` and `tcb_status==UpToDate` (**do not use the KBS on 8080 — that is RCAR key distribution and will 401**).
+4. Reconcile:
+   - first verify `report_data == sha512(evidence.runtime_data as-is bytes)`, then read `runtime_data.signer` == on-chain signerAddress (never hand-roll quote offsets; for old evidence without this field, fall back to the first-20-bytes reading);
+   - if a nonce was sent, check that `runtime_data.nonce` echoes it (distinguishes a fresh quote from a cached one);
+   - `runtime_data.tls_public_key` (if present) == sha256 of the certificate public key obtained in the handshake;
+   - compose/volumes/image hash == on-chain (per the §① encoding); MRTD/boot chain == AS reference values (cmdline is OR).
+5. In RTMR3, recognize cryptpilot (old images) + take the last successful start_app for the compose/image/volumes reconciliation + reconcile the `claim_config` owner.

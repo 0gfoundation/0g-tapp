@@ -1,78 +1,80 @@
 # App Deployment Runbook (tapp + TappRegistry)
 
-把一个 app（以 sandbox **provider** + **broker** 为例）从零部署到 tapp、并在 TappRegistry 上链可用的标准流程与踩坑清单。
+The standard procedure — and the pitfall checklist — for deploying an app (using the sandbox **provider** + **broker** as the example) from zero onto tapp and making it usable on-chain in TappRegistry.
 
-- **合约**：TappRegistry BeaconProxy `0x2Ce80374318B1d7Fb3345724457a182E0ad165c9`
-- **RPC / chainId**：`https://evmrpc-testnet.0g.ai` / `16602`
-- **compose**：provider → `0g-sandbox/docker/sandbox/docker-compose.yml`，broker → `0g-sandbox/docker/broker/docker-compose.yml`
+- **Contract**: TappRegistry BeaconProxy `0x2Ce80374318B1d7Fb3345724457a182E0ad165c9`
+- **RPC / chainId**: `https://evmrpc-testnet.0g.ai` / `16602`
+- **compose**: provider → `0g-sandbox/docker/sandbox/docker-compose.yml`, broker → `0g-sandbox/docker/broker/docker-compose.yml`
 
-> 详细的合约用法见 [`contract/CONTRACTS.md`](../contract/CONTRACTS.md)，tapp-cli 用法见 [`.claude/skills/0g-tapp-cli/SKILL.md`](../.claude/skills/0g-tapp-cli/SKILL.md)。
+> For detailed contract usage see [`contract/CONTRACTS.md`](../contract/CONTRACTS.md); for tapp-cli usage see [`.claude/skills/0g-tapp-cli/SKILL.md`](../.claude/skills/0g-tapp-cli/SKILL.md).
 
 ---
 
-## 标准步骤
+## Standard steps
 
-| # | 步骤 | 命令 / 要点 | provider | broker |
+| # | Step | Command / key points | provider | broker |
 |---|------|------------|:---:|:---:|
-| 1 | 配 tapp-server config 的 owner，起 tapp 服务器 | 该 owner key 之后用于所有 start/stop/register | ✅ | ✅ |
-| 2 | `start-app` 起服务 | `PROVIDER_ADDRESS` 必须 == 该 app 的链上 owner；先 `docker-login` 私有 registry；`.env` 的 `TAPP_REGISTRY`/`SETTLEMENT_CONTRACT` 要齐 | ✅ | ✅ |
-| 3 | `register-onchain` 注册上链 | 各质押 1 0G | ✅ | ✅ |
+| 1 | Set the owner in the tapp-server config, start the tapp server | this owner key is used for all subsequent start/stop/register | ✅ | ✅ |
+| 2 | `start-app` to bring up the services | `PROVIDER_ADDRESS` must == the app's on-chain owner; `docker-login` to the private registry first; `.env` must have both `TAPP_REGISTRY`/`SETTLEMENT_CONTRACT` | ✅ | ✅ |
+| 3 | `register-onchain` to register on-chain | 1 0G stake each | ✅ | ✅ |
 
-> 步骤 2+3 可合并为一条：`start-app --register-onchain --rpc-url … --contract … --stake-wei …`
-> 会在容器启动**之前**幂等注册（未注册→registerApp；已注册但本节点 signer 不在 node list→addNode；已在→跳过）。
-> server 先 pull 镜像算好 hash，交易确认后才 up；重启后 signer 变的场景会自动走 addNode（旧 node 仍需手动 remove/update）。
-| 4 | `authorizeInvalidator(appId, <SandboxServing 合约地址>)` | 授权兄弟合约 SandboxServing 调 `invalidateAcks`，使改价能作废用户 ack；**必须在第 5 步前** | ✅ | — |
-| 5 | `cmd/provider register` 绑服务到 SandboxServing | 设 `services[provider].appId` + 价格 | ✅ | — |
+> Steps 2+3 can be combined into one command: `start-app --register-onchain --rpc-url … --contract … --stake-wei …`
+> It registers idempotently **before** the containers start (not registered→registerApp; registered but this node's signer not in the node list→addNode; already present→skip).
+> The server pulls images and computes hashes first, and only brings services up after the transaction confirms; when the signer changed after a restart, it automatically takes the addNode path (the old node still has to be removed/updated manually).
+| 4 | `authorizeInvalidator(appId, <SandboxServing contract address>)` | authorizes the sibling contract SandboxServing to call `invalidateAcks`, so that a price change can invalidate user acks; **must happen before step 5** | ✅ | — |
+| 5 | `cmd/provider register` to bind the service to SandboxServing | sets `services[provider].appId` + pricing | ✅ | — |
 
 ```bash
-# 2. 起服务（先 docker-login）
+# 2. Start services (docker-login first)
 tapp-cli -s http://<server>:50051 -k 0x<owner-key> docker-login -r <registry> -u <user> -p <pass>
 tapp-cli -s http://<server>:50051 -k 0x<owner-key> start-app -f <compose> --app-id <appId>
 
-# 3. 注册上链（key 必须既是 server owner 又是有钱的 app owner）
+# 3. Register on-chain (the key must be both the server owner and a funded app owner)
 tapp-cli -s http://<server>:50051 -k 0x<owner-key> register-onchain \
   --app-id <appId> --rpc-url https://evmrpc-testnet.0g.ai \
   --contract 0x2Ce80374318B1d7Fb3345724457a182E0ad165c9 --stake-wei 1000000000000000000
 
-# 2+3 合并版：先注册再起（幂等，可反复跑）
+# 2+3 combined: register first, then start (idempotent, safe to re-run)
 tapp-cli -s http://<server>:50051 -k 0x<owner-key> start-app -f <compose> --app-id <appId> \
   --register-onchain --rpc-url https://evmrpc-testnet.0g.ai \
   --contract 0x2Ce80374318B1d7Fb3345724457a182E0ad165c9 --stake-wei 1000000000000000000
 
-# 4. 授权 invalidator（注意：授权的是 SandboxServing 合约地址，不是 owner 钱包）
-#    暂无 tapp-cli 子命令，直接 cast send（注意 gas）
+# 4. Authorize the invalidator (note: authorize the SandboxServing contract address, not the owner wallet)
+#    No tapp-cli subcommand yet — use cast send directly (watch the gas)
 cast send 0x2Ce80374318B1d7Fb3345724457a182E0ad165c9 \
   "authorizeInvalidator(string,address)" "<appId>" 0x<SANDBOX_SERVING_CONTRACT> \
   --rpc-url https://evmrpc-testnet.0g.ai --private-key 0x<owner-key> \
   --legacy --gas-price 3000000000
 
-# 5. provider 注册服务（在 0g-sandbox repo）
+# 5. provider registers the service (in the 0g-sandbox repo)
 PROVIDER_KEY=0x<owner-key> go run ./cmd/provider register --app-id <appId> --url ... --price-per-cpu ...
 ```
 
-> broker 只到第 3 步；步骤 4、5 是 provider 专属。
+> The broker only goes through step 3; steps 4 and 5 are provider-only.
 
 ---
 
-## 踩坑清单（最容易再犯）
+## Pitfall checklist (the mistakes most likely to be repeated)
 
-- **三 key 合一**：`register-onchain` 的 `--private-key` 必须**同时**满足「能连 server（server owner 或白名单）」+「是 app 将来的 owner」+「链上有钱（质押 1 0G + gas）」。三者必须同一地址——最常卡这。
-- **invalidator 授给合约，不是钱包**：`invalidateAcks` 判 `msg.sender == SandboxServing 合约`。授权 owner EOA 会让 `isAuthorizedInvalidator` 返回 true，但合约调用仍 revert `sandbox not authorized as invalidator`。
-- **`PROVIDER_ADDRESS` 必须 == app 链上 owner**，否则 sandbox 的 signer_mismatch monitor 报不一致、voucher 全 `INVALID_SIGNATURE`。
-- **重启 → TEE signer 变**：TEE 派生 signer 不持久化，任何 `stop/start` 后链上 node 过期 → 补 `update-node-onchain`（`--old-signer` 传旧的，新 signer 自动从 server 取）。
-- **换 owner 无 transfer**：owner 在 `registerApp` 写死。换 owner = 旧 owner `removeNode` 注销（质押锁 `lockPeriod`=86400s/1 天，到期旧 owner 自己 `withdraw()`）→ 新 owner 重新 `register`。
-- **app-id 全局唯一**：register 撞名报 `app already exists`。已存在只能 `add-node` / `update-node`（`update-node` 会替掉原 node，注意别误删别处生产 node）。
-- **service appId set-once**：改 appId 报 `appId immutable; deregister to change`，要先 deregister。
-- **`cast send` gas 太低被拒**：默认 tip 1 wei < 最低 2 gwei，手动加 `--legacy --gas-price 3000000000`。tapp-cli 的 onchain 子命令自己处理 gas，无需此参。
-- **私有 registry 临时 token 寿命短**：docker-login 后很快过期，拉镜像 `unauthorized` 就重新登录。
-- **部分云主机 docker 无 DNS**：解析不了 `docker.io`，公共镜像拉不下来，需在主机配 docker DNS（`/etc/docker/daemon.json` 的 `"dns"`）。
+- **Three keys in one**: the `--private-key` for `register-onchain` must **simultaneously** satisfy: "can connect to the server (server owner or allowlisted)" + "will be the app's owner" + "funded on-chain (1 0G stake + gas)". All three must be the same address — this is the most common blocker.
+- **Authorize the invalidator to a contract, not a wallet**: `invalidateAcks` checks `msg.sender == the SandboxServing contract`. Authorizing the owner EOA makes `isAuthorizedInvalidator` return true, but the contract call still reverts with `sandbox not authorized as invalidator`.
+- **`PROVIDER_ADDRESS` must == the app's on-chain owner**, otherwise the sandbox's signer_mismatch monitor reports a mismatch and every voucher gets `INVALID_SIGNATURE`.
+- **Restart → TEE signer changes**: the TEE-derived signer is not persisted; after any `stop/start` the on-chain node is stale → fix with `update-node-onchain` (pass the old one via `--old-signer`; the new signer is fetched from the server automatically).
+- **No owner transfer**: the owner is fixed at `registerApp`. Changing owner = the old owner deregisters via `removeNode` (the stake locks for `lockPeriod`=86400s/1 day; the old owner calls `withdraw()` itself when it expires) → the new owner does a fresh `register`.
+- **app-id is globally unique**: registering with a taken name fails with `app already exists`. For an existing one you can only `add-node` / `update-node` (`update-node` replaces the original node — be careful not to accidentally remove a production node elsewhere).
+- **service appId is set-once**: changing appId fails with `appId immutable; deregister to change`; you must deregister first.
+- **`cast send` rejected for gas too low**: the default tip of 1 wei is below the 2 gwei minimum; add `--legacy --gas-price 3000000000` manually. tapp-cli's onchain subcommands handle gas themselves — this flag is not needed there.
+- **Private-registry temporary tokens are short-lived**: they expire soon after docker-login; if an image pull hits `unauthorized`, just log in again.
+- **Some cloud hosts have no docker DNS**: `docker.io` fails to resolve and public images can't be pulled; configure docker DNS on the host (`"dns"` in `/etc/docker/daemon.json`).
+- **FDE (≥0.7.0): `fde_volume_key - KMS refused the volume key` refuses to start**: a node configured with KMS must obtain the volume key before starting an app. Three possible causes — the app is not yet registered on-chain to this node (use `--register-onchain`, which handles the ordering); the KMS trust anchors are not configured (`update-trust-anchors --scan-url --scan-pubkey`, or provide them together at claim-config time); or the KMS cluster is genuinely down. There is **no** silent fallback to plaintext startup — that is by design.
+- **FDE: where the data lands depends on how the compose spells it**: named volumes go into the encrypted volume automatically (zero changes); `./data/` goes in explicitly; other `./` relative paths live in RAM and are lost on restart; absolute paths are plaintext (start-app prints a warning). See README "Where app data lives".
 
 ---
 
-## imageHashes 全空的根因（已修，存档）
+## Root cause of all-empty imageHashes (fixed, archived)
 
-**现象**：链上 `getAppInfo(appId).imageHashes` 为空数组 `[]`，且 `tapp-cli get-app-info` 显示 `Image Hash: {}`（compose/volume hash 正常）。
+**Symptom**: on-chain `getAppInfo(appId).imageHashes` is an empty array `[]`, and `tapp-cli get-app-info` shows `Image Hash: {}` (compose/volume hashes are normal).
 
-**根因**：tapp-server 通过 `docker compose images --format json` 枚举镜像。某些主机该命令输出**单行 JSON 数组** `[{...},{...}]`，而**旧 tapp-server 二进制按 NDJSON 逐行解析** → `invalid type: map, expected a string` → 整行 skip → `image_count=0` → image_hash `{}`。
+**Root cause**: tapp-server enumerates images via `docker compose images --format json`. On some hosts this command outputs a **single-line JSON array** `[{...},{...}]`, while the **old tapp-server binary parsed it as NDJSON line by line** → `invalid type: map, expected a string` → the whole line skipped → `image_count=0` → image_hash `{}`.
 
-**修复**：`prune`/重拉/重新注册都治不了，必须换二进制。当前源码 `src/boot/manager.rs` 已改为 `serde_json::from_str::<Vec<ImageInfo>>(stdout.trim())` 整体数组解析。换上当前 build 的 tapp-server + 重启 app + `update-onchain` 后 imageHashes 即非空。
+**Fix**: `prune`/re-pulling/re-registering do not cure it — the binary must be replaced. The current source `src/boot/manager.rs` now parses the whole array with `serde_json::from_str::<Vec<ImageInfo>>(stdout.trim())`. After installing a current build of tapp-server + restarting the app + `update-onchain`, imageHashes is non-empty.

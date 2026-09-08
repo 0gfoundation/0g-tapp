@@ -14,27 +14,74 @@ pub struct EthKeyPair {
     pub x25519_public_key: Option<Vec<u8>>, // 32-byte X25519 public key
 }
 
-/// Application key service — always uses in-memory key generation.
-/// Keys are derived per app_id and persist for the lifetime of the process.
+/// Application key service.
+///
+/// One **common signer** is generated randomly at startup (so it rotates with
+/// every boot, like everything TEE-derived here), and every app signer is
+/// DERIVED from it: `keccak("tapp-app-signer-v1" || common_priv || app_id)`.
+/// The common signer is the node's own identity — it exists before any app
+/// does, it is what `GetEvidence` attests when no app_id is given, and the
+/// daemon's TLS listener key derives from it, which is what lets a client pin
+/// the management channel against attested evidence instead of trusting the
+/// network. The empty app_id resolves to the common signer everywhere.
 /// KBS/KMS secret retrieval is handled separately via kms_client.
 pub struct AppKeyService {
-    /// In-memory key storage: app_id -> EthKeyPair
+    /// The node's common key pair, fixed for the process lifetime.
+    common: EthKeyPair,
+    /// Derived-key cache: app_id -> EthKeyPair
     app_keys: Mutex<HashMap<String, EthKeyPair>>,
 }
 
 impl AppKeyService {
     pub fn new() -> Self {
-        info!("Initialized app key service (in-memory)");
+        let common = Self::generate_eth_keypair(true)
+            .expect("OS randomness must be available to generate the common signer");
+        info!(
+            common_signer = %format!("0x{}", hex::encode(&common.eth_address)),
+            "Initialized app key service (common signer generated; app keys derive from it)"
+        );
         Self {
+            common,
             app_keys: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Generate a new Ethereum key pair for an app
+    /// The node's common key pair. Public counterpart of every derived app key.
+    pub fn common_key(&self) -> &EthKeyPair {
+        &self.common
+    }
+
+    /// Generate a fresh random Ethereum key pair (used only for the common signer).
     fn generate_eth_keypair(x25519: bool) -> TappResult<EthKeyPair> {
         use k256::elliptic_curve::rand_core::OsRng;
-
         let signing_key = SigningKey::random(&mut OsRng);
+        Self::keypair_from_signing_key(signing_key, x25519)
+    }
+
+    /// Deterministically derive an app's key pair from the common signer.
+    /// Domain-separated and one-way: the app key says nothing about the common
+    /// key, and distinct app_ids can never collide. The counter handles the
+    /// astronomically unlikely hash-not-a-valid-scalar case.
+    fn derive_eth_keypair(&self, app_id: &str, x25519: bool) -> TappResult<EthKeyPair> {
+        for counter in 0u8..=255 {
+            let mut hasher = Keccak256::new();
+            hasher.update(b"tapp-app-signer-v1");
+            hasher.update(&self.common.private_key);
+            hasher.update(app_id.as_bytes());
+            hasher.update([counter]);
+            let candidate = hasher.finalize();
+            if let Ok(signing_key) = SigningKey::from_slice(&candidate) {
+                return Self::keypair_from_signing_key(signing_key, x25519);
+            }
+        }
+        Err(DockerError::ContainerOperationFailed {
+            operation: "derive_app_key".to_string(),
+            reason: "no valid scalar in 256 attempts (statistically impossible)".to_string(),
+        }
+        .into())
+    }
+
+    fn keypair_from_signing_key(signing_key: SigningKey, x25519: bool) -> TappResult<EthKeyPair> {
         let private_key = signing_key.to_bytes().to_vec();
         let verifying_key = signing_key.verifying_key();
 
@@ -87,6 +134,11 @@ impl AppKeyService {
         app_id: &str,
         x25519: bool,
     ) -> TappResult<EthKeyPair> {
+        // The empty app_id IS the common signer — the node's own identity,
+        // available before any app exists.
+        if app_id.is_empty() {
+            return Ok(self.common.clone());
+        }
         let mut keys = self.app_keys.lock().await;
 
         if let Some(key_pair) = keys.get(app_id) {
@@ -94,15 +146,14 @@ impl AppKeyService {
             return Ok(key_pair.clone());
         }
 
-        // Generate new key
         info!(
             app_id = %app_id,
             x25519_enabled = x25519,
-            "Generating new in-memory key"
+            "Deriving app key from the common signer"
         );
-        let key_pair = Self::generate_eth_keypair(x25519)?;
+        let key_pair = self.derive_eth_keypair(app_id, x25519)?;
 
-        // Store it
+        // Cache it (derivation is deterministic; the cache is an optimization)
         keys.insert(app_id.to_string(), key_pair.clone());
 
         Ok(key_pair)
@@ -111,6 +162,9 @@ impl AppKeyService {
     /// Get private key for an app (local access only)
     /// WARNING: Returns sensitive private key material
     pub async fn get_private_key(&self, app_id: &str) -> TappResult<Vec<u8>> {
+        if app_id.is_empty() {
+            return Ok(self.common.private_key.clone());
+        }
         let keys = self.app_keys.lock().await;
         if let Some(key_pair) = keys.get(app_id) {
             warn!(
@@ -131,6 +185,10 @@ impl AppKeyService {
         &self,
         app_id: &str,
     ) -> TappResult<(Vec<u8>, Vec<u8>, Option<Vec<u8>>)> {
+        if app_id.is_empty() {
+            let c = &self.common;
+            return Ok((c.eth_address.clone(), c.public_key.clone(), c.x25519_public_key.clone()));
+        }
         let keys = self.app_keys.lock().await;
         if let Some(key_pair) = keys.get(app_id) {
             Ok((

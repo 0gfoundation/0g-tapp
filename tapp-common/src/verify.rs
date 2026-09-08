@@ -623,9 +623,20 @@ fn fresh_nonce() -> Vec<u8> {
 }
 
 async fn fetch_evidence(tee_url: &str, app_id: &str, nonce: &[u8]) -> Result<Vec<u8>> {
-    let mut client = TappServiceClient::connect(tee_url.to_string())
-        .await
-        .map_err(|e| anyhow!("connect {}: {}", tee_url, e))?;
+    // An https teeUrl (the node's :50052 TLS listener serves a per-boot
+    // self-signed cert) gets encryption without authentication: evidence is
+    // Intel-signed and carries our nonce, so the channel needs no identity of
+    // its own — the same reasoning as the pinless AS connection above.
+    let mut client = if tee_url.starts_with("https://") {
+        let channel = crate::pinned_tls::grpc_channel(tee_url, Vec::new())
+            .await
+            .map_err(|e| anyhow!("connect {}: {}", tee_url, e))?;
+        TappServiceClient::new(channel)
+    } else {
+        TappServiceClient::connect(tee_url.to_string())
+            .await
+            .map_err(|e| anyhow!("connect {}: {}", tee_url, e))?
+    };
     let resp = client
         .get_evidence(tonic::Request::new(GetEvidenceRequest {
             app_id: app_id.to_owned(),
