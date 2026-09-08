@@ -2270,6 +2270,17 @@ impl TappService for TappServiceImpl {
         let req = request.into_inner();
         let app_id = &req.app_id;
 
+        // The empty app_id aliases the COMMON signer everywhere in AppKeyService.
+        // Refuse it here: this handler is reachable by any container holding the
+        // socket, and letting one derive under the node's own identity would make
+        // every future node-scoped secret readable by every app — and the call
+        // itself a signing oracle for the node identity.
+        if app_id.is_empty() {
+            return Err(Status::invalid_argument(
+                "app_id must not be empty — the node's own namespace is not servable here",
+            ));
+        }
+
         let secret = self.kms_derive(app_id, &req.material).await?;
 
         self.measure_secret_resource(app_id, &req.material, true).await;

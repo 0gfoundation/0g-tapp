@@ -82,6 +82,9 @@ tapp-cli -s <teeUrl> get-evidence --app-id <APP_ID> --nonce $(openssl rand -hex 
   common signer（每次启动生成，所有 app signer 由它派生），`runtime_data.tls_public_key`
   是 :50052 管理口 TLS key 的 SPKI sha256。用途：验完 quote 后拿它做 `--tls-pin`，
   管理通道即可防主动中间人，且不需要任何带外分发。验证流程与 app 证据完全相同。
+  两个边界：它证明的是"一台真 TDX 节点"而非"你拨的这个地址上的节点"——防拦截、不防
+  重定向到攻击者自己的真节点（common signer 上链锚定是后续项）；且 pin 随重启轮换
+  （common signer 换 → TLS key 换），旧 pin 会 fail-closed，重启后需重新取证。
 
 ### `report_data` 的结构（v0.4.0+）
 

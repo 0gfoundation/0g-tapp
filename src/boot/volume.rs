@@ -333,17 +333,47 @@ pub async fn ensure_scratch(app_id: &str, key: &[u8]) -> TappResult<()> {
         };
         let key_hex = hex::encode(key);
         let is_luks = quiet_success("cryptsetup", &["isLuks", &loop_dev]).await;
-        let key_opens = is_luks
-            && run(
-                "cryptsetup",
-                &["open", "--test-passphrase", "--key-file", "-", &loop_dev],
-                Some(key_hex.as_bytes()),
-            )
-            .await
-            .is_ok();
-        // Not LUKS (interrupted format) or wrong key (previous boot): tear down
-        // completely — detach first, unlink second — then recreate below.
-        if !key_opens {
+        let stale = if !is_luks {
+            true // interrupted format: nothing readable to preserve
+        } else {
+            // Exact gate: cryptsetup exit code 2 means "no key available with
+            // this passphrase" — the one condition that licenses a wipe. Any
+            // other failure (tooling, IO) propagates and stays retryable.
+            let status = {
+                let mut cmd = Command::new(resolve("cryptsetup"));
+                cmd.args(["open", "--test-passphrase", "--key-file", "-", &loop_dev])
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null());
+                let mut child = cmd
+                    .spawn()
+                    .map_err(|e| err(format!("failed to spawn cryptsetup: {e}")))?;
+                let mut handle = child.stdin.take().expect("stdin was piped");
+                handle
+                    .write_all(key_hex.as_bytes())
+                    .await
+                    .map_err(|e| err(format!("failed to write cryptsetup stdin: {e}")))?;
+                drop(handle);
+                child
+                    .wait()
+                    .await
+                    .map_err(|e| err(format!("failed to wait for cryptsetup: {e}")))?
+            };
+            match status.code() {
+                Some(0) => false,
+                Some(2) => true,
+                other => {
+                    return Err(err(format!(
+                        "cryptsetup --test-passphrase failed with exit {:?} — not a key \
+                         mismatch, refusing to wipe; retry the start",
+                        other
+                    ))
+                    .into())
+                }
+            }
+        };
+        // Tear down completely — detach first, unlink second — then recreate below.
+        if stale {
             tracing::warn!(
                 app_id,
                 "scratch volume not openable with this boot's key — wiping and recreating"
