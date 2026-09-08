@@ -305,49 +305,87 @@ pub fn scratch_key_from_signer(signer_private_key: &[u8]) -> Vec<u8> {
 }
 
 /// Open (creating if necessary) the app's scratch volume: LUKS on /data, keyed
-/// per boot. A volume the key cannot open is the expected corpse of a previous
-/// boot — it is wiped and recreated rather than reported, because scratch data
-/// is disposable by declaration.
+/// per boot. A volume this key cannot open is the expected corpse of a previous
+/// boot and is wiped and recreated — but ONLY on a proven key mismatch. Every
+/// other failure (mount EBUSY, ENOSPC, tooling errors) propagates and stays
+/// retryable: wiping on those would destroy a volume that was merely busy, and
+/// wiping while its mapper is still open would leave the app running on a
+/// deleted backing file.
 pub async fn ensure_scratch(app_id: &str, key: &[u8]) -> TappResult<()> {
     let img = scratch_image_path(app_id);
     let mapper = scratch_mapper_name(app_id);
-    match ensure_luks(app_id, &img, &mapper, key).await {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            tracing::warn!(
-                app_id, error = %e,
-                "scratch volume unusable (stale key from a previous boot?) — wiping and recreating"
-            );
-            // Detach whatever loop device still holds the image, then remove it.
-            let img_str = img.to_string_lossy().to_string();
-            if let Ok(out) = run("losetup", &["-j", &img_str], None).await {
-                if let Some(dev) = String::from_utf8_lossy(&out).split(':').next() {
-                    if !dev.is_empty() {
-                        let _ = run("losetup", &["-d", dev.trim()], None).await;
-                    }
-                }
+
+    // An open mapper means a key already unlocked this volume during this boot;
+    // the stale-key question does not arise. Only a closed LUKS image gets the
+    // key test.
+    let mapper_open = PathBuf::from("/dev/mapper").join(&mapper).exists();
+    if !mapper_open && img.exists() {
+        let img_str = img.to_string_lossy().to_string();
+        // Reuse a crash-leftover attachment, as ensure_luks does.
+        let existing = run("losetup", &["-j", &img_str], None).await?;
+        let existing = String::from_utf8_lossy(&existing);
+        let loop_dev = match existing.split(':').next().filter(|s| !s.is_empty()) {
+            Some(dev) => dev.trim().to_string(),
+            None => {
+                let out = run("losetup", &["--find", "--show", &img_str], None).await?;
+                String::from_utf8_lossy(&out).trim().to_string()
             }
-            let _ = tokio::fs::remove_file(&img).await;
-            ensure_luks(app_id, &img, &mapper, key).await
+        };
+        let key_hex = hex::encode(key);
+        let is_luks = quiet_success("cryptsetup", &["isLuks", &loop_dev]).await;
+        let key_opens = is_luks
+            && run(
+                "cryptsetup",
+                &["open", "--test-passphrase", "--key-file", "-", &loop_dev],
+                Some(key_hex.as_bytes()),
+            )
+            .await
+            .is_ok();
+        // Not LUKS (interrupted format) or wrong key (previous boot): tear down
+        // completely — detach first, unlink second — then recreate below.
+        if !key_opens {
+            tracing::warn!(
+                app_id,
+                "scratch volume not openable with this boot's key — wiping and recreating"
+            );
+            run("losetup", &["-d", &loop_dev], None).await?;
+            tokio::fs::remove_file(&img)
+                .await
+                .map_err(|e| err(format!("failed to remove stale scratch image: {e}")))?;
         }
     }
+
+    ensure_luks(app_id, &img, &mapper, key).await
 }
 
 /// Point `<app_dir>/data` at a plain, persistent directory on /data. The app
-/// declared `data: plain`: readable by whoever holds the disk, survives reboots.
+/// declared `data: plain`: readable by whoever holds the disk, survives reboots
+/// — and, like the encrypted image files, `/data/tapp/plain/<app_id>` is left
+/// in place forever after stop-app, so the data is there for a later start.
 pub async fn ensure_plain(app_id: &str) -> TappResult<()> {
     let target = PathBuf::from(PLAIN_DIR).join(app_id);
-    tokio::fs::create_dir_all(&target)
+    let app_dir = super::manager::DockerComposeManager::get_app_dir(app_id);
+    link_data_dir(&app_dir.join("data"), &target).await?;
+    info!(app_id, target = %target.display(), "plain persistent data directory linked");
+    Ok(())
+}
+
+/// Make `link` a symlink to `target` (created if missing), replacing only what
+/// can be replaced without losing data: a stale symlink, an EMPTY directory, or
+/// a stray file. A non-empty directory is refused — it is data under another
+/// mode, and shadowing it silently would look like data loss.
+async fn link_data_dir(link: &std::path::Path, target: &std::path::Path) -> TappResult<()> {
+    tokio::fs::create_dir_all(target)
         .await
         .map_err(|e| err(format!("failed to create {}: {e}", target.display())))?;
-    let app_dir = super::manager::DockerComposeManager::get_app_dir(app_id);
-    tokio::fs::create_dir_all(&app_dir)
-        .await
-        .map_err(|e| err(format!("failed to create {}: {e}", app_dir.display())))?;
-    let link = app_dir.join("data");
+    if let Some(parent) = link.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| err(format!("failed to create {}: {e}", parent.display())))?;
+    }
     match tokio::fs::symlink_metadata(&link).await {
         Ok(md) if md.file_type().is_symlink() => {
-            if tokio::fs::read_link(&link).await.ok().as_deref() == Some(&target) {
+            if tokio::fs::read_link(&link).await.ok().as_deref() == Some(target) {
                 return Ok(());
             }
             tokio::fs::remove_file(&link)
@@ -355,8 +393,6 @@ pub async fn ensure_plain(app_id: &str) -> TappResult<()> {
                 .map_err(|e| err(format!("failed to replace stale data symlink: {e}")))?;
         }
         Ok(md) if md.is_dir() => {
-            // Only an empty directory is replaced. A non-empty one is data under a
-            // different mode; shadowing it silently would look like data loss.
             tokio::fs::remove_dir(&link).await.map_err(|e| {
                 err(format!(
                     "{} exists and is not empty — it holds data from another data \
@@ -372,10 +408,9 @@ pub async fn ensure_plain(app_id: &str) -> TappResult<()> {
         }
         Err(_) => {}
     }
-    tokio::fs::symlink(&target, &link)
+    tokio::fs::symlink(target, link)
         .await
         .map_err(|e| err(format!("failed to symlink {}: {e}", link.display())))?;
-    info!(app_id, target = %target.display(), "plain persistent data directory linked");
     Ok(())
 }
 
@@ -440,6 +475,53 @@ mod tests {
         assert!(data_mode("x-tapp: {data: 3}\nservices: {}").is_err());
         // Broken YAML is not this check's problem; it fails later with a better error.
         assert_eq!(data_mode(": : :").unwrap(), DataMode::Encrypted);
+    }
+
+    /// All link_data_dir branches, with plain tempdirs — no root, no cryptsetup.
+    #[tokio::test]
+    async fn link_data_dir_replaces_only_what_loses_nothing() {
+        let tmp = std::env::temp_dir().join(format!("tapp-link-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let target = tmp.join("target");
+        let other = tmp.join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        let link = tmp.join("app").join("data");
+
+        // Fresh: parent + target created, symlink laid down. Then idempotent.
+        link_data_dir(&link, &target).await.expect("fresh link");
+        assert_eq!(std::fs::read_link(&link).unwrap(), target);
+        link_data_dir(&link, &target).await.expect("idempotent");
+
+        // Stale symlink (points elsewhere): replaced.
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&other, &link).unwrap();
+        link_data_dir(&link, &target).await.expect("stale symlink replaced");
+        assert_eq!(std::fs::read_link(&link).unwrap(), target);
+
+        // Empty directory (leftover ram mode): replaced.
+        std::fs::remove_file(&link).unwrap();
+        std::fs::create_dir(&link).unwrap();
+        link_data_dir(&link, &target).await.expect("empty dir replaced");
+        assert_eq!(std::fs::read_link(&link).unwrap(), target);
+
+        // Stray file: replaced.
+        std::fs::remove_file(&link).unwrap();
+        std::fs::write(&link, "stray").unwrap();
+        link_data_dir(&link, &target).await.expect("stray file replaced");
+        assert_eq!(std::fs::read_link(&link).unwrap(), target);
+
+        // Non-empty directory: REFUSED, contents untouched.
+        std::fs::remove_file(&link).unwrap();
+        std::fs::create_dir(&link).unwrap();
+        std::fs::write(link.join("keep.txt"), "precious").unwrap();
+        let refused = link_data_dir(&link, &target).await;
+        assert!(refused.is_err(), "non-empty dir must be refused");
+        assert_eq!(
+            std::fs::read_to_string(link.join("keep.txt")).unwrap(),
+            "precious"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

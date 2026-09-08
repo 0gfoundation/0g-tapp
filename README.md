@@ -329,8 +329,10 @@ bind_address = "127.0.0.1:50051"
 
 # The same gRPC service behind TLS (self-signed cert, regenerated in memory on
 # every start). Remote clients use `tapp-cli -s https://<host>:50052 --insecure`
-# — encrypted but unauthenticated; node identity comes from attestation, not
-# this certificate. Set to "" to disable.
+# — encrypted but unauthenticated: this defeats passive observers, while an
+# active on-path attacker can still terminate and relay. Pin the peer with
+# `--tls-pin` or use a CA-issued front when that matters; node identity for
+# third parties comes from attestation either way. Set to "" to disable.
 tls_bind_address = "0.0.0.0:50052"
 
 # Recommended. Listened on IN ADDITION to bind_address, and the only transport that

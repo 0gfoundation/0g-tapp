@@ -42,6 +42,10 @@ e2e exercised on app `0g-kms`: register-onchain (app-level default + first node
 inherit), add-node-onchain (per-node override), update-node-onchain — all verified
 on-chain via getNode/getAppInfo.
 
+> A superseded earlier deployment lives at proxy `0x95a0BF4148b30F6F8D86870534c51df46Da5511c`
+> (no `version()`, 3-field `getNode`); some long-lived apps (testnet sandbox
+> provider / attestor) are still registered there. Details in git history.
+
 ---
 
 ## Mainnet (0G, chain ID 16661)

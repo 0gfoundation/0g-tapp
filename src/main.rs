@@ -205,6 +205,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // TLS listener: same service, same auth, behind a per-boot self-signed cert
     // (in memory only). Remote management connects here (`tapp-cli --insecure`)
     // so start-app payloads and registry tokens never cross the network readable.
+    // The port is bound HERE, synchronously: a taken :50052 must fail startup
+    // with a clear error, not detonate later inside a spawned task.
     if !config.server.tls_bind_address.is_empty() {
         let tls_addr: SocketAddr = config.server.tls_bind_address.parse().map_err(|e| {
             format!(
@@ -212,6 +214,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 config.server.tls_bind_address, e
             )
         })?;
+        let tls_listener = tokio::net::TcpListener::bind(tls_addr)
+            .await
+            .map_err(|e| format!("cannot bind tls listener {tls_addr}: {e}"))?;
         let (cert_pem, key_pem) = tapp_server::tls_cert::boot_identity()?;
         let identity = tonic::transport::Identity::from_pem(cert_pem, key_pem);
         let tls_server = Server::builder()
@@ -219,7 +224,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map_err(|e| format!("tls config: {e}"))?
             .layer(layer.clone())
             .add_service(grpc.clone())
-            .serve(tls_addr);
+            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(tls_listener));
         info!("🔐 TAPP gRPC TLS listener on {} (self-signed, per-boot)", tls_addr);
         tokio::spawn(async move {
             if let Err(e) = tls_server.await {
