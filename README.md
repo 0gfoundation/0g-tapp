@@ -128,6 +128,34 @@ TEE-protected kernel memory; a closed volume would protect nothing an open one
 doesn't). To migrate existing plaintext data in: `stop-app`, copy the data into
 the still-mounted `data/` directory, `start-app`.
 
+##### Choosing a different data mode (`x-tapp.data`, ≥0.8.0)
+
+The encrypted volume is the default, not the only shape. An app declares its
+`data/` mode at the top level of its compose (`x-` keys are ignored by docker,
+and the declaration is part of the compose content — hashed, registered
+on-chain and measured like everything else):
+
+```yaml
+x-tapp:
+  data: plain   # encrypted (default) | plain | ram | scratch
+services: ...
+```
+
+| mode | lives on | who can read it | after a reboot |
+|---|---|---|---|
+| `encrypted` (default) | data disk, LUKS, KMS key | TEE only | **still there** |
+| `plain` | data disk, plaintext | whoever holds the disk | still there |
+| `ram` | RAM rootfs | TEE only | gone |
+| `scratch` | data disk, LUKS, per-boot key | TEE only | gone (key dies with the signer; volume is wiped and recreated) |
+
+`plain` is for data that protects itself — the KMS's own TEE-sealed share is
+the canonical case (and what breaks the KMS↔FDE bootstrap circle: a KMS node
+cannot fetch its volume key from a cluster that hasn't formed yet). `scratch`
+is disk-sized secret cache: too big for RAM, no need to outlive the boot.
+Switching modes does **not** migrate data — the old volume or directory stays
+where it was, and the app starts on an empty one; move data by hand. A typo'd
+mode is refused at `start-app`, never silently mapped.
+
 #### Stopping an Application
 
 Stop and remove a deployed application:

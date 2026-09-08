@@ -1,7 +1,7 @@
 ---
 name: 0g-tapp-cli
 description: Use this skill when the user wants to deploy, manage, or troubleshoot applications on a 0G Tapp (Trusted Application Platform) server using tapp-cli. Covers start/stop apps, on-chain registration, registry login, check task status, view logs, and manage docker compose deployments across multiple remote TEE servers.
-version: 1.10.0
+version: 1.11.0
 author: 0G Labs
 tags: [0g, tapp, tee, docker, deployment, cli, onchain]
 ---
@@ -253,6 +253,7 @@ Each app gets its **own encrypted volume** (LUKS; key derived per-app by the KMS
 - **KMS gate**: on a KMS-configured server, start **fails** if the volume key can't be fetched — no silent plaintext downgrade. The app must be registered on-chain first (`--register-onchain` handles ordering), and the server must trust a verifier for the KMS's self-signed TLS (`update-trust-anchors --scan-url --scan-pubkey`, or `claim-config` with those flags). No KMS configured at all → plaintext dir + warning.
 - `stop-app` leaves the volume open (key stays in the kernel); a CVM reboot locks everything; data survives because a registered node re-derives the same key. Volume file: `/data/tapp/volumes/<app_id>.img` (sparse — apparent size = whole disk, real usage = real writes).
 - Migration of plaintext data into the volume: `stop-app` → copy into `<app_dir>/data/` (volume stays mounted) → `start-app`.
+- **Per-app data mode** (server ≥0.8.0): compose top-level `x-tapp: {data: encrypted|plain|ram|scratch}` (absent = encrypted). `plain` = persistent plaintext dir on /data — for self-protecting data, canonically the KMS's own sealed share (breaks the KMS↔FDE bootstrap circle). `ram` = TEE-secret, gone on reboot, eats RAM. `scratch` = LUKS keyed from the app signer per boot — disk-sized secret cache, auto-wiped+recreated when the key rotates. The declaration rides the compose → hashed on-chain, third-party visible. Switching modes never migrates data (old volume/dir left in place, app starts empty). Typo → start-app refused with `x-tapp.data must be one of…`.
 
 ## Troubleshooting — common errors
 

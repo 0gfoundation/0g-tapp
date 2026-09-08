@@ -578,29 +578,58 @@ impl TappService for TappServiceImpl {
             .clone()
             .unwrap_or_else(|| "0x0000000000000000000000000000000000000000".to_string());
 
-        // Encrypted data volume key, derived from KMS under the "fde" namespace.
-        // Built here (the RPC layer owns the KMS client) but awaited inside the
-        // start task, so a slow KMS round trip delays the task, never this RPC.
-        // No KMS configured → None → the app runs on a plain directory (loudly).
-        let volume_key: Option<boot::VolumeKeyFut> =
-            if self.kms_client.read().await.is_some() && !req_inner.measure_only {
-                let kms = self.kms_client.clone();
-                let keys = self.app_key_service.clone();
-                let id = app_id.clone();
-                Some(Box::pin(async move {
-                    kms_derive_with(&kms, &keys, &id, boot::volume::FDE_MATERIAL)
-                        .await
-                        .map_err(|e| e.message().to_string())
-                }))
-            } else {
-                None
-            };
+        // Resolve the app's declared data mode (compose x-tapp.data, default
+        // encrypted) into a plan. Key futures are built here (the RPC layer owns
+        // the KMS client) but awaited inside the start task, so a slow KMS round
+        // trip delays the task, never this RPC. A bad declaration is refused now,
+        // before a task exists.
+        let mode = boot::volume::data_mode(&req_inner.compose_content)
+            .map_err(Status::invalid_argument)?;
+        let data_plan = if req_inner.measure_only {
+            // Measure-only returns before any data directory is provisioned.
+            boot::DataPlan::Ram
+        } else {
+            match mode {
+                boot::volume::DataMode::Encrypted => {
+                    if self.kms_client.read().await.is_some() {
+                        let kms = self.kms_client.clone();
+                        let keys = self.app_key_service.clone();
+                        let id = app_id.clone();
+                        boot::DataPlan::Encrypted(Box::pin(async move {
+                            kms_derive_with(&kms, &keys, &id, boot::volume::FDE_MATERIAL)
+                                .await
+                                .map_err(|e| e.message().to_string())
+                        }))
+                    } else {
+                        boot::DataPlan::RamDowngraded
+                    }
+                }
+                boot::volume::DataMode::Plain => boot::DataPlan::Plain,
+                boot::volume::DataMode::Ram => boot::DataPlan::Ram,
+                boot::volume::DataMode::Scratch => {
+                    let keys = self.app_key_service.clone();
+                    let id = app_id.clone();
+                    boot::DataPlan::Scratch(Box::pin(async move {
+                        // Create-if-missing, then derive: the signer is local (TEE),
+                        // so scratch needs no KMS and dies with the signer — per boot.
+                        keys.get_app_key(&id, "ethereum", false)
+                            .await
+                            .map_err(|e| format!("create app key: {e}"))?;
+                        let signer_key = keys
+                            .get_private_key(&id)
+                            .await
+                            .map_err(|e| format!("get app key: {e}"))?;
+                        Ok(boot::volume::scratch_key_from_signer(&signer_key))
+                    }))
+                }
+            }
+        };
 
         // Start the app with deployer address
         let response = self
             .boot_service
             .clone()
-            .start_app(req_inner, deployer.clone(), volume_key)
+            .start_app(req_inner, deployer.clone(), data_plan)
             .await?;
 
         // Derive the app's TLS identity now rather than waiting for it to be asked for.
