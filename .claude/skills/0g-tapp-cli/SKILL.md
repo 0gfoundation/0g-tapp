@@ -1,7 +1,7 @@
 ---
 name: 0g-tapp-cli
 description: Use this skill when the user wants to deploy, manage, or troubleshoot applications on a 0G Tapp (Trusted Application Platform) server using tapp-cli. Covers start/stop apps, on-chain registration, registry login, check task status, view logs, and manage docker compose deployments across multiple remote TEE servers.
-version: 1.12.0
+version: 1.13.0
 author: 0G Labs
 tags: [0g, tapp, tee, docker, deployment, cli, onchain]
 ---
@@ -79,6 +79,7 @@ tapp-cli -s <server> -k 0x<key> docker-logout                    # logout from D
 - **`tls key : <sha256>  (sha256 of the public key, attested)`** (v0.4.0+) appears in both modes when the app has a TLS key, followed by the `openssl s_client | … | openssl dgst -sha256` one-liner for comparing it against a live endpoint. Line absent = no TLS key derived, which is normal, not a failure.
 - Output line: `boot-chain : ✓ (executables=3, matches policy reference)` = matched; `✗ (executables=33, ...)` = did not match; `?` = policy set no executables claim. (`executables` is the AR4SI claim: **3** = approved boot chain, **33** = unrecognized.)
 - **`--as-endpoint`** picks the Attestation Service (default `https://35.253.66.70:50004`). **It speaks TLS now**, and a bare `host:port` still means plaintext — so an endpoint that moved to TLS must be given with its scheme or the connection fails as an h2 protocol error.
+- Deployed verifier instances (explorer URLs per network incl. mainnet, the attested instance's trust-anchor URL+pin, the AS endpoint) are registered in `docs/TAPPSCAN.md` — the public explorer is `https://tappscan.0g.ai` (`?net=mainnet` for mainnet).
 - **`--as-pubkey 0x<sha256>`** pins the AS's TLS key. The AS is a TEE with a self-signed certificate, so this **replaces** CA validation rather than adding to it. Without it the connection is encrypted but unauthenticated — anyone on the path can hand back any verdict — and that is reported rather than refused. Current value: `0x7b13d132…`, the same key scan serves, since both are the same tapp app. Point it at a self-hosted local AS (e.g. `127.0.0.1:50004`, see the `verifier/0g-tapp-verifier` submodule) to use RVPS-backed reference values.
 - **Policy ids** — two formats depending on build mode:
   - **canonical** (v0.3.0+): `0g-tapp-<cloud>-<boot_format>-<version>-<env>` (e.g. `0g-tapp-gcp-grub-v0.3.0-dev`). Reference values at `verifier/reference-values/<cloud>/<boot_format>/<version>/<env>.json`.
