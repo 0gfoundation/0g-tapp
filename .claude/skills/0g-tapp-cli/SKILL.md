@@ -1,7 +1,7 @@
 ---
 name: 0g-tapp-cli
 description: Use this skill when the user wants to deploy, manage, or troubleshoot applications on a 0G Tapp (Trusted Application Platform) server using tapp-cli. Covers start/stop apps, on-chain registration, registry login, check task status, view logs, and manage docker compose deployments across multiple remote TEE servers.
-version: 1.11.0
+version: 1.12.0
 author: 0G Labs
 tags: [0g, tapp, tee, docker, deployment, cli, onchain]
 ---
@@ -75,6 +75,7 @@ tapp-cli -s <server> -k 0x<key> docker-logout                    # logout from D
 - **`--policy-ids <id>` = static references** (AS boot-chain check: shim/grub/kernel/initrd/kernel_cmdline or uki vs the image's reference values).
 - **Whichever axis has NO reference, the measured values are printed verbatim**: no `--contract` → owner/compose/images as attested; no `--policy-ids` → boot-chain component digests in reference-value JSON (`{"measurement.<comp>.SHA-384": [...]}`), directly diffable against `verifier/reference-values/<cloud>/<boot_format>/<version>/<env>.json`.
 - **`kms : <urls>`** (v0.6.0+) lists the KMS cluster the node draws key material from, one per line, with a warning on any plaintext `http://` entry (those nodes' identity cannot be checked). `none configured` means exactly that — not that it was checked.
+- The deployed clusters per network (mainnet/testnet endpoints for `--kbs-urls`, group pubkeys — **same app_id `0g-kms`, two different masters**), the derivation namespaces, and the authorization model are in `docs/KMS.md`. Pointing a consumer at the wrong network's cluster silently derives every key from the wrong master.
 - **`tls key : <sha256>  (sha256 of the public key, attested)`** (v0.4.0+) appears in both modes when the app has a TLS key, followed by the `openssl s_client | … | openssl dgst -sha256` one-liner for comparing it against a live endpoint. Line absent = no TLS key derived, which is normal, not a failure.
 - Output line: `boot-chain : ✓ (executables=3, matches policy reference)` = matched; `✗ (executables=33, ...)` = did not match; `?` = policy set no executables claim. (`executables` is the AR4SI claim: **3** = approved boot chain, **33** = unrecognized.)
 - **`--as-endpoint`** picks the Attestation Service (default `https://35.253.66.70:50004`). **It speaks TLS now**, and a bare `host:port` still means plaintext — so an endpoint that moved to TLS must be given with its scheme or the connection fails as an h2 protocol error.
@@ -92,11 +93,12 @@ tapp-cli -s <server> -k 0x<key> claim-config                                # cl
 tapp-cli -s <server> -k 0x<key> claim-config \
   --chain-rpc-url https://evmrpc-testnet.0g.ai \
   --chain-contract 0x<TappRegistry> \
-  --kbs-urls "http://kms-1:9091,http://kms-2:9091" \
+  --kbs-urls "https://kms-1:9443,https://kms-2:9443" \
   --tls-key-source kms                                                       # claim + set chain + KMS + TLS key source
 ```
 - First-come-first-served, exactly once per boot. CLI verifies result end-to-end.
 - `--chain-*`, `--kbs-urls` and `--tls-key-source` optional if already baked into config.toml.
+- **What to put in `--kbs-urls`**: the deployed cluster endpoints per network are in `docs/KMS.md` — mainnet and testnet both run app_id `0g-kms` but are two clusters with two masters; the doc's group pubkeys are how you check you reached the right one.
 - `--tls-key-source local|kms` (v0.4.0+, default `local`) — decides whether app TLS keys survive a restart, see App TLS certificates above. Must be decided at claim time; `kms` on a node with no KMS/chain config will fail when a cert is requested.
 - `--scan-url https://… --scan-pubkey 0x…` (v0.5.0+) — which verifier this node believes about KMS node identity, and its pinned key. Both or neither. See Trust anchors below.
 
