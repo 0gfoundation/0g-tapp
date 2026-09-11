@@ -380,10 +380,14 @@ file_path = "/var/log/tapp/"   # daily-rotated files; on RAM-rootfs CVM images u
 max_log_files = 7              # rotated daily files to keep; oldest deleted at startup and rotation (default: 7)
 
 # Optional: KMS cluster for hardware-independent app secrets
+# The KMS cluster this node draws persistent secrets from (stable TLS keys,
+# volume passphrases, app base secrets). Access is authorized by on-chain
+# registration alone — see docs/KMS.md for the model, the derivation
+# namespaces, and the trust-anchor configuration that goes with this.
 [kbs]
 node_urls = [
-    "http://kms-node-1:9091",
-    "http://kms-node-2:9091",
+    "https://kms-node-1:9443",
+    "https://kms-node-2:9443",
 ]
 
 # Optional: on-chain TappRegistry integration
