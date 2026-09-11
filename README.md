@@ -417,6 +417,13 @@ tapp-cli -s http://<tapp>:50051 -k 0x<your-key> claim-config \
   --scan-pubkey 0x<sha256 of the verifier's TLS key>
 ```
 
+The values to put in `--kbs-urls` — the deployed KMS cluster endpoints for
+mainnet and testnet, and the group public key that verifies you reached the
+right one (**both networks use the app_id `0g-kms`, but they are two different
+clusters with two different masters**) — are listed in
+[`docs/KMS.md`](KMS.md), which also explains why `--scan-url`/`--scan-pubkey`
+must accompany a `kms` setup.
+
 ### Trust anchors
 
 Which KMS cluster a tapp draws key material from, and which verifier it believes about that
