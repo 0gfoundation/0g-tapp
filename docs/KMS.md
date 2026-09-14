@@ -133,6 +133,8 @@ tapp-cli -s <node> -k <owner-key> claim-config \
   classic failure**: fetching a key dies with a bare `error sending request`,
   which reads like a connectivity problem but means "I don't trust that
   certificate". `update-trust-anchors` fixes it on a running node, no restart.
+  The deployed verifier's URL and pin to put here are in
+  [TAPPSCAN.md](TAPPSCAN.md).
   Check with `get-tapp-info` — the `kms :` and `Verifier` lines show exactly
   what the node believes.
 
