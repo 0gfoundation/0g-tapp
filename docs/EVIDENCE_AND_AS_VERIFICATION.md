@@ -307,6 +307,43 @@ tapp.0g.com <operation> {"app_id","operation","result","error",
 - `docker_login` records `registry/username/signer/timestamp` (no password).
 - Pattern: the first runtime event of each session lands on `pcrIndex=1`; subsequent ones land on `pcrIndex=4`.
 
+### Reading key-access events with EMPTY hashes (the restart window)
+
+In real traces, bursts of `get_app_secret_key` / `get_secret_resource` events
+appear with `compose_hash`/`volumes_hash`/`image_hash` all empty. This is not
+data loss and not an unattributed key grab — it is a deterministic artifact of
+how the measured server code works, and its meaning can be derived from that
+code rather than taken on trust:
+
+**Mechanics.** Each event copies the server's in-memory record of the app *at
+the moment of the fetch*. `stop_app` clears the recorded hashes (an empty hash
+is the code's "stopped" marker), and a restart's `start_app` writes the new
+ones only when the deploy completes — but `docker compose up` has already
+launched the containers midway, and their init processes fetch keys
+immediately. Every fetch inside that stop→start window therefore copies an
+empty record. The same mechanics also mean the window cannot appear on a first
+deploy: with no record at all the fetch is refused outright (`App not found`),
+so empties occur only between a measured `stop_app` and a measured `start_app`.
+
+**Why the key still went nowhere unaccounted.** Three facts, each checkable
+independently, bound the recipient:
+
+1. These RPCs are **socket-only** (`MethodPermission::LocalOnly`): the key can
+   only have been handed to a container on this same measured CVM — there is no
+   path to an external caller. This is in the measured server binary, so it is
+   not a claim, it is part of what the quote attests.
+2. Which containers can exist on the CVM is **fully enumerated by the log**:
+   every deploy is a measured `start_app` carrying its compose hash.
+3. The empty burst is **bracketed** by a `stop_app` (still carrying the old
+   hashes) and a `start_app` (carrying the new ones) — so the fetching
+   container belongs to one of exactly two composes, both of whose fingerprints
+   are on the record.
+
+Conclusion a verifier can draw: an empty-hash key access proves *that* a key
+was fetched (that is the point of measuring it) by a container of either the
+outgoing or the incoming compose — never by anything outside the evidence. The
+event is honest ignorance of *which of the two*, not absence of accountability.
+
 ### claim_config (runtime claiming of owner+config; mandatory check for canonical images)
 
 Canonical images do not bake in owner/chain/kbs (one set of golden reference values network-wide, at path `<env>.json` with no owner layer),
