@@ -12,6 +12,9 @@ One CVM = one point in this grid; each combination has its own image, its own re
 | **env** | `dev` (HARDEN=0) \| `prod` (HARDEN=1) | `HARDEN` | dev keeps cloud-init/SSH for debugging; prod purges it |
 | **version** | tapp-server release tag | `TAPP_SERVER_URL` | which tapp-server binary + image-name suffix |
 
+Not a dimension but it does change the measurement: **`DEV_SSH_PUBKEY`** (dev only) bakes an SSH
+public key into a hardened image — see [Dev SSH access](#dev-ssh-access-cloud-independent).
+
 > **Two build modes** (`BUILD_MODE`, default `canonical`):
 > - **canonical** — owner-agnostic image: owner/chain/kbs are claimed at runtime
 >   (`tapp-cli claim-config`) as a measured `claim_config` event. One image and ONE
@@ -36,6 +39,7 @@ Here `<version>` is the **image** version `<tapp-server tag>[-r<image_rev>]` (`b
 | default boot format | grub | grub (`uki` opt-in via `BOOT_FORMAT=uki`) |
 | kernel | `linux-image-gcp` (+ fix A: point `/boot/vmlinuz`) | base **generic** kernel (ECS uses virtio; no swap) |
 | guest / dev SSH inject | `google-guest-agent` | cloud-init pinned to `datasource_list: [ AliYun ]` |
+| ⤷ cloud-free alternative | `DEV_SSH_PUBKEY` — same on both, and the only option on bare metal ([below](#dev-ssh-access-cloud-independent)) ||
 | convert boot handling | grub → ESP grub.cfg sync (`cryptpilot-convert`, #130) | grub → ESP sync; `uki` → `cryptpilot-convert --uki` (dracut + systemd-boot-efi) |
 | publish | `publish-gcp-image.sh` → GCS + `gcloud compute images create` | `publish-ali-image.sh` → OSS + `aliyun ecs ImportImage` |
 
@@ -194,6 +198,56 @@ Stage A always:
 Why it is a build-time hard gate (`cvm/ci/check-no-auto-update.sh`, run on the final image in `build-cvm.yml`): an auto-upgrade restarts tapp-server — observed on testnet as a glibc upgrade restarting `tapp-server` + `containerd` + `sysbox` in one go — and tapp derives the app signer in memory, so **within that same boot** every on-chain node/service of every app on the node silently goes stale. (On an image variant whose `/boot`/ESP is writable at runtime, an auto kernel upgrade would additionally change RTMR + `kernel_cmdline` and invalidate the reference values; here the rootfs overlay is RAM-backed, so that one is the secondary concern.) Package updates go through a rebuild, which regenerates reference values, never through the running node.
 
 Scope: this covers **apt**. `HARDEN=1` additionally purges the other self-changing components (`snapd` auto-refresh, `ubuntu-pro-client`'s `ua-timer`/`apt-news`/`esm-cache`, `motd-news`); on a `HARDEN=0` dev image those are still present.
+
+<a name="dev-ssh-access-cloud-independent"></a>
+### Dev SSH access without a cloud — `DEV_SSH_PUBKEY` (dev only)
+The `HARDEN=0` dev variants get you in by letting the **cloud inject your key at boot**: on GCP
+`google-guest-agent` reads it from `metadata.google.internal`, on Alibaba Cloud cloud-init reads it
+from `100.100.100.200`. That is why the dev image has to pick a cloud — and why **neither dev
+variant can be used on bare metal**, where no metadata service exists at all and a self-launched TD
+is handed nothing.
+
+`DEV_SSH_PUBKEY` removes the dependency by baking the key at **build** time, so nothing has to be
+asked for at boot:
+
+```bash
+DEV_SSH_PUBKEY="$(cat ~/.ssh/id_ed25519.pub)" CLOUD=ali BOOT_FORMAT=uki HARDEN=1 \
+  ./build-tapp.sh base-noble.qcow2 out-dev.qcow2      # then: ssh root@<ip>
+```
+
+or the `dev_ssh_pubkey` input on `build-cvm`. Unset ⇒ the block is skipped and the image is
+byte-identical, so this is inert on every normal build. It reinstalls the `openssh-server` that
+`HARDEN=1` purges, writes `/root/.ssh/authorized_keys`, and unmasks the getty.
+
+On `build-cvm` the key is **ignored for the prod image, with a warning** (log annotation + run
+summary) rather than rejected up front, so `env=both` stays usable — one dispatch gives a keyed dev
+image and a clean prod one. A **malformed** key is still a hard failure in `Validate inputs`
+whatever the env: it is always a typo, and it would otherwise build a dev image whose
+`authorized_keys` grants nothing, discovered only when the login fails.
+
+One image then works on GCP, Alibaba Cloud **and** bare metal. Prefer baking a *team's* keys over one
+person's: the key is measured, so rotating it means rebuilding.
+
+**The cloud's own entry points stay dead either way.** `gcloud compute ssh` and GCP's browser SSH
+both work by pushing an ephemeral key to instance metadata for `google-guest-agent` to install, and
+that agent is purged — verified on a hardened image as `Permission denied (publickey)`. Alibaba
+Cloud's console "remote connect" fails for the same reason. Your baked key is the only way in, and
+`gcloud compute instances get-serial-port-output` (hypervisor-level, so it needs nothing in the
+guest) the only fallback.
+
+That is the trade, and it is the point: the cloud's convenience *is* its ability to inject
+credentials into your instance, which is exactly what hardening removes. In exchange, **who can get
+in becomes part of the measurement** — the key lands in the verity-sealed rootfs, whose root hash is
+in the initrd, which is in the UKI. Measured on real TDX hardware, the same image with and without a
+baked key:
+
+| image | `measurement.uki.SHA-384` |
+|---|---|
+| hardened, no key | `335c28e6971fc1ef…` |
+| hardened + baked key | `b0a640cae384ddde…` |
+
+So a keyed dev image has its own reference values and **cannot be mistaken for a production one** by
+any verifier. It is still a deliberate back door: never publish one as a production image.
 
 ## Verification (passed)
 - Image static checks: all the above packages gone, getty masked, netplan = 01-dhcp, resolv.conf 3 lines, gcp initrd cryptpilot = 16.

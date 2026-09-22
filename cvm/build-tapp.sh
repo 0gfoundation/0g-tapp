@@ -47,6 +47,8 @@ SYSBOX_DEB_URL="${SYSBOX_DEB_URL:-https://downloads.nestybox.com/sysbox/releases
 #   BOOT_FORMAT grub | uki — boot format (stage B convert). Defaults to grub for any cloud;
 #               set uki explicitly. Determines --uki + UKI prereqs + the reference-value shape (grub 5 / uki 1).
 # Both exported so prepare-*.sh (stage B) inherits them.
+# Orthogonal to both, and DEV ONLY: DEV_SSH_PUBKEY bakes an SSH public key so a HARDENED
+# image can be logged into with no cloud component at all (see the dev-access block below).
 export CLOUD="${CLOUD:-gcp}"
 export BOOT_FORMAT="${BOOT_FORMAT:-grub}"
 # passed through to prepare-tapp.sh (used by convert)
@@ -458,6 +460,41 @@ else
   cat >> "$TMPD/provision-base.sh" <<'EOF'
 mkdir -p /etc/cloud/cloud.cfg.d
 printf 'datasource_list: [ AliYun ]\n' > /etc/cloud/cloud.cfg.d/99-aliyun-ds.cfg
+EOF
+fi
+
+# ===== Dev SSH access, cloud-independent (opt-in via DEV_SSH_PUBKEY) =====
+# Additive and opt-in: with DEV_SSH_PUBKEY unset this block does nothing and the image is
+# byte-identical to before. When set, it gives a HARDENED image a way in WITHOUT any cloud
+# component: the key is baked at build time instead of fetched from a metadata service at
+# boot, so ONE image works on GCP, Alibaba Cloud and bare metal alike (the first two each
+# have their own metadata service, the third has none at all -- which is why the HARDEN=0
+# dev variants, which rely on that injection, cannot be used on bare metal).
+#
+# Consequence worth knowing: the cloud's own convenience paths stay dead, because they are
+# the injection this removes -- `gcloud compute ssh` and GCP's browser SSH both push an
+# ephemeral key to metadata for google-guest-agent to install, and that agent is purged
+# (verified: "Permission denied (publickey)"). The baked key is then the only way in, and
+# reading the serial console the only fallback.
+#
+# In exchange, WHO CAN GET IN becomes part of the measurement rather than something the
+# cloud decides at boot: the key lands in the verity-sealed rootfs, whose root hash is in
+# the initrd, which is in the UKI -- so an image built with a key has a different
+# measurement.uki than the same image without one, and a verifier can tell them apart.
+#
+# DEV ONLY. This is a deliberate back door; an image built with it must never be published
+# as a production image (the differing reference values make that mistake detectable, not
+# impossible). Runs after the harden block, so it reinstalls the sshd HARDEN=1 purged.
+if [ -n "${DEV_SSH_PUBKEY:-}" ]; then
+  echo "==> [dev-access] DEV_SSH_PUBKEY set: reinstall sshd + bake authorized_keys (no cloud-init, no guest agent)"
+  cat >> "$TMPD/provision-base.sh" <<EOF
+export DEBIAN_FRONTEND=noninteractive
+apt-get install -y openssh-server
+systemctl enable ssh
+mkdir -p /root/.ssh && chmod 700 /root/.ssh
+printf '%s\n' '$DEV_SSH_PUBKEY' > /root/.ssh/authorized_keys
+chmod 600 /root/.ssh/authorized_keys
+systemctl unmask serial-getty@ttyS0.service getty@tty1.service || true
 EOF
 fi
 
