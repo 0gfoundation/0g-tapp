@@ -249,6 +249,12 @@ baked key:
 So a keyed dev image has its own reference values and **cannot be mistaken for a production one** by
 any verifier. It is still a deliberate back door: never publish one as a production image.
 
+**A keyed image needs its own `image_rev`.** The key changes the measurement but appears in no
+identifier — not the image name, the reference-value path, the AS policy id, nor the concurrency
+group. So building one under an identity that already has reference values would replace what
+every node of that identity verifies against. `build-cvm` now refuses that (see
+`allow_refval_overwrite`), but the fix is to bump `image_rev`, not to override the guard.
+
 ## Verification (passed)
 - Image static checks: all the above packages gone, getty masked, netplan = 01-dhcp, resolv.conf 3 lines, gcp initrd cryptpilot = 16.
 - Runtime (real TDX): SSH unreachable; app starts normally via tapp + measurement + RA.

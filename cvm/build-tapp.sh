@@ -485,15 +485,25 @@ fi
 # DEV ONLY. This is a deliberate back door; an image built with it must never be published
 # as a production image (the differing reference values make that mistake detectable, not
 # impossible). Runs after the harden block, so it reinstalls the sshd HARDEN=1 purged.
+DEV_SSH_UPLOAD=()   # extra virt-customize args for stage A; empty unless a key was supplied
 if [ -n "${DEV_SSH_PUBKEY:-}" ]; then
   echo "==> [dev-access] DEV_SSH_PUBKEY set: reinstall sshd + bake authorized_keys (no cloud-init, no guest agent)"
-  cat >> "$TMPD/provision-base.sh" <<EOF
+  # The key is the only arbitrary user-supplied string in this build, so it is written host-side
+  # and UPLOADED as a file -- never interpolated into provision-base.sh, which runs as root inside
+  # the guest. An unquoted heredoc here would let an apostrophe in a legitimate key comment
+  # (ssh-keygen -C "o'brien@laptop") break the generated script, and a crafted value run commands
+  # as root at build time. The heredoc below is therefore quoted, and carries no user bytes.
+  printf '%s\n' "$DEV_SSH_PUBKEY" > "$TMPD/dev_authorized_keys"
+  DEV_SSH_UPLOAD=(
+    --mkdir /root/.ssh
+    --chmod 0700:/root/.ssh
+    --upload "$TMPD/dev_authorized_keys":/root/.ssh/authorized_keys
+    --chmod 0600:/root/.ssh/authorized_keys
+  )
+  cat >> "$TMPD/provision-base.sh" <<'EOF'
 export DEBIAN_FRONTEND=noninteractive
 apt-get install -y openssh-server
 systemctl enable ssh
-mkdir -p /root/.ssh && chmod 700 /root/.ssh
-printf '%s\n' '$DEV_SSH_PUBKEY' > /root/.ssh/authorized_keys
-chmod 600 /root/.ssh/authorized_keys
 systemctl unmask serial-getty@ttyS0.service getty@tty1.service || true
 EOF
 fi
@@ -543,6 +553,7 @@ virt-customize -a "$IN" \
   --upload "$TMPD/config.toml":/etc/tapp/config.toml \
   --mkdir /etc/systemd/resolved.conf.d \
   --upload "$TMPD/99-fallback-dns.conf":/etc/systemd/resolved.conf.d/99-fallback-dns.conf \
+  ${DEV_SSH_UPLOAD[@]+"${DEV_SSH_UPLOAD[@]}"} \
   --run "$TMPD/provision-base.sh"
 
 # ---- stage B: kernel + convert + ESP (IN_PLACE operates on the input, reusing the validated script) ----
