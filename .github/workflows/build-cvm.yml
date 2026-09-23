@@ -86,6 +86,13 @@ on:
         type: string
         default: ""
 
+# Keyed on the IMAGE identity, and `cloud` stays in the key even though it no longer changes the
+# image: two dispatches of the same identity for different publish targets are now a legitimate
+# thing to do, and they must not cancel or serialise each other. The cost is that both then do the
+# identity work -- registering the same policy id (idempotent, same values) and pushing the same
+# refvalues/<...> branch, where the second one fails and marks a good dual-publish red. Publishing
+# one build to several targets, or splitting the identity work out of publish, is the real fix;
+# until then, publish once and re-run with publish=false for the second target.
 concurrency:
   group: build-cvm-${{ inputs.cloud || 'gcp' }}-${{ inputs.boot_format }}-${{ inputs.build_mode || 'canonical' }}-${{ inputs.version }}-r${{ inputs.image_rev || '1' }}-${{ inputs.owner }}
   cancel-in-progress: false

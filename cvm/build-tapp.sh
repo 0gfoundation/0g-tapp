@@ -448,9 +448,16 @@ else
   #
   # DEV_SSH_PUBKEY replaces both: the key is baked at build time, so one dev image serves GCP,
   # Alibaba Cloud and bare metal, and the image no longer varies by cloud. See the dev-access
-  # block below. Nothing cloud-specific is installed here any more; a dev image built without
-  # DEV_SSH_PUBKEY simply has no way in other than the serial console.
-  echo "==> [harden] HARDEN=0: no cloud key-injection agent (use DEV_SSH_PUBKEY for access)"
+  # block below. Nothing cloud-specific is installed here any more.
+  #
+  # That is NOT the same as having no way in. Only HARDEN=1 purges cloud-init; the dev variant
+  # keeps it, and dropping the AliYun datasource pin left it unpinned rather than absent -- so on
+  # a cloud, ds-identify still detects the platform (GCE detection is DMI-based and needs no
+  # google-guest-agent) and can inject the project's SSH key from instance metadata on first boot.
+  # A keyless dev image is therefore still reachable on GCP or Alibaba Cloud by whatever keys the
+  # project hands out. What it has no way into is BARE METAL, where no metadata service exists --
+  # which is the gap DEV_SSH_PUBKEY closes, and the serial console is the only other route there.
+  echo "==> [harden] HARDEN=0: no cloud key-injection agent installed; cloud-init is still present (see comment)"
 fi
 
 # ===== Dev SSH access, cloud-independent (opt-in via DEV_SSH_PUBKEY) =====

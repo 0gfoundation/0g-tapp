@@ -245,15 +245,25 @@ image and a clean prod one. A **malformed** key is still a hard failure in `Vali
 whatever the env: it is always a typo, and it would otherwise build a dev image whose
 `authorized_keys` grants nothing, discovered only when the login fails.
 
-One image then works on GCP, Alibaba Cloud **and** bare metal. Prefer baking a *team's* keys over one
-person's: the key is measured, so rotating it means rebuilding.
+One image then works on GCP, Alibaba Cloud **and** bare metal — bare metal being the one where it is
+the *only* option, see below. Prefer baking a *team's* keys over one person's: the key is measured,
+so rotating it means rebuilding.
 
-**The cloud's own entry points stay dead either way.** `gcloud compute ssh` and GCP's browser SSH
-both work by pushing an ephemeral key to instance metadata for `google-guest-agent` to install, and
-that agent is purged — verified on a hardened image as `Permission denied (publickey)`. Alibaba
-Cloud's console "remote connect" fails for the same reason. Your baked key is the only way in, and
+**On a hardened image the cloud's own entry points stay dead.** `gcloud compute ssh` and GCP's
+browser SSH both work by pushing an ephemeral key to instance metadata for `google-guest-agent` to
+install, and `HARDEN=1` purges that agent — verified on a hardened image as
+`Permission denied (publickey)`. Alibaba Cloud's console "remote connect" fails for the same
+reason. There, your baked key is the only way in, and
 `gcloud compute instances get-serial-port-output` (hypervisor-level, so it needs nothing in the
 guest) the only fallback.
+
+**A dev image is a different matter, and not as cloud-independent as it looks.** Only `HARDEN=1`
+purges cloud-init; `HARDEN=0` keeps it, and no longer pins its datasource — so on a cloud,
+ds-identify still detects the platform (GCE detection is DMI-based and needs no guest agent) and
+can inject the project's SSH key from instance metadata. A keyless dev image is therefore still
+reachable on GCP or Alibaba Cloud by whatever keys the project hands out. Pin the datasource to
+`None` if you want that closed. What a keyless dev image has no way into is **bare metal**, where
+there is no metadata service to ask — that is the gap `DEV_SSH_PUBKEY` closes.
 
 That is the trade, and it is the point: the cloud's convenience *is* its ability to inject
 credentials into your instance, which is exactly what hardening removes. In exchange, **who can get

@@ -94,7 +94,7 @@ echo "==> [fix A] point /boot/vmlinuz and initrd.img symlinks at the newest gene
 virt-customize -a "$WORK" --run-command '
   set -e
   k=$(ls /boot/vmlinuz-*-generic 2>/dev/null | sort -V | tail -1 | sed "s#/boot/##")
-  [ -n "$k" ] || { echo "ERROR: no generic kernel (vmlinuz-*-generic) in the image"; exit 1; }
+  [ -n "$k" ] || { echo "ERROR: no generic kernel (vmlinuz-*-generic) in the image -- this image now boots one HWE generic kernel on every platform, so a base carrying only a vendor kernel needs INSTALL_KERNEL=1 to have one installed"; exit 1; }
   ln -sf "$k" /boot/vmlinuz
   ln -sf "initrd.img-${k#vmlinuz-}" /boot/initrd.img
   echo "vmlinuz -> $k"
