@@ -1,9 +1,15 @@
 #!/usr/bin/env bash
-# gen-reference-values.sh <image.qcow2> <cloud> <boot_format> <version> <env> [owner]
+# gen-reference-values.sh <image.qcow2> <boot_format> <version> <env> [owner]
 #
 # Compute the boot-chain reference values from a built image and write:
-#   canonical (owner omitted): verifier/reference-values/<cloud>/<boot_format>/<version>/<env>.json
-#   custom    (owner given):   verifier/reference-values/<cloud>/<boot_format>/<version>/<env>/<owner>.json
+#   canonical (owner omitted): verifier/reference-values/<boot_format>/<version>/<env>.json
+#   custom    (owner given):   verifier/reference-values/<boot_format>/<version>/<env>/<owner>.json
+#
+# Cloud-agnostic: the image is identical on every platform (one HWE generic kernel; the dev
+# variant's access is DEV_SSH_PUBKEY, not a per-cloud agent), so its measurements are too.
+# The older <cloud>/<boot_format>/... paths are LEFT IN PLACE for images built before this and
+# the nodes still running them -- they are never written again. Same for the oldest flat
+# <version>/<env>.json. See verifier/reference-values/README.md.
 # in the schema policy.rego consumes ("measurement.<component>.SHA-384": [<hex>...]).
 #
 # Uses a #128-fixed cryptpilot-fde (0.8.0+), which on a never-booted image (empty grubenv)
@@ -16,21 +22,20 @@
 
 set -euo pipefail
 
-U="usage: $0 <image.qcow2> <cloud> <boot_format> <version> <env> [owner]"
+U="usage: $0 <image.qcow2> <boot_format> <version> <env> [owner]"
 IMG="${1:?$U}"
-CLOUD="${2:?$U}"
-BOOT_FORMAT="${3:?$U}"
-VERSION="${4:?$U}"
-ENV="${5:?$U}"
+BOOT_FORMAT="${2:?$U}"
+VERSION="${3:?$U}"
+ENV="${4:?$U}"
 # owner optional: omit for canonical mode (no owner baked in the image)
-OWNER="$(printf '%s' "${6:-}" | sed 's/^0[xX]//' | tr 'A-Z' 'a-z')"
+OWNER="$(printf '%s' "${5:-}" | sed 's/^0[xX]//' | tr 'A-Z' 'a-z')"
 
 FDE="${CRYPTPILOT_FDE:-/usr/bin/cryptpilot-fde-host}"
 [ -x "$FDE" ] || { echo "cryptpilot-fde-host not found at $FDE — run ci/setup-toolchain.sh first" >&2; exit 2; }
 command -v python3 >/dev/null || { echo "python3 required" >&2; exit 2; }
 
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
-REFVAL_BASE="$REPO/verifier/reference-values/${CLOUD}/${BOOT_FORMAT}/${VERSION}"
+REFVAL_BASE="$REPO/verifier/reference-values/${BOOT_FORMAT}/${VERSION}"
 
 if [ -n "$OWNER" ]; then
   # custom: .../v0.3.0/<env>/<owner>.json

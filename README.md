@@ -582,7 +582,7 @@ verbatim** so you can compare manually:
 - no `--contract` → prints owner / compose / images as attested;
 - no `--policy-ids` → prints the boot-chain component digests in reference-value JSON
   (`{"measurement.<shim|grub|kernel|initrd|kernel_cmdline|uki>.SHA-384": [...]}`), directly
-  diffable against `verifier/reference-values/<cloud>/<boot_format>/<version>/<env>.json`.
+  diffable against `verifier/reference-values/<boot_format>/<version>/<env>.json`.
 
 Both modes also print `tls key : <sha256>  (sha256 of the public key, attested)` when the app
 has a TLS key, followed by the `openssl s_client | … | openssl dgst -sha256` one-liner for
@@ -596,7 +596,7 @@ tapp-cli verify-app \
   --app-id my-app \
   --rpc-url https://evmrpc-testnet.0g.ai \
   --contract 0x<TappRegistry> \
-  --policy-ids 0g-tapp-<cloud>-<boot_format>-<version>-<env>
+  --policy-ids 0g-tapp-<boot_format>-<version>-<env>
   # --as-endpoint https://host:port  # CoCo-AS gRPC; TLS now, so give the scheme
   # --as-pubkey 0x<sha256>           # pin the AS's attested TLS key
 

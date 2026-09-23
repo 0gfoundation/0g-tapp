@@ -1,7 +1,7 @@
 ---
 name: 0g-tapp-cli
 description: Use this skill when the user wants to deploy, manage, or troubleshoot applications on a 0G Tapp (Trusted Application Platform) server using tapp-cli. Covers start/stop apps, on-chain registration, registry login, check task status, view logs, and manage docker compose deployments across multiple remote TEE servers.
-version: 1.13.0
+version: 1.14.0
 author: 0G Labs
 tags: [0g, tapp, tee, docker, deployment, cli, onchain]
 ---
@@ -73,7 +73,7 @@ tapp-cli -s <server> -k 0x<key> docker-logout                    # logout from D
 ### verify-app: two independent reference axes
 - **`--contract`+`--rpc-url` = dynamic references** (on-chain): reconciles runtime events vs the registry → `reconcile : signer✓ compose✓ volumes✓ image✓ owner✓`. The **owner** check (v0.3.0+) compares the `claim_config` event's owner against the on-chain app owner (`✗` = hijacked/mismatched → Result ❌; `?` = no claim_config event, pre-0.3 image).
 - **`--policy-ids <id>` = static references** (AS boot-chain check: shim/grub/kernel/initrd/kernel_cmdline or uki vs the image's reference values).
-- **Whichever axis has NO reference, the measured values are printed verbatim**: no `--contract` → owner/compose/images as attested; no `--policy-ids` → boot-chain component digests in reference-value JSON (`{"measurement.<comp>.SHA-384": [...]}`), directly diffable against `verifier/reference-values/<cloud>/<boot_format>/<version>/<env>.json`.
+- **Whichever axis has NO reference, the measured values are printed verbatim**: no `--contract` → owner/compose/images as attested; no `--policy-ids` → boot-chain component digests in reference-value JSON (`{"measurement.<comp>.SHA-384": [...]}`), directly diffable against `verifier/reference-values/<boot_format>/<version>/<env>.json`.
 - **`kms : <urls>`** (v0.6.0+) lists the KMS cluster the node draws key material from, one per line, with a warning on any plaintext `http://` entry (those nodes' identity cannot be checked). `none configured` means exactly that — not that it was checked.
 - The deployed clusters per network (mainnet/testnet endpoints for `--kbs-urls`, group pubkeys — **same app_id `0g-kms`, two different masters**), the derivation namespaces, and the authorization model are in `docs/KMS.md`. Pointing a consumer at the wrong network's cluster silently derives every key from the wrong master.
 - **`tls key : <sha256>  (sha256 of the public key, attested)`** (v0.4.0+) appears in both modes when the app has a TLS key, followed by the `openssl s_client | … | openssl dgst -sha256` one-liner for comparing it against a live endpoint. Line absent = no TLS key derived, which is normal, not a failure.
@@ -82,9 +82,10 @@ tapp-cli -s <server> -k 0x<key> docker-logout                    # logout from D
 - Deployed verifier instances (explorer URLs per network incl. mainnet, the attested instance's trust-anchor URL+pin, the AS endpoint) are registered in `docs/TAPPSCAN.md` — the public explorer is `https://tappscan.0g.ai` (`?net=mainnet` for mainnet).
 - **`--as-pubkey 0x<sha256>`** pins the AS's TLS key. The AS is a TEE with a self-signed certificate, so this **replaces** CA validation rather than adding to it. Without it the connection is encrypted but unauthenticated — anyone on the path can hand back any verdict — and that is reported rather than refused. Current value: `0x7b13d132…`, the same key scan serves, since both are the same tapp app. Point it at a self-hosted local AS (e.g. `127.0.0.1:50004`, see the `verifier/0g-tapp-verifier` submodule) to use RVPS-backed reference values.
 - **Policy ids** — two formats depending on build mode:
-  - **canonical** (v0.3.0+): `0g-tapp-<cloud>-<boot_format>-<version>-<env>` (e.g. `0g-tapp-gcp-grub-v0.3.0-dev`). Reference values at `verifier/reference-values/<cloud>/<boot_format>/<version>/<env>.json`.
-  - **custom** (per-owner): `0g-tapp-<cloud>-<boot_format>-<version>-<env>-<owner>`. Reference values at `.../env/<owner>.json`.
-  - Must be registered on the AS first (stored as `<id>_cpu`); use `verifier/register-shared-as.sh <cloud> <boot_format> <version> <env> [owner] [as-endpoint]`.
+  - **canonical** (v0.3.0+): `0g-tapp-<boot_format>-<version>-<env>` (e.g. `0g-tapp-grub-v0.3.0-dev`). Reference values at `verifier/reference-values/<boot_format>/<version>/<env>.json`.
+  - **custom** (per-owner): `0g-tapp-<boot_format>-<version>-<env>-<owner>`. Reference values at `.../env/<owner>.json`.
+  - Must be registered on the AS first (stored as `<id>_cpu`); use `verifier/register-shared-as.sh <boot_format> <version> <env> [owner] [as-endpoint]`.
+  - **Images built before the cloud dimension was dropped** keep the older `0g-tapp-<cloud>-<boot_format>-…` ids and `<cloud>/<boot_format>/…` paths; those stay registered, so a node on such an image still verifies with its original policy id. New builds are cloud-free — one image now boots on GCP, Alibaba Cloud and bare metal with identical measurements.
 - Note: `ear.status=affirming` also needs platform TCB `UpToDate`; `executables=3` alone (boot chain matched) is the boot-chain conclusion independent of TCB.
 
 ### Claim ownership (v0.3.0+, canonical images)

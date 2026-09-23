@@ -42,8 +42,11 @@ ENABLE_SYSBOX="${ENABLE_SYSBOX:-0}"
 SYSBOX_VERSION="${SYSBOX_VERSION:-0.7.0}"
 SYSBOX_DEB_URL="${SYSBOX_DEB_URL:-https://downloads.nestybox.com/sysbox/releases/v${SYSBOX_VERSION}/sysbox-ce_${SYSBOX_VERSION}-0.linux_amd64.deb}"
 # Two independent build dimensions (each image = one of each):
-#   CLOUD       gcp | ali  — kernel/guest/publish. gcp: linux-image-gcp + fix A + google-guest-agent +
-#               publish-gcp-image.sh; ali: generic kernel + cloud-init(AliYun) + publish-ali-image.sh.
+#   CLOUD       gcp | ali  — **publish target only** (Stage C: publish-gcp-image.sh vs
+#               publish-ali-image.sh). It no longer changes a single byte of the image: one HWE
+#               generic kernel serves every platform, and the dev variant's key injection is now
+#               DEV_SSH_PUBKEY instead of a per-cloud agent. So one build can be published to
+#               either cloud, or to neither and booted on bare metal.
 #   BOOT_FORMAT grub | uki — boot format (stage B convert). Defaults to grub for any cloud;
 #               set uki explicitly. Determines --uki + UKI prereqs + the reference-value shape (grub 5 / uki 1).
 # Both exported so prepare-*.sh (stage B) inherits them.
@@ -436,31 +439,25 @@ network:
 NETEOF
 chmod 600 /etc/netplan/01-dhcp.yaml
 EOF
-elif [ "$CLOUD" = gcp ]; then
-  echo "==> [harden] HARDEN=0 gcp: reinstall google-guest-agent to restore GCP SSH key injection"
-  cat >> "$TMPD/provision-base.sh" <<'EOF'
-# dev variant only: google-guest-agent (from Ubuntu universe) injects the instance
-# SSH public key from metadata into ~ubuntu/.ssh/authorized_keys. It talks to the
-# metadata server by the hostname metadata.google.internal by default; since we pin
-# resolv.conf to public DNS (see fix C) that name will not resolve, so we also add a
-# direct IP mapping (169.254.169.254) to /etc/hosts. Both are GCP back-door-class
-# components and are intentionally NOT installed on the hardened variant.
-apt-get install -y google-guest-agent
-systemctl enable google-guest-agent.service || true
-grep -q 'metadata.google.internal' /etc/hosts || \
-  printf '169.254.169.254 metadata.google.internal metadata\n' >> /etc/hosts
-EOF
 else
-  # ali (or other) dev variant: the dev build does NOT purge cloud-init (only HARDEN=1 does), and on
-  # Alibaba Cloud cloud-init injects the instance SSH key + configures networking from the Ali metadata
-  # service (100.100.100.200). So no google-guest-agent (that is GCP-only) — rely on cloud-init, and
-  # PIN its datasource to AliYun: Alibaba recommends pinning rather than relying on ds-identify picking
-  # AliYun out of ~30 candidate datasources, so key/network injection is reliable.
-  echo "==> [harden] HARDEN=0 $CLOUD: pin cloud-init datasource to AliYun for SSH/network injection (no google-guest-agent)"
-  cat >> "$TMPD/provision-base.sh" <<'EOF'
-mkdir -p /etc/cloud/cloud.cfg.d
-printf 'datasource_list: [ AliYun ]\n' > /etc/cloud/cloud.cfg.d/99-aliyun-ds.cfg
-EOF
+  # HARDEN=0 dev variant. It used to restore whichever key-injection agent the target cloud
+  # uses -- google-guest-agent reading metadata.google.internal on GCP, cloud-init pinned to
+  # `datasource_list: [ AliYun ]` reading 100.100.100.200 on Alibaba Cloud -- which is what
+  # forced a dev image to pick a cloud, and left bare metal with no usable dev image at all
+  # (a self-launched TD is handed no metadata service to ask).
+  #
+  # DEV_SSH_PUBKEY replaces both: the key is baked at build time, so one dev image serves GCP,
+  # Alibaba Cloud and bare metal, and the image no longer varies by cloud. See the dev-access
+  # block below. Nothing cloud-specific is installed here any more.
+  #
+  # That is NOT the same as having no way in. Only HARDEN=1 purges cloud-init; the dev variant
+  # keeps it, and dropping the AliYun datasource pin left it unpinned rather than absent -- so on
+  # a cloud, ds-identify still detects the platform (GCE detection is DMI-based and needs no
+  # google-guest-agent) and can inject the project's SSH key from instance metadata on first boot.
+  # A keyless dev image is therefore still reachable on GCP or Alibaba Cloud by whatever keys the
+  # project hands out. What it has no way into is BARE METAL, where no metadata service exists --
+  # which is the gap DEV_SSH_PUBKEY closes, and the serial console is the only other route there.
+  echo "==> [harden] HARDEN=0: no cloud key-injection agent installed; cloud-init is still present (see comment)"
 fi
 
 # ===== Dev SSH access, cloud-independent (opt-in via DEV_SSH_PUBKEY) =====

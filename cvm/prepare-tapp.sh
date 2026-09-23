@@ -1,10 +1,11 @@
 #!/bin/bash
 # prepare-tapp.sh <input-base.qcow2> <output-tapp.qcow2>
 #
-# Turn a GCP Ubuntu base image into a working cryptpilot tapp image.
+# Turn an Ubuntu base image into a working cryptpilot tapp image.
 # Chains four steps, two of which are the key fixes:
-#   [kernel swap] install linux-image-gcp (optional, when INSTALL_KERNEL=1)
-#   [fix A] point the /boot/vmlinuz symlink at the gcp kernel -- so convert builds the
+#   [kernel swap] install the HWE generic kernel (optional, when INSTALL_KERNEL=1) -- >=6.16,
+#           for the TDX RTMR measurement interface. One kernel for every platform; see [1/4].
+#   [fix A] point the /boot/vmlinuz symlink at that kernel -- so convert builds the
 #           cryptpilot-enabled initrd for the correct kernel
 #           (otherwise: read-only rootfs / RTMR not extended / verity bypassed)
 #   [convert] cryptpilot-convert (auto-sets TMPDIR=/tmp to avoid dracut failing in chroot)
@@ -16,20 +17,20 @@
 set -euo pipefail
 
 # ===== Tunables =====
-# Two INDEPENDENT dimensions (a CVM is built as exactly one of each; each image = one boot format = one
+# BOOT_FORMAT is the only dimension that changes the image (each image = one boot format = one
 # measurement chain):
-#   CLOUD       gcp | ali  — kernel/guest tuning. gcp swaps in linux-image-gcp + points /boot/vmlinuz at
-#               it (fix A); ali (and others) keep the base's generic kernel (Ali ECS boots it via virtio).
 #   BOOT_FORMAT grub | uki — boot format. grub: traditional shim/grub (convert #130 syncs the ESP
 #               grub.cfg); uki: systemd-boot / Unified Kernel Image (convert --uki; needs dracut +
 #               systemd-boot-efi). Reference value differs: grub -> 5 components, uki -> 1 (measurement.uki).
-# Default BOOT_FORMAT = grub for any cloud; set uki explicitly (e.g. a uki image on ali).
+# CLOUD no longer selects a kernel -- one HWE generic kernel serves every platform (see [1/4]). It
+# survives only to pick the Stage C publish target and, with grub, whether the ESP verify below can
+# run; the image itself is identical whatever it is set to.
 CLOUD="${CLOUD:-gcp}"
 BOOT_FORMAT="${BOOT_FORMAT:-grub}"
 CONFIG_DIR="${CONFIG_DIR:-./config_dir}"
 FDE_PACKAGE="${FDE_PACKAGE:-cryptpilot-fde_0.7.0_amd64.deb}"
 ROOTFS_MODE="${ROOTFS_MODE:---rootfs-no-encryption}"   # or "--rootfs-passphrase <pass>"
-INSTALL_KERNEL="${INSTALL_KERNEL:-1}"                   # 1=install gcp kernel; 0=image already has it
+INSTALL_KERNEL="${INSTALL_KERNEL:-1}"                   # 1=install the HWE generic kernel; 0=image already has it
 PURGE_KERNEL="${PURGE_KERNEL:-}"                        # old kernel to purge, e.g. linux-image-6.8.0-106-generic; empty=do not purge
 DNS_FALLBACK="${DNS_FALLBACK:-8.8.8.8 8.8.4.4 1.1.1.1}" # systemd-resolved fallback DNS; empty=skip this fix
 NBD_RESET="${NBD_RESET:-1}"                             # reset the nbd module (max_part=16) before convert; 1=yes, 0=skip
@@ -52,81 +53,52 @@ else
   cp -f "$IN" "$WORK"
 fi
 
-# --- [1/4] kernel (CLOUD-specific): gcp swaps in its tuned kernel + fix A; others keep generic ---
-if [ "$CLOUD" = gcp ]; then
-  if [ "$INSTALL_KERNEL" = 1 ]; then
-    echo "==> [1/4] installing newest COMPLETE gcp kernel (virt-customize)"
-    # Not the bare linux-image-gcp meta: it can race ahead of the archive — 2026-09-07
-    # it pulled the 7.0.0-1011 image while linux-modules-extra-7.0.0-1011-gcp was not
-    # published yet, and cryptpilot-convert needs modules-extra for zram. Same fix as
-    # the generic branch below: newest versioned gcp kernel that HAS its modules-extra.
-    vc_args=(-a "$WORK" --run-command '
-      set -e
-      apt-get update
-      v=$(apt-cache pkgnames linux-modules-extra- \
-          | grep -E "^linux-modules-extra-[0-9]+\.[0-9]+\.[0-9]+-[0-9]+-gcp$" \
-          | sed "s/^linux-modules-extra-//" | sort -V | tail -1)
-      [ -n "$v" ] || { echo "ERROR: no gcp kernel with modules-extra found"; exit 1; }
-      echo "installing kernel $v"
-      DEBIAN_FRONTEND=noninteractive apt-get install -y "linux-image-$v" "linux-modules-extra-$v"
-    ')
-    [ -n "$PURGE_KERNEL" ] && vc_args+=(--run-command "apt-get autoremove --purge $PURGE_KERNEL -y || true")
-    vc_args+=(--run-command 'update-grub')
-    virt-customize "${vc_args[@]}"
-  else
-    echo "==> [1/4] skipping kernel install (INSTALL_KERNEL=0)"
-  fi
-  echo "==> [fix A] point /boot/vmlinuz and initrd.img symlinks at the gcp kernel"
-  virt-customize -a "$WORK" --run-command '
+# --- [1/4] kernel: the HWE generic kernel, on every platform ---
+# One kernel for all targets. It used to be CLOUD-specific: GCP got linux-image-gcp because the
+# noble GA generic kernel is 6.8, which lacks the TDX RTMR runtime-measurement interface (sysfs
+# measurements/rtmrN:sha384 + EXTEND_RTMR ioctl, mainlined in 6.16) that every
+# extend_runtime_measurement needs. Installing the HWE generic kernel (>=6.16) satisfies that on
+# its own, so the split earned nothing but a second image and a second reference set.
+#
+# Verified on real GCP TDX hardware with 6.17.0-42-generic (same generation as the 6.17.0-1018-gcp
+# it replaces): boots, gve/GVNIC brings up ens3, RTMR extend works (claim_config + start_app land
+# in RTMR3), and the node's live measurement.uki equals the one extracted offline from the image.
+# gve has been mainline since 5.3, so GCP networking needs no vendor kernel.
+if [ "$INSTALL_KERNEL" = 1 ]; then
+  echo "==> [1/4] installing newest COMPLETE generic kernel (TDX RTMR extend needs >=6.16)"
+  # Not the bare HWE meta: it can race ahead of the archive (e.g. pulls a 7.0 image
+  # whose linux-modules-extra-* is not published yet, which cryptpilot-convert needs
+  # for zram). Pick the newest versioned generic kernel that HAS its modules-extra.
+  vc_args=(-a "$WORK" --run-command '
     set -e
-    k=$(ls /boot/vmlinuz-*-gcp 2>/dev/null | sort -V | tail -1 | sed "s#/boot/##")
-    [ -n "$k" ] || { echo "ERROR: no gcp kernel (vmlinuz-*-gcp) in the image"; exit 1; }
-    ln -sf "$k" /boot/vmlinuz
-    ln -sf "initrd.img-${k#vmlinuz-}" /boot/initrd.img
-    echo "vmlinuz -> $k"
-  '
+    apt-get update
+    v=$(apt-cache pkgnames linux-modules-extra- \
+        | grep -E "^linux-modules-extra-[0-9]+\.[0-9]+\.[0-9]+-[0-9]+-generic$" \
+        | sed "s/^linux-modules-extra-//" | sort -V | tail -1)
+    [ -n "$v" ] || { echo "ERROR: no generic kernel with modules-extra found"; exit 1; }
+    case "$v" in 6.[0-9].*|6.1[0-5].*|[1-5].*) echo "ERROR: newest complete kernel $v lacks TDX RTMR extend (>=6.16 needed)"; exit 1 ;; esac
+    echo "installing kernel $v"
+    DEBIAN_FRONTEND=noninteractive apt-get install -y "linux-image-$v" "linux-modules-extra-$v"
+  ')
+  # Purge the GA 6.8 kernel: it lacks TDX RTMR extend, and (grub mode) would
+  # linger as an alternate bootable menu entry. The kernel installed above
+  # stays, satisfying convert's need for one *-generic kernel.
+  vc_args+=(--run-command 'apt-get purge -y "linux-image-6.8.*" "linux-modules-6.8.*" "linux-headers-6.8*" 2>/dev/null || true; apt-get autoremove -y || true')
+  [ -n "$PURGE_KERNEL" ] && vc_args+=(--run-command "apt-get autoremove --purge $PURGE_KERNEL -y || true")
+  vc_args+=(--run-command 'update-grub')
+  virt-customize "${vc_args[@]}"
 else
-  # Ali (and other clouds) boot the generic kernel via virtio — but the noble GA
-  # generic kernel is 6.8, which lacks the TDX RTMR runtime-measurement interface
-  # (sysfs measurements/rtmrN:sha384 + EXTEND_RTMR ioctl, mainlined in 6.16).
-  # Without it every extend_runtime_measurement fails (claim_config/start_app!).
-  # Install the HWE generic kernel (≥6.16, same generation as the gcp kernel).
-  if [ "$INSTALL_KERNEL" = 1 ]; then
-    echo "==> [1/4] CLOUD=$CLOUD: installing newest COMPLETE generic kernel (TDX RTMR extend needs >=6.16)"
-    # Not the bare HWE meta: it can race ahead of the archive (e.g. pulls a 7.0 image
-    # whose linux-modules-extra-* is not published yet, which cryptpilot-convert needs
-    # for zram). Pick the newest versioned generic kernel that HAS its modules-extra.
-    vc_args=(-a "$WORK" --run-command '
-      set -e
-      apt-get update
-      v=$(apt-cache pkgnames linux-modules-extra- \
-          | grep -E "^linux-modules-extra-[0-9]+\.[0-9]+\.[0-9]+-[0-9]+-generic$" \
-          | sed "s/^linux-modules-extra-//" | sort -V | tail -1)
-      [ -n "$v" ] || { echo "ERROR: no generic kernel with modules-extra found"; exit 1; }
-      case "$v" in 6.[0-9].*|6.1[0-5].*|[1-5].*) echo "ERROR: newest complete kernel $v lacks TDX RTMR extend (>=6.16 needed)"; exit 1 ;; esac
-      echo "installing kernel $v"
-      DEBIAN_FRONTEND=noninteractive apt-get install -y "linux-image-$v" "linux-modules-extra-$v"
-    ')
-    # Purge the GA 6.8 kernel: it lacks TDX RTMR extend, and (grub mode) would
-    # linger as an alternate bootable menu entry. The kernel installed above
-    # stays, satisfying convert's need for one *-generic kernel.
-    vc_args+=(--run-command 'apt-get purge -y "linux-image-6.8.*" "linux-modules-6.8.*" "linux-headers-6.8*" 2>/dev/null || true; apt-get autoremove -y || true')
-    [ -n "$PURGE_KERNEL" ] && vc_args+=(--run-command "apt-get autoremove --purge $PURGE_KERNEL -y || true")
-    vc_args+=(--run-command 'update-grub')
-    virt-customize "${vc_args[@]}"
-  else
-    echo "==> [1/4] skipping kernel install (INSTALL_KERNEL=0)"
-  fi
-  echo "==> [fix A] point /boot/vmlinuz and initrd.img symlinks at the newest generic kernel"
-  virt-customize -a "$WORK" --run-command '
-    set -e
-    k=$(ls /boot/vmlinuz-*-generic 2>/dev/null | sort -V | tail -1 | sed "s#/boot/##")
-    [ -n "$k" ] || { echo "ERROR: no generic kernel (vmlinuz-*-generic) in the image"; exit 1; }
-    ln -sf "$k" /boot/vmlinuz
-    ln -sf "initrd.img-${k#vmlinuz-}" /boot/initrd.img
-    echo "vmlinuz -> $k"
-  '
+  echo "==> [1/4] skipping kernel install (INSTALL_KERNEL=0)"
 fi
+echo "==> [fix A] point /boot/vmlinuz and initrd.img symlinks at the newest generic kernel"
+virt-customize -a "$WORK" --run-command '
+  set -e
+  k=$(ls /boot/vmlinuz-*-generic 2>/dev/null | sort -V | tail -1 | sed "s#/boot/##")
+  [ -n "$k" ] || { echo "ERROR: no generic kernel (vmlinuz-*-generic) in the image -- this image now boots one HWE generic kernel on every platform, so a base carrying only a vendor kernel needs INSTALL_KERNEL=1 to have one installed"; exit 1; }
+  ln -sf "$k" /boot/vmlinuz
+  ln -sf "initrd.img-${k#vmlinuz-}" /boot/initrd.img
+  echo "vmlinuz -> $k"
+'
 
 # --- [1b/4] boot-format prerequisites (BOOT_FORMAT-specific): UKI needs dracut + systemd-boot ---
 if [ "$BOOT_FORMAT" = uki ]; then
