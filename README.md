@@ -29,6 +29,8 @@
 To run 0G Tapp, you need to create an Alibaba Cloud ECS instance with confidential computing support.
 
 > **GCP (Intel TDX) variant**: To build a hardened, measured, attestable confidential image for Google Cloud from a stock Ubuntu 24.04 cloud image, see [`cvm/`](cvm/) — one-command build (`build-tapp.sh`), full SOP and root-cause notes in [`cvm/cryptpilot-gcp-boot-fix.md`](cvm/cryptpilot-gcp-boot-fix.md), and a security-hardening audit (removes SSH / cloud-init / google-guest-agent / metadata startup-scripts and other backdoor vectors).
+>
+> Because that audit removes the agent the cloud injects keys through, `gcloud compute ssh` and GCP's browser SSH do **not** work on a hardened image. For a dev image, build with `DEV_SSH_PUBKEY` to bake your own key instead (works on GCP, Alibaba Cloud and bare metal alike, and shows up in the measurement) — see [`cvm/README.md`](cvm/README.md#dev-ssh-access-cloud-independent).
 
 #### Step 1: Import the Confidential Image
 

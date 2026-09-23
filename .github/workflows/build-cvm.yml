@@ -74,6 +74,14 @@ on:
         description: "replace an existing image of the same name (delete + recreate). Off = fail if it exists."
         type: boolean
         default: false
+      allow_refval_overwrite:
+        description: "Let this build replace reference values that already exist for its identity. OFF (default) fails instead, because overwriting them re-registers new measurements behind the SAME AS policy id and every node still running the previous image stops verifying — with no deploy and no warning. The fix is almost always to bump image_rev, not to tick this."
+        type: boolean
+        default: false
+      dev_ssh_pubkey:
+        description: "DEV IMAGES ONLY. An SSH public key line ('ssh-ed25519 AAAA... comment') to bake into the image, so a hardened image can be logged into with no cloud component — works on GCP, Alibaba Cloud and bare metal alike (the cloud's own `gcloud compute ssh` / browser SSH stay dead either way, since the agent they inject through is purged). Blank = no key, image byte-identical. IGNORED on a prod image, with a warning, so env=both is fine: you get a keyed dev image and a clean prod one. A keyed image has a DIFFERENT measurement.uki, so no verifier can mistake it for a production image — but never publish it as one, and give it its OWN image_rev: the key changes the measurement while appearing in no identifier, so reusing an identity would replace the reference values its nodes verify against."
+        type: string
+        default: ""
 
 concurrency:
   group: build-cvm-${{ inputs.cloud || 'gcp' }}-${{ inputs.boot_format }}-${{ inputs.build_mode || 'canonical' }}-${{ inputs.version }}-r${{ inputs.image_rev || '1' }}-${{ inputs.owner }}
@@ -107,6 +115,21 @@ jobs:
       # chain). cloud defaults to gcp; boot_format defaults to grub (uki is opt-in, any cloud).
       CLOUD: ${{ inputs.cloud || 'gcp' }}
       BOOT_FORMAT: ${{ inputs.boot_format }}
+      # DEV ONLY, orthogonal to both dimensions: bakes an SSH key into the image. Empty = no key
+      # and a byte-identical image, so this is inert on every normal build. It changes
+      # measurement.uki, so a keyed image has its own reference values and a verifier can always
+      # tell it from a production one.
+      # Forced empty for the prod matrix job rather than rejected up front, so `env=both` works:
+      # one dispatch gives a keyed dev image AND a clean prod image. The prod job says out loud
+      # that it dropped the key (see "Notice: dev_ssh_pubkey ignored" below) so a silently
+      # key-less image is never a surprise.
+      DEV_SSH_PUBKEY: ${{ matrix.env == 'dev' && inputs.dev_ssh_pubkey || '' }}
+      # The same value UNGATED, for the form check below, which must see it on every matrix job
+      # (env=both: a malformed key would otherwise slip through on the prod half). Both arrive
+      # via env rather than ${{ }} inside a run: script -- a raw expansion there is the standard
+      # Actions script-injection shape, and this is the only input a human pastes arbitrary text
+      # into. Every other input in that step already comes through env.
+      DEV_SSH_PUBKEY_INPUT: ${{ inputs.dev_ssh_pubkey }}
       KBS_URLS: ${{ vars.TAPP_KBS_URLS }}                       # required (no safe default)
       GCP_PROJECT: ${{ vars.GCP_PROJECT || 'g-devops' }}
       GCS_BUCKET: ${{ vars.GCS_BUCKET || 'gs://tapp-image' }}
@@ -154,6 +177,21 @@ jobs:
             echo "error: image_name requires a single env (dev or prod), not both." >&2
             FAIL=1
           fi
+          # dev_ssh_pubkey is checked for FORM here, not for which env it may apply to: prod simply
+          # ignores it (see the job env + the skip notice below), so env=both stays usable — one
+          # dispatch yields a keyed dev image and a clean prod one. A malformed key, on the other
+          # hand, is always a typo: it would build a dev image whose authorized_keys grants
+          # nothing, discovered only when the login fails, so stop now even if this build ignores it.
+          # Whole-string match, not per-line: grep -E '^...$' succeeds if ANY line matches, so a
+          # valid key followed by arbitrary lines would pass the check and then be baked in.
+          # bash's =~ anchors across the entire value and `.` does not cross newlines.
+          # [^[:cntrl:]] for the comment, not `.`: bash's `.` DOES cross newlines, so `( .*)?$`
+          # would accept "<valid key>\n<anything>". This keeps spaces and quotes in a comment legal.
+          KEYRE='^(ssh-(rsa|ed25519|dss)|ecdsa-sha2-nistp(256|384|521)|sk-(ssh-ed25519|ecdsa-sha2-nistp256)@openssh\.com) [A-Za-z0-9+/]+=*( [^[:cntrl:]]*)?$'
+          if [ -n "$DEV_SSH_PUBKEY_INPUT" ] && ! [[ $DEV_SSH_PUBKEY_INPUT =~ $KEYRE ]]; then
+            echo "error: dev_ssh_pubkey is not a single well-formed SSH public key line (expected e.g. 'ssh-ed25519 AAAA... comment'; a private key, a truncated paste or extra lines look like this)." >&2
+            FAIL=1
+          fi
           # The tapp-server release asset must exist (otherwise the build dies mid-way).
           URL="https://github.com/0gfoundation/0g-tapp/releases/download/${VERSION}/tapp-server"
           if ! curl -sfIL --max-time 30 "$URL" >/dev/null; then
@@ -183,6 +221,32 @@ jobs:
           echo "imgver=$IMGVER" >> "$GITHUB_OUTPUT"
           echo "image version: $IMGVER (tapp-server binary: $VERSION)"
 
+      - name: Refuse to overwrite an identity's reference values
+        # The whole protection for image identity used to be prose. gen-reference-values.sh writes
+        # its JSON unconditionally and register-shared-as.sh registers the policy id
+        # unconditionally, so rebuilding under an identity that already has reference values
+        # silently replaces what every node of that identity verifies against -- the no-deploy,
+        # no-warning mass failure docs/VERSIONING.md describes. Two ways to reach it: forgetting
+        # image_rev after an image change, and building a DEV_SSH_PUBKEY image under a plain dev
+        # identity (the key changes the measurement but appears in no identifier). Same guard.
+        if: ${{ inputs.publish && !inputs.allow_refval_overwrite }}
+        env:
+          IMGVER: ${{ steps.v.outputs.imgver }}
+          MENV: ${{ matrix.env }}
+        run: |
+          git fetch --depth=1 origin dev
+          if [ -n "$OWNER" ]; then
+            O="$(printf '%s' "$OWNER" | sed 's/^0[xX]//' | tr 'A-Z' 'a-z')"
+            REF="verifier/reference-values/$CLOUD/$BOOT_FORMAT/$IMGVER/$MENV/$O.json"
+          else
+            REF="verifier/reference-values/$CLOUD/$BOOT_FORMAT/$IMGVER/$MENV.json"
+          fi
+          if git cat-file -e "origin/dev:$REF" 2>/dev/null; then
+            echo "::error title=identity already has reference values::$REF exists on dev. Publishing would re-register new measurements behind the same AS policy id and break every node still running that image. Bump image_rev (currently $IMAGE_REV), or set allow_refval_overwrite if you really mean to replace it."
+            exit 1
+          fi
+          echo "identity is free: $REF does not exist on dev"
+
       - name: Fetch build inputs (base image + 0.8.0 guest deb)
         run: cvm/ci/fetch-inputs.sh "$VERSION"   # → cvm/base-noble.qcow2 + cryptpilot-fde-guest_0.8.0_amd64.deb
 
@@ -191,6 +255,16 @@ jobs:
         # fde-host(#128) built from the pinned fork; idempotent (fast no-op on an already-provisioned
         # runner). Needed by the build (convert #130) and the reference-value step (fde-host #128).
         run: cvm/ci/setup-toolchain.sh
+
+      - name: Notice — dev_ssh_pubkey ignored on a prod image
+        # Only fires on the prod half of the build. Says it in the log AND in the run summary,
+        # because a key that silently did not make it into the image is discovered otherwise
+        # only when the login fails.
+        if: ${{ inputs.dev_ssh_pubkey != '' && matrix.env != 'dev' }}
+        run: |
+          MSG="dev_ssh_pubkey was supplied but this is the **${{ matrix.env }}** image — the key was NOT baked in. A production image must carry no login credential; use the dev image for SSH access."
+          echo "::warning title=dev_ssh_pubkey ignored::$MSG"
+          echo "⚠️ $MSG" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Stage A+B — build the image
         run: |
