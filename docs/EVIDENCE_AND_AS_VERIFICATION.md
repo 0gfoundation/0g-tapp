@@ -191,6 +191,11 @@ Returns an `attestation_token` (JWT / EAR format). Decode the payload and look a
 Decoded evidence(hex) = `{ cc_eventlog: <base64>, gpu_evidence: null, quote: <base64>, runtime_data: <base64> }`
 (`runtime_data` only exists from v0.4.0+, see §②).
 
+`gpu_evidence` is `null` on a CPU-only node, and on a GPU node whose driver is absent or whose
+GPUs are not in confidential-computing mode — it is not an error in itself, but on a node you
+expect to have GPUs it means the GPU half of the attestation is missing. See
+[§ GPU evidence](#gpu-evidence-confidential-gpus) below for what it holds when it is present.
+
 ### Verify the report_data binding + read the signer (v0.4.0+)
 
 ```python
@@ -369,6 +374,57 @@ On every VM reboot the RTMRs are zeroed, the claim happens again, and it is meas
 `owner✓/✗/?` (✓ = claim_config owner == on-chain owner; ✗ = mismatch, Result ❌; ? = no claim_config event,
 images predating 0.3). Also, without `--policy-ids`, the boot-chain component measurements are printed verbatim in the reference-value JSON format,
 so they can be diffed directly against `verifier/reference-values/…/<env>.json`.
+
+---
+
+## GPU evidence (confidential GPUs)
+
+On a node built with `ENABLE_GPU=1` (see [`cvm/GPU.md`](../cvm/GPU.md)) running confidential GPUs,
+`gpu_evidence` carries one entry per GPU:
+
+```json
+{ "collection_time": "2026-09-24T07:38:03.993595964Z",
+  "evidence_list": [ { "index": 0,
+                       "name": "NVIDIA H100 80GB HBM3",
+                       "uuid": "GPU-87bf5184-…",
+                       "cc_enabled": true,
+                       "driver_version": "580.178.04",
+                       "vbios_version": "96.00.D9.00.01",
+                       "attestation_report": "<base64, 8192 bytes>",
+                       "certificate": "<base64>" } ] }
+```
+
+`cc_enabled: false` means the GPU is present but not in confidential-computing mode — the report
+is then about a GPU that does not protect anything, so treat it as a failed check, not a warning.
+
+### Binding the GPU report to the TDX quote
+
+The reason this field lives inside the TDX evidence rather than being fetched separately: each
+GPU report carries a nonce, and that nonce is **the first 32 bytes of the quote's `report_data`**
+— which §② already showed is `sha512(runtime_data)`, and `runtime_data` carries the caller's own
+challenge. So one chain runs from the challenge you sent, through the CPU quote, into every GPU
+report. Without checking it, a genuine GPU report from some other machine (or some other moment)
+would pass.
+
+The nonce sits at **offset 4** of the decoded `attestation_report` (an SPDM MEASUREMENTS
+response), so verify it directly:
+
+```python
+h        = hashlib.sha512(base64.b64decode(j["runtime_data"])).digest()
+assert bytes.fromhex(report_data) == h                     # §④: quote binds runtime_data
+for g in j["gpu_evidence"]["evidence_list"]:
+    assert g["cc_enabled"] is True
+    rep = base64.b64decode(g["attestation_report"])
+    assert rep[4:36] == h[:32]                             # GPU report binds to THIS quote
+```
+
+Measured end to end on GCP `a3-highgpu-1g` (TDX + H100, tapp-server 0.8.0) with a random
+challenge: `sha512(runtime_data)` == quote `report_data` == `06c9f5df…bc59`, and its first 32
+bytes were found at offset 4 of the GPU report.
+
+The GPU report's own signature and certificate chain are verified against NVIDIA's device
+identity (NRAS or a local verifier); that step is outside this document, and skipping it means
+you checked the report is *fresh and bound to this node* but not that it is *genuine*.
 
 ---
 
