@@ -13,7 +13,10 @@
 #                        Per-owner image + per-owner reference set (legacy mode).
 #                        Identifiers: image og-tdx-dev-grub-<ver>-<owner>, refval .../<owner>.json
 #
-# Dimensions: boot_format × env × image version (× owner only in custom mode).
+# Dimensions: boot_format × enable_gpu × env × image version (× owner only in custom mode).
+# enable_gpu changes the image (an NVIDIA driver in the verity-sealed rootfs and the initrd
+# measures differently), so it rides in the image version as a `-gpu` marker and therefore keys
+# the image name, the reference-value path and the AS policy id like every other image change.
 # `cloud` is NOT a dimension any more — it only chooses where Stage C publishes to. The image is
 # identical on every platform (one HWE generic kernel; dev access via dev_ssh_pubkey rather than a
 # per-cloud agent), so its measurements, reference values and AS policy id carry no cloud.
@@ -73,6 +76,10 @@ on:
         type: choice
         options: [grub, uki]
         default: grub
+      enable_gpu:
+        description: "build a CONFIDENTIAL GPU image: NVIDIA open driver + container toolkit + CC mode (cvm/GPU.md). The driver lands in the verity-sealed rootfs and the initrd, so this image measures differently from a CPU-only one and gets its own identity — `-gpu` is appended to the image version, hence to the image name, the reference-value path and the AS policy id. It is NOT a drop-in replacement for the CPU image. Note uki does not currently fit the ESP on a GPU image; use grub."
+        type: boolean
+        default: false
       overwrite:
         description: "replace an existing image of the same name (delete + recreate). Off = fail if it exists."
         type: boolean
@@ -94,7 +101,7 @@ on:
 # one build to several targets, or splitting the identity work out of publish, is the real fix;
 # until then, publish once and re-run with publish=false for the second target.
 concurrency:
-  group: build-cvm-${{ inputs.cloud || 'gcp' }}-${{ inputs.boot_format }}-${{ inputs.build_mode || 'canonical' }}-${{ inputs.version }}-r${{ inputs.image_rev || '1' }}-${{ inputs.owner }}
+  group: build-cvm-${{ inputs.cloud || 'gcp' }}-${{ inputs.boot_format }}-${{ inputs.enable_gpu && 'gpu' || 'cpu' }}-${{ inputs.build_mode || 'canonical' }}-${{ inputs.version }}-r${{ inputs.image_rev || '1' }}-${{ inputs.owner }}
   cancel-in-progress: false
 
 # The reference-values step pushes a refvalues/* branch and opens a PR into dev with GITHUB_TOKEN;
@@ -126,6 +133,11 @@ jobs:
       # publish-gcp-image.sh vs publish-ali-image.sh and nothing else.
       CLOUD: ${{ inputs.cloud || 'gcp' }}
       BOOT_FORMAT: ${{ inputs.boot_format }}
+      # Second dimension that changes the image. Unlike DEV_SSH_PUBKEY (which changes the
+      # measurement while appearing in no identifier, and so needs a manual image_rev), this one
+      # is folded into the image version below, so a GPU image can never collide with the
+      # CPU image's reference values.
+      ENABLE_GPU: ${{ inputs.enable_gpu && '1' || '0' }}
       # DEV ONLY, orthogonal to both dimensions: bakes an SSH key into the image. Empty = no key
       # and a byte-identical image, so this is inert on every normal build. It changes
       # measurement.uki, so a keyed image has its own reference values and a verifier can always
@@ -228,9 +240,15 @@ jobs:
           # for a changed image would overwrite the reference values already registered for the old
           # one under the same policy id, and every node still running it would stop verifying.
           # rev 1 == no suffix, so identifiers built before image_rev existed keep working.
-          if [ "$IMAGE_REV" = 1 ]; then IMGVER="$VERSION"; else IMGVER="${VERSION}-r${IMAGE_REV}"; fi
+          # A GPU image is a different artifact from the CPU one at the same binary version, so
+          # the marker goes in ahead of the revision: variant first, then the revision within it
+          # (v0.8.0-gpu, v0.8.0-gpu-r2). A CPU build is untouched by this and keeps producing the
+          # exact identifiers it produced before.
+          IMGVER="$VERSION"
+          [ "$ENABLE_GPU" = 1 ] && IMGVER="${IMGVER}-gpu"
+          [ "$IMAGE_REV" = 1 ] || IMGVER="${IMGVER}-r${IMAGE_REV}"
           echo "imgver=$IMGVER" >> "$GITHUB_OUTPUT"
-          echo "image version: $IMGVER (tapp-server binary: $VERSION)"
+          echo "image version: $IMGVER (tapp-server binary: $VERSION, gpu: $ENABLE_GPU)"
 
       - name: Refuse to overwrite an identity's reference values
         # The whole protection for image identity used to be prose. gen-reference-values.sh writes
@@ -246,11 +264,15 @@ jobs:
           MENV: ${{ matrix.env }}
         run: |
           git fetch --depth=1 origin dev
+          # These paths must match gen-reference-values.sh / register-shared-as.sh exactly, or the
+          # guard checks somewhere nothing is ever written and reports "free" every single time.
+          # That is precisely what happened when the cloud dimension was dropped and a stale
+          # $CLOUD segment was left here: the protection was inert from that commit until this one.
           if [ -n "$OWNER" ]; then
             O="$(printf '%s' "$OWNER" | sed 's/^0[xX]//' | tr 'A-Z' 'a-z')"
-            REF="verifier/reference-values/$CLOUD/$BOOT_FORMAT/$IMGVER/$MENV/$O.json"
+            REF="verifier/reference-values/$BOOT_FORMAT/$IMGVER/$MENV/$O.json"
           else
-            REF="verifier/reference-values/$CLOUD/$BOOT_FORMAT/$IMGVER/$MENV.json"
+            REF="verifier/reference-values/$BOOT_FORMAT/$IMGVER/$MENV.json"
           fi
           if git cat-file -e "origin/dev:$REF" 2>/dev/null; then
             echo "::error title=identity already has reference values::$REF exists on dev. Publishing would re-register new measurements behind the same AS policy id and break every node still running that image. Bump image_rev (currently $IMAGE_REV), or set allow_refval_overwrite if you really mean to replace it."
@@ -287,7 +309,7 @@ jobs:
           # an assignment BEFORE expansion, so a variable there (even empty) turns every
           # later VAR=val into the command name ("KBS_URLS=...: command not found").
           [ "$BUILD_MODE" = "custom" ] && export OWNER_ADDRESS="$OWNER"
-          HARDEN=${{ steps.v.outputs.harden }} ENABLE_SYSBOX=1 \
+          HARDEN=${{ steps.v.outputs.harden }} ENABLE_SYSBOX=1 ENABLE_GPU="$ENABLE_GPU" \
             TAPP_SERVER_URL="https://github.com/0gfoundation/0g-tapp/releases/download/${VERSION}/tapp-server" \
             ./build-tapp.sh base-noble.qcow2 "out-${{ matrix.env }}.qcow2"
 

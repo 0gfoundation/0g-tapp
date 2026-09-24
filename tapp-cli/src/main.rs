@@ -5,6 +5,7 @@ use tapp_common::proto::{
     DockerLoginRequest,
     DockerLogoutRequest, GetAppContainerStatusRequest, GetAppInfoRequest, GetAppKeyRequest,
     GetAppLogsRequest, GetAppSecretKeyRequest, GetAppCsrRequest, GetAppTlsCertRequest, GetEvidenceRequest,
+    ProvisionDataDiskRequest,
     GetSecretResourceRequest,
     GetServiceLogsRequest, GetServiceStatusRequest, GetTappInfoRequest, GetTaskStatusRequest,
     ListAppsRequest, ListWhitelistRequest, MountFile, PruneImagesRequest, RemoveFromWhitelistRequest,
@@ -282,6 +283,27 @@ enum Commands {
         /// Application ID
         #[arg(short, long)]
         app_id: String,
+    },
+
+    /// Give this node the persistent disk that /data lives on (owner only)
+    ///
+    /// A node whose data disk could not be chosen automatically boots, refuses to run apps,
+    /// and waits for this. That is the normal state on any GPU machine type (clouds attach
+    /// local SSDs that cannot be declined, so "the one blank disk" never exists) and on most
+    /// bare metal. Run with --dry-run first to see what the node can see.
+    ///
+    /// An existing ext4 disk is adopted with its data intact; a disk carrying any other
+    /// filesystem is refused, never overwritten. One time per disk: afterwards it is found
+    /// by its tapp-data label on every boot.
+    ProvisionDataDisk {
+        /// Block device, e.g. /dev/nvme0n2. Omit to let the node choose, which works only
+        /// when exactly one non-ephemeral candidate exists.
+        #[arg(long, default_value = "")]
+        device: String,
+
+        /// Show the candidate disks and what would happen; change nothing.
+        #[arg(long)]
+        dry_run: bool,
     },
 
     /// Get attestation evidence for an application
@@ -935,6 +957,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::PruneImages { all } => {
             let private_key = require_private_key(&cli.private_key)?;
             prune_images(&cli.server, all, private_key).await?;
+        }
+        Commands::ProvisionDataDisk { device, dry_run } => {
+            let private_key = require_private_key(&cli.private_key)?;
+            provision_data_disk(&cli.server, device, dry_run, private_key).await?;
         }
         Commands::GetTappInfo => {
             get_tapp_info(&cli.server).await?;
@@ -2640,6 +2666,56 @@ async fn docker_logout(
         std::process::exit(1);
     }
 
+    Ok(())
+}
+
+async fn provision_data_disk(
+    server: &str,
+    device: String,
+    dry_run: bool,
+    private_key: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut client = create_client(server).await?;
+    let mut request = Request::new(ProvisionDataDiskRequest { device, dry_run });
+    add_signature_metadata(&mut request, &private_key, "ProvisionDataDisk")?;
+
+    let result = client.provision_data_disk(request).await?.into_inner();
+
+    // The candidate list is printed either way. On failure it IS the answer ("which disk did
+    // you mean?"); on success it is the evidence that the node picked the disk you expected.
+    if !result.candidates.is_empty() {
+        println!("Disks this node considers:");
+        for c in &result.candidates {
+            println!(
+                "  {:<16} {:>7} GiB  fs={:<6} label={:<10} model={:<14}{}",
+                c.device,
+                c.size_bytes / (1024 * 1024 * 1024),
+                if c.filesystem.is_empty() { "-" } else { &c.filesystem },
+                if c.label.is_empty() { "-" } else { &c.label },
+                if c.model.is_empty() { "-" } else { &c.model },
+                if c.ephemeral { "  [ephemeral — never chosen automatically]" } else { "" },
+            );
+        }
+        println!();
+    }
+
+    if result.success {
+        println!("✓ {}", result.message);
+        if !result.device.is_empty() {
+            println!("  device : {}", result.device);
+            println!("  action : {}", result.action);
+        }
+        println!(
+            "  /data  : {}",
+            if result.data_mounted { "mounted" } else { "NOT mounted" }
+        );
+        if result.data_mounted && !dry_run {
+            println!("\nRestart tapp-server to restore file logging: systemctl restart tapp-server");
+        }
+    } else {
+        println!("✗ {}", result.message);
+        std::process::exit(1);
+    }
     Ok(())
 }
 

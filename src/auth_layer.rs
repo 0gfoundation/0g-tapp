@@ -290,6 +290,11 @@ fn classify(method_name: &str) -> Option<MethodPermission> {
         // deprecated stub that errors either way, and tapp-cli already signs for
         // GetAppContainerStatus.
         | "ListAppMeasurements"
+        // Formats a block device, so it is owner authority even though a node needing it
+        // is by definition not yet doing anything. The ordering that implies — claim
+        // first, then hand the node its disk — is deliberate: an unclaimed node reachable
+        // on the network would otherwise let a passer-by pick which disk becomes /data.
+        | "ProvisionDataDisk"
         | "GetAppContainerStatus" => MethodPermission::OwnerOnly,
 
         // Owner or whitelist methods

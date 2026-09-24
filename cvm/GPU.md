@@ -69,7 +69,7 @@ gcloud compute instances create <name> \
   --create-disk=name=<name>-data,size=200GB,auto-delete=yes
 ```
 
-### The data disk needs labelling by hand on a GPU host
+### A GPU host needs its data disk named, not just attached
 
 **Attaching a blank disk is not enough on a GPU machine type.** The image auto-provisions `/data`
 by looking for exactly one blank non-boot disk, and GPU machine types break that: GCP attaches
@@ -79,29 +79,39 @@ has two extra blank disks. The build excludes GCP scratch disks by their NVMe mo
 the underlying rule still cannot work on any host with more than one genuine spare disk, bare
 metal included.
 
-So on a GPU host, or any host with several spare disks, **label the data disk before the node
-needs it**:
+The node still boots and is reachable; it refuses to run apps (`FAILED_PRECONDITION` on
+StartApp) and says why on the console. Give it the disk over the API — the `ProvisionDataDisk`
+RPC, owner only, so claim the node first:
+
+```bash
+tapp-cli -s <node> provision-data-disk --dry-run -k <key>              # what does it see?
+tapp-cli -s <node> provision-data-disk --device /dev/nvme0n2 -k <key>
+systemctl restart tapp-server                                          # restores file logging
+```
+
+The dry run prints every disk the node considered, with the ephemeral ones marked — on
+`a3-highgpu-1g` that is two local SSDs and your data disk, which is exactly the picture that
+explains the refusal. Naming an ephemeral disk is allowed but is a deliberate choice: its
+contents vanish on stop/start.
+
+An existing ext4 disk is adopted (relabelled, data preserved), never reformatted; any other
+filesystem is refused outright. Once labelled `tapp-data` the disk is found by label on every
+later boot, so this is one time per disk and survives reboots and migration.
+
+If you would rather the node never see an unprovisioned disk, prepare it anywhere first — the
+label is the whole contract:
 
 ```bash
 mkfs.ext4 -L tapp-data <device>
 ```
 
-Once labelled, provisioning short-circuits on the label and never guesses. A disk that already
-carries an ext4 filesystem is adopted (relabelled), never reformatted, so this is safe to do to a
-disk holding data. The label survives reboots and migration; it is a one-time step per disk.
-
-On a cloud, run the `mkfs` on any ordinary VM with the disk attached, then move the disk to the
-node. To avoid that dance per node, make the labelled disk into an image once and create every
-node's data disk from it:
+On a cloud that means attaching the disk to any ordinary VM once. To skip that per node, turn
+one labelled disk into an image and create every node's data disk from it:
 
 ```bash
 gcloud compute images create tapp-data-blank --source-disk=<labelled-disk> --source-disk-zone=<zone>
 gcloud compute disks create <node>-data --image=tapp-data-blank --size=200GB --zone=<zone>
 ```
-
-If `/data` never appears, `tapp-server` does not start — the unit has `RequiresMountsFor=/data`.
-The reason is printed on the console (and so into the cloud's serial log), naming the disks it
-found and the `mkfs.ext4 -L tapp-data` command that fixes it.
 
 ## Checking a running GPU node
 
@@ -140,13 +150,28 @@ GCP `a3-highgpu-1g`, TDX confidential VM, image built from Ubuntu 24.04 with ker
 | `gpu_evidence` | present, `cc_enabled: true`, VBIOS `96.00.D9.00.01`, report + certificate chain |
 | GPU↔CPU binding | GPU report offset 4 == quote `report_data[0:32]` == `sha512(runtime_data)[0:32]` |
 
+## Building through CI
+
+`build-cvm` takes `enable_gpu`. It appends `-gpu` to the image version, which is what keys the
+image name, the reference-value path and the AS policy id — so a GPU image can never land on a
+CPU image's reference values:
+
+| | CPU | GPU |
+|---|---|---|
+| image name | `og-tdx-dev-grub-v0-9-0` | `og-tdx-dev-grub-v0-9-0-gpu` |
+| reference values | `grub/v0.9.0/dev.json` | `grub/v0.9.0-gpu/dev.json` |
+| AS policy id | `0g-tapp-grub-v0.9.0-dev` | `0g-tapp-grub-v0.9.0-gpu-dev` |
+
+Verifiers must be told the GPU policy id; it is a different identity, deliberately.
+
 ## Not yet done
 
-- **CI does not build GPU images.** `build-cvm.yml` has no GPU dimension, so reference values and
-  the AS policy id have no way to distinguish a GPU image from a CPU one. Until that lands, GPU
-  images are built by hand and must not reuse a CPU image's identity.
 - **UKI.** The 105 MB ESP on the GCP image layout cannot hold a GPU UKI, and the partition is
   sandwiched between others so it cannot grow in place. GPU images use grub until the ESP is
   enlarged in stage 0.
 - **Multi-GPU.** Fabric Manager is installed and version-matched but has only been reasoned
   about, not run: every measurement above is from a single-GPU host.
+- **The GPU report's signature** is not checked by anything in this repo yet. The binding check
+  in `docs/EVIDENCE_AND_AS_VERIFICATION.md` proves the report is fresh and about this node;
+  proving it is genuine means verifying it against NVIDIA's device identity (NRAS or a local
+  verifier), which no policy here does.

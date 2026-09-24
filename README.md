@@ -64,12 +64,18 @@ there would be lost on reboot). The node provisions a single blank attached disk
 
 On a host with **more than one** spare disk — bare metal, or any GPU machine type, where the
 cloud attaches local SSDs that cannot be declined — the node refuses to guess which disk is
-`/data` and says so on the console. Label the intended disk first, and it is used with no
-guessing:
+`/data`. It still boots and is reachable; it simply will not run apps until it has a disk, and
+says why on the console. Give it one over the API (owner only, so claim the node first):
 
 ```bash
-mkfs.ext4 -L tapp-data <device>       # an existing ext4 disk is adopted, never reformatted
+tapp-cli -s <server> provision-data-disk --dry-run -k <key>          # what disks does it see?
+tapp-cli -s <server> provision-data-disk --device /dev/nvme0n2 -k <key>
 ```
+
+An existing ext4 disk is adopted with its data intact; anything else is refused, never
+overwritten. One time per disk — afterwards the `tapp-data` label is found on every boot. If
+you would rather prepare the disk before the node ever sees it, `mkfs.ext4 -L tapp-data <device>`
+on any machine has the same effect.
 
 Once the instance is created and running, 0G Tapp service will start automatically.
 

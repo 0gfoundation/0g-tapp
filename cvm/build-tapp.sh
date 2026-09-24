@@ -117,9 +117,15 @@ cat > "$TMPD/tapp-server.service" <<'EOF'
 Description=TAPP gRPC Server - Trusted Application
 After=network.target
 Wants=network.target
-# File logs live on the persistent /data disk (RAM rootfs would grow unbounded,
-# issue #23) — same fail-loud policy as docker/containerd: no /data, no start.
-RequiresMountsFor=/data
+# Ordered after /data but NOT dependent on it. docker and containerd keep the hard
+# RequiresMountsFor=/data (container layers on the RAM rootfs is issue #23 and must never
+# happen), but tapp-server itself must come up without it, for one reason: a node whose
+# disk could not be provisioned automatically — every GPU machine type, most bare metal —
+# used to boot into silence, with no shell on a hardened image and no way to say what was
+# wrong. It now starts, refuses to run apps, and exposes ProvisionDataDisk so the owner can
+# hand it a disk. File logging degrades to the console for that run (tapp-server refuses to
+# create its log directory on the RAM overlay) and returns on the next restart.
+After=data.mount
 
 [Service]
 Type=simple

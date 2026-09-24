@@ -143,6 +143,26 @@ service TappService {
   // the evidence can see. Mutable-and-unmeasured would be strictly worse than fixed.
   rpc UpdateTrustAnchors(UpdateTrustAnchorsRequest)
       returns (UpdateTrustAnchorsResponse);
+
+  // Provision the persistent disk that /data lives on.
+  //
+  // A node without /data runs but can host nothing: the root filesystem is a RAM overlay,
+  // so container stores, app volumes and file logs have nowhere durable to go, and StartApp
+  // is refused rather than quietly filling RAM.
+  //
+  // Auto-provisioning at boot covers the common case — exactly one blank attached disk —
+  // and deliberately refuses to guess when a host carries several. That is not an edge
+  // case: every GPU machine type has cloud scratch disks attached that cannot be declined,
+  // and bare metal usually has more than one spare disk. Before this RPC the only way out
+  // of that refusal was a shell, which a hardened image does not have, so the node stayed
+  // silently useless.
+  //
+  // Owner only, so a freshly booted node is claimed first (ClaimConfig) and then given its
+  // disk. A disk that already carries a non-ext4 filesystem is never touched; existing ext4
+  // is adopted by relabelling, with its contents intact. Once labelled the disk is found by
+  // label on every later boot, so this is a one-time step per disk.
+  rpc ProvisionDataDisk(ProvisionDataDiskRequest)
+      returns (ProvisionDataDiskResponse);
 }
 
 enum LogLevel {
@@ -825,4 +845,40 @@ message UpdateTrustAnchorsResponse {
   string scan_url = 4;
   string scan_public_key = 5;
   int64 timestamp = 6;
+}
+
+// ---- ProvisionDataDisk ----
+
+message ProvisionDataDiskRequest {
+  // Block device to provision, e.g. "/dev/nvme0n2". Leave empty to let the node choose,
+  // which succeeds only when exactly one candidate remains once the boot disk and
+  // ephemeral cloud scratch disks are excluded — i.e. the same rule boot-time
+  // auto-provisioning uses, retried on demand.
+  string device = 1;
+
+  // Report what would happen and change nothing. Read `candidates` from the response
+  // before committing to a device.
+  bool dry_run = 2;
+}
+
+message DataDiskCandidate {
+  string device = 1;        // "/dev/nvme0n2"
+  uint64 size_bytes = 2;
+  string filesystem = 3;    // "" when the disk carries no filesystem
+  string label = 4;         // "" when unlabelled
+  // Ephemeral cloud scratch ("local SSD"): wiped on stop/start, so never chosen
+  // automatically. Naming one explicitly is allowed and is a deliberate choice.
+  bool ephemeral = 5;
+  string model = 6;         // as the kernel reports it, e.g. "nvme_card-pd"
+}
+
+message ProvisionDataDiskResponse {
+  bool success = 1;
+  string message = 2;
+  string device = 3;                          // the device that was (or would be) used
+  repeated DataDiskCandidate candidates = 4;  // every disk considered, in discovery order
+  // "formatted" (disk was blank), "adopted" (existing ext4 relabelled, data preserved),
+  // or "already_provisioned" (a tapp-data disk was already present).
+  string action = 5;
+  bool data_mounted = 6;                      // true once /data is mounted and writable
 }
