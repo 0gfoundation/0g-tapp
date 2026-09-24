@@ -13,6 +13,7 @@ pub mod balance_withdrawal;
 pub mod kms_client;
 pub mod boot;
 pub mod config;
+pub mod data_disk;
 pub mod measurement_service;
 pub mod nonce_manager;
 pub use tapp_common::pinned_tls;
@@ -225,6 +226,17 @@ async fn kms_derive_with(
 }
 
 impl TappServiceImpl {
+    fn to_proto_candidate(c: data_disk::Candidate) -> DataDiskCandidate {
+        DataDiskCandidate {
+            device: c.device,
+            size_bytes: c.size_bytes,
+            filesystem: c.filesystem,
+            label: c.label,
+            ephemeral: c.ephemeral,
+            model: c.model,
+        }
+    }
+
     /// See [`kms_derive_with`].
     async fn kms_derive(&self, app_id: &str, material: &str) -> Result<Vec<u8>, Status> {
         kms_derive_with(&self.kms_client, &self.app_key_service, app_id, material).await
@@ -595,6 +607,20 @@ impl TappService for TappServiceImpl {
         // Get signer address before consuming request
         info!("Calling StartApp");
         debug!("Request: {:?}", request);
+
+        // Refuse before doing anything if the node has nowhere durable to write. Without
+        // /data, docker is down (RequiresMountsFor) and any app that did start would put its
+        // state on the RAM overlay — lost at reboot and growing until the machine dies. The
+        // docker error you would otherwise get names a socket, not the actual problem, which
+        // is a disk nobody attached; say so, and name the call that fixes it.
+        if !data_disk::is_data_mounted() {
+            return Err(Status::failed_precondition(
+                "no persistent data disk: /data is not mounted, so this node cannot host apps \
+                 (the root filesystem is a RAM overlay). Provision one with ProvisionDataDisk \
+                 (tapp-cli provision-data-disk), then retry.",
+            ));
+        }
+
         let signer = auth_layer::get_signer_address(&request);
         let req_inner = request.into_inner();
         let app_id = req_inner.app_id.clone();
@@ -2177,6 +2203,120 @@ impl TappService for TappServiceImpl {
         }))
     }
 
+    async fn provision_data_disk(
+        &self,
+        request: Request<ProvisionDataDiskRequest>,
+    ) -> Result<Response<ProvisionDataDiskResponse>, Status> {
+        info!("Calling ProvisionDataDisk");
+        let signer = auth_layer::get_signer_address(&request);
+        let req = request.into_inner();
+        let device = (!req.device.is_empty()).then_some(req.device.as_str());
+
+        // Failures here are operator errors ("several disks, name one"), not server faults,
+        // and the caller is the person who can act on them — so the reason travels back in
+        // full rather than being flattened to INTERNAL. The candidate list goes with it,
+        // because "which disks did you see?" is the next question every time.
+        let result = match data_disk::provision(device, req.dry_run) {
+            Ok(p) => p,
+            Err(e) => {
+                let candidates = data_disk::candidates()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(Self::to_proto_candidate)
+                    .collect();
+                tracing::warn!(error = %e, signer = %signer.unwrap_or_default(), "ProvisionDataDisk failed");
+                return Ok(Response::new(ProvisionDataDiskResponse {
+                    success: false,
+                    message: e.to_string(),
+                    device: String::new(),
+                    candidates,
+                    action: String::new(),
+                    data_mounted: data_disk::is_data_mounted(),
+                }));
+            }
+        };
+
+        // Record it in the runtime measurement. A dry run changes nothing and is not an event.
+        //
+        // What makes this worth measuring is not "a disk was attached" but WHICH KIND: a disk
+        // that was `formatted` means the node started from nothing, while `adopted` means it
+        // inherited content it never created. Those are very different nodes and, unrecorded,
+        // indistinguishable from outside. The inherited content is not uniformly protected —
+        // app volumes are LUKS/KMS-sealed and cannot be forged but CAN be an older state, and
+        // file logs under /data/log are protected by nothing at all. A verifier that reads
+        // `adopted` knows to ask where that disk came from; the log is append-only, so the
+        // question survives being asked late.
+        if !req.dry_run {
+            let measurement_data = serde_json::json!({
+                "operation": measurement_service::OPERATION_NAME_PROVISION_DATA_DISK,
+                "action": result.action.as_str(),
+                "device": result.device,
+                // The device path is this boot's accident; the filesystem UUID is the disk.
+                "fs_uuid": result.fs_uuid,
+                "signer": signer.clone().unwrap_or_default(),
+                "timestamp": utils::current_timestamp()
+            })
+            .to_string();
+            if let Err(e) = self
+                .measurement_service
+                .extend_measurement(
+                    measurement_service::OPERATION_NAME_PROVISION_DATA_DISK,
+                    &measurement_data,
+                )
+                .await
+            {
+                // The disk is mounted and the node is usable, but the record of how it got that
+                // way is missing — which is exactly the gap this event exists to close. Fail the
+                // call rather than return success over an unrecorded change of state.
+                tracing::error!(error = %e, "failed to extend runtime measurement for ProvisionDataDisk");
+                return Err(Status::internal(format!(
+                    "the disk was provisioned but the measured event could not be recorded ({e}); \
+                     this node's evidence would not show how it got its /data. Treat the node as \
+                     suspect and rebuild it rather than using it."
+                )));
+            }
+        }
+
+        tracing::info!(
+            device = %result.device,
+            action = result.action.as_str(),
+            fs_uuid = %result.fs_uuid,
+            dry_run = req.dry_run,
+            data_mounted = result.data_mounted,
+            signer = %signer.unwrap_or_default(),
+            event = "PROVISION_DATA_DISK_SUCCESS",
+            "Data disk provisioned"
+        );
+
+        let message = if req.dry_run {
+            format!(
+                "dry run: would use {} ({}); nothing was changed",
+                result.device,
+                result.action.as_str()
+            )
+        } else {
+            format!(
+                "{} {} as LABEL=tapp-data; /data {}",
+                result.device,
+                result.action.as_str(),
+                if result.data_mounted { "mounted" } else { "NOT mounted" }
+            )
+        };
+
+        Ok(Response::new(ProvisionDataDiskResponse {
+            success: true,
+            message,
+            device: result.device,
+            candidates: result
+                .candidates
+                .into_iter()
+                .map(Self::to_proto_candidate)
+                .collect(),
+            action: result.action.as_str().to_string(),
+            data_mounted: result.data_mounted,
+        }))
+    }
+
     async fn get_app_container_status(
         &self,
         request: Request<GetAppContainerStatusRequest>,
@@ -2372,6 +2512,31 @@ pub fn init_tracing(config: &config::LoggingConfig) -> TappResult<()> {
             (directory, file_name_prefix)
         };
 
+        // Refuse to create the log directory on the root filesystem.
+        //
+        // On a CVM image "/" is a RAM overlay and the configured path (/data/log/tapp) is on
+        // the persistent disk. With that disk unmounted, create_dir_all would happily make
+        // the directory on the overlay and logging would appear to work — while consuming
+        // RAM without bound and losing every line at reboot (issue #23). That silent success
+        // is worse than no file logging at all, so fall back to the console and say why. The
+        // node still runs; ProvisionDataDisk is how the disk gets attached, and the file
+        // sink comes back on the next restart.
+        if data_disk::resolves_onto_root_fs(directory) {
+            eprintln!(
+                "WARNING: logging.file_path {} would land on the root filesystem, which on this \
+                 image is a RAM overlay -- the persistent disk is not mounted. File logging is \
+                 DISABLED for this run; logs go to the console only. Provision the data disk \
+                 (tapp-cli provision-data-disk) and restart to restore it.",
+                directory.display()
+            );
+            tracing_subscriber::registry()
+                .with(filter)
+                .with(stdout_layer)
+                .with(None::<Box<dyn Layer<_> + Send + Sync>>)
+                .init();
+            return Ok(());
+        }
+
         std::fs::create_dir_all(directory).map_err(|e| error::ConfigError::InvalidValue {
             field: "logging.file_path".to_string(),
             reason: format!("Cannot create log directory: {}", e),
@@ -2418,12 +2583,13 @@ pub fn init_tracing(config: &config::LoggingConfig) -> TappResult<()> {
         tracing_subscriber::registry()
             .with(filter)
             .with(stdout_layer)
-            .with(file_layer)
+            .with(Some(file_layer))
             .init();
     } else {
         tracing_subscriber::registry()
             .with(filter)
             .with(stdout_layer)
+            .with(None::<Box<dyn Layer<_> + Send + Sync>>)
             .init();
     }
 

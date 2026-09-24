@@ -14,6 +14,7 @@
 - **KMS Integration**: Fetch hardware-independent app secrets from a KMS cluster (decrypted locally within the TEE)
 - **Attested TLS**: Hand an app a TLS certificate whose public key is committed to by the attestation evidence, so a client can tie the connection it made to the TEE it verified
 - **Encrypted app data volumes**: Every app's persistent data lives in its own LUKS volume, keyed per-app by the KMS — encrypted at rest, isolated between apps, and portable across hosts and reboots
+- **Confidential GPUs**: An opt-in build stage (`ENABLE_GPU=1`) adds the NVIDIA open driver and turns on GPU confidential-computing mode, and the resulting evidence carries a per-GPU attestation report bound to the same quote as the CPU's — see [`cvm/GPU.md`](cvm/GPU.md)
 
 ## Getting Started
 
@@ -56,6 +57,25 @@ Create a new ECS instance with the following specifications:
 - **Region**: China (Beijing) - Zone L
 - **Instance Type**: `ecs.gn8v-tee.4xlarge`
 - **Image**: Select the imported confidential image
+
+Attach a data disk as well: `/data` holds the app volumes, the container stores and the logs,
+and `tapp-server` does not start without it (the root filesystem is a RAM overlay, so writing
+there would be lost on reboot). The node provisions a single blank attached disk by itself.
+
+On a host with **more than one** spare disk — bare metal, or any GPU machine type, where the
+cloud attaches local SSDs that cannot be declined — the node refuses to guess which disk is
+`/data`. It still boots and is reachable; it simply will not run apps until it has a disk, and
+says why on the console. Give it one over the API (owner only, so claim the node first):
+
+```bash
+tapp-cli -s <server> provision-data-disk --dry-run -k <key>          # what disks does it see?
+tapp-cli -s <server> provision-data-disk --device /dev/nvme0n2 -k <key>
+```
+
+An existing ext4 disk is adopted with its data intact; anything else is refused, never
+overwritten. One time per disk — afterwards the `tapp-data` label is found on every boot. If
+you would rather prepare the disk before the node ever sees it, `mkfs.ext4 -L tapp-data <device>`
+on any machine has the same effect.
 
 Once the instance is created and running, 0G Tapp service will start automatically.
 

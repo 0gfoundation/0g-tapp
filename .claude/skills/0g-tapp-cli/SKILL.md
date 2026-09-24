@@ -1,7 +1,7 @@
 ---
 name: 0g-tapp-cli
 description: Use this skill when the user wants to deploy, manage, or troubleshoot applications on a 0G Tapp (Trusted Application Platform) server using tapp-cli. Covers start/stop apps, on-chain registration, registry login, check task status, view logs, and manage docker compose deployments across multiple remote TEE servers.
-version: 1.14.0
+version: 1.17.0
 author: 0G Labs
 tags: [0g, tapp, tee, docker, deployment, cli, onchain]
 ---
@@ -121,6 +121,26 @@ Owner-only, and **every call is extended into the runtime measurement** carrying
 
 **What the node then does** (v0.5.0+): before fetching key material it pins the verifier against `--scan-pubkey`, asks it for the KMS app's attested keys, and pins the KMS node against that set. No path degrades to unverified — if the verifier is unreachable and nothing is cached, it refuses. A pin mismatch triggers one refresh (a rebooted node has legitimately re-derived its key) then rejects.
 - After VM reboot the server is UNCLAIMED again and must be claimed again.
+
+### The node has no data disk (`FAILED_PRECONDITION` on start-app)
+
+A node whose `/data` could not be provisioned automatically boots and answers RPCs but refuses
+to run apps — the rootfs is a RAM overlay, so an app started there would lose its state at
+reboot and grow RAM until the machine dies. This is the **normal** first state on any GPU
+machine type (clouds attach local SSDs that cannot be declined, so "the single blank disk" never
+exists) and on most bare metal. The console log names the disks it saw.
+
+```bash
+tapp-cli -s <server> provision-data-disk --dry-run -k <key>            # list candidates, change nothing
+tapp-cli -s <server> provision-data-disk --device /dev/nvme0n2 -k <key>
+systemctl restart tapp-server                                          # restores file logging
+```
+
+The RPC is `ProvisionDataDisk`. Owner only, so **claim the node first** (`claim-owner` / `ClaimConfig`) — an unclaimed node on
+the network must not let a passer-by choose which disk gets formatted. Disks marked `[ephemeral]`
+are cloud scratch: wiped on stop/start, never chosen automatically, and naming one is a
+deliberate act. An existing ext4 disk is adopted (relabelled, data preserved); any other
+filesystem is refused. One time per disk.
 
 ### Server health & whitelist
 ```bash
@@ -327,8 +347,11 @@ tapp-cli -s <teeUrl> get-evidence --app-id <APP_ID> --nonce $(openssl rand -hex 
 - `composeHash/volumesHash/imageHashes` == the last `result:"success"` `start_app` event in RTMR3 eventlog. Hash encoding (rebuild before compare): compose=raw 48B SHA-384; volumes=sorted `key + ':' + raw(digest) + '\n'` per entry; image=`sha256:<hex>` ascii per service.
 - Boot chain MRTD/shim/grub/kernel/initrd == AS reference values (initrd may differ per host). `kernel_cmdline` matches by **OR** of two refs (new-grub `/vmlinuz...` vs old-grub `(hd0,gptN)/boot/vmlinuz...`) — both pass.
 - RTMR3 `EV_EVENT_TAG` events are `<domain> <op> <value>`: `tapp.0g.com` = start_app/stop_app/... ; `cryptpilot.alibabacloud.com` = FDE (only on old aliyun images, absent on GCP).
+- **`provision_data_disk`** (RTMR3, domain `tapp.0g.com`): present when the owner gave the node its `/data` disk over the API. Read `action`: `formatted` = the disk was blank and this node created everything on it; **`adopted` = the node inherited content it did not create**. Adopted is legitimate (it is how a replacement node picks up a failed one's data) but changes what stored state is worth — app volumes are LUKS/KMS-sealed so unforgeable yet possibly *stale* (a rollback encryption cannot detect), and `/data/log/tapp/` is protected by nothing, so the node may be serving a fabricated history of itself. Track the disk by `fs_uuid`, not `device`. Full treatment: `docs/EVIDENCE_AND_AS_VERIFICATION.md`.
+- **`gpu_evidence`** is `null` on a CPU-only node. On a confidential-GPU node it holds one entry per GPU (`name`, `uuid`, `cc_enabled`, `driver_version`, `vbios_version`, `attestation_report`, `certificate`). Two checks, both required: `cc_enabled == true` (a GPU that is present but not in CC mode protects nothing), and the report is bound to **this** quote — the nonce at **offset 4** of the decoded `attestation_report` equals the first 32 bytes of `report_data`, i.e. `sha512(runtime_data)[:32]`. Skipping the binding lets a genuine report from another machine or another moment pass. Building/running such a node: `cvm/GPU.md`.
 
 ## Reference
 - RA / evidence + AS verification (full flow, encoding rules, tested walkthrough): `docs/EVIDENCE_AND_AS_VERIFICATION.md`; runnable verifier `docs/verify_app.py` (+ `docs/attestation.proto`).
+- Confidential GPUs — building a GPU image (`ENABLE_GPU=1`), the driver/Fabric Manager pinning, the data-disk labelling a GPU host needs, and the four post-boot checks: `cvm/GPU.md`.
 - Full end-to-end app deploy flow + pitfalls (provider/broker: start → register → authorizeInvalidator → provider register): `docs/DEPLOY_RUNBOOK.md`.
 - Contract addresses & on-chain query examples: `contract/CONTRACTS.md`.

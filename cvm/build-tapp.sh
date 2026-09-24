@@ -16,7 +16,7 @@ export DEBIAN_FRONTEND=noninteractive
 
 # ===== Tunables =====
 TAPP_SERVER_BIN="${TAPP_SERVER_BIN:-}"                              # path to a local tapp-server binary; empty -> download from URL
-TAPP_SERVER_URL="${TAPP_SERVER_URL:-https://github.com/0gfoundation/0g-tapp/releases/download/v0.1.0/tapp-server}"
+TAPP_SERVER_URL="${TAPP_SERVER_URL:-https://github.com/0gfoundation/0g-tapp/releases/download/v0.8.0/tapp-server}"
 BUILD_MODE="${BUILD_MODE:-canonical}"  # canonical (default): owner-agnostic image, one refval set for all owners.
                                        # custom: OWNER_ADDRESS baked in, per-owner initrd measurement + refval set.
 OWNER_ADDRESS="${OWNER_ADDRESS:-}"     # Required when BUILD_MODE=custom; ignored in canonical mode.
@@ -54,6 +54,12 @@ SYSBOX_DEB_URL="${SYSBOX_DEB_URL:-https://downloads.nestybox.com/sysbox/releases
 # image can be logged into with no cloud component at all (see the dev-access block below).
 export CLOUD="${CLOUD:-gcp}"
 export BOOT_FORMAT="${BOOT_FORMAT:-grub}"
+# GPU confidential computing (opt-in). Same base image and same pipeline as a CPU-only build --
+# stage B just installs the NVIDIA open driver + container toolkit on top and turns CC mode on.
+# It must happen there rather than in stage A, because the driver compiles against the kernel
+# this image boots and stage A still has the base one. Exported so prepare-tapp.sh sees it.
+export ENABLE_GPU="${ENABLE_GPU:-0}"
+export NVIDIA_DRIVER_BRANCH="${NVIDIA_DRIVER_BRANCH:-580}"   # open module; 575 does not build against 6.17 (see prepare-tapp.sh [1a/4])
 # passed through to prepare-tapp.sh (used by convert)
 export CONFIG_DIR="${CONFIG_DIR:-$HERE/config_dir}"
 export FDE_PACKAGE="${FDE_PACKAGE:-$HERE/cryptpilot-fde-guest_0.8.0_amd64.deb}"   # 0.8.0 in-image runtime (cryptpilot-fde split into -host/-guest at 0.8.0)
@@ -111,9 +117,15 @@ cat > "$TMPD/tapp-server.service" <<'EOF'
 Description=TAPP gRPC Server - Trusted Application
 After=network.target
 Wants=network.target
-# File logs live on the persistent /data disk (RAM rootfs would grow unbounded,
-# issue #23) — same fail-loud policy as docker/containerd: no /data, no start.
-RequiresMountsFor=/data
+# Ordered after /data but NOT dependent on it. docker and containerd keep the hard
+# RequiresMountsFor=/data (container layers on the RAM rootfs is issue #23 and must never
+# happen), but tapp-server itself must come up without it, for one reason: a node whose
+# disk could not be provisioned automatically — every GPU machine type, most bare metal —
+# used to boot into silence, with no shell on a hardened image and no way to say what was
+# wrong. It now starts, refuses to run apps, and exposes ProvisionDataDisk so the owner can
+# hand it a disk. File logging degrades to the console for that run (tapp-server refuses to
+# create its log directory on the RAM overlay) and returns on the next restart.
+After=data.mount
 
 [Service]
 Type=simple
@@ -157,7 +169,7 @@ level = "info"
 format = "pretty"
 # On the persistent /data disk, NOT the RAM rootfs (rw_overlay="ram") — file
 # logs on "/" consume RAM and are lost on reboot (issue #23). tapp-server keeps
-# at most `max_log_files` daily files (default 7).
+# at most \`max_log_files\` daily files (default 7).
 file_path = "/data/log/tapp/"
 
 [server]
@@ -172,7 +184,7 @@ unix_socket_path = "/run/tapp/tapp.sock"
 
 [server.permission]
 enabled = true
-# owner: unset ⇒ boots UNCLAIMED; first valid `tapp-cli claim-owner` signer
+# owner: unset ⇒ boots UNCLAIMED; first valid \`tapp-cli claim-owner\` signer
 # becomes the owner (measured claim_owner runtime event). A baked owner
 # (legacy) re-introduces per-owner reference values.
 $OWNER_LINE
@@ -308,13 +320,22 @@ grep -q 'LABEL=tapp-data' /etc/fstab || printf '%s\n' 'LABEL=tapp-data /data ext
 # Auto-provision /data on first boot with NO SSH. Find the single non-boot whole disk and:
 #   - blank (no filesystem signature)      -> mkfs.ext4 -L tapp-data     (fresh node)
 #   - already ext4 (e.g. a migrated disk)  -> e2label tapp-data          (adopt, NEVER reformat)
-# SAFE: only real disks (sd*/nvme*/vd*), never the boot disk, never a partitioned disk; with zero or
-# more-than-one candidates it refuses to guess; an existing fs is adopted (labelled), never wiped.
+# SAFE: only real disks (sd*/nvme*/vd*), never the boot disk, never a partitioned disk, never an
+# ephemeral cloud scratch disk; with zero or more-than-one candidates it refuses to guess; an
+# existing fs is adopted (labelled), never wiped.
 # So attaching ANY single data disk -- brand-new or an old one carrying data -- just works, no SSH,
 # no manual mkfs/label. A disk already labelled tapp-data short-circuits at the top. Idempotent.
 cat > /usr/local/sbin/tapp-data-provision.sh <<'PROVSH'
 #!/bin/bash
 set -u
+# A node that ends up without /data does not start tapp-server, and on a hardened image there is
+# no shell to read the journal with -- the failure is invisible, and looks like the node is simply
+# broken. So anything that leaves /data unprovisioned is said on the console too, where the cloud's
+# serial log (or a bare-metal screen) shows it, together with the one command that fixes it.
+say() {
+  echo "tapp-data-provision: $*" >&2
+  { echo "tapp-data-provision: $*" > /dev/console; } 2>/dev/null || true
+}
 udevadm settle 2>/dev/null || true
 # already have a tapp-data fs (labelled on an earlier boot, or operator-provided)? done.
 blkid -L tapp-data >/dev/null 2>&1 && exit 0
@@ -322,6 +343,32 @@ blkid -L tapp-data >/dev/null 2>&1 && exit 0
 esp="$(blkid -L UEFI 2>/dev/null)" || true
 bootdisk=""
 [ -n "${esp:-}" ] && bootdisk="$(lsblk -no pkname "$esp" 2>/dev/null | head -1)"
+# Cloud scratch ("local SSD") is ephemeral -- wiped on stop/start -- so it must never become /data.
+# This is not a corner case: GCP attaches local SSDs unconditionally to every GPU machine type
+# (a3-highgpu-1g gets two, and they cannot be declined), which leaves the "exactly one candidate"
+# rule permanently unsatisfiable on a GPU host -- measured on a3-highgpu-1g, where the candidate
+# set was (local-ssd, local-ssd, data-pd) and provisioning refused, so /data never mounted and
+# tapp-server never started.
+#
+# GCP's own /dev/disk/by-id/google-local-nvme-ssd-N aliases are NOT available to us: those udev
+# rules ship in google-guest-configs, which this image deliberately does not install. The alias
+# check below is kept for images that do have them; what actually discriminates here is the NVMe
+# model string, which GCP sets to "nvme_card-pd" for a persistent disk and "nvme_card<N>"
+# (nvme_card0, nvme_card1, ...) for each local SSD -- so match the prefix, not a fixed string.
+is_scratch() {
+  local n="$1" l model
+  for l in /dev/disk/by-id/*; do
+    [ -e "$l" ] || continue
+    case "${l##*/}" in *local-nvme-ssd*|*local-ssd*|*ephemeral*) ;; *) continue ;; esac
+    [ "$(readlink -f "$l" 2>/dev/null)" = "/dev/$n" ] && return 0
+  done
+  model="$(tr -d ' ' < "/sys/block/$n/device/model" 2>/dev/null)"
+  case "$model" in
+    nvme_card-pd) return 1 ;;      # persistent disk -- a legitimate /data candidate
+    nvme_card*)   return 0 ;;      # nvme_card0, nvme_card1, ... -- local SSD
+  esac
+  return 1
+}
 # collect candidate non-boot whole disks (no partitions)
 cands=()
 while read -r name type; do
@@ -329,12 +376,18 @@ while read -r name type; do
   case "$name" in sd*|nvme*|vd*) ;; *) continue ;; esac                            # real disks only (skip zram/loop/dm/sr)
   [ "$name" = "$bootdisk" ] && continue                                            # never the boot disk
   [ -n "$(lsblk -rno NAME "/dev/$name" 2>/dev/null | tail -n +2)" ] && continue    # skip partitioned disks
+  is_scratch "$name" && continue                                                   # never ephemeral scratch
   cands+=("/dev/$name")
 done < <(lsblk -dno NAME,TYPE 2>/dev/null)
 if [ "${#cands[@]}" -eq 0 ]; then
-  echo "tapp-data-provision: no candidate data disk; /data stays unmounted (docker fails loud)" >&2; exit 0
+  say "no candidate data disk found; /data stays unmounted, so tapp-server will NOT start."
+  say "remedy: attach a data disk, or pre-label one with: mkfs.ext4 -L tapp-data <device>"
+  exit 0
 elif [ "${#cands[@]}" -gt 1 ]; then
-  echo "tapp-data-provision: multiple candidate disks (${cands[*]}); refusing to guess" >&2; exit 0
+  say "multiple candidate disks (${cands[*]}); refusing to guess which one is /data."
+  say "/data stays unmounted, so tapp-server will NOT start."
+  say "remedy: pre-label the intended disk and reboot: mkfs.ext4 -L tapp-data <device>"
+  exit 0
 fi
 dev="${cands[0]}"
 fstype="$(blkid -p -s TYPE -o value "$dev" 2>/dev/null || true)"
@@ -345,7 +398,9 @@ elif [ "$fstype" = ext4 ]; then
   e2label "$dev" tapp-data                                                         # adopt existing data, no reformat
   echo "tapp-data-provision: adopted existing ext4 $dev -> LABEL=tapp-data (data preserved)"
 else
-  echo "tapp-data-provision: $dev has unexpected fs '$fstype'; not touching it" >&2; exit 0
+  say "$dev has unexpected fs '$fstype'; not touching it. /data stays unmounted, so tapp-server"
+  say "will NOT start. remedy: pre-label an ext4 disk with: mkfs.ext4 -L tapp-data <device>"
+  exit 0
 fi
 PROVSH
 chmod 0755 /usr/local/sbin/tapp-data-provision.sh

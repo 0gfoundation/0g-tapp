@@ -191,6 +191,11 @@ Returns an `attestation_token` (JWT / EAR format). Decode the payload and look a
 Decoded evidence(hex) = `{ cc_eventlog: <base64>, gpu_evidence: null, quote: <base64>, runtime_data: <base64> }`
 (`runtime_data` only exists from v0.4.0+, see §②).
 
+`gpu_evidence` is `null` on a CPU-only node, and on a GPU node whose driver is absent or whose
+GPUs are not in confidential-computing mode — it is not an error in itself, but on a node you
+expect to have GPUs it means the GPU half of the attestation is missing. See
+[§ GPU evidence](#gpu-evidence-confidential-gpus) below for what it holds when it is present.
+
 ### Verify the report_data binding + read the signer (v0.4.0+)
 
 ```python
@@ -307,6 +312,40 @@ tapp.0g.com <operation> {"app_id","operation","result","error",
 - `docker_login` records `registry/username/signer/timestamp` (no password).
 - Pattern: the first runtime event of each session lands on `pcrIndex=1`; subsequent ones land on `pcrIndex=4`.
 
+### provision_data_disk — read this one before trusting anything stored
+
+```
+tapp.0g.com provision_data_disk {"operation","action","device","fs_uuid","signer","timestamp"}
+```
+
+Emitted when the owner gives the node the persistent disk `/data` lives on (`ProvisionDataDisk`,
+see [`cvm/GPU.md`](../cvm/GPU.md)). Absent on a node whose disk was provisioned at boot from a
+single blank candidate, or that was handed a disk already labelled `tapp-data` — both of which
+mean nobody made a choice worth recording.
+
+**`action` is the field that matters.**
+
+| value | what the node's storage is |
+|---|---|
+| `formatted` | the disk was blank; everything under `/data` was created by this node |
+| `adopted` | the disk already held ext4 and was relabelled — the node **inherited content it did not create** |
+
+`adopted` is not an error, and it is how a replacement node picks up a failed one's data, which
+is a deliberate feature. But it changes what stored state is worth: not everything under `/data`
+is protected the same way.
+
+- **App volumes** are LUKS, keyed per app by the KMS, so their contents cannot be forged — but
+  nothing dates them. An adopted disk can carry a *stale* copy, which rolls that app's data back
+  to whenever the disk was last written. Encryption does not detect this.
+- **File logs** (`/data/log/tapp/`) are protected by nothing at all. A pre-seeded disk can hand a
+  node a fabricated account of its own history, and the node will serve it through `GetServiceLogs`
+  as its own.
+- Container image layers are digest-checked at `start_app`, so those are safe either way.
+
+So on `adopted`, establish where the disk came from before treating `/data` as this node's. The
+`fs_uuid` is the durable identity to track it by — `device` is whichever name the kernel gave it
+that boot and means nothing afterwards.
+
 ### Reading key-access events with EMPTY hashes (the restart window)
 
 In real traces, bursts of `get_app_secret_key` / `get_secret_resource` events
@@ -369,6 +408,57 @@ On every VM reboot the RTMRs are zeroed, the claim happens again, and it is meas
 `owner✓/✗/?` (✓ = claim_config owner == on-chain owner; ✗ = mismatch, Result ❌; ? = no claim_config event,
 images predating 0.3). Also, without `--policy-ids`, the boot-chain component measurements are printed verbatim in the reference-value JSON format,
 so they can be diffed directly against `verifier/reference-values/…/<env>.json`.
+
+---
+
+## GPU evidence (confidential GPUs)
+
+On a node built with `ENABLE_GPU=1` (see [`cvm/GPU.md`](../cvm/GPU.md)) running confidential GPUs,
+`gpu_evidence` carries one entry per GPU:
+
+```json
+{ "collection_time": "2026-09-24T07:38:03.993595964Z",
+  "evidence_list": [ { "index": 0,
+                       "name": "NVIDIA H100 80GB HBM3",
+                       "uuid": "GPU-87bf5184-…",
+                       "cc_enabled": true,
+                       "driver_version": "580.178.04",
+                       "vbios_version": "96.00.D9.00.01",
+                       "attestation_report": "<base64, 8192 bytes>",
+                       "certificate": "<base64>" } ] }
+```
+
+`cc_enabled: false` means the GPU is present but not in confidential-computing mode — the report
+is then about a GPU that does not protect anything, so treat it as a failed check, not a warning.
+
+### Binding the GPU report to the TDX quote
+
+The reason this field lives inside the TDX evidence rather than being fetched separately: each
+GPU report carries a nonce, and that nonce is **the first 32 bytes of the quote's `report_data`**
+— which §② already showed is `sha512(runtime_data)`, and `runtime_data` carries the caller's own
+challenge. So one chain runs from the challenge you sent, through the CPU quote, into every GPU
+report. Without checking it, a genuine GPU report from some other machine (or some other moment)
+would pass.
+
+The nonce sits at **offset 4** of the decoded `attestation_report` (an SPDM MEASUREMENTS
+response), so verify it directly:
+
+```python
+h        = hashlib.sha512(base64.b64decode(j["runtime_data"])).digest()
+assert bytes.fromhex(report_data) == h                     # §④: quote binds runtime_data
+for g in j["gpu_evidence"]["evidence_list"]:
+    assert g["cc_enabled"] is True
+    rep = base64.b64decode(g["attestation_report"])
+    assert rep[4:36] == h[:32]                             # GPU report binds to THIS quote
+```
+
+Measured end to end on GCP `a3-highgpu-1g` (TDX + H100, tapp-server 0.8.0) with a random
+challenge: `sha512(runtime_data)` == quote `report_data` == `06c9f5df…bc59`, and its first 32
+bytes were found at offset 4 of the GPU report.
+
+The GPU report's own signature and certificate chain are verified against NVIDIA's device
+identity (NRAS or a local verifier); that step is outside this document, and skipping it means
+you checked the report is *fresh and bound to this node* but not that it is *genuine*.
 
 ---
 

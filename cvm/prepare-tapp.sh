@@ -100,6 +100,83 @@ virt-customize -a "$WORK" --run-command '
   echo "vmlinuz -> $k"
 '
 
+# --- [1a/4] GPU confidential computing (ENABLE_GPU=1, opt-in) ---
+# Same base image, same pipeline; GPU is one more stage rather than a second product.
+# It has to run HERE -- after the kernel install above, before convert -- because the driver
+# builds a kernel module and Stage A still had the base 6.8 GA kernel, which this image does
+# not boot. With only the target kernel's headers present, DKMS builds against it.
+#
+# Driver: the OPEN kernel module, which confidential computing mode requires -- not optional.
+#
+# 580, the floor GCP's confidential-GPU guidance gives ("580 or higher"). That floor is real here
+# rather than advisory: 575.57.08 does NOT build against this image's 6.17 kernel -- measured, the
+# module fails on `implicit declaration of function 'dma_buf_attachment_is_dynamic'`, a symbol
+# 6.17 took out of the public dma-buf headers and that NVIDIA's conftest does not probe for.
+# Alibaba pins 550/570 because their platform runs a 5.10 kernel; ours must be >=6.16 for the TDX
+# RTMR interface, so a newer driver is the matched pair and there is nothing to retreat to.
+#
+# Fabric Manager -- which multi-GPU needs for NVSwitch, and Protected PCIe with it -- comes from
+# the UNVERSIONED package: NVIDIA drops the branch suffix on its newest line, so while
+# nvidia-fabricmanager-575 exists, 580's counterpart is plain `nvidia-fabricmanager`. It must be
+# version-pinned rather than just installed, because that package now resolves to 610/615 and
+# Fabric Manager has to match the driver exactly. Pinning to the version the driver itself
+# resolved to is the only pairing that stays correct as the repo moves.
+#
+# It is installed unconditionally and left DISABLED: only multi-GPU hosts need it, but installing
+# it later would change the measurement and put every node on a new image, whereas enabling the
+# service at runtime does not. So one image serves single- and multi-GPU hosts.
+#
+# Everything lands in the verity-sealed rootfs and the initrd, so a GPU image measures
+# differently from a CPU-only one and carries its own reference values. That is expected.
+if [ "${ENABLE_GPU:-0}" = 1 ]; then
+  echo "==> [1a/4] ENABLE_GPU=1: NVIDIA open driver ${NVIDIA_DRIVER_BRANCH:-580} + container toolkit + CC mode"
+  virt-customize -a "$WORK" --run-command "
+    set -e
+    export DEBIAN_FRONTEND=noninteractive
+    k=\$(ls /boot/vmlinuz-*-generic | sort -V | tail -1 | sed 's#/boot/vmlinuz-##')
+    echo \"building driver against kernel \$k\"
+    apt-get update
+    # DKMS needs the TARGET kernel's headers; only they are present, so it cannot pick another.
+    apt-get install -y \"linux-headers-\$k\" dkms build-essential curl ca-certificates gnupg
+
+    # NVIDIA CUDA repo (driver) + libnvidia-container repo (container toolkit)
+    curl -fsSL -o /tmp/cuda-keyring.deb https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+    dpkg -i /tmp/cuda-keyring.deb && rm -f /tmp/cuda-keyring.deb
+    curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+    curl -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
+      | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
+      > /etc/apt/sources.list.d/nvidia-container-toolkit.list
+    apt-get update
+
+    apt-get install -y nvidia-driver-${NVIDIA_DRIVER_BRANCH:-580}-open nvidia-container-toolkit
+    nvidia-ctk runtime configure --runtime=docker            # register the nvidia runtime with docker
+
+    # Pin Fabric Manager to the version the driver actually resolved to (see header).
+    drvver=\$(dpkg-query -W -f='\${Version}' nvidia-dkms-${NVIDIA_DRIVER_BRANCH:-580}-open | sed 's/-.*//')
+    echo \"pinning Fabric Manager to the driver's own version: \$drvver\"
+    apt-get install -y \"nvidia-fabricmanager=\$drvver-*\" \
+      || { echo \"ERROR: no nvidia-fabricmanager matching driver \$drvver; multi-GPU needs an exact match\"; exit 1; }
+    systemctl disable nvidia-fabricmanager.service 2>/dev/null || true
+
+    # Confidential computing mode. nvidia-smi conf-compute -srs 1 has to run once the driver is
+    # up on the real machine, so it hangs off nvidia-persistenced -- which CC also needs anyway,
+    # since the CPU<->GPU SPDM session requires persistence mode.
+    mkdir -p /etc/systemd/system/nvidia-persistenced.service.d
+    printf '%s\n' '[Service]' 'ExecStartPost=-/usr/bin/nvidia-smi conf-compute -srs 1' \
+      > /etc/systemd/system/nvidia-persistenced.service.d/10-cc-mode.conf
+    systemctl enable nvidia-persistenced.service || true
+
+    # Linux Kernel Crypto API, required to bring up that SPDM session (GCP's guidance).
+    printf '%s\n' ecdsa_generic ecdh > /etc/modules-load.d/nvidia-cc-lkca.conf
+
+    # The module must exist for the kernel this image boots, or none of the above matters.
+    test -f \"/lib/modules/\$k/updates/dkms/nvidia.ko\" \
+      || test -f \"/lib/modules/\$k/updates/dkms/nvidia.ko.zst\" \
+      || { echo \"ERROR: nvidia.ko was not built for \$k -- driver ${NVIDIA_DRIVER_BRANCH:-580} may not support this kernel\"; exit 1; }
+    echo \"nvidia.ko present for \$k\"
+  "
+fi
+
 # --- [1b/4] boot-format prerequisites (BOOT_FORMAT-specific): UKI needs dracut + systemd-boot ---
 if [ "$BOOT_FORMAT" = uki ]; then
   # convert --uki builds a Unified Kernel Image via dracut + systemd-boot. dracut-network: the
