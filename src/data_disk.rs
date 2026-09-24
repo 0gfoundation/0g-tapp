@@ -270,6 +270,21 @@ pub struct Provisioned {
     pub action: Action,
     pub candidates: Vec<Candidate>,
     pub data_mounted: bool,
+    /// Filesystem UUID of the disk that became /data, empty on a dry run.
+    ///
+    /// The device path is whatever the kernel happened to enumerate this boot and means
+    /// nothing later; the UUID is written into the filesystem and identifies it for good. It is
+    /// what goes into the measured event, so "which disk is this node's /data" stays an
+    /// answerable question after a reboot renames everything.
+    pub fs_uuid: String,
+}
+
+/// Filesystem UUID of `device`, or empty if it has none.
+pub fn fs_uuid(device: &str) -> String {
+    run("blkid", &["-s", "UUID", "-o", "value", device])
+        .unwrap_or_default()
+        .trim()
+        .to_string()
 }
 
 /// Format or adopt `device` (or the sole candidate when `device` is `None`), label it
@@ -290,11 +305,13 @@ pub fn provision(device: Option<&str>, dry_run: bool) -> Result<Provisioned, Dat
             } else {
                 mount_data()?
             };
+            let uuid = fs_uuid(&dev);
             return Ok(Provisioned {
                 device: dev,
                 action: Action::AlreadyProvisioned,
                 candidates: cands,
                 data_mounted: mounted,
+                fs_uuid: uuid,
             });
         }
     }
@@ -327,6 +344,7 @@ pub fn provision(device: Option<&str>, dry_run: bool) -> Result<Provisioned, Dat
             action,
             candidates: cands,
             data_mounted: is_data_mounted(),
+            fs_uuid: String::new(),
         });
     }
 
@@ -343,11 +361,13 @@ pub fn provision(device: Option<&str>, dry_run: bool) -> Result<Provisioned, Dat
     }
 
     let mounted = mount_data()?;
+    let uuid = fs_uuid(&chosen.device);
     Ok(Provisioned {
         device: chosen.device,
         action,
         candidates: cands,
         data_mounted: mounted,
+        fs_uuid: uuid,
     })
 }
 

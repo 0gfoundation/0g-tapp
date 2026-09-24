@@ -312,6 +312,40 @@ tapp.0g.com <operation> {"app_id","operation","result","error",
 - `docker_login` records `registry/username/signer/timestamp` (no password).
 - Pattern: the first runtime event of each session lands on `pcrIndex=1`; subsequent ones land on `pcrIndex=4`.
 
+### provision_data_disk — read this one before trusting anything stored
+
+```
+tapp.0g.com provision_data_disk {"operation","action","device","fs_uuid","signer","timestamp"}
+```
+
+Emitted when the owner gives the node the persistent disk `/data` lives on (`ProvisionDataDisk`,
+see [`cvm/GPU.md`](../cvm/GPU.md)). Absent on a node whose disk was provisioned at boot from a
+single blank candidate, or that was handed a disk already labelled `tapp-data` — both of which
+mean nobody made a choice worth recording.
+
+**`action` is the field that matters.**
+
+| value | what the node's storage is |
+|---|---|
+| `formatted` | the disk was blank; everything under `/data` was created by this node |
+| `adopted` | the disk already held ext4 and was relabelled — the node **inherited content it did not create** |
+
+`adopted` is not an error, and it is how a replacement node picks up a failed one's data, which
+is a deliberate feature. But it changes what stored state is worth: not everything under `/data`
+is protected the same way.
+
+- **App volumes** are LUKS, keyed per app by the KMS, so their contents cannot be forged — but
+  nothing dates them. An adopted disk can carry a *stale* copy, which rolls that app's data back
+  to whenever the disk was last written. Encryption does not detect this.
+- **File logs** (`/data/log/tapp/`) are protected by nothing at all. A pre-seeded disk can hand a
+  node a fabricated account of its own history, and the node will serve it through `GetServiceLogs`
+  as its own.
+- Container image layers are digest-checked at `start_app`, so those are safe either way.
+
+So on `adopted`, establish where the disk came from before treating `/data` as this node's. The
+`fs_uuid` is the durable identity to track it by — `device` is whichever name the kernel gave it
+that boot and means nothing afterwards.
+
 ### Reading key-access events with EMPTY hashes (the restart window)
 
 In real traces, bursts of `get_app_secret_key` / `get_secret_resource` events

@@ -2236,9 +2236,51 @@ impl TappService for TappServiceImpl {
             }
         };
 
+        // Record it in the runtime measurement. A dry run changes nothing and is not an event.
+        //
+        // What makes this worth measuring is not "a disk was attached" but WHICH KIND: a disk
+        // that was `formatted` means the node started from nothing, while `adopted` means it
+        // inherited content it never created. Those are very different nodes and, unrecorded,
+        // indistinguishable from outside. The inherited content is not uniformly protected —
+        // app volumes are LUKS/KMS-sealed and cannot be forged but CAN be an older state, and
+        // file logs under /data/log are protected by nothing at all. A verifier that reads
+        // `adopted` knows to ask where that disk came from; the log is append-only, so the
+        // question survives being asked late.
+        if !req.dry_run {
+            let measurement_data = serde_json::json!({
+                "operation": measurement_service::OPERATION_NAME_PROVISION_DATA_DISK,
+                "action": result.action.as_str(),
+                "device": result.device,
+                // The device path is this boot's accident; the filesystem UUID is the disk.
+                "fs_uuid": result.fs_uuid,
+                "signer": signer.clone().unwrap_or_default(),
+                "timestamp": utils::current_timestamp()
+            })
+            .to_string();
+            if let Err(e) = self
+                .measurement_service
+                .extend_measurement(
+                    measurement_service::OPERATION_NAME_PROVISION_DATA_DISK,
+                    &measurement_data,
+                )
+                .await
+            {
+                // The disk is mounted and the node is usable, but the record of how it got that
+                // way is missing — which is exactly the gap this event exists to close. Fail the
+                // call rather than return success over an unrecorded change of state.
+                tracing::error!(error = %e, "failed to extend runtime measurement for ProvisionDataDisk");
+                return Err(Status::internal(format!(
+                    "the disk was provisioned but the measured event could not be recorded ({e}); \
+                     this node's evidence would not show how it got its /data. Treat the node as \
+                     suspect and rebuild it rather than using it."
+                )));
+            }
+        }
+
         tracing::info!(
             device = %result.device,
             action = result.action.as_str(),
+            fs_uuid = %result.fs_uuid,
             dry_run = req.dry_run,
             data_mounted = result.data_mounted,
             signer = %signer.unwrap_or_default(),

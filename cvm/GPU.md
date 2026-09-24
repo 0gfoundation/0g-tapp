@@ -98,6 +98,13 @@ An existing ext4 disk is adopted (relabelled, data preserved), never reformatted
 filesystem is refused outright. Once labelled `tapp-data` the disk is found by label on every
 later boot, so this is one time per disk and survives reboots and migration.
 
+Both outcomes are written into the runtime measurement as a `provision_data_disk` event carrying
+`action` (`formatted` or `adopted`), the device and the filesystem UUID. Know what you are doing
+when you adopt: the node inherits content it did not create, and while app volumes are LUKS-sealed
+against forgery they can still be *stale*, and `/data/log/tapp/` is protected by nothing at all.
+The event is what lets a verifier tell the two cases apart later — see
+`docs/EVIDENCE_AND_AS_VERIFICATION.md`.
+
 If you would rather the node never see an unprovisioned disk, prepare it anywhere first — the
 label is the whole contract:
 

@@ -23,6 +23,21 @@ pub const OPERATION_NAME_CLAIM_CONFIG: &str = "claim_config";
 /// carries the resulting state in full so the newest event alone is the current answer.
 pub const OPERATION_NAME_UPDATE_TRUST_ANCHORS: &str = "update_trust_anchors";
 pub const OPERATION_NAME_GET_SECRET_RESOURCE: &str = "get_secret_resource";
+/// Giving the node the persistent disk that /data lives on.
+///
+/// Measured because it is an owner action that changes what the node is — a node with no
+/// /data cannot host anything, and after this one it can. But the reason it MUST be measured
+/// is the distinction it records: a disk that was `formatted` means the node started from
+/// nothing, while one that was `adopted` means it inherited content it did not create. That
+/// content is not all protected equally. App volumes are LUKS-encrypted under KMS keys so they
+/// cannot be forged — but they CAN be an older state, so adopting a stale disk rolls app data
+/// back; and file logs under /data/log are protected by nothing at all, so a pre-seeded disk
+/// can hand a node a fabricated history of itself.
+///
+/// None of that is detectable from outside if the choice goes unrecorded — the two cases look
+/// identical in the evidence. With the event, a verifier reading `adopted` knows to ask where
+/// that disk came from, and the append-only log means the question can always be asked later.
+pub const OPERATION_NAME_PROVISION_DATA_DISK: &str = "provision_data_disk";
 
 pub struct MeasurementService {
     aa: Arc<Mutex<AttestationAgent>>,
