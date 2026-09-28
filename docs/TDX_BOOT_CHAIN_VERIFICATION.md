@@ -5,8 +5,13 @@ boot-chain measurements (shim / grub / kernel / initrd / kernel_cmdline) against
 values produced from that image.
 
 **The mechanism is [cryptpilot](https://github.com/openanolis/cryptpilot)'s and is
-platform-agnostic** — the same scheme is used regardless of cloud (Aliyun, GCP, …). The
-cloud a node happens to run on is irrelevant to this verification.
+platform-agnostic** — the same scheme is used regardless of cloud (Aliyun, GCP, …).
+
+Since the `cloud` build dimension was dropped, the *values* are platform-agnostic too: one
+image (one HWE generic kernel; dev access baked in via `DEV_SSH_PUBKEY` rather than injected by
+a per-cloud agent) boots on GCP, Alibaba Cloud and bare metal with identical measurements, so
+there is one reference set and one policy id per build wherever it runs. Images built before
+that kept a per-cloud reference set; those stay registered.
 
 > Note: older cryptpilot used a different scheme (AAEL events like
 > `cryptpilot.alibabacloud.com fde_rootfs_hash` extended into RTMR3). Current cryptpilot
@@ -77,14 +82,24 @@ same values — no need to trust a running node. (cryptpilot
 never-booted images by falling back to GRUB's default menuentry when `grubenv` has no
 `saved_entry`.)
 
-Output is keyed `measurement.<component>.SHA-384`. Because `cryptpilot-convert` /
-`cryptpilot-fde` only run on an Alinux host, generation is **manual, not CI-automated**.
+Output is keyed `measurement.<component>.SHA-384`. `cryptpilot-convert` / `cryptpilot-fde` only
+run on an Alinux host, so generation happens on the **al8 self-hosted runner** — automated in
+[`build-cvm.yml`](../.github/workflows/build-cvm.yml), which calls `cvm/ci/gen-reference-values.sh`
+and opens a PR with the result. Run that script by hand for the same effect off-CI.
 
 The values are checked into this repo under
-[`verifier/reference-values/<tapp-server-version>/<env>.json`](../verifier/reference-values/) — **one set per
-tapp-server release × environment** (`dev`/`prod` images differ), starting at `v0.1.0`. See
-that directory's README. The policy itself is image-/version-/env-agnostic; only these
-values vary.
+[`verifier/reference-values/<boot_format>/<version>/<env>.json`](../verifier/reference-values/) —
+**one set per boot format × image version × environment** (`dev`/`prod` images differ). Two
+older layouts (`<cloud>/<boot_format>/…`, and the oldest flat `<version>/…`) are kept for images
+built under them; see that directory's README for the eras. The policy itself is
+image-/version-/env-agnostic; only these values vary.
+
+> **Two boot formats, and this document describes `grub`.** A `uki` image fuses
+> kernel+initrd+cmdline into one signed EFI binary, so its whole boot chain is a **single**
+> value, `measurement.uki.SHA-384`, instead of the five below. `verifier/policy.rego` handles
+> both (one rule per format; only the one whose reference values are present fires). Production
+> images have used `uki` since v0.2.0, so that is the shape you will meet most often —
+> everything here about how the chain is measured and verified applies to it unchanged.
 
 ## 5. Verification — CoCo-AS + Rego policy
 

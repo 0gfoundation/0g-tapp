@@ -172,8 +172,8 @@ The image is a **separate artifact from the binary it carries**, and it is measu
 | | example |
 |---|---|
 | published image name | `og-tdx-dev-grub-v0-3-0-r2` |
-| reference values | `verifier/reference-values/gcp/grub/v0.3.0-r2/dev.json` |
-| AS policy id | `0g-tapp-gcp-grub-v0.3.0-r2-dev` |
+| reference values | `verifier/reference-values/grub/v0.3.0-r2/dev.json` |
+| AS policy id | `0g-tapp-grub-v0.3.0-r2-dev` |
 
 Any change to the image changes its measurements. Reusing the identity makes `register-shared-as.sh` overwrite the reference values behind the **same policy id**, so every node still running the previous image fails verification from that moment on — no deploy, no warning. Bumping the revision leaves the old values registered and gives the new image its own policy.
 
