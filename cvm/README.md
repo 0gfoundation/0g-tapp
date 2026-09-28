@@ -68,6 +68,7 @@ Convert-side handling follows `BOOT_FORMAT`, not the cloud: grub syncs the ESP `
 | `cryptpilot-gcp-boot-fix.md` | **Main doc**: root-cause analysis + fixes + full SOP (§9) + security-hardening audit (§11) + convert issues for Alibaba Cloud (§7) |
 | `build-tapp.sh` | **One-shot full chain** (cloud-generic, `CLOUD=`): base image → final tapp image (Stage A app/docker/SGX/DNS + hardening + /data + Sysbox / Stage B kernel + convert / opt-in Stage C publish via `PUBLISH_AS=`) |
 | `prepare-tapp.sh` | Stage B only (when a base already exists): HWE generic kernel + fix A + DNS (guestfish) + nbd reset + `cryptpilot-convert` (grub or `--uki`) |
+| `run-tapp-td.sh` | **Launch the image as a TD on a bare-metal TDX host** (own QEMU, no cloud). TDX flags taken from `canonical/tdx`'s own launchers; see [`BARE_METAL.md`](BARE_METAL.md) |
 | `publish-gcp-image.sh` | **Stage C (gcp)**: `qemu-img` raw → oldgnu sparse `tar.gz` → `gsutil` → `gcloud compute images create` (confidential guest-os-features). Needs gcloud/gsutil auth |
 | `publish-ali-image.sh` | **Stage C (ali)**: `ossutil cp` → `aliyun ecs ImportImage` (x86_64/UEFI/QCOW2) → enable NVMe → wait Available. Needs ossutil/aliyun auth |
 | `fix-esp-grub.sh` | Sync the ESP grub only (gcp/grub fix B, standalone against an already-converted image) |
@@ -77,6 +78,11 @@ Convert-side handling follows `BOOT_FORMAT`, not the cloud: grub syncs the ESP `
 
 > The output qcow2 (~4–4.5G, converted / verity-sealed / hardened) is the **output** of `build-tapp.sh` and is not committed (gitignored).
 > The same applies to `cryptpilot-fde_*.deb` and the tapp-server binary: the deb must be placed locally in this directory; tapp-server is pulled by default from a GitHub release (see below).
+
+> **Running on bare metal?** The image is the same; what changes is that you launch the TD
+> yourself and own the quote-generation setup. [`BARE_METAL.md`](BARE_METAL.md) is the runbook —
+> verified end to end on an `ecs.ebmg8i.48xlarge`, including the one step that is genuinely easy
+> to get wrong (which PCCS can serve *your* platform).
 
 ## Pipeline (stages)
 - **Stage 0 — base prep** *(one-time, reused across builds & both clouds)*: official Ubuntu 24.04 cloud image → resize to 20 GiB → base qcow2. See `cryptpilot-gcp-boot-fix.md` §0. The base is **cloud-neutral** (generic kernel only). Input to Stage A, not part of `build-tapp.sh`.
