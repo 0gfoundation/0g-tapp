@@ -195,6 +195,14 @@ jobs:
             echo "error: image_rev must be a positive integer; got '${IMAGE_REV:-<empty>}'." >&2
             FAIL=1
           fi
+          # A GPU UKI does not fit the 105 MB ESP, and the partition is sandwiched between others so
+          # it cannot grow in place -- convert fails on "No space left on device". Rejecting the
+          # pair here rather than there saves an hour of DKMS building an artifact that is known
+          # to be undeliverable. Remove this check when the ESP is enlarged in stage 0.
+          if [ "$ENABLE_GPU" = 1 ] && [ "$BOOT_FORMAT" = uki ]; then
+            echo "error: enable_gpu with boot_format=uki cannot produce an image -- the NVIDIA driver's initrd does not fit the 105MB ESP and convert fails late. Use boot_format=grub (see cvm/GPU.md)." >&2
+            FAIL=1
+          fi
           # env=both runs two matrix jobs; a fixed image_name would make them clobber each other.
           if [ -n "${{ inputs.image_name }}" ] && [ "${{ inputs.env }}" = "both" ]; then
             echo "error: image_name requires a single env (dev or prod), not both." >&2

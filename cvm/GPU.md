@@ -18,10 +18,11 @@ TAPP_SERVER_URL=https://github.com/0gfoundation/0g-tapp/releases/download/v0.8.0
 ```
 
 Add `HARDEN=0 DEV_SSH_PUBKEY="ssh-ed25519 AAAA… you@host"` for an image you need a shell on.
-Do not expect to get in without it: `HARDEN=0` leaves cloud-init installed, but the image also
-writes a static `/etc/resolv.conf`, which cannot resolve `metadata.google.internal`, so on GCP
-cloud-init falls back to `DataSourceNone` and injects no keys. `DEV_SSH_PUBKEY` is the only way
-in, on every platform.
+On GCP, do not expect to get in without it: `HARDEN=0` leaves cloud-init installed, but the image
+also writes a static `/etc/resolv.conf`, which cannot resolve `metadata.google.internal`, so
+cloud-init falls back to `DataSourceNone` and injects no keys — measured on a TDX instance. That
+reasoning is GCP-specific and does not carry to platforms whose metadata endpoint is an IP rather
+than a name; see [`cvm/README.md`](README.md) for what is measured where.
 
 **`build-tapp.sh` modifies its input image in place.** Copy a pristine base for every run — a
 second run against a consumed base fails partway through, typically on `gpg: dearmoring failed:

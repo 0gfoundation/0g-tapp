@@ -263,13 +263,36 @@ reason. There, your baked key is the only way in, and
 `gcloud compute instances get-serial-port-output` (hypervisor-level, so it needs nothing in the
 guest) the only fallback.
 
-**A dev image is a different matter, and not as cloud-independent as it looks.** Only `HARDEN=1`
-purges cloud-init; `HARDEN=0` keeps it, and no longer pins its datasource — so on a cloud,
-ds-identify still detects the platform (GCE detection is DMI-based and needs no guest agent) and
-can inject the project's SSH key from instance metadata. A keyless dev image is therefore still
-reachable on GCP or Alibaba Cloud by whatever keys the project hands out. Pin the datasource to
-`None` if you want that closed. What a keyless dev image has no way into is **bare metal**, where
-there is no metadata service to ask — that is the gap `DEV_SSH_PUBKEY` closes.
+**A dev image keeps cloud-init, and whether that is a way in depends on the platform.** Only
+`HARDEN=1` purges cloud-init; `HARDEN=0` keeps it and does not pin its datasource, so
+ds-identify still detects the platform and could in principle inject the project's SSH key from
+instance metadata. Whether it actually can turns on one detail — how that platform's metadata
+endpoint is addressed — and the answer measured so far is not uniform:
+
+| platform | metadata endpoint | keyless dev image |
+|---|---|---|
+| GCP | `metadata.google.internal` (a **name**) | **closed, measured** |
+| Alibaba Cloud | `100.100.100.200` (an **IP**) | **unmeasured, assume open** |
+| bare metal | none | closed |
+
+On GCP it is closed, and not by design: the image writes a static `/etc/resolv.conf` (fix C in
+`prepare-tapp.sh`), which cannot resolve an internal name, so cloud-init falls through to
+`DataSourceNone` and injects nothing. Measured on a TDX instance —
+
+```
+DataSourceGCE.py[WARNING]: address "http://metadata.google.internal/computeMetadata/v1/" is not resolvable
+Datasource DataSourceNone.  Used fallback datasource
+ci-info: no authorized SSH keys fingerprints found for user ubuntu
+```
+
+`sshd` runs and port 22 answers; there is simply no key. The same reasoning does **not** carry to
+Alibaba Cloud, whose endpoint is a literal IP and needs no resolution, so the static
+`resolv.conf` does nothing to it and key injection is plausible. That has not been measured —
+treat an Aliyun keyless dev image as reachable by the project's keys until someone checks, and
+pin the datasource to `None` if you need it closed.
+
+On **bare metal** there is no metadata service to ask on any platform, which is the gap
+`DEV_SSH_PUBKEY` closes unconditionally.
 
 That is the trade, and it is the point: the cloud's convenience *is* its ability to inject
 credentials into your instance, which is exactly what hardening removes. In exchange, **who can get
