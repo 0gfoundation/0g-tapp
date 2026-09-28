@@ -312,39 +312,6 @@ tapp.0g.com <operation> {"app_id","operation","result","error",
 - `docker_login` records `registry/username/signer/timestamp` (no password).
 - Pattern: the first runtime event of each session lands on `pcrIndex=1`; subsequent ones land on `pcrIndex=4`.
 
-### provision_data_disk — read this one before trusting anything stored
-
-```
-tapp.0g.com provision_data_disk {"operation","action","device","fs_uuid","signer","timestamp"}
-```
-
-Emitted when the owner gives the node the persistent disk `/data` lives on (`ProvisionDataDisk`,
-see [`cvm/GPU.md`](../cvm/GPU.md)). Absent on a node whose disk was provisioned at boot from a
-single blank candidate, or that was handed a disk already labelled `tapp-data` — both of which
-mean nobody made a choice worth recording.
-
-**`action` is the field that matters.**
-
-| value | what the node's storage is |
-|---|---|
-| `formatted` | the disk was blank; everything under `/data` was created by this node |
-| `adopted` | the disk already held ext4 and was relabelled — the node **inherited content it did not create** |
-
-`adopted` is not an error — it is how a replacement node takes over a failed one's data — and
-it is **not a trust signal either way**. Read this event as an audit trail, useful when
-reconstructing what happened to a node, and nothing more.
-
-It is worth being explicit about why, because the opposite reading is tempting: provenance is
-not what makes storage trustworthy here. Everything under `/data` outside an app's LUKS volume
-is host-controlled plaintext that can be rewritten at any moment, whoever created the
-filesystem — so a `formatted` disk is no guarantee that today's logs are genuine. And an app
-volume can be rolled back to an earlier valid state regardless of how the disk arrived, because
-encryption does not date anything. What the platform does and does not promise about data at
-rest is set out in [`DATA_AT_REST.md`](DATA_AT_REST.md); reason from that, not from this event.
-
-The `fs_uuid` is the durable identity to track a disk by — `device` is whichever name the
-kernel gave it that boot and means nothing afterwards.
-
 ### Reading key-access events with EMPTY hashes (the restart window)
 
 In real traces, bursts of `get_app_secret_key` / `get_secret_resource` events

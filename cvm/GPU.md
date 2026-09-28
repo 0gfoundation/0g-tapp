@@ -69,51 +69,28 @@ gcloud compute instances create <name> \
   --create-disk=name=<name>-data,size=200GB,auto-delete=yes
 ```
 
-### A GPU host needs its data disk named, not just attached
+### The data disk on a GPU host
 
-**Attaching a blank disk is not enough on a GPU machine type.** The image auto-provisions `/data`
-by looking for exactly one blank non-boot disk, and GPU machine types break that: GCP attaches
-local SSDs to every A2/A3 unconditionally and they cannot be declined, so `a3-highgpu-1g` always
-has two extra blank disks. The build excludes GCP scratch disks by their NVMe model string
-(`nvme_card<N>` for local SSD vs `nvme_card-pd` for a persistent disk), which covers GCP — but
-the underlying rule still cannot work on any host with more than one genuine spare disk, bare
-metal included.
+GPU machine types attach ephemeral local SSDs unconditionally — `a3-highgpu-1g` gets two, and
+they cannot be declined — so a naive "find the one blank disk" rule never resolves there. The
+image excludes cloud scratch by its NVMe model string (`nvme_card<N>` for local SSD vs
+`nvme_card-pd` for a persistent disk), which means **attaching one data disk is enough and it
+provisions itself**, exactly as on a CPU instance.
 
-The node still boots and is reachable; it refuses to run apps (`FAILED_PRECONDITION` on
-StartApp) and says why on the console. Give it the disk over the API — the `ProvisionDataDisk`
-RPC, owner only, so claim the node first:
+The local SSDs are left unused. They are wiped on stop/start, so they cannot hold `/data`.
 
-```bash
-tapp-cli -s <node> provision-data-disk --dry-run -k <key>              # what does it see?
-tapp-cli -s <node> provision-data-disk --device /dev/nvme0n2 -k <key>
-systemctl restart tapp-server                                          # restores file logging
-```
-
-The dry run prints every disk the node considered, with the ephemeral ones marked — on
-`a3-highgpu-1g` that is two local SSDs and your data disk, which is exactly the picture that
-explains the refusal. Naming an ephemeral disk is allowed but is a deliberate choice: its
-contents vanish on stop/start.
-
-An existing ext4 disk is adopted (relabelled, data preserved), never reformatted; any other
-filesystem is refused outright. Once labelled `tapp-data` the disk is found by label on every
-later boot, so this is one time per disk and survives reboots and migration.
-
-Both outcomes are written into the runtime measurement as a `provision_data_disk` event carrying
-`action` (`formatted` or `adopted`), the device and the filesystem UUID. Know what you are doing
-when you adopt: the node inherits content it did not create, and while app volumes are LUKS-sealed
-against forgery they can still be *stale*, and `/data/log/tapp/` is protected by nothing at all.
-The event is what lets a verifier tell the two cases apart later — see
-`docs/EVIDENCE_AND_AS_VERIFICATION.md`.
-
-If you would rather the node never see an unprovisioned disk, prepare it anywhere first — the
-label is the whole contract:
+If a host has more than one genuine spare disk, the node refuses to guess rather than risk
+formatting the wrong one, and says so on the console — naming the disks it found and the command
+below, so the serial log shows why the node is idle. Label the intended disk beforehand, on any
+machine with a shell:
 
 ```bash
 mkfs.ext4 -L tapp-data <device>
 ```
 
-On a cloud that means attaching the disk to any ordinary VM once. To skip that per node, turn
-one labelled disk into an image and create every node's data disk from it:
+A disk carrying that label is used directly on every boot with no guessing; one already holding
+ext4 is adopted by relabelling, never reformatted. To skip the per-node step on a cloud, turn one
+labelled disk into an image and create every node's data disk from it:
 
 ```bash
 gcloud compute images create tapp-data-blank --source-disk=<labelled-disk> --source-disk-zone=<zone>

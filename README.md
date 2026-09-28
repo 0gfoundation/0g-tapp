@@ -62,20 +62,24 @@ Attach a data disk as well: `/data` holds the app volumes, the container stores 
 and `tapp-server` does not start without it (the root filesystem is a RAM overlay, so writing
 there would be lost on reboot). The node provisions a single blank attached disk by itself.
 
-On a host with **more than one** spare disk — bare metal, or any GPU machine type, where the
-cloud attaches local SSDs that cannot be declined — the node refuses to guess which disk is
-`/data`. It still boots and is reachable; it simply will not run apps until it has a disk, and
-says why on the console. Give it one over the API (owner only, so claim the node first):
+Ephemeral cloud scratch disks are excluded, so a GPU machine type — where the cloud attaches
+local SSDs that cannot be declined — still provisions its one attached data disk by itself.
+
+On a host with **more than one** spare disk, which is normal on bare metal, the node cannot tell
+which one is meant to be `/data` and refuses to guess rather than risk formatting the wrong disk.
+**Label the intended disk before attaching it**, on any machine with a shell:
 
 ```bash
-tapp-cli -s <server> provision-data-disk --dry-run -k <key>          # what disks does it see?
-tapp-cli -s <server> provision-data-disk --device /dev/nvme0n2 -k <key>
+mkfs.ext4 -L tapp-data <device>
 ```
 
-An existing ext4 disk is adopted with its data intact; anything else is refused, never
-overwritten. One time per disk — afterwards the `tapp-data` label is found on every boot. If
-you would rather prepare the disk before the node ever sees it, `mkfs.ext4 -L tapp-data <device>`
-on any machine has the same effect.
+The label is the whole contract: a disk carrying it is used directly, on that boot and every
+later one, with no guessing. A disk that already holds an ext4 filesystem is adopted by
+relabelling, never reformatted, so this is safe to run against a disk holding data. If several
+disks should act as one, combine them first (LVM or RAID) and label the resulting volume.
+
+When the node has to guess and cannot, it says so on the console — naming the disks it found and
+the command above — so the cloud's serial log shows why a node is idle.
 
 Once the instance is created and running, 0G Tapp service will start automatically.
 
@@ -120,6 +124,13 @@ containers start. The key is stored nowhere — any node registered on-chain for
 the app re-derives the same key on demand, which is what lets data survive
 reboots (a reboot wipes the kernel's key and locks the volume) and move between
 hosts (copy the image file; the destination node derives the same key).
+
+Encryption is what keeps the host from **reading** the data or **forging** it. It does not make
+the volume tamper-evident, and it does not prove the volume is the **latest** state — a disk
+from last month decrypts today with the same key and passes every check. An app for which
+corrupted or stale data would be harmful has to handle that itself;
+[`docs/DATA_AT_REST.md`](docs/DATA_AT_REST.md) sets out exactly which guarantees hold, why the
+missing ones are hard, and what to do about them.
 
 What the compose file writes decides what protects it:
 

@@ -23,20 +23,6 @@ pub const OPERATION_NAME_CLAIM_CONFIG: &str = "claim_config";
 /// carries the resulting state in full so the newest event alone is the current answer.
 pub const OPERATION_NAME_UPDATE_TRUST_ANCHORS: &str = "update_trust_anchors";
 pub const OPERATION_NAME_GET_SECRET_RESOURCE: &str = "get_secret_resource";
-/// Giving the node the persistent disk that /data lives on.
-///
-/// An audit trail for an owner action, at the same level as `docker_login` — not a security
-/// boundary, and it should not be read as one. `formatted` vs `adopted` records whether the
-/// node started from a blank disk or took over an existing one, which is useful when
-/// reconstructing what happened to a node, and that is the whole of it.
-///
-/// It says nothing about whether the content is trustworthy, because provenance is not what
-/// makes storage trustworthy here. Everything on /data outside an app's LUKS volume is
-/// host-controlled plaintext that can be rewritten at any moment, whoever created the
-/// filesystem; and an app volume can be rolled back to an earlier valid state regardless of
-/// how the disk arrived. What the platform does and does not promise about data at rest is
-/// set out in docs/DATA_AT_REST.md.
-pub const OPERATION_NAME_PROVISION_DATA_DISK: &str = "provision_data_disk";
 
 pub struct MeasurementService {
     aa: Arc<Mutex<AttestationAgent>>,
