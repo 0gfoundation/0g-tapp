@@ -14,6 +14,7 @@
 - **KMS Integration**: Fetch hardware-independent app secrets from a KMS cluster (decrypted locally within the TEE)
 - **Attested TLS**: Hand an app a TLS certificate whose public key is committed to by the attestation evidence, so a client can tie the connection it made to the TEE it verified
 - **Encrypted app data volumes**: Every app's persistent data lives in its own LUKS volume, keyed per-app by the KMS — encrypted at rest, isolated between apps, and portable across hosts and reboots
+- **Confidential GPUs**: An opt-in build stage (`ENABLE_GPU=1`) adds the NVIDIA open driver and turns on GPU confidential-computing mode, and the resulting evidence carries a per-GPU attestation report bound to the same quote as the CPU's — see [`cvm/GPU.md`](cvm/GPU.md)
 
 ## Getting Started
 
@@ -56,6 +57,29 @@ Create a new ECS instance with the following specifications:
 - **Region**: China (Beijing) - Zone L
 - **Instance Type**: `ecs.gn8v-tee.4xlarge`
 - **Image**: Select the imported confidential image
+
+Attach a data disk as well: `/data` holds the app volumes, the container stores and the logs,
+and `tapp-server` does not start without it (the root filesystem is a RAM overlay, so writing
+there would be lost on reboot). The node provisions a single blank attached disk by itself.
+
+Ephemeral cloud scratch disks are excluded, so a GPU machine type — where the cloud attaches
+local SSDs that cannot be declined — still provisions its one attached data disk by itself.
+
+On a host with **more than one** spare disk, which is normal on bare metal, the node cannot tell
+which one is meant to be `/data` and refuses to guess rather than risk formatting the wrong disk.
+**Label the intended disk before attaching it**, on any machine with a shell:
+
+```bash
+mkfs.ext4 -L tapp-data <device>
+```
+
+The label is the whole contract: a disk carrying it is used directly, on that boot and every
+later one, with no guessing. A disk that already holds an ext4 filesystem is adopted by
+relabelling, never reformatted, so this is safe to run against a disk holding data. If several
+disks should act as one, combine them first (LVM or RAID) and label the resulting volume.
+
+When the node has to guess and cannot, it says so on the console — naming the disks it found and
+the command above — so the cloud's serial log shows why a node is idle.
 
 Once the instance is created and running, 0G Tapp service will start automatically.
 
@@ -100,6 +124,13 @@ containers start. The key is stored nowhere — any node registered on-chain for
 the app re-derives the same key on demand, which is what lets data survive
 reboots (a reboot wipes the kernel's key and locks the volume) and move between
 hosts (copy the image file; the destination node derives the same key).
+
+Encryption is what keeps the host from **reading** the data or **forging** it. It does not make
+the volume tamper-evident, and it does not prove the volume is the **latest** state — a disk
+from last month decrypts today with the same key and passes every check. An app for which
+corrupted or stale data would be harmful has to handle that itself;
+[`docs/DATA_AT_REST.md`](docs/DATA_AT_REST.md) sets out exactly which guarantees hold, why the
+missing ones are hard, and what to do about them.
 
 What the compose file writes decides what protects it:
 

@@ -1,7 +1,7 @@
 ---
 name: 0g-tapp-cli
 description: Use this skill when the user wants to deploy, manage, or troubleshoot applications on a 0G Tapp (Trusted Application Platform) server using tapp-cli. Covers start/stop apps, on-chain registration, registry login, check task status, view logs, and manage docker compose deployments across multiple remote TEE servers.
-version: 1.14.0
+version: 1.19.0
 author: 0G Labs
 tags: [0g, tapp, tee, docker, deployment, cli, onchain]
 ---
@@ -121,6 +121,23 @@ Owner-only, and **every call is extended into the runtime measurement** carrying
 
 **What the node then does** (v0.5.0+): before fetching key material it pins the verifier against `--scan-pubkey`, asks it for the KMS app's attested keys, and pins the KMS node against that set. No path degrades to unverified — if the verifier is unreachable and nothing is cached, it refuses. A pin mismatch triggers one refresh (a rebooted node has legitimately re-derived its key) then rejects.
 - After VM reboot the server is UNCLAIMED again and must be claimed again.
+
+### The node has no data disk (apps will not start)
+
+`/data` holds the app volumes, container stores and logs, and `tapp-server` does not start
+without it — the rootfs is a RAM overlay, so anything written there is lost at reboot. A node
+that could not pick a data disk by itself says so **on the console** (serial log on a cloud),
+naming the disks it saw. Cloud scratch disks are excluded, so a GPU machine type with one
+attached data disk provisions itself; a host with several genuine spare disks does not, and the
+intended disk must be labelled beforehand on any machine with a shell:
+
+```bash
+mkfs.ext4 -L tapp-data <device>
+```
+
+The label is the contract — a disk carrying it is used on every boot with no guessing, and one
+already holding ext4 is adopted by relabelling, never reformatted. Combine several disks (LVM or
+RAID) and label the result if they should act as one.
 
 ### Server health & whitelist
 ```bash
@@ -327,8 +344,10 @@ tapp-cli -s <teeUrl> get-evidence --app-id <APP_ID> --nonce $(openssl rand -hex 
 - `composeHash/volumesHash/imageHashes` == the last `result:"success"` `start_app` event in RTMR3 eventlog. Hash encoding (rebuild before compare): compose=raw 48B SHA-384; volumes=sorted `key + ':' + raw(digest) + '\n'` per entry; image=`sha256:<hex>` ascii per service.
 - Boot chain MRTD/shim/grub/kernel/initrd == AS reference values (initrd may differ per host). `kernel_cmdline` matches by **OR** of two refs (new-grub `/vmlinuz...` vs old-grub `(hd0,gptN)/boot/vmlinuz...`) — both pass.
 - RTMR3 `EV_EVENT_TAG` events are `<domain> <op> <value>`: `tapp.0g.com` = start_app/stop_app/... ; `cryptpilot.alibabacloud.com` = FDE (only on old aliyun images, absent on GCP).
+- **`gpu_evidence`** is `null` on a CPU-only node. On a confidential-GPU node it holds one entry per GPU (`name`, `uuid`, `cc_enabled`, `driver_version`, `vbios_version`, `attestation_report`, `certificate`). Two checks, both required: `cc_enabled == true` (a GPU that is present but not in CC mode protects nothing), and the report is bound to **this** quote — the nonce at **offset 4** of the decoded `attestation_report` equals the first 32 bytes of `report_data`, i.e. `sha512(runtime_data)[:32]`. Skipping the binding lets a genuine report from another machine or another moment pass. Building/running such a node: `cvm/GPU.md`.
 
 ## Reference
 - RA / evidence + AS verification (full flow, encoding rules, tested walkthrough): `docs/EVIDENCE_AND_AS_VERIFICATION.md`; runnable verifier `docs/verify_app.py` (+ `docs/attestation.proto`).
+- Confidential GPUs — building a GPU image (`ENABLE_GPU=1`), the driver/Fabric Manager pinning, the data-disk labelling a GPU host needs, and the four post-boot checks: `cvm/GPU.md`.
 - Full end-to-end app deploy flow + pitfalls (provider/broker: start → register → authorizeInvalidator → provider register): `docs/DEPLOY_RUNBOOK.md`.
 - Contract addresses & on-chain query examples: `contract/CONTRACTS.md`.
