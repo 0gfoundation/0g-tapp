@@ -1,7 +1,7 @@
 ---
 name: 0g-tapp-cli
 description: Use this skill when the user wants to deploy, manage, or troubleshoot applications on a 0G Tapp (Trusted Application Platform) server using tapp-cli. Covers start/stop apps, on-chain registration, registry login, check task status, view logs, and manage docker compose deployments across multiple remote TEE servers.
-version: 1.17.0
+version: 1.18.0
 author: 0G Labs
 tags: [0g, tapp, tee, docker, deployment, cli, onchain]
 ---
@@ -347,7 +347,7 @@ tapp-cli -s <teeUrl> get-evidence --app-id <APP_ID> --nonce $(openssl rand -hex 
 - `composeHash/volumesHash/imageHashes` == the last `result:"success"` `start_app` event in RTMR3 eventlog. Hash encoding (rebuild before compare): compose=raw 48B SHA-384; volumes=sorted `key + ':' + raw(digest) + '\n'` per entry; image=`sha256:<hex>` ascii per service.
 - Boot chain MRTD/shim/grub/kernel/initrd == AS reference values (initrd may differ per host). `kernel_cmdline` matches by **OR** of two refs (new-grub `/vmlinuz...` vs old-grub `(hd0,gptN)/boot/vmlinuz...`) — both pass.
 - RTMR3 `EV_EVENT_TAG` events are `<domain> <op> <value>`: `tapp.0g.com` = start_app/stop_app/... ; `cryptpilot.alibabacloud.com` = FDE (only on old aliyun images, absent on GCP).
-- **`provision_data_disk`** (RTMR3, domain `tapp.0g.com`): present when the owner gave the node its `/data` disk over the API. Read `action`: `formatted` = the disk was blank and this node created everything on it; **`adopted` = the node inherited content it did not create**. Adopted is legitimate (it is how a replacement node picks up a failed one's data) but changes what stored state is worth — app volumes are LUKS/KMS-sealed so unforgeable yet possibly *stale* (a rollback encryption cannot detect), and `/data/log/tapp/` is protected by nothing, so the node may be serving a fabricated history of itself. Track the disk by `fs_uuid`, not `device`. Full treatment: `docs/EVIDENCE_AND_AS_VERIFICATION.md`.
+- **`provision_data_disk`** (RTMR3, domain `tapp.0g.com`): present when the owner gave the node its `/data` disk over the API; `action` is `formatted` (blank disk) or `adopted` (took over an existing one). **Audit trail, not a trust signal** — do not treat `formatted` as evidence that stored data is genuine. Everything on `/data` outside an app's LUKS volume is host-controlled plaintext rewritable at any time, and an app volume can be rolled back to an earlier valid state whatever the disk's provenance. Track a disk by `fs_uuid`, not `device`. What is and is not promised about data at rest: `docs/DATA_AT_REST.md`.
 - **`gpu_evidence`** is `null` on a CPU-only node. On a confidential-GPU node it holds one entry per GPU (`name`, `uuid`, `cc_enabled`, `driver_version`, `vbios_version`, `attestation_report`, `certificate`). Two checks, both required: `cc_enabled == true` (a GPU that is present but not in CC mode protects nothing), and the report is bound to **this** quote — the nonce at **offset 4** of the decoded `attestation_report` equals the first 32 bytes of `report_data`, i.e. `sha512(runtime_data)[:32]`. Skipping the binding lets a genuine report from another machine or another moment pass. Building/running such a node: `cvm/GPU.md`.
 
 ## Reference

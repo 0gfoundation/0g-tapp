@@ -2238,14 +2238,10 @@ impl TappService for TappServiceImpl {
 
         // Record it in the runtime measurement. A dry run changes nothing and is not an event.
         //
-        // What makes this worth measuring is not "a disk was attached" but WHICH KIND: a disk
-        // that was `formatted` means the node started from nothing, while `adopted` means it
-        // inherited content it never created. Those are very different nodes and, unrecorded,
-        // indistinguishable from outside. The inherited content is not uniformly protected —
-        // app volumes are LUKS/KMS-sealed and cannot be forged but CAN be an older state, and
-        // file logs under /data/log are protected by nothing at all. A verifier that reads
-        // `adopted` knows to ask where that disk came from; the log is append-only, so the
-        // question survives being asked late.
+        // This is an audit trail, not a security boundary: an owner action that changed what
+        // the node can do, recorded so it can be reconstructed later. It does not make the
+        // disk's content trustworthy and must not be read as if it did — see
+        // OPERATION_NAME_PROVISION_DATA_DISK and docs/DATA_AT_REST.md.
         if !req.dry_run {
             let measurement_data = serde_json::json!({
                 "operation": measurement_service::OPERATION_NAME_PROVISION_DATA_DISK,

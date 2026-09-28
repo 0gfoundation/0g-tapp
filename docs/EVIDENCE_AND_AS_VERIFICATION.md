@@ -330,21 +330,20 @@ mean nobody made a choice worth recording.
 | `formatted` | the disk was blank; everything under `/data` was created by this node |
 | `adopted` | the disk already held ext4 and was relabelled — the node **inherited content it did not create** |
 
-`adopted` is not an error, and it is how a replacement node picks up a failed one's data, which
-is a deliberate feature. But it changes what stored state is worth: not everything under `/data`
-is protected the same way.
+`adopted` is not an error — it is how a replacement node takes over a failed one's data — and
+it is **not a trust signal either way**. Read this event as an audit trail, useful when
+reconstructing what happened to a node, and nothing more.
 
-- **App volumes** are LUKS, keyed per app by the KMS, so their contents cannot be forged — but
-  nothing dates them. An adopted disk can carry a *stale* copy, which rolls that app's data back
-  to whenever the disk was last written. Encryption does not detect this.
-- **File logs** (`/data/log/tapp/`) are protected by nothing at all. A pre-seeded disk can hand a
-  node a fabricated account of its own history, and the node will serve it through `GetServiceLogs`
-  as its own.
-- Container image layers are digest-checked at `start_app`, so those are safe either way.
+It is worth being explicit about why, because the opposite reading is tempting: provenance is
+not what makes storage trustworthy here. Everything under `/data` outside an app's LUKS volume
+is host-controlled plaintext that can be rewritten at any moment, whoever created the
+filesystem — so a `formatted` disk is no guarantee that today's logs are genuine. And an app
+volume can be rolled back to an earlier valid state regardless of how the disk arrived, because
+encryption does not date anything. What the platform does and does not promise about data at
+rest is set out in [`DATA_AT_REST.md`](DATA_AT_REST.md); reason from that, not from this event.
 
-So on `adopted`, establish where the disk came from before treating `/data` as this node's. The
-`fs_uuid` is the durable identity to track it by — `device` is whichever name the kernel gave it
-that boot and means nothing afterwards.
+The `fs_uuid` is the durable identity to track a disk by — `device` is whichever name the
+kernel gave it that boot and means nothing afterwards.
 
 ### Reading key-access events with EMPTY hashes (the restart window)
 
