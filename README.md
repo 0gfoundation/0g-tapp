@@ -99,6 +99,13 @@ the app re-derives the same key on demand, which is what lets data survive
 reboots (a reboot wipes the kernel's key and locks the volume) and move between
 hosts (copy the image file; the destination node derives the same key).
 
+Encryption is what keeps the host from **reading** the data or **forging** it. It does not make
+the volume tamper-evident, and it does not prove the volume is the **latest** state — a disk
+from last month decrypts today with the same key and passes every check. An app for which
+corrupted or stale data would be harmful has to handle that itself;
+[`docs/DATA_AT_REST.md`](docs/DATA_AT_REST.md) sets out exactly which guarantees hold, why the
+missing ones are hard, and what to do about them.
+
 What the compose file writes decides what protects it:
 
 | compose writes to | where it lives | encrypted | survives reboot |
