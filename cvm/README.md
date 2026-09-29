@@ -206,6 +206,14 @@ ALIYUN_REGION=cn-beijing ./publish-ali-image.sh /path/og-tdx-ali-dev.qcow2 og-td
 ```
 Defaults `OSS_BUCKET=0g-confidential-disk` (`ALIYUN_REGION` required, no default). It refuses to clobber an existing image name. In CI the al8 build runner is itself an Ali ECS instance, so it authenticates via its **instance RAM role** (no AK/SK secret). Create a confidential (TDX) instance from the image; assign a public IPv4 (for Trustee attestation) and use **key-pair** auth (passwords are unsupported on confidential instances).
 
+**In CI, reach both clouds from one build: `cloud=both`.** The image is identical on every platform,
+so building twice to publish twice was waste — and the second dispatch also redid the identity work,
+pushing the same `refvalues/*` branch and failing there, which marked a good dual-publish red. With
+`cloud=both` one build is published to GCP and Alibaba Cloud while the reference values, the AS
+policy and the refvalues PR are produced once, as they should be for one image. `gcp` and `ali`
+remain if you want a single target. For a GPU build, which spends most of its 90 minutes in DKMS,
+this is the difference between one build and two.
+
 ## Three core fixes (all required)
 - **Fix A**: before convert, point the `/boot/vmlinuz` symlink at the gcp kernel → the cryptpilot stack goes into the correct initrd (fixes read-only / RTMR / verity).
 - **Fix B**: after convert, sync the boot-partition grub.cfg + modules to the ESP (fixes the boot crash bli.mod / vmlinuz not found).

@@ -67,9 +67,9 @@ on:
         type: boolean
         default: true
       cloud:
-        description: "Stage C publish target ONLY — does not change the image. The same build boots on GCP, Alibaba Cloud and bare metal, so its reference values and AS policy id carry no cloud."
+        description: "Stage C publish target(s) ONLY — does not change the image. `both` publishes the SAME build to GCP and Alibaba Cloud in one run; the identity work (reference values, AS policy, refvalues PR) is per-image and happens once regardless. The image boots on GCP, Alibaba Cloud and bare metal alike, so its reference values and AS policy id carry no cloud."
         type: choice
-        options: [gcp, ali]
+        options: [gcp, ali, both]
         default: gcp
       boot_format:
         description: "boot format (grub default; uki = one signed EFI, kernel+initrd+cmdline fused)"
@@ -93,15 +93,15 @@ on:
         type: string
         default: ""
 
-# Keyed on the IMAGE identity, and `cloud` stays in the key even though it no longer changes the
-# image: two dispatches of the same identity for different publish targets are now a legitimate
-# thing to do, and they must not cancel or serialise each other. The cost is that both then do the
-# identity work -- registering the same policy id (idempotent, same values) and pushing the same
-# refvalues/<...> branch, where the second one fails and marks a good dual-publish red. Publishing
-# one build to several targets, or splitting the identity work out of publish, is the real fix;
-# until then, publish once and re-run with publish=false for the second target.
+# Keyed on the IMAGE identity, and `cloud` is deliberately NOT in the key. It used to be, because
+# reaching two clouds meant two dispatches and they must not serialise each other -- at the cost of
+# both doing the identity work, pushing the same refvalues/<...> branch, the second failing and
+# marking a good dual-publish red. `cloud=both` removes the reason: one build reaches every target
+# and the identity work happens once. With the input out of the key, two dispatches of the same
+# identity now queue behind each other, which is what you want -- they would be writing the same
+# reference values and the same policy id.
 concurrency:
-  group: build-cvm-${{ inputs.cloud || 'gcp' }}-${{ inputs.boot_format }}-${{ inputs.enable_gpu && 'gpu' || 'cpu' }}-${{ inputs.build_mode || 'canonical' }}-${{ inputs.version }}-r${{ inputs.image_rev || '1' }}-${{ inputs.owner }}
+  group: build-cvm-${{ inputs.boot_format }}-${{ inputs.enable_gpu && 'gpu' || 'cpu' }}-${{ inputs.build_mode || 'canonical' }}-${{ inputs.version }}-r${{ inputs.image_rev || '1' }}-${{ inputs.owner }}
   cancel-in-progress: false
 
 # The reference-values step pushes a refvalues/* branch and opens a PR into dev with GITHUB_TOKEN;
@@ -129,9 +129,13 @@ jobs:
       # accidentally use it (canonical images must not know any owner).
       OWNER: ${{ inputs.build_mode == 'custom' && inputs.owner || '' }}
       # boot_format is the only dimension that changes the image (one BOOT_FORMAT = one measurement
-      # chain); it defaults to grub, uki is opt-in. CLOUD reaches Stage C only — it picks
-      # publish-gcp-image.sh vs publish-ali-image.sh and nothing else.
+      # chain); it defaults to grub, uki is opt-in. CLOUD reaches Stage C only — it selects which
+      # publish scripts run, and nothing else.
       CLOUD: ${{ inputs.cloud || 'gcp' }}
+      # One build, one or both publish targets. Derived here rather than compared in every step so
+      # adding a third target is one line, and so `both` cannot half-apply by a step being missed.
+      PUB_GCP: ${{ (inputs.cloud == 'gcp' || inputs.cloud == 'both' || inputs.cloud == '') && 'true' || 'false' }}
+      PUB_ALI: ${{ (inputs.cloud == 'ali' || inputs.cloud == 'both') && 'true' || 'false' }}
       BOOT_FORMAT: ${{ inputs.boot_format }}
       # Second dimension that changes the image. Unlike DEV_SSH_PUBKEY (which changes the
       # measurement while appearing in no identifier, and so needs a manual image_rev), this one
@@ -334,7 +338,7 @@ jobs:
       # KVM runner is available. Real boot + attestation validation is done on actual TDX hardware.
 
       - name: Authenticate to GCP
-        if: ${{ env.PUBLISH == 'true' && env.CLOUD == 'gcp' }}
+        if: ${{ env.PUBLISH == 'true' && env.PUB_GCP == 'true' }}
         run: |
           # Keep the SA credential OFF the persistent self-hosted runner: point gcloud/gsutil at a
           # job-scoped temp config dir (RUNNER_TEMP is wiped per job), so nothing lands in ~/.config/gcloud.
@@ -350,7 +354,7 @@ jobs:
           GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
 
       - name: Authenticate to Ali
-        if: ${{ env.PUBLISH == 'true' && env.CLOUD == 'ali' }}
+        if: ${{ env.PUBLISH == 'true' && env.PUB_ALI == 'true' }}
         run: |
           # The al8 runner is an Ali ECS instance; aliyun/ossutil authenticate via its instance RAM role
           # (no AK/SK secret). ossutil is already configured on the runner; point aliyun at the role too.
@@ -372,7 +376,7 @@ jobs:
           fi
 
       - name: Stage C — publish versioned image (gcp)
-        if: ${{ env.PUBLISH == 'true' && env.CLOUD == 'gcp' }}
+        if: ${{ env.PUBLISH == 'true' && env.PUB_GCP == 'true' }}
         run: |
           cd cvm
           IMG="${{ inputs.image_name }}"
@@ -383,7 +387,7 @@ jobs:
             ./publish-gcp-image.sh "out-${{ matrix.env }}.qcow2" "$IMG"
 
       - name: Stage C — publish versioned image (ali)
-        if: ${{ env.PUBLISH == 'true' && env.CLOUD == 'ali' }}
+        if: ${{ env.PUBLISH == 'true' && env.PUB_ALI == 'true' }}
         run: |
           cd cvm
           IMG="${{ inputs.image_name }}"
