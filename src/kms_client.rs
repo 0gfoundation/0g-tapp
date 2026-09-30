@@ -144,6 +144,44 @@ struct KmsResponse {
 }
 
 #[cfg(test)]
+mod onchain_visibility_tests {
+    use super::*;
+
+    /// The 404 body the KMS serves for an app it cannot see on-chain yet, verbatim from a
+    /// testnet node (`https://136.83.14.240:9443`) during a `start-app --register-onchain`
+    /// whose registration had landed on chain seconds earlier.
+    const NOT_YET: &str = r#"{"error":"app not found on-chain: r2-probe"}"#;
+
+    #[test]
+    fn the_transient_404_is_recognised_and_other_4xx_are_not() {
+        assert!(is_not_onchain_yet(NOT_YET));
+
+        // Everything else must keep failing fast. A signature the KMS rejects, an app whose
+        // attestation does not vouch for this node, a malformed request — none of these change
+        // by waiting, and waiting on them would turn a clear error into a two-minute hang.
+        assert!(!is_not_onchain_yet(r#"{"error":"invalid signature"}"#));
+        assert!(!is_not_onchain_yet(r#"{"error":"node not registered for app"}"#));
+        assert!(!is_not_onchain_yet(r#"{"error":"bad request"}"#));
+        assert!(!is_not_onchain_yet(""));
+    }
+
+    #[test]
+    fn the_wait_is_long_enough_for_the_cache_it_waits_on() {
+        // The KMS caches its on-chain view for ~30s, so anything at or below that is not a
+        // wait at all — it would expire before the thing it is waiting for.
+        let d = crate::config::RetryConfig::default();
+        assert!(
+            d.onchain_wait_ms >= 90_000,
+            "onchain_wait_ms is {}ms; the KMS's on-chain view is cached ~30s, so a budget under \
+             3x that will still fail the case this exists for",
+            d.onchain_wait_ms
+        );
+        // And it is a different budget from the node-error retries, which are seconds.
+        assert!(d.onchain_wait_ms > d.max_delay_ms);
+    }
+}
+
+#[cfg(test)]
 mod pin_tests {
     use super::*;
 
@@ -268,11 +306,32 @@ pub struct KmsClient {
     max_retries: usize,
     initial_delay_ms: u64,
     max_delay_ms: u64,
+    /// How long to keep retrying while the KMS reports the app as absent from the chain.
+    /// Separate from the retry budget above, which is for a node being down or erroring and is
+    /// deliberately short (seconds); this one waits out a cache, and the two are not the same
+    /// kind of wait. See `get_encrypted_secret`.
+    onchain_wait_ms: u64,
     /// `None` when no verifier is configured: the node then talks to KMS exactly as it
     /// did before, unverified. Kept possible on purpose — a tapp that has never been
     /// told which verifier to believe cannot invent one — but it is the weaker mode and
     /// says so in the logs.
     pins: Option<tokio::sync::Mutex<PinSource>>,
+}
+
+/// The KMS answered 404 because its cached view of the chain does not have this app yet.
+/// Distinguished from every other 4xx because it resolves on its own, given time.
+#[derive(Debug, thiserror::Error)]
+#[error("the KMS has not seen this app on-chain yet")]
+struct NotOnChainYet;
+
+/// Recognise that one condition in the KMS's 404 body: `{"error":"app not found on-chain: <id>"}`.
+///
+/// Matching the KMS's prose is not something to be pleased about, but it is the only signal on
+/// the wire — the status code alone cannot separate "not registered" from "not visible yet".
+/// Kept deliberately narrow so that a wording change on the KMS side becomes a visible
+/// regression (the wait stops happening) rather than a silent mismatch that retries everything.
+fn is_not_onchain_yet(body: &str) -> bool {
+    body.contains("app not found on-chain")
 }
 
 impl KmsClient {
@@ -283,6 +342,7 @@ impl KmsClient {
             max_retries: retry.max_retries,
             initial_delay_ms: retry.initial_delay_ms,
             max_delay_ms: retry.max_delay_ms,
+            onchain_wait_ms: retry.onchain_wait_ms,
             pins: None,
         }
     }
@@ -377,7 +437,65 @@ impl KmsClient {
 
     /// Request the encrypted secret from the KMS cluster.
     /// Tries each node in order and returns on the first success.
+    /// Fetch key material, waiting out the window in which the KMS has not yet seen a
+    /// just-landed on-chain registration.
+    ///
+    /// The KMS authorises from the chain and caches that view for about 30 seconds, so an app
+    /// registered moments ago is genuinely on-chain and genuinely absent from the KMS's answer.
+    /// `start-app --register-onchain` registers and starts in one command, which lands squarely
+    /// inside that window: the first volume-key fetch fails, and the error it used to produce
+    /// asked whether the caller had registered the app -- which they had, seconds earlier.
+    ///
+    /// So the wait belongs here rather than in each caller. Every other failure is passed
+    /// through untouched and still fails as fast as it did before.
     pub async fn get_encrypted_secret(
+        &self,
+        app_id: &str,
+        timestamp: i64,
+        pubkey_hex: &str,
+        signature_hex: &str,
+        material: &str,
+    ) -> Result<Vec<u8>> {
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_millis(self.onchain_wait_ms);
+        let mut delay = std::time::Duration::from_secs(5);
+        loop {
+            match self
+                .get_encrypted_secret_once(app_id, timestamp, pubkey_hex, signature_hex, material)
+                .await
+            {
+                Ok(v) => return Ok(v),
+                Err(e) if e.downcast_ref::<NotOnChainYet>().is_some() => {
+                    let left = deadline.saturating_duration_since(std::time::Instant::now());
+                    if left.is_zero() {
+                        // Say what is actually known: the app was not visible to the KMS for the
+                        // whole window. Whether it is registered at all is the caller's next
+                        // question, and the old message answered it for them, wrongly.
+                        return Err(anyhow!(
+                            "the KMS did not see app '{}' on-chain within {}s. If it was \
+                             registered just now, the registration may still be propagating — \
+                             retry. If it was never registered, register it first \
+                             (start-app --register-onchain).",
+                            app_id,
+                            self.onchain_wait_ms / 1000
+                        ));
+                    }
+                    let nap = delay.min(left);
+                    tracing::info!(
+                        app_id,
+                        wait_s = nap.as_secs(),
+                        remaining_s = left.as_secs(),
+                        "app not visible to the KMS yet (on-chain view is cached); waiting"
+                    );
+                    tokio::time::sleep(nap).await;
+                    delay = (delay * 2).min(std::time::Duration::from_secs(30));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    async fn get_encrypted_secret_once(
         &self,
         app_id: &str,
         timestamp: i64,
@@ -426,6 +544,17 @@ impl KmsClient {
                         let status = resp.status();
                         let body = resp.text().await.unwrap_or_default();
                         last_err = anyhow!("KMS {} returned {}: {}", url, status, body);
+                        // "not on-chain yet" is the one 4xx that DOES change on its own, so it
+                        // must not be swallowed by the rule below. The KMS decides authorisation
+                        // from the chain and caches that view for ~30s, so for a window after a
+                        // registration lands it answers 404 for an app that is genuinely
+                        // registered. Signalled up to the caller, which waits and retries the
+                        // whole request -- retrying this node would be pointless, since every
+                        // node reads the same chain and will answer the same way.
+                        if is_not_onchain_yet(&body) {
+                            tracing::warn!(url = %url, "KMS has not seen this app on-chain yet");
+                            return Err(NotOnChainYet.into());
+                        }
                         // Don't retry on client errors (4xx) — request won't change
                         if status.is_client_error() {
                             tracing::warn!(url = %url, %status, "KMS client error, skipping node");
