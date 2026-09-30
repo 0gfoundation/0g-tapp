@@ -159,21 +159,22 @@ The contract's "interface" is its **ABI**:
 The image is a **separate artifact from the binary it carries**, and it is measured: its identity is what remote attestation verifies against. It has no version number of its own — it is identified by the tapp-server version it ships plus a **revision**:
 
 ```
-<tapp-server version>[-r<image_rev>]      # rev 1 = no suffix: v0.3.0, v0.3.0-r2, v0.3.0-r3 …
+<tapp-server version>[-gpu][-r<image_rev>]   # rev 1 = no suffix: v0.3.0, v0.3.0-r2, v0.3.0-gpu-r2 …
 ```
 
 | Digit | Bump when |
 |---|---|
 | `<tapp-server version>` | A new tapp-server release goes into the image. Revision restarts at 1. |
-| **`-r<N>`** — REVISION | The **image content changed while the binary did not**: kernel, docker/containerd pin, CVM/cryptpilot config, hardening, anything in `cvm/`. |
+| **`-gpu`** — VARIANT | The image was built with `enable_gpu`. An NVIDIA driver in the verity-sealed rootfs and the initrd measures differently, so a GPU image is a different artifact at the same binary version and must never share an identity with the CPU one. Set by the workflow from its input; there is nothing to remember. See [`cvm/GPU.md`](../cvm/GPU.md). |
+| **`-r<N>`** — REVISION | The **image content changed while the binary did not**: kernel, docker/containerd pin, CVM/cryptpilot config, hardening, anything in `cvm/`. Counted within a variant — the GPU image has its own revision sequence. |
 
 **Never rebuild a changed image under an identity that is already published.** The image version keys three things at once:
 
 | | example |
 |---|---|
 | published image name | `og-tdx-dev-grub-v0-3-0-r2` |
-| reference values | `verifier/reference-values/gcp/grub/v0.3.0-r2/dev.json` |
-| AS policy id | `0g-tapp-gcp-grub-v0.3.0-r2-dev` |
+| reference values | `verifier/reference-values/grub/v0.3.0-r2/dev.json` |
+| AS policy id | `0g-tapp-grub-v0.3.0-r2-dev` |
 
 Any change to the image changes its measurements. Reusing the identity makes `register-shared-as.sh` overwrite the reference values behind the **same policy id**, so every node still running the previous image fails verification from that moment on — no deploy, no warning. Bumping the revision leaves the old values registered and gives the new image its own policy.
 
