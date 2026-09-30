@@ -1,7 +1,7 @@
 ---
 name: 0g-tapp-cli
 description: Use this skill when the user wants to deploy, manage, or troubleshoot applications on a 0G Tapp (Trusted Application Platform) server using tapp-cli. Covers start/stop apps, on-chain registration, registry login, check task status, view logs, and manage docker compose deployments across multiple remote TEE servers.
-version: 1.13.0
+version: 1.19.0
 author: 0G Labs
 tags: [0g, tapp, tee, docker, deployment, cli, onchain]
 ---
@@ -73,7 +73,7 @@ tapp-cli -s <server> -k 0x<key> docker-logout                    # logout from D
 ### verify-app: two independent reference axes
 - **`--contract`+`--rpc-url` = dynamic references** (on-chain): reconciles runtime events vs the registry → `reconcile : signer✓ compose✓ volumes✓ image✓ owner✓`. The **owner** check (v0.3.0+) compares the `claim_config` event's owner against the on-chain app owner (`✗` = hijacked/mismatched → Result ❌; `?` = no claim_config event, pre-0.3 image).
 - **`--policy-ids <id>` = static references** (AS boot-chain check: shim/grub/kernel/initrd/kernel_cmdline or uki vs the image's reference values).
-- **Whichever axis has NO reference, the measured values are printed verbatim**: no `--contract` → owner/compose/images as attested; no `--policy-ids` → boot-chain component digests in reference-value JSON (`{"measurement.<comp>.SHA-384": [...]}`), directly diffable against `verifier/reference-values/<cloud>/<boot_format>/<version>/<env>.json`.
+- **Whichever axis has NO reference, the measured values are printed verbatim**: no `--contract` → owner/compose/images as attested; no `--policy-ids` → boot-chain component digests in reference-value JSON (`{"measurement.<comp>.SHA-384": [...]}`), directly diffable against `verifier/reference-values/<boot_format>/<version>/<env>.json`.
 - **`kms : <urls>`** (v0.6.0+) lists the KMS cluster the node draws key material from, one per line, with a warning on any plaintext `http://` entry (those nodes' identity cannot be checked). `none configured` means exactly that — not that it was checked.
 - The deployed clusters per network (mainnet/testnet endpoints for `--kbs-urls`, group pubkeys — **same app_id `0g-kms`, two different masters**), the derivation namespaces, and the authorization model are in `docs/KMS.md`. Pointing a consumer at the wrong network's cluster silently derives every key from the wrong master.
 - **`tls key : <sha256>  (sha256 of the public key, attested)`** (v0.4.0+) appears in both modes when the app has a TLS key, followed by the `openssl s_client | … | openssl dgst -sha256` one-liner for comparing it against a live endpoint. Line absent = no TLS key derived, which is normal, not a failure.
@@ -82,9 +82,10 @@ tapp-cli -s <server> -k 0x<key> docker-logout                    # logout from D
 - Deployed verifier instances (explorer URLs per network incl. mainnet, the attested instance's trust-anchor URL+pin, the AS endpoint) are registered in `docs/TAPPSCAN.md` — the public explorer is `https://tappscan.0g.ai` (`?net=mainnet` for mainnet).
 - **`--as-pubkey 0x<sha256>`** pins the AS's TLS key. The AS is a TEE with a self-signed certificate, so this **replaces** CA validation rather than adding to it. Without it the connection is encrypted but unauthenticated — anyone on the path can hand back any verdict — and that is reported rather than refused. Current value: `0x7b13d132…`, the same key scan serves, since both are the same tapp app. Point it at a self-hosted local AS (e.g. `127.0.0.1:50004`, see the `verifier/0g-tapp-verifier` submodule) to use RVPS-backed reference values.
 - **Policy ids** — two formats depending on build mode:
-  - **canonical** (v0.3.0+): `0g-tapp-<cloud>-<boot_format>-<version>-<env>` (e.g. `0g-tapp-gcp-grub-v0.3.0-dev`). Reference values at `verifier/reference-values/<cloud>/<boot_format>/<version>/<env>.json`.
-  - **custom** (per-owner): `0g-tapp-<cloud>-<boot_format>-<version>-<env>-<owner>`. Reference values at `.../env/<owner>.json`.
-  - Must be registered on the AS first (stored as `<id>_cpu`); use `verifier/register-shared-as.sh <cloud> <boot_format> <version> <env> [owner] [as-endpoint]`.
+  - **canonical** (v0.3.0+): `0g-tapp-<boot_format>-<version>-<env>` (e.g. `0g-tapp-grub-v0.3.0-dev`). Reference values at `verifier/reference-values/<boot_format>/<version>/<env>.json`.
+  - **custom** (per-owner): `0g-tapp-<boot_format>-<version>-<env>-<owner>`. Reference values at `.../env/<owner>.json`.
+  - Must be registered on the AS first (stored as `<id>_cpu`); use `verifier/register-shared-as.sh <boot_format> <version> <env> [owner] [as-endpoint]`.
+  - **Images built before the cloud dimension was dropped** keep the older `0g-tapp-<cloud>-<boot_format>-…` ids and `<cloud>/<boot_format>/…` paths; those stay registered, so a node on such an image still verifies with its original policy id. New builds are cloud-free — one image now boots on GCP, Alibaba Cloud and bare metal with identical measurements.
 - Note: `ear.status=affirming` also needs platform TCB `UpToDate`; `executables=3` alone (boot chain matched) is the boot-chain conclusion independent of TCB.
 
 ### Claim ownership (v0.3.0+, canonical images)
@@ -120,6 +121,23 @@ Owner-only, and **every call is extended into the runtime measurement** carrying
 
 **What the node then does** (v0.5.0+): before fetching key material it pins the verifier against `--scan-pubkey`, asks it for the KMS app's attested keys, and pins the KMS node against that set. No path degrades to unverified — if the verifier is unreachable and nothing is cached, it refuses. A pin mismatch triggers one refresh (a rebooted node has legitimately re-derived its key) then rejects.
 - After VM reboot the server is UNCLAIMED again and must be claimed again.
+
+### The node has no data disk (apps will not start)
+
+`/data` holds the app volumes, container stores and logs, and `tapp-server` does not start
+without it — the rootfs is a RAM overlay, so anything written there is lost at reboot. A node
+that could not pick a data disk by itself says so **on the console** (serial log on a cloud),
+naming the disks it saw. Cloud scratch disks are excluded, so a GPU machine type with one
+attached data disk provisions itself; a host with several genuine spare disks does not, and the
+intended disk must be labelled beforehand on any machine with a shell:
+
+```bash
+mkfs.ext4 -L tapp-data <device>
+```
+
+The label is the contract — a disk carrying it is used on every boot with no guessing, and one
+already holding ext4 is adopted by relabelling, never reformatted. Combine several disks (LVM or
+RAID) and label the result if they should act as one.
 
 ### Server health & whitelist
 ```bash
@@ -326,8 +344,10 @@ tapp-cli -s <teeUrl> get-evidence --app-id <APP_ID> --nonce $(openssl rand -hex 
 - `composeHash/volumesHash/imageHashes` == the last `result:"success"` `start_app` event in RTMR3 eventlog. Hash encoding (rebuild before compare): compose=raw 48B SHA-384; volumes=sorted `key + ':' + raw(digest) + '\n'` per entry; image=`sha256:<hex>` ascii per service.
 - Boot chain MRTD/shim/grub/kernel/initrd == AS reference values (initrd may differ per host). `kernel_cmdline` matches by **OR** of two refs (new-grub `/vmlinuz...` vs old-grub `(hd0,gptN)/boot/vmlinuz...`) — both pass.
 - RTMR3 `EV_EVENT_TAG` events are `<domain> <op> <value>`: `tapp.0g.com` = start_app/stop_app/... ; `cryptpilot.alibabacloud.com` = FDE (only on old aliyun images, absent on GCP).
+- **`gpu_evidence`** is `null` on a CPU-only node. On a confidential-GPU node it holds one entry per GPU (`name`, `uuid`, `cc_enabled`, `driver_version`, `vbios_version`, `attestation_report`, `certificate`). Two checks, both required: `cc_enabled == true` (a GPU that is present but not in CC mode protects nothing), and the report is bound to **this** quote — the nonce at **offset 4** of the decoded `attestation_report` equals the first 32 bytes of `report_data`, i.e. `sha512(runtime_data)[:32]`. Skipping the binding lets a genuine report from another machine or another moment pass. Building/running such a node: `cvm/GPU.md`.
 
 ## Reference
 - RA / evidence + AS verification (full flow, encoding rules, tested walkthrough): `docs/EVIDENCE_AND_AS_VERIFICATION.md`; runnable verifier `docs/verify_app.py` (+ `docs/attestation.proto`).
+- Confidential GPUs — building a GPU image (`ENABLE_GPU=1`), the driver/Fabric Manager pinning, the data-disk labelling a GPU host needs, and the four post-boot checks: `cvm/GPU.md`.
 - Full end-to-end app deploy flow + pitfalls (provider/broker: start → register → authorizeInvalidator → provider register): `docs/DEPLOY_RUNBOOK.md`.
 - Contract addresses & on-chain query examples: `contract/CONTRACTS.md`.
