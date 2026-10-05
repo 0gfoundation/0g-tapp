@@ -53,6 +53,21 @@ done
 
 TARGET_ADDRESS="$TARGET_HOST:$TARGET_PORT"
 
+# The signature below is body-bound, which only tapp-server >= 0.9.0 can read. An
+# older server recovers some unrelated address from it — and ClaimConfig accepts
+# any signer, so it would record THAT as the owner, leaving the node unmanageable
+# until the VM is reset. So the version is checked first, and anything older (or
+# unreadable) is refused rather than sent.
+SERVER_VERSION=$(grpcurl -plaintext -import-path "$SCRIPT_DIR/../proto" -proto tapp_service.proto \
+  "$TARGET_ADDRESS" tapp_service.TappService/GetTappInfo 2>/dev/null | jq -r '.version // empty')
+if ! [[ "$SERVER_VERSION" =~ ^v?([0-9]+)\.([0-9]+) ]] \
+   || { [ "${BASH_REMATCH[1]}" -eq 0 ] && [ "${BASH_REMATCH[2]}" -lt 9 ]; }; then
+  echo "Error: tapp-server reports version '${SERVER_VERSION:-unknown}'. This script signs for" >&2
+  echo "tapp-server >= 0.9.0; an older one would record an unrelated address as the owner." >&2
+  echo "Claim it with: tapp-cli --legacy-sign claim-config" >&2
+  exit 1
+fi
+
 KBS_ARRAY=$(echo "$KBS_URLS" | tr ',' '\n' | grep -v '^$' | jq -R . | jq -s .)
 request=$(jq -n \
   --arg chain_rpc_url "$CHAIN_RPC_URL" \

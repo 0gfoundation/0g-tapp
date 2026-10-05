@@ -2,7 +2,10 @@ module github.com/0gfoundation/0g-tapp/contract
 
 go 1.23.5
 
-require github.com/ethereum/go-ethereum v1.14.12
+require (
+	github.com/ethereum/go-ethereum v1.14.12
+	golang.org/x/term v0.19.0
+)
 
 require (
 	github.com/Microsoft/go-winio v0.6.2 // indirect

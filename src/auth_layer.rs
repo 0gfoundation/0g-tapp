@@ -436,6 +436,34 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod authenticated_class_tests {
+    use super::*;
+
+    /// The replay guard skips the whole Authenticated class, because there any 65
+    /// bytes "pass" and recording them would let anyone grow the guard. That is
+    /// only safe while every member is idempotent by design — ClaimConfig is: a
+    /// claim succeeds once. A new Authenticated method would silently lose replay
+    /// protection, so adding one has to be a decision, made here.
+    #[test]
+    fn claim_config_is_the_only_authenticated_method() {
+        let proto = include_str!("../proto/tapp_service.proto");
+        let authenticated: Vec<&str> = proto
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("rpc "))
+            .filter_map(|rest| rest.split('(').next())
+            .map(str::trim)
+            .filter(|name| classify(name) == Some(MethodPermission::Authenticated))
+            .collect();
+        assert_eq!(
+            authenticated,
+            vec!["ClaimConfig"],
+            "a new Authenticated method bypasses the replay guard — make sure a \
+             replay of it is harmless, then extend this list"
+        );
+    }
+}
+
 /// Check if user has required permission
 fn is_authorized(required: &MethodPermission, actual: &Permission) -> bool {
     match required {
