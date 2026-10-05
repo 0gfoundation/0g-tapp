@@ -275,6 +275,7 @@ Each app gets its **own encrypted volume** (LUKS; key derived per-app by the KMS
 | Symptom | Cause / fix |
 |---|---|
 | `PermissionDenied` | wrong key, or server is UNCLAIMED (v0.3.0+ canonical image) — run `claim-config` first; or tapp-cli >= 0.9.0 against tapp-server < 0.9.0 — add `--legacy-sign` |
+| `refusing to claim: this tapp-server reports version …` | tapp-cli >= 0.9.0 claiming a node older than 0.9.0: add `--legacy-sign`. (Refused on purpose — such a server would recover an unrelated address from the new signature and record IT as the owner.) |
 | `this signature was already used` | a signature is single-use (v0.9.0+); just re-run the command (it signs afresh) |
 | `this node accepts only body-bound signatures` | tapp-server >= 0.9.0 with an old tapp-cli, or `--legacy-sign` given — upgrade tapp-cli / drop the flag |
 | `unauthorized: authentication required` (pull) | registry token expired → `docker-login` with fresh token, retry |

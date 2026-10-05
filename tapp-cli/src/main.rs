@@ -2526,6 +2526,30 @@ async fn claim_config(
 
     let mut client = create_client(server).await?;
 
+    // A claim is the one command a signature-format mismatch turns into damage.
+    // A pre-0.9.0 server recovers the signer from the legacy message, so a
+    // body-bound signature recovers to some unrelated address — and ClaimConfig
+    // accepts ANY signer, so the node would be claimed by an address nobody holds
+    // and stay unmanageable until the VM is reset. Every other command merely
+    // fails. So the server's version is checked first, and the claim refused
+    // rather than sent in a form that server cannot read.
+    if !*LEGACY_SIGN.get().unwrap_or(&false) {
+        let version = client
+            .get_tapp_info(Request::new(GetTappInfoRequest {}))
+            .await
+            .map(|r| r.into_inner().version)
+            .unwrap_or_default();
+        if !reads_body_bound_signatures(&version) {
+            eprintln!(
+                "✗ refusing to claim: this tapp-server reports version {:?}. Servers older \
+                 than 0.9.0 cannot read the signature this CLI sends, and would record an \
+                 unrelated address as the owner. Re-run with --legacy-sign.",
+                version
+            );
+            std::process::exit(1);
+        }
+    }
+
     let mut request = Request::new(ClaimConfigRequest {
         chain_rpc_url: chain_rpc_url.clone(),
         chain_contract_address: chain_contract_address.clone(),
@@ -3521,6 +3545,23 @@ async fn accept_app_ownership_onchain(
     Ok(())
 }
 
+/// Whether a tapp-server of this version verifies body-bound signatures
+/// (>= 0.9.0). An unreadable version is treated as "no": the caller refuses
+/// rather than guesses.
+fn reads_body_bound_signatures(version: &str) -> bool {
+    let mut parts = version.trim().trim_start_matches('v').split('.');
+    let major: u64 = match parts.next().and_then(|p| p.parse().ok()) {
+        Some(m) => m,
+        None => return false,
+    };
+    let minor: u64 = parts
+        .next()
+        .and_then(|p| p.split(|c: char| !c.is_ascii_digit()).next())
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(0);
+    major > 0 || minor >= 9
+}
+
 /// The message a request is signed over.
 ///
 /// Body-bound (default, tapp-server >= 0.9.0): `Method:0x<sha256(body)>:timestamp`,
@@ -3619,6 +3660,17 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    #[test]
+    fn only_0_9_and_later_read_body_bound_signatures() {
+        for v in ["0.9.0", "0.9.3", "0.10.0", "1.0.0", "v0.9.0", "0.9.0-rc1"] {
+            assert!(reads_body_bound_signatures(v), "{v}");
+        }
+        // Unknown or unreadable is "no" — the claim is refused, not guessed.
+        for v in ["0.8.0", "0.8.9", "0.6.0", "", "unknown", "x.y"] {
+            assert!(!reads_body_bound_signatures(v), "{v}");
+        }
+    }
 
     /// The server rebuilds exactly this string from the body it received
     /// (`build_sign_message_v2` in tapp-server's signature_auth.rs). Any drift
