@@ -78,9 +78,10 @@ All four contracts (impl, beacon, proxy, timelock) source-verified on https://ch
 - Registry `admin` (setMinStakeAmount / setLockPeriod / transferAdmin) =
   `0x87605ec8e10eb373c1d070e15e5d78fac4d7621d`.
 
-Both moved from `0x73443d8C05c74F8C2F5D499Da2597a1EE49E431b` on 2026-10-04
-(13:32–13:33 UTC, blocks 46146918–46146998): the four timelock roles were granted to
-the new address and then revoked from the old one, all signed by the old one. App
+Both moved from `0x73443d8C05c74F8C2F5D499Da2597a1EE49E431b` on 2026-10-04, all
+signed by the old address: the registry admin first (`AdminTransferred`, block
+46146695, 13:28:45 UTC), then the four timelock roles — granted to the new address
+and revoked from the old one (blocks 46146918–46146998, 13:32:00–13:33:10 UTC). App
 ownership is separate and did not move — e.g. `0g-kms` is still owned by
 `0x73443d…` (see [`docs/KMS.md`](../docs/KMS.md)).
 
