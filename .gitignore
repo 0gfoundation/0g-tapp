@@ -26,3 +26,6 @@ cvm/disk.raw
 
 # Python bytecode (examples/sign_message.py)
 __pycache__/
+
+# cmd/upgrade state snapshots
+contract/upgrade-state.*.txt

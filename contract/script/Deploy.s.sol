@@ -7,6 +7,9 @@ import "../src/proxy/UpgradeableBeacon.sol";
 import "../src/proxy/BeaconProxy.sol";
 
 /// @notice Deploy TappRegistry using the BeaconProxy + UpgradeableBeacon pattern.
+///         Leaves the broadcasting key as beacon owner and admin — fine locally. For
+///         testnet/mainnet use `go run ./cmd/deploy/ --network <net>`, which hands both
+///         off (and requires it on mainnet).
 ///
 ///         Required env vars:
 ///           MIN_STAKE_AMOUNT  — minimum stake per node, in wei

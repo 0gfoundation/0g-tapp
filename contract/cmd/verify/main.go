@@ -1,13 +1,14 @@
 // cmd/verify/main.go — verifies TappRegistry contracts on the 0G explorer
-// (chainscan-galileo.0g.ai) using the Etherscan-compatible API.
+// (chainscan-galileo.0g.ai / chainscan.0g.ai) using the Etherscan-compatible API.
 //
-// Usage — verify all three contracts via proxy address (recommended):
+// Usage — verify all three contracts behind the network's registry (recommended;
+// run it again after an upgrade and it verifies the new implementation):
 //
-//	go run ./cmd/verify/ --proxy 0x<proxy-addr>
+//	go run ./cmd/verify/ --network testnet|mainnet [--proxy 0x<proxy-addr>]
 //
 // Usage — verify a single contract manually:
 //
-//	go run ./cmd/verify/ --contract 0x<addr> \
+//	go run ./cmd/verify/ --network testnet --contract 0x<addr> \
 //	  --source src/TappRegistry.sol \
 //	  --source-key src/TappRegistry.sol \
 //	  --contract-name src/TappRegistry.sol:TappRegistry
@@ -26,23 +27,19 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/ethclient"
 
-	"github.com/0gfoundation/0g-tapp/contract/internal/chain"
+	reg "github.com/0gfoundation/0g-tapp/contract/cmd/internal/registry"
 )
 
 const (
-	defaultAPIURL     = "https://chainscan-galileo.0g.ai/open/api"
-	defaultRPC        = "https://evmrpc-testnet.0g.ai"
-	defaultCompiler   = "v0.8.24+commit.e11b9ed9"
-	defaultChainID    = "16602"
-	defaultAPIKey     = "00"
+	defaultCompiler = "v0.8.24+commit.e11b9ed9"
+	defaultAPIKey   = "00"
 )
 
-// beaconSlot is the ERC-1967 storage slot for the beacon address.
-var beaconSlot = common.HexToHash("0xa3f0ad74e5423aebfd80d3ef4346578335a9a72aeaee59ff6cb3582b35133d50")
+// explorer is the network's explorer base URL, for the links printed.
+var explorer string
 
 // contractSpec describes a single contract to verify.
 type contractSpec struct {
@@ -55,21 +52,25 @@ type contractSpec struct {
 }
 
 func main() {
-	proxyAddr    := flag.String("proxy",         "", "BeaconProxy address — auto-discovers all three contracts")
+	netFlags := reg.RegisterNetworkFlags(flag.CommandLine)
+	proxyAddr    := flag.String("proxy",         "", "BeaconProxy address — auto-discovers all three contracts (default: the network's registry)")
 	contractAddr := flag.String("contract",      "", "single contract address (manual mode)")
-	apiURL       := flag.String("api",           defaultAPIURL, "Etherscan-compatible API URL")
-	rpcURL       := flag.String("rpc",           defaultRPC, "EVM RPC endpoint (used to resolve beacon/impl)")
 	sourcePath   := flag.String("source",        "src/TappRegistry.sol", "Solidity source file (manual mode)")
 	sourceKey    := flag.String("source-key",    "src/TappRegistry.sol", "source key in standard-JSON (manual mode)")
 	contractName := flag.String("contract-name", "src/TappRegistry.sol:TappRegistry", "fully-qualified contract name (manual mode)")
 	compilerVer  := flag.String("compiler",      defaultCompiler, "solc compiler version")
-	chainID      := flag.String("chain-id",      defaultChainID, "chain ID")
 	apiKey       := flag.String("apikey",        defaultAPIKey, "API key")
 	flag.Parse()
 
+	n, err := netFlags.Resolve()
+	if err != nil {
+		fatalf("%v", err)
+	}
+	apiURL, rpcURL, chainID := &n.ExplorerAPI, &n.RPC, new(string)
+	*chainID = fmt.Sprintf("%d", n.ChainID)
+	explorer = n.Explorer
 	if *proxyAddr == "" && *contractAddr == "" {
-		fmt.Fprintln(os.Stderr, "error: --proxy or --contract is required")
-		os.Exit(1)
+		*proxyAddr = n.Proxy
 	}
 
 	httpClient := &http.Client{Timeout: 60 * time.Second}
@@ -105,25 +106,19 @@ func main() {
 
 	proxy := common.HexToAddress(*proxyAddr)
 
-	// Read beacon from proxy ERC-1967 slot.
-	raw, err := client.StorageAt(ctx, proxy, beaconSlot, nil)
+	beacon, err := reg.BeaconOf(ctx, client, proxy)
 	if err != nil {
-		fatalf("read beacon slot: %v", err)
+		fatalf("%v", err)
 	}
-	beacon := common.BytesToAddress(raw)
-	if beacon == (common.Address{}) {
-		fatalf("beacon slot is zero — is %s a BeaconProxy?", *proxyAddr)
-	}
-
-	// Read impl from beacon.implementation().
-	beaconContract, err := chain.NewUpgradeableBeacon(beacon, client)
+	beaconArtifact, err := reg.LoadArtifact("UpgradeableBeacon.sol", "UpgradeableBeacon")
 	if err != nil {
-		fatalf("bind beacon: %v", err)
+		fatalf("%v", err)
 	}
-	impl, err := beaconContract.Implementation(&bind.CallOpts{Context: ctx})
+	out, err := reg.Call(ctx, client, beaconArtifact.ABI, beacon, common.Address{}, "implementation")
 	if err != nil {
 		fatalf("beacon.implementation(): %v", err)
 	}
+	impl := out[0].(common.Address)
 
 	fmt.Printf("Proxy   : %s\n", proxy.Hex())
 	fmt.Printf("Beacon  : %s\n", beacon.Hex())
@@ -351,7 +346,7 @@ func verifyOne(httpClient *http.Client, ethClient *ethclient.Client, ctx context
 			}
 			if strings.Contains(strings.ToLower(status), "pass") {
 				fmt.Printf("  ✓ Verified: %s\n", status)
-				fmt.Printf("    https://chainscan-galileo.0g.ai/address/%s#code\n", addr)
+				fmt.Printf("    %s/address/%s#code\n", explorer, addr)
 			} else {
 				fmt.Fprintf(os.Stderr, "  ✗ Failed: %s\n", status)
 			}
@@ -362,7 +357,7 @@ func verifyOne(httpClient *http.Client, ethClient *ethclient.Client, ctx context
 			apiURL, guid, apiKey)
 	case strings.Contains(lower, "already"):
 		fmt.Printf("  ✓ Already verified\n")
-		fmt.Printf("    https://chainscan-galileo.0g.ai/address/%s#code\n", addr)
+		fmt.Printf("    %s/address/%s#code\n", explorer, addr)
 	default:
 		fmt.Fprintf(os.Stderr, "  ✗ Failed: [%s] %s\n", result.Status, result.Result)
 	}

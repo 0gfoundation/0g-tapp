@@ -1,199 +1,160 @@
-// cmd/deploy/main.go — deploys the TappRegistry beacon-proxy stack.
+// cmd/deploy — deploys a new TappRegistry: implementation, UpgradeableBeacon,
+// BeaconProxy (initialised), then hands the authority off the deploy key.
 //
-// Three-step deploy:
-//  1. Deploy TappRegistry implementation (no constructor args)
-//  2. Deploy UpgradeableBeacon(impl, deployer)
-//  3. Deploy BeaconProxy(beacon, initialize(minStakeAmount, lockPeriod))
+// Run `forge build` in contract/ first. Usage:
 //
-// Usage:
+//	PRIVATE_KEY=0x<throwaway> go run ./cmd/deploy/ --network testnet \
+//	  --stake 1000000000000000000 --lock 86400 \
+//	  [--beacon-owner 0x<timelock|wallet>] [--admin 0x<wallet>]
 //
-//	go run ./cmd/deploy/ \
-//	  --rpc      https://evmrpc-testnet.0g.ai \
-//	  --key      0x<private-key>              \
-//	  --chain-id 16602                        \
-//	  --stake    1000000000000000000          \
-//	  --lock     86400
+// The deploy key needs gas and nothing else. It starts out owning the beacon
+// (upgrades) and being the registry admin (stake parameters); --beacon-owner and
+// --admin move both away as soon as the contracts exist. On mainnet both are
+// REQUIRED: a deploy key left holding them is a key that can replace the
+// registry's code. Point --beacon-owner at the timelock there.
 package main
 
 import (
-	"context"
-	"encoding/hex"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"math/big"
 	"os"
-	"strings"
-	"time"
 
-	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
-	"github.com/ethereum/go-ethereum/crypto"
-	"github.com/ethereum/go-ethereum/ethclient"
+	"github.com/ethereum/go-ethereum/common"
 
-	"github.com/0gfoundation/0g-tapp/contract/internal/chain"
+	reg "github.com/0gfoundation/0g-tapp/contract/cmd/internal/registry"
 )
 
 func main() {
-	rpcURL   := flag.String("rpc",      "https://evmrpc-testnet.0g.ai", "EVM RPC endpoint")
-	keyHex   := flag.String("key",      "", "deployer private key (hex, with or without 0x)")
-	chainID  := flag.Int64("chain-id",  16602, "chain ID")
-	stake    := flag.String("stake",    "1000000000000000000", "minStakeAmount in wei (default 1 OG)")
-	lock     := flag.Int64("lock",      86400, "lockPeriod in seconds (default 1 day)")
-	flag.Parse()
+	fs := flag.NewFlagSet("deploy", flag.ExitOnError)
+	netFlags := reg.RegisterNetworkFlags(fs)
+	keyFlags := reg.RegisterKeyFlags(fs)
+	stake := fs.String("stake", "1000000000000000000", "minStakeAmount in wei")
+	lock := fs.Int64("lock", 86400, "lockPeriod in seconds")
+	beaconOwner := fs.String("beacon-owner", "", "who may upgrade (the timelock on mainnet); default: keep the deploy key")
+	admin := fs.String("admin", "", "registry admin (stake parameters); default: keep the deploy key")
+	_ = fs.Parse(os.Args[1:])
 
-	if *keyHex == "" {
-		fmt.Fprintln(os.Stderr, "error: --key is required")
-		os.Exit(1)
-	}
-
-	privKey, err := crypto.HexToECDSA(strings.TrimPrefix(*keyHex, "0x"))
+	n, err := netFlags.Resolve()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "parse key: %v\n", err)
-		os.Exit(1)
+		reg.Fatalf("%v", err)
 	}
-	deployer := crypto.PubkeyToAddress(privKey.PublicKey)
-	fmt.Printf("Deployer : %s\n", deployer.Hex())
+	if n.RequireAuthorityHandoff && (*beaconOwner == "" || *admin == "") {
+		reg.Fatalf("--network %s requires --beacon-owner and --admin: the deploy key must not keep the power to replace the registry's code", n.Name)
+	}
+	for name, v := range map[string]string{"--beacon-owner": *beaconOwner, "--admin": *admin} {
+		if v != "" && !common.IsHexAddress(v) {
+			reg.Fatalf("%s is not an address: %s", name, v)
+		}
+	}
+	minStake, ok := new(big.Int).SetString(*stake, 10)
+	if !ok {
+		reg.Fatalf("invalid --stake: %s", *stake)
+	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	key, err := keyFlags.Load()
+	if err != nil {
+		reg.Fatalf("%v", err)
+	}
+	deployer := reg.Address(key)
+
+	ctx, cancel := reg.Ctx()
 	defer cancel()
-
-	client, err := ethclient.DialContext(ctx, *rpcURL)
+	c, err := reg.Dial(ctx, n)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "dial rpc: %v\n", err)
-		os.Exit(1)
+		reg.Fatalf("%v", err)
 	}
-
-	auth, err := bind.NewKeyedTransactorWithChainID(privKey, big.NewInt(*chainID))
+	auth, err := reg.Transactor(ctx, c, key, n.ChainID)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "transactor: %v\n", err)
-		os.Exit(1)
+		reg.Fatalf("%v", err)
 	}
-	auth.Context = ctx
 
-	minStake := new(big.Int)
-	if _, ok := minStake.SetString(*stake, 10); !ok {
-		fmt.Fprintf(os.Stderr, "invalid stake: %s\n", *stake)
-		os.Exit(1)
+	impl, err := reg.LoadArtifact("TappRegistry.sol", "TappRegistry")
+	if err != nil {
+		reg.Fatalf("%v", err)
 	}
-	lockPeriod := big.NewInt(*lock)
+	beacon, err := reg.LoadArtifact("UpgradeableBeacon.sol", "UpgradeableBeacon")
+	if err != nil {
+		reg.Fatalf("%v", err)
+	}
+	proxy, err := reg.LoadArtifact("BeaconProxy.sol", "BeaconProxy")
+	if err != nil {
+		reg.Fatalf("%v", err)
+	}
 
-	loadBytecode := func(artifactPath string) []byte {
-		raw, err := os.ReadFile(artifactPath)
+	fmt.Printf("Network  : %s (chain %d)\nDeployer : %s\n", n.Name, n.ChainID, deployer.Hex())
+
+	deploy := func(label string, a reg.Artifact, args ...any) common.Address {
+		addr, tx, _, err := bind.DeployContract(auth, a.ABI, a.Bytecode, c, args...)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "read artifact %s: %v\n", artifactPath, err)
-			os.Exit(1)
+			reg.Fatalf("deploy %s: %v", label, err)
 		}
-		var artifact struct {
-			Bytecode struct {
-				Object string `json:"object"`
-			} `json:"bytecode"`
+		if _, err := reg.Mined(ctx, c, tx, "deploy "+label); err != nil {
+			reg.Fatalf("%v", err)
 		}
-		if err := json.Unmarshal(raw, &artifact); err != nil {
-			fmt.Fprintf(os.Stderr, "parse artifact %s: %v\n", artifactPath, err)
-			os.Exit(1)
+		fmt.Printf("  %-14s %s\n", label, addr.Hex())
+		return addr
+	}
+
+	fmt.Println("\n[1/4] contracts")
+	implAddr := deploy("implementation", impl)
+	beaconAddr := deploy("beacon", beacon, implAddr, deployer)
+	initData, err := impl.ABI.Pack("initialize", minStake, big.NewInt(*lock))
+	if err != nil {
+		reg.Fatalf("pack initialize: %v", err)
+	}
+	proxyAddr := deploy("proxy", proxy, beaconAddr, initData)
+
+	fmt.Println("\n[2/4] beacon owner")
+	if *beaconOwner != "" && common.HexToAddress(*beaconOwner) != deployer {
+		if err := reg.Send(ctx, c, auth, beacon.ABI, beaconAddr, "transferOwnership", common.HexToAddress(*beaconOwner)); err != nil {
+			reg.Fatalf("%v", err)
 		}
-		b, err := hex.DecodeString(strings.TrimPrefix(artifact.Bytecode.Object, "0x"))
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "decode bytecode: %v\n", err)
-			os.Exit(1)
+	} else {
+		fmt.Println("  kept by the deploy key")
+	}
+
+	fmt.Println("\n[3/4] registry admin")
+	if *admin != "" && common.HexToAddress(*admin) != deployer {
+		if err := reg.Send(ctx, c, auth, impl.ABI, proxyAddr, "transferAdmin", common.HexToAddress(*admin)); err != nil {
+			reg.Fatalf("%v", err)
 		}
-		return b
+	} else {
+		fmt.Println("  kept by the deploy key")
 	}
 
-	// ── Step 1: Deploy TappRegistry implementation ────────────────────────────
-	fmt.Printf("\n[1/3] Deploying TappRegistry implementation (chainID=%d)...\n", *chainID)
-
-	implABI, err := abi.JSON(strings.NewReader(chain.TappRegistryMetaData.ABI))
+	// Read back rather than trust the transactions: this is what is in force.
+	fmt.Println("\n[4/4] read back")
+	ownerNow, err := reg.Call(ctx, c, beacon.ABI, beaconAddr, common.Address{}, "owner")
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "parse TappRegistry ABI: %v\n", err)
-		os.Exit(1)
+		reg.Fatalf("beacon.owner(): %v", err)
 	}
-	implBytecode := loadBytecode("out/TappRegistry.sol/TappRegistry.json")
-
-	implAddr, implTx, _, err := bind.DeployContract(auth, implABI, implBytecode, client)
+	adminNow, err := reg.Call(ctx, c, impl.ABI, proxyAddr, common.Address{}, "admin")
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "deploy impl: %v\n", err)
-		os.Exit(1)
+		reg.Fatalf("admin(): %v", err)
 	}
-	fmt.Printf("  Tx hash : %s\n", implTx.Hash().Hex())
-	implReceipt, err := bind.WaitMined(ctx, client, implTx)
-	if err != nil || implReceipt.Status == 0 {
-		fmt.Fprintln(os.Stderr, "impl deploy failed")
-		os.Exit(1)
-	}
-	fmt.Printf("  Impl    : %s\n", implAddr.Hex())
-
-	// ── Step 2: Deploy UpgradeableBeacon ─────────────────────────────────────
-	fmt.Printf("\n[2/3] Deploying UpgradeableBeacon(impl=%s, owner=%s)...\n", implAddr.Hex(), deployer.Hex())
-
-	beaconABI, err := abi.JSON(strings.NewReader(chain.UpgradeableBeaconMetaData.ABI))
+	version, err := reg.Call(ctx, c, impl.ABI, proxyAddr, common.Address{}, "version")
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "parse UpgradeableBeacon ABI: %v\n", err)
-		os.Exit(1)
+		reg.Fatalf("version(): %v", err)
 	}
-	beaconBytecode := loadBytecode("out/UpgradeableBeacon.sol/UpgradeableBeacon.json")
-
-	beaconAddr, beaconTx, _, err := bind.DeployContract(auth, beaconABI, beaconBytecode, client, implAddr, deployer)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "deploy beacon: %v\n", err)
-		os.Exit(1)
-	}
-	fmt.Printf("  Tx hash : %s\n", beaconTx.Hash().Hex())
-	beaconReceipt, err := bind.WaitMined(ctx, client, beaconTx)
-	if err != nil || beaconReceipt.Status == 0 {
-		fmt.Fprintln(os.Stderr, "beacon deploy failed")
-		os.Exit(1)
-	}
-	fmt.Printf("  Beacon  : %s\n", beaconAddr.Hex())
-
-	// ── Step 3: Deploy BeaconProxy ────────────────────────────────────────────
-	fmt.Printf("\n[3/3] Deploying BeaconProxy(beacon=%s, stake=%s, lock=%d)...\n",
-		beaconAddr.Hex(), minStake, *lock)
-
-	initCalldata, err := implABI.Pack("initialize", minStake, lockPeriod)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "pack initialize: %v\n", err)
-		os.Exit(1)
-	}
-
-	proxyConstructorABI, _ := abi.JSON(strings.NewReader(`[{
-		"type": "constructor",
-		"inputs": [
-			{"name": "beacon", "type": "address"},
-			{"name": "data",   "type": "bytes"}
-		],
-		"stateMutability": "payable"
-	}]`))
-	proxyBytecode := loadBytecode("out/BeaconProxy.sol/BeaconProxy.json")
-
-	proxyAddr, proxyTx, _, err := bind.DeployContract(auth, proxyConstructorABI, proxyBytecode, client,
-		beaconAddr, initCalldata)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "deploy proxy: %v\n", err)
-		os.Exit(1)
-	}
-	fmt.Printf("  Tx hash : %s\n", proxyTx.Hash().Hex())
-	proxyReceipt, err := bind.WaitMined(ctx, client, proxyTx)
-	if err != nil || proxyReceipt.Status == 0 {
-		fmt.Fprintln(os.Stderr, "proxy deploy failed")
-		os.Exit(1)
-	}
-	fmt.Printf("  Proxy   : %s\n", proxyAddr.Hex())
 
 	fmt.Printf(`
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-DEPLOY COMPLETE
+DEPLOYED on %s — record these in CONTRACTS.md
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Implementation : %s
-Beacon         : %s
-Proxy (stable) : %s
-minStakeAmount : %s wei
-lockPeriod     : %d seconds
+Proxy (users call this) : %s
+Beacon                  : %s
+Implementation          : %s   (version %v)
+Beacon owner (upgrades) : %s
+Registry admin          : %s
+minStakeAmount          : %s wei
+lockPeriod              : %d s
 
-Explorer (proxy):
-  https://chainscan-galileo.0g.ai/address/%s
+%s/address/%s
+Next: go run ./cmd/verify/ --network %s --proxy %s
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-`, implAddr.Hex(), beaconAddr.Hex(), proxyAddr.Hex(),
-		minStake.String(), *lock, proxyAddr.Hex())
+`, n.Name, proxyAddr.Hex(), beaconAddr.Hex(), implAddr.Hex(), version[0],
+		ownerNow[0].(common.Address).Hex(), adminNow[0].(common.Address).Hex(),
+		minStake, *lock, n.Explorer, proxyAddr.Hex(), n.Name, proxyAddr.Hex())
 }

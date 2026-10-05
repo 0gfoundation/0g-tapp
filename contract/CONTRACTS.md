@@ -107,9 +107,17 @@ Events `AppOwnershipTransferStarted(appId, owner, pendingOwner)` and
   0–11 unchanged. `test_Upgrade_From010_PreservesStateAndStartsWithNothingPending`
   upgrades a populated 0.1.0 proxy and checks every field.
 
-Rollout: testnet — deploy the implementation and `beacon.upgradeTo` directly;
-mainnet — schedule through the timelock (1-day delay), see Upgrading above. Record
-each in its network's upgrades table and flip this section to "deployed".
+Rollout with `go run ./cmd/upgrade/` (Go Tools below), which keeps the beacon
+owner's key off the machine doing the work. Testnet: the owner (`0x73443d…`) signs
+the printed `upgradeTo`. Mainnet: the owner is the timelock — its proposer
+(`0x87605ec8…`) schedules, and after the 1-day delay an executor executes. Then
+`go run ./cmd/verify/ --network <net>`. Record each in its network's upgrades table
+and flip this section to "deployed". Both paths have been rehearsed end to end on
+local forks of the live networks: state unchanged, the new functions live.
+
+The 0.1.0 implementations live on both networks (testnet `0x9Ea52Ef3…`, mainnet
+`0xf399583d…`) are byte-identical, metadata aside, to the 0.1.0 fixture the
+upgrade test runs against.
 
 ---
 
@@ -138,61 +146,85 @@ optional per-node override (empty = inherit).
 
 ## Go Tools
 
-All contract operations are handled by Go tools under `contract/cmd/`. Docker is required only for compilation (forge runs inside a container to work around host GLIBC constraints).
-
-### Compile
-
-Compiles Solidity via Docker and extracts ABIs to `internal/chain/abi/`.
+Deploy, upgrade and verify are Go tools under `contract/cmd/`. They read forge's build
+output directly, so the one prerequisite is:
 
 ```bash
-cd contract
-go run ./cmd/compile/
+cd contract && forge build
 ```
 
-After an ABI change, regenerate Go bindings:
+All three take `--network testnet|mainnet`, which supplies the RPC, chain id, explorer
+and the registry's proxy address; `--rpc` / `--chain-id` override it for a local
+anvil fork. A command refuses an RPC that is not on the network's chain.
 
-```bash
-$(go env GOPATH)/bin/abigen \
-  --abi internal/chain/abi/TappRegistry.json \
-  --pkg chain --type TappRegistry \
-  --out internal/chain/tapp_registry.go
-```
+Keys: `--keystore <file>` (a foundry/geth keystore — `~/.foundry/keystores/<name>`;
+password prompted, or `--password-file`), or `PRIVATE_KEY` in the environment.
+`--key 0x…` still works for throwaway keys, with a warning: it is visible in the
+process list and the shell history.
 
 ### Deploy (first time)
 
 ```bash
-cd contract
-go run ./cmd/deploy/ \
-  --rpc   https://evmrpc-testnet.0g.ai \
-  --key   0x<DEPLOYER_PRIVATE_KEY>     \
-  --stake 1000000000000000000          \
-  --lock  86400
+PRIVATE_KEY=0x<throwaway> go run ./cmd/deploy/ --network testnet \
+  --stake 1000000000000000000 --lock 86400 \
+  --beacon-owner 0x<timelock or wallet> --admin 0x<wallet>
 ```
 
-Output lists Implementation, Beacon, and Proxy addresses. Set the Proxy as `TAPP_REGISTRY_CONTRACT`.
+The deploy key needs gas and nothing else: `--beacon-owner` (who may upgrade) and
+`--admin` (stake parameters) are handed over as soon as the contracts exist, and read
+back. On mainnet both are required — a deploy key left holding them could replace
+the registry's code. Output lists the proxy (`TAPP_REGISTRY_CONTRACT`), beacon,
+implementation and the authority in force.
 
 ### Upgrade
 
-Edit `src/TappRegistry.sol`, recompile, then:
-
 ```bash
-cd contract
-go run ./cmd/upgrade/ \
-  --rpc    https://evmrpc-testnet.0g.ai     \
-  --key    0x<DEPLOYER_PRIVATE_KEY>         \
-  --beacon 0x<UPGRADEABLE_BEACON_ADDRESS>
+PRIVATE_KEY=0x<throwaway> go run ./cmd/upgrade/ --network testnet     # or mainnet
+go run ./cmd/upgrade/ --network testnet --check 0x<new implementation>
 ```
 
-Deploys a new implementation and calls `beacon.upgradeTo`. The proxy address is unchanged.
+The key only pays for putting the new implementation on chain. The switch
+(`beacon.upgradeTo`) belongs to the beacon owner, and the tool reads what that is:
+
+| beacon owner | what happens |
+|---|---|
+| this key | the switch is sent (dev chains) |
+| a wallet (testnet: `0x73443d…`) | the exact transaction is printed for the owner to sign elsewhere — wallet, hardware key — after simulating it **as** the owner |
+| a TimelockController (mainnet) | the schedule and execute transactions are printed, with the delay read from it; `--proposer <addr>` simulates the schedule as that proposer |
+
+Before anything changes it snapshots the registry (admin, stake parameters, and for
+`--apps` — default `0g-kms` — app info, node list, ack version) to
+`upgrade-state.<proxy>.txt`; `--check <impl>` then confirms the beacon moved and every
+value is unchanged, or, for a timelock, whether the operation is unscheduled,
+pending (until when) or ready. `--impl <addr>` re-prints the switch for an
+implementation already deployed.
+
+Rehearse on a fork first — it costs nothing and runs the real state:
+
+```bash
+anvil --fork-url https://evmrpc.0g.ai --port 8545 &
+PRIVATE_KEY=<an anvil account> go run ./cmd/upgrade/ --network mainnet --rpc http://127.0.0.1:8545 \
+  --proposer 0x87605ec8e10eb373c1d070e15e5d78fac4d7621d --apps 0g-kms,0g-agentic-id
+# impersonate the proposer (anvil_impersonateAccount), send the schedule tx,
+# evm_increaseTime 86401, send the execute tx, then --check
+```
 
 ### Verify
 
 ```bash
-cd contract
-go run ./cmd/verify/ --proxy 0x<BEACON_PROXY_ADDRESS>
+go run ./cmd/verify/ --network testnet      # or mainnet
 ```
 
-Auto-discovers impl, beacon, and proxy from the given BeaconProxy address. Checks which are unverified, extracts constructor args from on-chain data, submits source, and polls for results. All three contracts are verified in one command.
+Auto-discovers impl, beacon and proxy behind the network's registry (or `--proxy`),
+skips what is already verified, extracts constructor args from on-chain data, submits
+source and polls. Run it again after an upgrade and it verifies the new
+implementation.
+
+### Compile (only to regenerate the Go bindings in `internal/chain/`)
+
+`go run ./cmd/compile/` builds via Docker and extracts ABIs to `internal/chain/abi/`;
+then `abigen` regenerates `internal/chain/tapp_registry.go`. The tools above do not
+need them.
 
 ---
 
