@@ -177,7 +177,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Step 8: Create gRPC server with auth layer
     let auth_layer = if let Some(pm) = permission_manager {
-        AuthLayer::with_permission_manager(pm)
+        let require_signed_body = config
+            .server
+            .permission
+            .as_ref()
+            .map(|p| p.require_signed_body)
+            .unwrap_or(false);
+        AuthLayer::with_permission_manager(pm, require_signed_body)
     } else {
         AuthLayer::new(config.server.permission.clone())
     };

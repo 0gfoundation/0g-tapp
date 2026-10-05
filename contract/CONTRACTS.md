@@ -83,6 +83,36 @@ proposer key. Direct `beacon.upgradeTo` no longer works — only the timelock ca
 
 ---
 
+## Pending: implementation 0.2.0 (app ownership transfer)
+
+Source is on `dev`; **not yet deployed on either network** — both proxies still
+answer `version()` = `"0.1.0"`. Adds a two-step app-owner transfer:
+
+| Function | Who | Effect |
+|---|---|---|
+| `transferAppOwnership(appId, newOwner)` | app owner | nominate (`address(0)` cancels; again = replace) |
+| `acceptAppOwnership(appId)` | the nominee | becomes owner; nomination cleared |
+| `pendingAppOwner(appId)` → address | anyone | current nominee, or `address(0)` |
+
+Events `AppOwnershipTransferStarted(appId, owner, pendingOwner)` and
+`AppOwnershipTransferred(appId, previousOwner, newOwner)`.
+
+- **Stake**: live nodes' stake travels with the app (`removeNode` refunds whoever
+  owns the app then); stake already locked to the old owner stays theirs.
+- **Acks** are not bumped: no code changes, and every change the new owner can
+  make bumps the ack version anyway.
+- A nomination is deleted when the app unregisters (last `removeNode`), so a stale
+  nominee can never accept a later registration of the same id.
+- **Storage**: one new mapping at slot 12, taken from `__gap` (48 → 47); slots
+  0–11 unchanged. `test_Upgrade_From010_PreservesStateAndStartsWithNothingPending`
+  upgrades a populated 0.1.0 proxy and checks every field.
+
+Rollout: testnet — deploy the implementation and `beacon.upgradeTo` directly;
+mainnet — schedule through the timelock (1-day delay), see Upgrading above. Record
+each in its network's upgrades table and flip this section to "deployed".
+
+---
+
 ## Contract Architecture
 
 ```

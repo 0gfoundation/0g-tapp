@@ -1237,6 +1237,10 @@ impl TappService for TappServiceImpl {
             chain: chain_config,
             scan_url: scan_url.clone(),
             scan_public_key: scan_public_key.clone(),
+            pending_owner: match &self.permission_manager {
+                Some(pm) => pm.pending_owner().await.unwrap_or_default(),
+                None => String::new(),
+            },
         };
 
         Ok(Response::new(GetTappInfoResponse {
@@ -1694,6 +1698,140 @@ impl TappService for TappServiceImpl {
             kbs_node_urls: resulting.kbs_node_urls,
             scan_url: resulting.scan_url,
             scan_public_key: resulting.scan_public_key,
+            timestamp,
+        }))
+    }
+
+    async fn transfer_owner(
+        &self,
+        request: Request<TransferOwnerRequest>,
+    ) -> Result<Response<TransferOwnerResponse>, Status> {
+        info!("Calling TransferOwner");
+        let req = request.into_inner();
+        let pm = self
+            .permission_manager
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("Permission management not enabled"))?;
+
+        // A baked-in owner comes back on the next process start (and the persisted
+        // successor would then be a hard mismatch), so a transfer here would be
+        // neither durable nor true. Changing it means changing the image.
+        if self
+            .config
+            .server
+            .permission
+            .as_ref()
+            .and_then(|p| p.owner_address.as_ref())
+            .is_some()
+        {
+            return Err(Status::failed_precondition(
+                "this node's owner is baked into config.toml; it cannot be transferred at \
+                 runtime",
+            ));
+        }
+
+        let nominee = req.new_owner.trim();
+        let nominee = if nominee.is_empty() {
+            None
+        } else {
+            if nominee
+                .trim_start_matches("0x")
+                .trim_start_matches("0X")
+                .len()
+                != 40
+                || nominee.parse::<ethers::types::Address>().is_err()
+            {
+                return Err(Status::invalid_argument(format!(
+                    "new_owner is not an EVM address: {nominee:?}"
+                )));
+            }
+            Some(nominee)
+        };
+        let owner = pm.owner_address().await.unwrap_or_default();
+        if nominee.map(permission::PermissionManager::normalize_address).as_deref()
+            == Some(owner.as_str())
+        {
+            return Err(Status::invalid_argument("new_owner is already the owner"));
+        }
+
+        let pending = pm.nominate_owner(nominee).await;
+        info!(
+            owner = %owner,
+            pending = ?pending,
+            event = "OWNER_TRANSFER_NOMINATED",
+            "Owner transfer nomination updated"
+        );
+        Ok(Response::new(TransferOwnerResponse {
+            success: true,
+            message: match &pending {
+                Some(p) => format!("{p} nominated; the transfer completes when it calls AcceptOwner"),
+                None => "nomination cancelled".to_string(),
+            },
+            owner,
+            pending_owner: pending.unwrap_or_default(),
+        }))
+    }
+
+    async fn accept_owner(
+        &self,
+        request: Request<AcceptOwnerRequest>,
+    ) -> Result<Response<AcceptOwnerResponse>, Status> {
+        info!("Calling AcceptOwner");
+        let signer = auth_layer::get_signer_address(&request)
+            .ok_or_else(|| Status::unauthenticated("Signer address not found"))?;
+        let pm = self
+            .permission_manager
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("Permission management not enabled"))?;
+
+        let (previous, owner, cleared) = pm
+            .accept_owner(&signer)
+            .await
+            .map_err(Status::permission_denied)?;
+
+        // Measure before persisting, roll back on failure: an unmeasured change of
+        // hands is the outcome that must not happen.
+        let timestamp = utils::current_timestamp();
+        let measurement_data = serde_json::json!({
+            "operation": measurement_service::OPERATION_NAME_TRANSFER_OWNER,
+            "previous_owner": previous,
+            "owner": owner,
+            "whitelist_cleared": cleared,
+            "timestamp": timestamp
+        })
+        .to_string();
+        if let Err(e) = self
+            .measurement_service
+            .extend_measurement(
+                measurement_service::OPERATION_NAME_TRANSFER_OWNER,
+                &measurement_data,
+            )
+            .await
+        {
+            pm.rollback_accept(&previous, &owner, cleared).await;
+            return Err(Status::internal(format!(
+                "Failed to extend measurement for the transfer, nothing changed: {}",
+                e
+            )));
+        }
+
+        // A process restart within this boot restores the new owner, not the old one.
+        if let Err(e) = pm.persist_owner().await {
+            tracing::warn!(error = %e, "Failed to persist transferred owner");
+        }
+
+        info!(
+            previous_owner = %previous,
+            owner = %owner,
+            whitelist_cleared = cleared.len(),
+            event = "OWNER_TRANSFERRED",
+            "Owner transferred and measurement extended"
+        );
+        Ok(Response::new(AcceptOwnerResponse {
+            success: true,
+            message: format!("ownership transferred from {previous} to {owner}"),
+            previous_owner: previous,
+            owner,
             timestamp,
         }))
     }

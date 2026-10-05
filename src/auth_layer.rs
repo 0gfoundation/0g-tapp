@@ -1,6 +1,10 @@
 use crate::config::PermissionConfig;
 use crate::permission::{Permission, PermissionManager};
-use crate::signature_auth::{build_sign_message, recover_evm_address, verify_timestamp};
+use crate::signature_auth::{
+    build_sign_message, build_sign_message_v2, recover_evm_address, verify_timestamp_within,
+    ReplayGuard, MAX_TIMESTAMP_DIFF, SIGNED_BODY_MAX_TIMESTAMP_DIFF,
+};
+use sha2::Digest;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use tonic::body::BoxBody;
@@ -14,19 +18,25 @@ use tracing::{debug, info, warn};
 pub struct AuthLayer {
     permission_manager: Option<Arc<PermissionManager>>,
     enabled: bool,
+    /// Signatures already used, shared across both listeners (TCP and socket) —
+    /// one execution per signature, whichever path it arrives on.
+    replay: Arc<ReplayGuard>,
+    /// When set, legacy "method:timestamp" signatures are refused. Off by
+    /// default: old CLIs must keep working until a fleet is known-upgraded.
+    require_signed_body: bool,
 }
 
 impl AuthLayer {
     pub fn new(config: Option<PermissionConfig>) -> Self {
-        let (permission_manager, enabled) = if let Some(cfg) = config {
+        let (permission_manager, enabled, require_signed_body) = if let Some(cfg) = config {
             if cfg.enabled {
                 let pm = PermissionManager::new(cfg.owner_address.clone());
-                (Some(Arc::new(pm)), true)
+                (Some(Arc::new(pm)), true, cfg.require_signed_body)
             } else {
-                (None, false)
+                (None, false, false)
             }
         } else {
-            (None, false)
+            (None, false, false)
         };
         // NOTE: main.rs always uses with_permission_manager; this path only
         // serves tests and keeps the claim/persistence wiring out of the layer.
@@ -34,13 +44,20 @@ impl AuthLayer {
         Self {
             permission_manager,
             enabled,
+            replay: Arc::new(ReplayGuard::default()),
+            require_signed_body,
         }
     }
 
-    pub fn with_permission_manager(permission_manager: Arc<PermissionManager>) -> Self {
+    pub fn with_permission_manager(
+        permission_manager: Arc<PermissionManager>,
+        require_signed_body: bool,
+    ) -> Self {
         Self {
             permission_manager: Some(permission_manager),
             enabled: true,
+            replay: Arc::new(ReplayGuard::default()),
+            require_signed_body,
         }
     }
 }
@@ -53,6 +70,8 @@ impl<S> Layer<S> for AuthLayer {
             inner: service,
             permission_manager: self.permission_manager.clone(),
             enabled: self.enabled,
+            replay: self.replay.clone(),
+            require_signed_body: self.require_signed_body,
         }
     }
 }
@@ -63,6 +82,8 @@ pub struct AuthMiddleware<S> {
     inner: S,
     permission_manager: Option<Arc<PermissionManager>>,
     enabled: bool,
+    replay: Arc<ReplayGuard>,
+    require_signed_body: bool,
 }
 
 impl<S> Service<http::Request<BoxBody>> for AuthMiddleware<S>
@@ -84,6 +105,8 @@ where
         let mut inner = std::mem::replace(&mut self.inner, clone);
         let permission_manager = self.permission_manager.clone();
         let enabled = self.enabled;
+        let replay = self.replay.clone();
+        let require_signed_body = self.require_signed_body;
 
         Box::pin(async move {
             // Extract method name from URI path
@@ -156,14 +179,97 @@ where
                 .and_then(|v| v.to_str().ok())
                 .map(|s| s.to_string());
 
-            // Validate signature
-            let signer_address = match validate_signature(signature, timestamp_str, &method_name) {
-                Ok(addr) => addr,
-                Err(status) => {
-                    let response = status.into_http();
-                    return Ok(response);
-                }
+            // "2" = the signature covers the request body. Absent = legacy, which
+            // covers only the method and the moment. The version is declared rather
+            // than guessed: ECDSA recovery always yields SOME address, so trying
+            // both message formats could not tell which one the client meant.
+            let body_bound = req
+                .headers()
+                .get("x-signature-version")
+                .and_then(|v| v.to_str().ok())
+                .map(|v| v.trim() == "2")
+                .unwrap_or(false);
+
+            if !body_bound && require_signed_body {
+                warn!(
+                    method = %method_name,
+                    event = "AUTH_LEGACY_SIGNATURE_REFUSED",
+                    "Refused a signature that does not cover the request body"
+                );
+                return Ok(Status::unauthenticated(
+                    "this node requires body-bound signatures (x-signature-version: 2); \
+                     upgrade tapp-cli to >= 0.9.0",
+                )
+                .into_http());
+            }
+
+            // Hash exactly the bytes that will be decoded — the server's own view of
+            // the request, not a re-encoding of it. The body is buffered, hashed and
+            // handed on unchanged.
+            let body_hash = if body_bound {
+                let (parts, body) = req.into_parts();
+                let bytes = match http_body_util::BodyExt::collect(http_body_util::Limited::new(
+                    body,
+                    MAX_SIGNED_BODY_BYTES,
+                ))
+                .await
+                {
+                    Ok(c) => c.to_bytes(),
+                    Err(e) => {
+                        warn!(method = %method_name, error = %e, "Could not read request body");
+                        return Ok(Status::invalid_argument(format!(
+                            "could not read the request body: {e}"
+                        ))
+                        .into_http());
+                    }
+                };
+                let hash = match unary_message_hash(&bytes) {
+                    Ok(h) => h,
+                    Err(e) => return Ok(Status::invalid_argument(e).into_http()),
+                };
+                req = http::Request::from_parts(
+                    parts,
+                    tonic::body::boxed(http_body_util::Full::new(bytes)),
+                );
+                Some(hash)
+            } else {
+                None
             };
+
+            // Validate signature
+            let (signer_address, signed_ts, window) =
+                match validate_signature(signature.as_deref(), timestamp_str, &method_name, body_hash) {
+                    Ok(v) => v,
+                    Err(status) => {
+                        let response = status.into_http();
+                        return Ok(response);
+                    }
+                };
+
+            // One execution per signature. Checked after recovery so unsigned noise
+            // cannot fill the guard, before permission so a replay is refused as a
+            // replay rather than reported as whatever the original request was.
+            if !replay.admit(signature.as_deref().unwrap_or_default(), signed_ts, window) {
+                warn!(
+                    method = %method_name,
+                    signer = %signer_address,
+                    event = "AUTH_SIGNATURE_REPLAYED",
+                    "Refused a signature that was already used"
+                );
+                return Ok(Status::unauthenticated(
+                    "this signature was already used; sign the request again",
+                )
+                .into_http());
+            }
+
+            if !body_bound {
+                warn!(
+                    method = %method_name,
+                    signer = %signer_address,
+                    event = "AUTH_LEGACY_SIGNATURE",
+                    "Accepted a legacy signature that does not cover the request body"
+                );
+            }
 
             // Get user permission level
             let user_permission = pm.get_permission(&signer_address).await;
@@ -271,6 +377,9 @@ fn classify(method_name: &str) -> Option<MethodPermission> {
         // unclaimed anybody may claim (first-come-first-served); once claimed
         // the handler rejects with ALREADY_EXISTS.
         "ClaimConfig" => MethodPermission::Authenticated,
+        // Same shape: any valid signature reaches the handler, which accepts only
+        // the address the current owner nominated.
+        "AcceptOwner" => MethodPermission::Authenticated,
 
         // Owner-only methods
         "StartApp"
@@ -279,6 +388,8 @@ fn classify(method_name: &str) -> Option<MethodPermission> {
         // which KMS key it will accept. Owner authority is the right level — the owner
         // can already start arbitrary apps — but it must not be reachable unsigned.
         | "UpdateTrustAnchors"
+        // Nominating a successor. Takes effect only when the successor accepts.
+        | "TransferOwner"
         | "AddToWhitelist"
         | "RemoveFromWhitelist"
         | "ListWhitelist"
@@ -355,12 +466,43 @@ fn is_authorized(required: &MethodPermission, actual: &Permission) -> bool {
     }
 }
 
-/// Validate signature and return signer address
+/// tonic's default `max_decoding_message_size` (4 MiB) plus the 5-byte gRPC frame
+/// header. A larger body would be refused by the decoder anyway; capping the
+/// buffer here keeps an unauthenticated caller from making this layer hold more.
+const MAX_SIGNED_BODY_BYTES: usize = 4 * 1024 * 1024 + 5;
+
+/// sha256 of the single protobuf message inside a unary gRPC request body
+/// (`flag:u8 ‖ len:u32be ‖ message`). This is exactly what a client gets from
+/// `prost::Message::encode_to_vec` on the request it is about to send.
+fn unary_message_hash(body: &[u8]) -> Result<[u8; 32], String> {
+    if body.len() < 5 {
+        return Err("request body is not a gRPC message".into());
+    }
+    if body[0] != 0 {
+        return Err(
+            "compressed requests cannot carry a body-bound signature; disable request \
+             compression"
+                .into(),
+        );
+    }
+    let len = u32::from_be_bytes([body[1], body[2], body[3], body[4]]) as usize;
+    if body.len() != 5 + len {
+        return Err("a body-bound signature covers exactly one request message".into());
+    }
+    Ok(sha2::Sha256::digest(&body[5..]).into())
+}
+
+/// Validate signature and return `(signer address, signed timestamp, window)`.
+///
+/// `body_hash` selects the format: `Some` = body-bound
+/// (`method:0x<sha256>:timestamp`, wide window), `None` = legacy
+/// (`method:timestamp`, narrow window).
 fn validate_signature(
-    signature: Option<String>,
+    signature: Option<&str>,
     timestamp_str: Option<String>,
     method_name: &str,
-) -> Result<String, Status> {
+    body_hash: Option<[u8; 32]>,
+) -> Result<(String, i64, i64), Status> {
     // Check signature
     let sig = signature.ok_or_else(|| {
         warn!(
@@ -390,24 +532,34 @@ fn validate_signature(
         Status::invalid_argument("Invalid timestamp format")
     })?;
 
+    let window = if body_hash.is_some() {
+        SIGNED_BODY_MAX_TIMESTAMP_DIFF
+    } else {
+        MAX_TIMESTAMP_DIFF
+    };
+
     // Verify timestamp is within acceptable window
-    if !verify_timestamp(timestamp).unwrap_or(false) {
+    if !verify_timestamp_within(timestamp, window) {
         warn!(
             method = %method_name,
             timestamp = %timestamp,
             event = "AUTH_TIMESTAMP_EXPIRED",
             "Timestamp outside acceptable window"
         );
-        return Err(Status::unauthenticated(
-            "Timestamp outside acceptable window (±2 minutes)",
-        ));
+        return Err(Status::unauthenticated(format!(
+            "Timestamp outside acceptable window (±{} seconds)",
+            window
+        )));
     }
 
     // Build the message that should have been signed
-    let message = build_sign_message(method_name, timestamp);
+    let message = match &body_hash {
+        Some(h) => build_sign_message_v2(method_name, h, timestamp),
+        None => build_sign_message(method_name, timestamp),
+    };
 
     // Recover signer address from signature
-    let signer_address = recover_evm_address(&message, &sig).map_err(|e| {
+    let signer_address = recover_evm_address(&message, sig).map_err(|e| {
         warn!(
             method = %method_name,
             error = %e,
@@ -423,5 +575,237 @@ fn validate_signature(
         "Successfully recovered signer address"
     );
 
-    Ok(signer_address)
+    Ok((signer_address, timestamp, window))
+}
+
+/// The signed-body path end to end, through the real middleware: real signatures,
+/// real gRPC framing, the body buffered and handed on. Unit tests of the pieces
+/// would pass while the seam between them (what the client hashes vs what the
+/// server hashes) was wrong, which is the one thing that matters here.
+#[cfg(test)]
+mod signed_body_tests {
+    use super::*;
+    use k256::ecdsa::SigningKey;
+    use prost::Message;
+    use sha3::Keccak256;
+    use std::sync::Mutex;
+    use tonic::codegen::Bytes;
+
+    const KEY: [u8; 32] = [7u8; 32];
+    const OTHER_KEY: [u8; 32] = [9u8; 32];
+
+    fn address_of(key: &[u8; 32]) -> String {
+        let sk = SigningKey::from_slice(key).unwrap();
+        let point = sk.verifying_key().to_encoded_point(false);
+        let hash = Keccak256::digest(&point.as_bytes()[1..]);
+        format!("0x{}", hex::encode(&hash[12..]))
+    }
+
+    /// EIP-191 personal_sign, r‖s‖v with v = 27/28 — what tapp-cli produces.
+    fn personal_sign(key: &[u8; 32], message: &str) -> String {
+        let prefix = format!("\x19Ethereum Signed Message:\n{}", message.len());
+        let mut h = Keccak256::new();
+        h.update(prefix.as_bytes());
+        h.update(message.as_bytes());
+        let digest: [u8; 32] = h.finalize().into();
+        let sk = SigningKey::from_slice(key).unwrap();
+        let (sig, rid) = sk.sign_prehash_recoverable(&digest).unwrap();
+        let mut bytes = sig.to_bytes().to_vec();
+        bytes.push(rid.to_byte() + 27);
+        format!("0x{}", hex::encode(bytes))
+    }
+
+    fn frame(message: &[u8]) -> Vec<u8> {
+        let mut out = vec![0u8];
+        out.extend_from_slice(&(message.len() as u32).to_be_bytes());
+        out.extend_from_slice(message);
+        out
+    }
+
+    fn start_app(compose: &str) -> crate::proto::StartAppRequest {
+        crate::proto::StartAppRequest {
+            compose_content: compose.into(),
+            app_id: "demo".into(),
+            ..Default::default()
+        }
+    }
+
+    /// What the inner service saw: the body bytes and the authenticated signer.
+    type Seen = Arc<Mutex<Option<(Vec<u8>, Option<String>)>>>;
+
+    fn middleware(require_signed_body: bool) -> (AuthMiddleware<impl Service<
+        http::Request<BoxBody>,
+        Response = http::Response<BoxBody>,
+        Error = std::convert::Infallible,
+        Future = impl Send,
+    > + Clone + Send + 'static>, Seen) {
+        let seen: Seen = Arc::new(Mutex::new(None));
+        let record = seen.clone();
+        let inner = tower::service_fn(move |req: http::Request<BoxBody>| {
+            let record = record.clone();
+            async move {
+                let signer = req.extensions().get::<SignerAddress>().map(|s| s.0.clone());
+                let body = http_body_util::BodyExt::collect(req.into_body())
+                    .await
+                    .map(|c| c.to_bytes().to_vec())
+                    .unwrap_or_default();
+                *record.lock().unwrap() = Some((body, signer));
+                Ok::<_, std::convert::Infallible>(http::Response::new(tonic::body::empty_body()))
+            }
+        });
+        let pm = Arc::new(PermissionManager::new(Some(address_of(&KEY))));
+        let layer = AuthLayer::with_permission_manager(pm, require_signed_body);
+        (layer.layer(inner), seen)
+    }
+
+    fn request(
+        method: &str,
+        body: Vec<u8>,
+        signature: &str,
+        timestamp: i64,
+        version: Option<&str>,
+    ) -> http::Request<BoxBody> {
+        let mut b = http::Request::builder()
+            .uri(format!("http://node/tapp_service.TappService/{method}"))
+            .header("x-signature", signature)
+            .header("x-timestamp", timestamp.to_string());
+        if let Some(v) = version {
+            b = b.header("x-signature-version", v);
+        }
+        b.body(tonic::body::boxed(http_body_util::Full::new(Bytes::from(body))))
+            .unwrap()
+    }
+
+    /// The grpc-status a refusal carries; None = the request reached the service.
+    fn grpc_status(resp: &http::Response<BoxBody>) -> Option<i32> {
+        resp.headers()
+            .get("grpc-status")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse().ok())
+    }
+
+    fn signed_v2(key: &[u8; 32], method: &str, msg: &crate::proto::StartAppRequest, ts: i64) -> String {
+        let hash: [u8; 32] = sha2::Sha256::digest(msg.encode_to_vec()).into();
+        personal_sign(key, &build_sign_message_v2(method, &hash, ts))
+    }
+
+    #[tokio::test]
+    async fn a_body_bound_signature_from_the_owner_passes_and_the_body_arrives_intact() {
+        let (mut svc, seen) = middleware(false);
+        let msg = start_app("services: {}");
+        let ts = chrono::Utc::now().timestamp();
+        let sig = signed_v2(&KEY, "StartApp", &msg, ts);
+        let body = frame(&msg.encode_to_vec());
+
+        let resp = svc
+            .call(request("StartApp", body.clone(), &sig, ts, Some("2")))
+            .await
+            .unwrap();
+        assert_eq!(grpc_status(&resp), None, "the owner's request must reach the service");
+        let (got_body, signer) = seen.lock().unwrap().clone().expect("service was called");
+        assert_eq!(got_body, body, "the buffered body must be handed on byte for byte");
+        assert_eq!(signer.as_deref(), Some(address_of(&KEY).as_str()));
+    }
+
+    #[tokio::test]
+    async fn a_body_swapped_in_flight_is_refused() {
+        let (mut svc, seen) = middleware(false);
+        let signed_for = start_app("services: {web: {image: nginx}}");
+        let ts = chrono::Utc::now().timestamp();
+        let sig = signed_v2(&KEY, "StartApp", &signed_for, ts);
+        // Same signature, different compose: the interceptor's move.
+        let swapped = start_app("services: {web: {image: evil}}");
+
+        let resp = svc
+            .call(request("StartApp", frame(&swapped.encode_to_vec()), &sig, ts, Some("2")))
+            .await
+            .unwrap();
+        // Recovers some unrelated address, which holds no permission.
+        assert_eq!(grpc_status(&resp), Some(tonic::Code::PermissionDenied as i32));
+        assert!(seen.lock().unwrap().is_none(), "the swapped request must not reach the service");
+    }
+
+    #[tokio::test]
+    async fn a_signature_is_good_for_one_execution() {
+        let (mut svc, _) = middleware(false);
+        let msg = start_app("services: {}");
+        let ts = chrono::Utc::now().timestamp();
+        let sig = signed_v2(&KEY, "StartApp", &msg, ts);
+        let body = frame(&msg.encode_to_vec());
+
+        let first = svc.call(request("StartApp", body.clone(), &sig, ts, Some("2"))).await.unwrap();
+        assert_eq!(grpc_status(&first), None);
+        let replay = svc.call(request("StartApp", body, &sig, ts, Some("2"))).await.unwrap();
+        assert_eq!(grpc_status(&replay), Some(tonic::Code::Unauthenticated as i32));
+    }
+
+    #[tokio::test]
+    async fn the_body_bound_window_is_ten_minutes_and_legacy_stays_at_two() {
+        let (mut svc, _) = middleware(false);
+        let msg = start_app("services: {}");
+        let body = frame(&msg.encode_to_vec());
+        let now = chrono::Utc::now().timestamp();
+
+        // Body-bound, 8 minutes old: accepted.
+        let ts = now - 480;
+        let sig = signed_v2(&KEY, "StartApp", &msg, ts);
+        let resp = svc.call(request("StartApp", body.clone(), &sig, ts, Some("2"))).await.unwrap();
+        assert_eq!(grpc_status(&resp), None);
+
+        // Body-bound, 11 minutes old: refused.
+        let ts = now - 660;
+        let sig = signed_v2(&KEY, "StartApp", &msg, ts);
+        let resp = svc.call(request("StartApp", body.clone(), &sig, ts, Some("2"))).await.unwrap();
+        assert_eq!(grpc_status(&resp), Some(tonic::Code::Unauthenticated as i32));
+
+        // Legacy, 3 minutes old: refused — the wide window is only for bound bodies.
+        let ts = now - 180;
+        let sig = personal_sign(&KEY, &build_sign_message("StartApp", ts));
+        let resp = svc.call(request("StartApp", body, &sig, ts, None)).await.unwrap();
+        assert_eq!(grpc_status(&resp), Some(tonic::Code::Unauthenticated as i32));
+    }
+
+    #[tokio::test]
+    async fn legacy_signatures_work_by_default_and_are_refused_when_required() {
+        let msg = start_app("services: {}");
+        let body = frame(&msg.encode_to_vec());
+        let ts = chrono::Utc::now().timestamp();
+
+        let (mut lenient, _) = middleware(false);
+        let sig = personal_sign(&KEY, &build_sign_message("StartApp", ts));
+        let resp = lenient.call(request("StartApp", body.clone(), &sig, ts, None)).await.unwrap();
+        assert_eq!(grpc_status(&resp), None, "old CLIs keep working until the switch is flipped");
+
+        let (mut strict, _) = middleware(true);
+        let sig = personal_sign(&KEY, &build_sign_message("StartApp", ts + 1));
+        let resp = strict.call(request("StartApp", body, &sig, ts + 1, None)).await.unwrap();
+        assert_eq!(grpc_status(&resp), Some(tonic::Code::Unauthenticated as i32));
+    }
+
+    #[tokio::test]
+    async fn a_body_bound_signature_from_someone_else_holds_no_permission() {
+        let (mut svc, _) = middleware(false);
+        let msg = start_app("services: {}");
+        let ts = chrono::Utc::now().timestamp();
+        let sig = signed_v2(&OTHER_KEY, "StartApp", &msg, ts);
+        let resp = svc
+            .call(request("StartApp", frame(&msg.encode_to_vec()), &sig, ts, Some("2")))
+            .await
+            .unwrap();
+        assert_eq!(grpc_status(&resp), Some(tonic::Code::PermissionDenied as i32));
+    }
+
+    #[test]
+    fn framing_is_checked_before_anything_is_hashed() {
+        assert!(unary_message_hash(&[0, 0, 0]).is_err(), "short");
+        assert!(unary_message_hash(&[1, 0, 0, 0, 0]).is_err(), "compressed");
+        let mut two = frame(b"a");
+        two.extend(frame(b"b"));
+        assert!(unary_message_hash(&two).is_err(), "more than one message");
+        // An empty message (AcceptOwnerRequest {}) is a valid, hashable body.
+        assert_eq!(
+            unary_message_hash(&frame(b"")).unwrap(),
+            <[u8; 32]>::from(sha2::Sha256::digest(b""))
+        );
+    }
 }

@@ -42,6 +42,10 @@ pub struct PermissionManager {
     /// design: cleared on VM reboot, exactly matching the RTMR lifetime.
     owner_state_path: Option<std::path::PathBuf>,
 
+    /// Successor nominated by the current owner, not yet accepted. In memory
+    /// only: a process restart drops the nomination, which the owner can repeat.
+    pending_owner: RwLock<Option<String>>,
+
     /// Whitelist of EVM addresses allowed to start apps
     whitelist: Arc<RwLock<HashSet<String>>>,
 
@@ -56,6 +60,7 @@ impl PermissionManager {
                 tapp_owner_address.map(|a| Self::normalize_address(&a)),
             ),
             owner_state_path: None,
+            pending_owner: RwLock::new(None),
             whitelist: Arc::new(RwLock::new(HashSet::new())),
             app_ownership: Arc::new(RwLock::new(HashMap::new())),
         }
@@ -157,6 +162,55 @@ impl PermissionManager {
         let addr = Self::normalize_address(evm_address);
         *self.tapp_owner_address.write().await = Some(addr.clone());
         addr
+    }
+
+    /// Nominate a successor (`Some`) or cancel a nomination (`None`). Returns the
+    /// normalized nominee. Changes nothing about who owns the node.
+    pub async fn nominate_owner(&self, nominee: Option<&str>) -> Option<String> {
+        let nominee = nominee.map(Self::normalize_address);
+        *self.pending_owner.write().await = nominee.clone();
+        nominee
+    }
+
+    /// The nominated successor, if any.
+    pub async fn pending_owner(&self) -> Option<String> {
+        self.pending_owner.read().await.clone()
+    }
+
+    /// Complete a transfer: `evm_address` must be the nominee. Atomically makes
+    /// it the owner, clears the nomination and the whitelist (the old owner's
+    /// delegates are not the new owner's), and returns
+    /// `(previous owner, new owner, cleared whitelist)` so the caller can measure
+    /// the change — or put everything back with [`Self::rollback_accept`].
+    pub async fn accept_owner(
+        &self,
+        evm_address: &str,
+    ) -> Result<(String, String, Vec<String>), String> {
+        let addr = Self::normalize_address(evm_address);
+        let mut pending = self.pending_owner.write().await;
+        match pending.as_deref() {
+            Some(p) if p == addr => {}
+            Some(_) => return Err("this address is not the nominated owner".into()),
+            None => return Err("no ownership transfer is pending".into()),
+        }
+        let mut owner = self.tapp_owner_address.write().await;
+        let previous = owner
+            .clone()
+            .ok_or_else(|| "the tapp is unclaimed; there is nothing to transfer".to_string())?;
+        let mut whitelist = self.whitelist.write().await;
+        let mut cleared: Vec<String> = whitelist.drain().collect();
+        cleared.sort();
+        *owner = Some(addr.clone());
+        *pending = None;
+        Ok((previous, addr, cleared))
+    }
+
+    /// Undo [`Self::accept_owner`] (used when measuring the transfer fails, before
+    /// anything was persisted), restoring the owner, nomination and whitelist.
+    pub async fn rollback_accept(&self, previous: &str, nominee: &str, whitelist: Vec<String>) {
+        *self.tapp_owner_address.write().await = Some(previous.to_string());
+        *self.pending_owner.write().await = Some(nominee.to_string());
+        self.whitelist.write().await.extend(whitelist);
     }
 
     /// Add address to whitelist (tapp owner only)
@@ -360,5 +414,81 @@ mod tests {
         let addr3 =
             PermissionManager::normalize_address("0X1234567890123456789012345678901234567890");
         assert_eq!(addr3, "0x1234567890123456789012345678901234567890");
+    }
+
+    const A: &str = "0x1111111111111111111111111111111111111111";
+    const B: &str = "0x2222222222222222222222222222222222222222";
+    const C: &str = "0x3333333333333333333333333333333333333333";
+
+    #[tokio::test]
+    async fn a_nomination_changes_nothing_until_the_nominee_accepts() {
+        let pm = PermissionManager::new(Some(A.into()));
+        pm.nominate_owner(Some(B)).await;
+        assert!(pm.is_owner(A).await, "nominating must not move ownership");
+        assert_eq!(pm.get_permission(B).await, Permission::Public);
+        assert_eq!(pm.pending_owner().await.as_deref(), Some(B));
+    }
+
+    #[tokio::test]
+    async fn only_the_nominee_can_accept() {
+        let pm = PermissionManager::new(Some(A.into()));
+        assert!(pm.accept_owner(B).await.is_err(), "nothing pending");
+        pm.nominate_owner(Some(B)).await;
+        assert!(pm.accept_owner(C).await.is_err(), "a third party cannot take it");
+        assert!(pm.accept_owner(A).await.is_err(), "nor can the current owner");
+        assert!(pm.is_owner(A).await);
+    }
+
+    #[tokio::test]
+    async fn accepting_moves_ownership_and_clears_the_old_owners_delegates() {
+        let pm = PermissionManager::new(Some(A.into()));
+        pm.add_to_whitelist(C.into()).await.unwrap();
+        // Case and prefix of the nominee as typed must not matter.
+        pm.nominate_owner(Some(&B.to_uppercase().replace("0X", "0x"))).await;
+        let (prev, new, cleared) = pm.accept_owner(B).await.unwrap();
+        assert_eq!((prev.as_str(), new.as_str()), (A, B));
+        assert_eq!(cleared, vec![C.to_string()]);
+        assert!(pm.is_owner(B).await);
+        assert_eq!(pm.get_permission(A).await, Permission::Public, "the old owner keeps nothing");
+        assert_eq!(pm.get_permission(C).await, Permission::Public, "nor do its delegates");
+        assert!(pm.pending_owner().await.is_none());
+        assert!(pm.accept_owner(B).await.is_err(), "a nomination is consumed once");
+    }
+
+    #[tokio::test]
+    async fn a_failed_measurement_rolls_everything_back() {
+        let pm = PermissionManager::new(Some(A.into()));
+        pm.add_to_whitelist(C.into()).await.unwrap();
+        pm.nominate_owner(Some(B)).await;
+        let (prev, new, cleared) = pm.accept_owner(B).await.unwrap();
+        pm.rollback_accept(&prev, &new, cleared).await;
+        assert!(pm.is_owner(A).await);
+        assert_eq!(pm.pending_owner().await.as_deref(), Some(B), "the nominee can retry");
+        assert_eq!(pm.get_permission(C).await, Permission::Whitelist);
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_nomination_cannot_be_accepted() {
+        let pm = PermissionManager::new(Some(A.into()));
+        pm.nominate_owner(Some(B)).await;
+        pm.nominate_owner(None).await;
+        assert!(pm.accept_owner(B).await.is_err());
+        assert!(pm.is_owner(A).await);
+    }
+
+    #[tokio::test]
+    async fn a_transferred_owner_survives_a_process_restart_within_the_boot() {
+        let dir = std::env::temp_dir().join(format!("tapp-owner-xfer-{}", std::process::id()));
+        let path = dir.join("owner");
+        let pm = PermissionManager::new(None).with_owner_state_path(path.clone());
+        pm.claim_owner(A).await.unwrap();
+        pm.persist_owner().await.unwrap();
+        pm.nominate_owner(Some(B)).await;
+        pm.accept_owner(B).await.unwrap();
+        pm.persist_owner().await.unwrap();
+
+        let restarted = PermissionManager::new(None).with_owner_state_path(path);
+        assert_eq!(restarted.load_persisted_owner().as_deref(), Some(B));
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

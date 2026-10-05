@@ -143,6 +143,19 @@ service TappService {
   // the evidence can see. Mutable-and-unmeasured would be strictly worse than fixed.
   rpc UpdateTrustAnchors(UpdateTrustAnchorsRequest)
       returns (UpdateTrustAnchorsResponse);
+
+  // Hand the node to a new owner without a reboot, in two steps so a mistyped
+  // address cannot strand it: the current owner nominates (TransferOwner), and
+  // nothing changes until the nominee proves it holds that key (AcceptOwner).
+  // Nominating again replaces the nominee; an empty new_owner cancels.
+  //
+  // Refused on a node whose owner is baked into config.toml: that owner returns on
+  // the next process start, so a transfer there would be neither durable nor true.
+  //
+  // The completed transfer is extended into the runtime measurement (from, to, and
+  // the whitelist it cleared), so a change of hands is visible in the evidence.
+  rpc TransferOwner(TransferOwnerRequest) returns (TransferOwnerResponse);
+  rpc AcceptOwner(AcceptOwnerRequest) returns (AcceptOwnerResponse);
 }
 
 enum LogLevel {
@@ -478,6 +491,9 @@ message TappConfigInfo {
   // means KMS node identities cannot be checked — not that they are checked and pass.
   string scan_url = 7;
   string scan_public_key = 8;
+
+  // Address nominated by TransferOwner and not yet accepted; empty when none.
+  string pending_owner = 9;
 }
 
 message GetTappInfoResponse {
@@ -825,4 +841,25 @@ message UpdateTrustAnchorsResponse {
   string scan_url = 4;
   string scan_public_key = 5;
   int64 timestamp = 6;
+}
+
+message TransferOwnerRequest {
+  string new_owner = 1;  // EVM address to nominate; empty cancels a nomination
+}
+
+message TransferOwnerResponse {
+  bool success = 1;
+  string message = 2;
+  string owner = 3;          // Unchanged until the nominee accepts
+  string pending_owner = 4;  // Normalized nominee; empty after a cancel
+}
+
+message AcceptOwnerRequest {}
+
+message AcceptOwnerResponse {
+  bool success = 1;
+  string message = 2;
+  string previous_owner = 3;
+  string owner = 4;
+  int64 timestamp = 5;
 }

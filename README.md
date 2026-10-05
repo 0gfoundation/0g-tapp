@@ -369,6 +369,11 @@ enabled = true
 #
 # Whitelist: use `tapp-cli add-to-whitelist` after claiming (each change is a
 # measured runtime event). The old initial_whitelist config was removed.
+#
+# Refuse legacy signatures that do not cover the request body (see "Request
+# signing"). Off by default so pre-0.9.0 CLIs keep working; turn it on once
+# every operator of this node has upgraded.
+# require_signed_body = true
 
 [boot]
 socket_path = "/var/run/docker.sock"
@@ -421,7 +426,7 @@ The values to put in `--kbs-urls` — the deployed KMS cluster endpoints for
 mainnet and testnet, and the group public key that verifies you reached the
 right one (**both networks use the app_id `0g-kms`, but they are two different
 clusters with two different masters**) — are listed in
-[`docs/KMS.md`](KMS.md), which also explains why `--scan-url`/`--scan-pubkey`
+[`docs/KMS.md`](docs/KMS.md), which also explains why `--scan-url`/`--scan-pubkey`
 must accompany a `kms` setup.
 
 ### Trust anchors
@@ -492,6 +497,66 @@ cannot invent one.
 
 Legacy mode: setting `owner_address` in `config.toml` still works (the owner is
 claimed automatically at startup and also measured).
+
+### Transferring ownership (tapp-server >= 0.9.0)
+
+A node can change hands without a reboot. Two steps, so a mistyped address cannot
+strand it — nothing changes until the nominee proves it holds the key:
+
+```bash
+# current owner nominates (again = replace the nominee; --cancel withdraws)
+tapp-cli -s https://<tapp>:50052 --tls-pin <pin> -k 0x<owner-key> transfer-owner --new-owner 0x<new>
+
+# the nominee accepts, signing with ITS key
+tapp-cli -s https://<tapp>:50052 --tls-pin <pin> -k 0x<new-key> accept-owner
+```
+
+`get-tapp-info` shows a pending nominee. Acceptance is extended into the runtime
+measurement as a `transfer_owner` event (previous owner, new owner, and the
+whitelist it cleared), so a change of hands is visible in the evidence; the
+nomination itself is not measured, because it changes nothing until accepted. On
+acceptance the whitelist is **cleared** — the previous owner's delegates are not
+the new owner's — and the new owner is persisted for the rest of the boot. A node
+whose owner is baked into `config.toml` refuses: that owner returns on the next
+process start, so the transfer would be neither durable nor true.
+
+This is the **node** owner (who may run `start-app`, `stop-app`, … on this
+machine). The **registry** owner of an app is separate, and transfers the same
+way on chain (TappRegistry >= 0.2.0):
+
+```bash
+tapp-cli -k 0x<owner-key> transfer-app-ownership -a <app_id> -r <rpc> -c <registry> --new-owner 0x<new>
+tapp-cli -k 0x<new-key>   accept-app-ownership   -a <app_id> -r <rpc> -c <registry>
+```
+
+Live nodes' stake travels with the app (`removeNode` refunds whoever owns the app at
+that moment); stake already locked by earlier `removeNode` calls stays with the
+address it was locked to. Acknowledgements are not invalidated — no code changed,
+and every change the new owner can make bumps the ack version anyway. Handing over
+an app completely means both transfers.
+
+### Request signing
+
+Every signed RPC carries `x-signature` (EIP-191 `personal_sign`, 65-byte r‖s‖v),
+`x-timestamp`, and since 0.9.0 `x-signature-version: 2`. Version 2 signs
+
+```
+<Method>:0x<sha256 of the encoded protobuf request>:<unix timestamp>
+```
+
+— the hash is over the exact message bytes in the gRPC frame, which the server
+hashes as received, so a request altered in flight no longer recovers to the
+owner. Each signature is accepted **once** (replays are refused) within **±10
+minutes** of its timestamp.
+
+Without the version header the legacy message `<Method>:<timestamp>` is accepted,
+with a ±2 minute window and the same single-use rule. It authorises the method
+with *any* body, so it stays narrow and every acceptance is logged as
+`AUTH_LEGACY_SIGNATURE`; `require_signed_body = true` refuses it outright.
+tapp-cli >= 0.9.0 signs version 2 by default; `--legacy-sign` is for older
+servers (which report a version-2 signature as "Insufficient permission") and is
+never chosen automatically, since falling back on failure would hand anyone able
+to make a request fail the weaker signature.
 
 ## On-chain Registration
 

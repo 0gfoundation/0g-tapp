@@ -23,15 +23,6 @@ pragma solidity ^0.8.24;
 ///         lockPeriod seconds in the owner's locked balance. The owner may call
 ///         withdraw() at any time to collect all matured entries.
 ///
-///         Ownership
-///         ---------
-///         An app's owner can hand it over in two steps: transferAppOwnership
-///         nominates, acceptAppOwnership (from the nominee) completes. Live nodes'
-///         stake travels with the app — removeNode refunds whoever owns the app at
-///         that moment — while stake already locked by earlier removeNode calls
-///         stays with the address it was locked to. The ack version is NOT bumped:
-///         no code changes, and every change the new owner can make bumps it.
-///
 ///         Acknowledge
 ///         -----------
 ///         Each app has an ackVersion counter. Users acknowledge a specific version;
@@ -45,7 +36,7 @@ pragma solidity ^0.8.24;
 ///           3. Submit evidence to an RA service; confirm the returned signerAddress
 ///              and codeHash match on-chain values.
 ///           4. Call acknowledgeApp(appId) to record acknowledgement on-chain.
-contract TappRegistry {
+contract TappRegistryV010 {
 
     // ─── Structs ──────────────────────────────────────────────────────────────
 
@@ -112,11 +103,8 @@ contract TappRegistry {
     // slot 11 — appId => contract => is authorized to call invalidateAcks
     mapping(string => mapping(address => bool)) private _authorizedInvalidators;
 
-    // slot 12 — appId => nominee of a pending ownership transfer (0 = none)
-    mapping(string => address) private _pendingAppOwner;
-
-    // slots 13–59: reserved for future upgrades
-    uint256[47] private __gap;
+    // slots 12–59: reserved for future upgrades
+    uint256[48] private __gap;
 
     // ─── Events ───────────────────────────────────────────────────────────────
 
@@ -140,9 +128,6 @@ contract TappRegistry {
     event MinStakeUpdated(uint256 oldAmount, uint256 newAmount);
     event LockPeriodUpdated(uint256 oldPeriod, uint256 newPeriod);
     event AdminTransferred(address indexed previousAdmin, address indexed newAdmin);
-    /// @dev pendingOwner == 0 means a nomination was cancelled.
-    event AppOwnershipTransferStarted(string indexed appId, address indexed owner, address indexed pendingOwner);
-    event AppOwnershipTransferred(string indexed appId, address indexed previousOwner, address indexed newOwner);
 
     // ─── Modifiers ────────────────────────────────────────────────────────────
 
@@ -193,7 +178,7 @@ contract TappRegistry {
     ///      MINOR on an ABI change, PATCH on a logic-only (storage-layout-safe)
     ///      change.
     function version() external pure returns (string memory) {
-        return "0.2.0";
+        return "0.1.0";
     }
 
     // ─── Admin ────────────────────────────────────────────────────────────────
@@ -366,9 +351,6 @@ contract TappRegistry {
         uint256 newAckVersion = 0;
         if (list.length == 0) {
             delete _apps[appId];
-            // A nomination must not outlive the app: once the id is free, someone
-            // else may register it, and a stale nominee could then accept THEIR app.
-            delete _pendingAppOwner[appId];
             newAckVersion = ++_appAckVersions[appId];
         }
 
@@ -377,38 +359,6 @@ contract TappRegistry {
         if (newAckVersion != 0) {
             emit AppUnregistered(appId, owner);
         }
-    }
-
-    // ─── Ownership ────────────────────────────────────────────────────────────
-
-    /// @notice Nominate a new owner for an app (owner only). Nothing changes until
-    ///         the nominee calls acceptAppOwnership, so a mistyped address cannot
-    ///         strand the app. Nominating again replaces the nominee; address(0)
-    ///         cancels.
-    function transferAppOwnership(string calldata appId, address newOwner)
-        external
-        onlyAppOwner(appId)
-    {
-        require(newOwner != msg.sender, "already owner");
-        _pendingAppOwner[appId] = newOwner;
-        emit AppOwnershipTransferStarted(appId, msg.sender, newOwner);
-    }
-
-    /// @notice Complete a transfer nominated by transferAppOwnership. Only the
-    ///         nominee may call.
-    function acceptAppOwnership(string calldata appId) external {
-        address nominee = _pendingAppOwner[appId];
-        require(nominee != address(0) && nominee == msg.sender, "not pending owner");
-        AppInfo storage app = _apps[appId];
-        address previous = app.owner;
-        app.owner = msg.sender;
-        delete _pendingAppOwner[appId];
-        emit AppOwnershipTransferred(appId, previous, msg.sender);
-    }
-
-    /// @notice The nominee of a pending transfer, or address(0).
-    function pendingAppOwner(string calldata appId) external view returns (address) {
-        return _pendingAppOwner[appId];
     }
 
     /// @notice Withdraw all matured locked stake entries for the caller.

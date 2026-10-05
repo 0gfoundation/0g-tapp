@@ -6,7 +6,21 @@ use sha3::{Digest, Keccak256};
 const SIGNATURE_LENGTH: usize = 65;
 
 /// Maximum timestamp difference allowed (120 seconds)
+///
+/// This is the LEGACY window, for signatures that do not bind the request body
+/// ("method:timestamp"). It stays tight because such a signature is good for the
+/// method with ANY body — widening it widens what an interceptor can do with it.
 pub const MAX_TIMESTAMP_DIFF: i64 = 120;
+
+/// Window for body-bound signatures ("method:0x<sha256(body)>:timestamp").
+///
+/// Wider than the legacy window on purpose: a body-bound signature authorises one
+/// specific request content and (with the replay guard) at most one execution, so
+/// the only thing a longer validity buys an attacker is choosing WHEN that exact
+/// request lands. What it buys operators is tolerance for clock drift and slow
+/// manual flows, which is what used to produce spurious "timestamp outside
+/// acceptable window" failures.
+pub const SIGNED_BODY_MAX_TIMESTAMP_DIFF: i64 = 600;
 
 /// Recover EVM address from signature
 ///
@@ -73,21 +87,64 @@ pub fn verify_evm_signature(
     Ok(recovered_address.to_lowercase() == normalized_expected.to_lowercase())
 }
 
-/// Verify timestamp is within acceptable range
+/// Verify timestamp is within acceptable range (legacy window)
 pub fn verify_timestamp(timestamp: i64) -> Result<bool> {
-    let now = chrono::Utc::now().timestamp();
-    let diff = (now - timestamp).abs();
-
-    if diff > MAX_TIMESTAMP_DIFF {
-        return Ok(false);
-    }
-
-    Ok(true)
+    Ok(verify_timestamp_within(timestamp, MAX_TIMESTAMP_DIFF))
 }
 
-/// Build the message format for signing: "method_name:timestamp"
+/// Verify timestamp is within `window` seconds of now, either direction.
+pub fn verify_timestamp_within(timestamp: i64, window: i64) -> bool {
+    let now = chrono::Utc::now().timestamp();
+    (now - timestamp).abs() <= window
+}
+
+/// Build the LEGACY message format for signing: "method_name:timestamp".
+/// Binds the method and the moment, NOT the request content.
 pub fn build_sign_message(method_name: &str, timestamp: i64) -> String {
     format!("{}:{}", method_name, timestamp)
+}
+
+/// Build the body-bound message format: "method_name:0x<sha256>:timestamp".
+///
+/// `body_hash` is sha256 over the encoded protobuf request message — the exact
+/// bytes inside the gRPC data frame, which are the exact bytes the client's
+/// `prost::Message::encode_to_vec` produced. The server hashes what it actually
+/// received, so a request whose body was altered in flight recovers to a
+/// different (unauthorised) address and dies in the permission check.
+pub fn build_sign_message_v2(method_name: &str, body_hash: &[u8; 32], timestamp: i64) -> String {
+    format!("{}:0x{}:{}", method_name, hex::encode(body_hash), timestamp)
+}
+
+// ============================================================================
+// Replay guard
+// ============================================================================
+
+/// Remembers signatures for as long as their timestamp could still validate, so
+/// each one authorises at most ONE execution. Without this, any observed
+/// signature could be resubmitted for the width of the window — harmless for an
+/// idempotent read, not for StartApp.
+///
+/// Memory is bounded by (ops per window) — these are operator actions, not
+/// traffic, so the map stays tiny. A legitimate retry is unaffected: the CLI
+/// signs afresh on every call.
+#[derive(Default)]
+pub struct ReplayGuard {
+    /// keccak256(signature bytes) → the signed timestamp.
+    seen: std::sync::Mutex<std::collections::HashMap<[u8; 32], i64>>,
+}
+
+impl ReplayGuard {
+    /// Admit a signature exactly once. `signed_ts` is the timestamp inside the
+    /// signed message; `window` the widest window this signature validates under.
+    /// Returns false when the signature was already used.
+    pub fn admit(&self, signature_hex: &str, signed_ts: i64, window: i64) -> bool {
+        let digest: [u8; 32] = Keccak256::digest(signature_hex.trim().as_bytes()).into();
+        let now = chrono::Utc::now().timestamp();
+        let mut seen = self.seen.lock().unwrap_or_else(|p| p.into_inner());
+        // Prune whatever can no longer validate anyway (small slack for clock skew).
+        seen.retain(|_, ts| (now - *ts).abs() <= window + 60);
+        seen.insert(digest, signed_ts).is_none()
+    }
 }
 
 // ============================================================================
