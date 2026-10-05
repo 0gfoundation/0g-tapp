@@ -23,9 +23,6 @@ pub const OPERATION_NAME_CLAIM_CONFIG: &str = "claim_config";
 /// carries the resulting state in full so the newest event alone is the current answer.
 pub const OPERATION_NAME_UPDATE_TRUST_ANCHORS: &str = "update_trust_anchors";
 pub const OPERATION_NAME_GET_SECRET_RESOURCE: &str = "get_secret_resource";
-/// A completed owner transfer (the nominee accepted). Nominations are not
-/// measured — they change nothing until accepted, and a cancelled one never did.
-pub const OPERATION_NAME_TRANSFER_OWNER: &str = "transfer_owner";
 
 pub struct MeasurementService {
     aa: Arc<Mutex<AttestationAgent>>,

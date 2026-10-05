@@ -493,42 +493,45 @@ cannot invent one.
 Legacy mode: setting `owner_address` in `config.toml` still works (the owner is
 claimed automatically at startup and also measured).
 
-### Transferring ownership (tapp-server >= 0.9.0)
+### Handing an app over to a new owner
 
-A node can change hands without a reboot. Two steps, so a mistyped address cannot
-strand it — nothing changes until the nominee proves it holds the key:
+Only the app's **registry** owner is transferable (TappRegistry >= 0.2.0). Machines
+are not transferred — the new owner replaces them with its own.
 
-```bash
-# current owner nominates (again = replace the nominee; --cancel withdraws)
-tapp-cli -s https://<tapp>:50052 --tls-pin <pin> -k 0x<owner-key> transfer-owner --new-owner 0x<new>
+1. **Transfer on chain**, in two steps so a mistyped address cannot strand the app
+   (with no admin override, an app owned by an address nobody controls could never
+   be updated, its nodes never removed, its stake never refunded):
 
-# the nominee accepts, signing with ITS key
-tapp-cli -s https://<tapp>:50052 --tls-pin <pin> -k 0x<new-key> accept-owner
-```
+   ```bash
+   tapp-cli -k 0x<owner-key> transfer-app-ownership -a <app_id> -r <rpc> -c <registry> --new-owner 0x<new>
+   tapp-cli -k 0x<new-key>   accept-app-ownership   -a <app_id> -r <rpc> -c <registry>
+   ```
 
-`get-tapp-info` shows a pending nominee. Acceptance is extended into the runtime
-measurement as a `transfer_owner` event (previous owner, new owner, and the
-whitelist it cleared), so a change of hands is visible in the evidence; the
-nomination itself is not measured, because it changes nothing until accepted. On
-acceptance the whitelist is **cleared** — the previous owner's delegates are not
-the new owner's — and the new owner is persisted for the rest of the boot. A node
-whose owner is baked into `config.toml` refuses: that owner returns on the next
-process start, so the transfer would be neither durable nor true.
+   Nothing changes until the nominee accepts; nominating again replaces the nominee,
+   `--cancel` withdraws. Live nodes' stake travels with the app (`removeNode` refunds
+   whoever owns the app at that moment); stake already locked by earlier `removeNode`
+   calls stays with the address it was locked to. Acknowledgements are not
+   invalidated — no code changed, and every change the new owner can make bumps the
+   ack version.
 
-This is the **node** owner (who may run `start-app`, `stop-app`, … on this
-machine). The **registry** owner of an app is separate, and transfers the same
-way on chain (TappRegistry >= 0.2.0):
+2. **Replace every node** with a machine the new owner has claimed — on each one:
 
-```bash
-tapp-cli -k 0x<owner-key> transfer-app-ownership -a <app_id> -r <rpc> -c <registry> --new-owner 0x<new>
-tapp-cli -k 0x<new-key>   accept-app-ownership   -a <app_id> -r <rpc> -c <registry>
-```
+   ```bash
+   tapp-cli -s <new-node> -k 0x<new-key> start-app -f docker-compose.yml -a <app_id> \
+     --register-onchain --rpc-url <rpc> --contract <registry> --stake-wei <wei> \
+     [--old-signer 0x<node being replaced>]   # needed only when the app has several nodes
+   ```
 
-Live nodes' stake travels with the app (`removeNode` refunds whoever owns the app at
-that moment); stake already locked by earlier `removeNode` calls stays with the
-address it was locked to. Acknowledgements are not invalidated — no code changed,
-and every change the new owner can make bumps the ack version anyway. Handing over
-an app completely means both transfers.
+   The new signer replaces the old one in place (`updateNode`): one transaction, the
+   stake carried over, no moment where the app has no node. It also orders things so
+   an `encrypted` app works: the new signer is on chain before the node asks the KMS
+   for its volume key.
+
+**Until a node is replaced, its machine's owner can still obtain the app's KMS keys**
+— the KMS authorizes by the on-chain node list — so replace promptly. The keys
+themselves do not change: they derive from the app id, so the new nodes get the same
+ones and an encrypted volume can be copied across. By the same token, anything
+encrypted before the hand-over was readable by the previous owner.
 
 ### Request signing
 

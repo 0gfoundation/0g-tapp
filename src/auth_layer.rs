@@ -357,9 +357,6 @@ fn classify(method_name: &str) -> Option<MethodPermission> {
         // unclaimed anybody may claim (first-come-first-served); once claimed
         // the handler rejects with ALREADY_EXISTS.
         "ClaimConfig" => MethodPermission::Authenticated,
-        // Same shape: any valid signature reaches the handler, which accepts only
-        // the address the current owner nominated.
-        "AcceptOwner" => MethodPermission::Authenticated,
 
         // Owner-only methods
         "StartApp"
@@ -368,8 +365,6 @@ fn classify(method_name: &str) -> Option<MethodPermission> {
         // which KMS key it will accept. Owner authority is the right level — the owner
         // can already start arbitrary apps — but it must not be reachable unsigned.
         | "UpdateTrustAnchors"
-        // Nominating a successor. Takes effect only when the successor accepts.
-        | "TransferOwner"
         | "AddToWhitelist"
         | "RemoveFromWhitelist"
         | "ListWhitelist"

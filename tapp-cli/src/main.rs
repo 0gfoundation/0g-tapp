@@ -9,7 +9,7 @@ use tapp_common::proto::{
     GetServiceLogsRequest, GetServiceStatusRequest, GetTappInfoRequest, GetTaskStatusRequest,
     ListAppsRequest, ListWhitelistRequest, MountFile, PruneImagesRequest, RemoveFromWhitelistRequest,
     StartAppRequest, StartServiceRequest, StopAppRequest, StopServiceRequest,
-    UpdateTrustAnchorsRequest, WithdrawBalanceRequest, TransferOwnerRequest, AcceptOwnerRequest,
+    UpdateTrustAnchorsRequest, WithdrawBalanceRequest,
 };
 use tonic::{metadata::MetadataValue, Request};
 
@@ -480,23 +480,6 @@ enum Commands {
         scan_pubkey: Option<String>,
     },
 
-    /// Nominate a new owner for this node (owner only). Nothing changes until the
-    /// nominee runs accept-owner with its own key, so a mistyped address cannot
-    /// strand the node. Nominating again replaces the nominee; --cancel withdraws.
-    TransferOwner {
-        /// EVM address of the new owner
-        #[arg(long, required_unless_present = "cancel")]
-        new_owner: Option<String>,
-
-        /// Withdraw a pending nomination
-        #[arg(long, conflicts_with = "new_owner")]
-        cancel: bool,
-    },
-
-    /// Accept a nomination made with transfer-owner. Sign with the NOMINATED key
-    /// (-k / TAPP_PRIVATE_KEY). Measured; clears the previous owner's whitelist.
-    AcceptOwner,
-
     AddToWhitelist {
         /// EVM address to add
         #[arg(short, long)]
@@ -782,8 +765,10 @@ enum Commands {
     /// Nominate a new on-chain owner for an app (app owner only; registry >= 0.2.0).
     /// Nothing changes until the nominee runs accept-app-ownership. Live nodes'
     /// stake travels with the app; stake already locked by earlier removeNode
-    /// calls stays with you. This is the REGISTRY owner — the node's own owner
-    /// (who may run start-app etc. on it) is separate: see transfer-owner.
+    /// calls stays with you. Machines are not transferred: the new owner then
+    /// replaces each node with one of its own (start-app --register-onchain on
+    /// its machine updates the node in place), which is what cuts the previous
+    /// owner off from the app's KMS keys.
     TransferAppOwnership {
         /// Application ID
         #[arg(short, long)]
@@ -824,6 +809,27 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let result = run().await;
+    // A pre-0.9.0 server verifies the legacy message, recovers an unrelated
+    // address from a body-bound signature, and reports that as a permission
+    // problem — which says nothing about the actual cause.
+    if let Err(e) = &result {
+        if let Some(status) = e.downcast_ref::<tonic::Status>() {
+            if status.code() == tonic::Code::PermissionDenied
+                && status.message() == "Insufficient permission for this operation"
+                && !*LEGACY_SIGN.get().unwrap_or(&false)
+            {
+                eprintln!(
+                    "hint: if this tapp-server is older than 0.9.0 it cannot read body-bound \
+                     signatures — retry with --legacy-sign (or upgrade the server)."
+                );
+            }
+        }
+    }
+    result
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut cli = Cli::parse();
     let _ = INSECURE.set(cli.insecure);
     let _ = LEGACY_SIGN.set(cli.legacy_sign);
@@ -974,15 +980,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 scan_pubkey.unwrap_or_default(),
             )
             .await?;
-        }
-        Commands::TransferOwner { new_owner, cancel } => {
-            let private_key = require_private_key(&cli.private_key)?;
-            let new_owner = if cancel { String::new() } else { new_owner.unwrap_or_default() };
-            transfer_owner(&cli.server, private_key, new_owner).await?;
-        }
-        Commands::AcceptOwner => {
-            let private_key = require_private_key(&cli.private_key)?;
-            accept_owner(&cli.server, private_key).await?;
         }
         Commands::AddToWhitelist { address } => {
             let private_key = require_private_key(&cli.private_key)?;
@@ -2447,78 +2444,6 @@ fn split_urls(arg: Option<String>) -> Vec<String> {
         .collect()
 }
 
-/// Print a refusal the way an operator needs it, naming the likely cause when the
-/// server simply predates what this CLI sent.
-fn exit_with_status(status: tonic::Status, rpc: &str) -> ! {
-    match status.code() {
-        tonic::Code::Unimplemented => eprintln!(
-            "✗ this server has no {rpc} — it predates the RPC (tapp-server < 0.9.0)."
-        ),
-        // A pre-0.9.0 server verifies the legacy message, recovers some unrelated
-        // address from a body-bound signature, and reports that as a permission problem.
-        tonic::Code::PermissionDenied
-            if status.message() == "Insufficient permission for this operation"
-                && !*LEGACY_SIGN.get().unwrap_or(&false) =>
-        {
-            eprintln!(
-                "✗ {}\n  If this server is older than 0.9.0 it cannot read body-bound \
-                 signatures: retry with --legacy-sign (or upgrade the server).",
-                status.message()
-            )
-        }
-        _ => eprintln!("✗ {}", status.message()),
-    }
-    std::process::exit(1);
-}
-
-async fn transfer_owner(
-    server: &str,
-    private_key: String,
-    new_owner: String,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let mut client = create_client(server).await?;
-    let mut request = Request::new(TransferOwnerRequest { new_owner });
-    add_signature_metadata(&mut request, &private_key, "TransferOwner")?;
-    let result = match client.transfer_owner(request).await {
-        Ok(r) => r.into_inner(),
-        Err(status) => exit_with_status(status, "TransferOwner"),
-    };
-    if !result.success {
-        eprintln!("✗ {}", result.message);
-        std::process::exit(1);
-    }
-    if result.pending_owner.is_empty() {
-        println!("✓ Nomination cancelled — {} remains the owner", result.owner);
-    } else {
-        println!("✓ Nominated {}", result.pending_owner);
-        println!("  Owner (unchanged until accepted): {}", result.owner);
-        println!(
-            "  Next: the nominee runs `tapp-cli -s {} -k <its key> accept-owner`",
-            server
-        );
-    }
-    Ok(())
-}
-
-async fn accept_owner(server: &str, private_key: String) -> Result<(), Box<dyn std::error::Error>> {
-    let mut client = create_client(server).await?;
-    let mut request = Request::new(AcceptOwnerRequest {});
-    add_signature_metadata(&mut request, &private_key, "AcceptOwner")?;
-    let result = match client.accept_owner(request).await {
-        Ok(r) => r.into_inner(),
-        Err(status) => exit_with_status(status, "AcceptOwner"),
-    };
-    if !result.success {
-        eprintln!("✗ {}", result.message);
-        std::process::exit(1);
-    }
-    println!("✓ Ownership transferred (measured — this change is in the event log)");
-    println!("  Previous owner: {}", result.previous_owner);
-    println!("  Owner:          {}", result.owner);
-    println!("  The previous owner's whitelist was cleared; re-add delegates if needed.");
-    Ok(())
-}
-
 async fn update_trust_anchors(
     server: &str,
     private_key: String,
@@ -2881,12 +2806,6 @@ async fn get_tapp_info(server: &str) -> Result<(), Box<dyn std::error::Error>> {
             if !server_config.owner_address.is_empty() {
                 println!("  Owner Address: {}", server_config.owner_address);
             }
-        }
-        if !config.pending_owner.is_empty() {
-            println!(
-                "  Pending Owner: {} (nominated; becomes owner when it runs accept-owner)",
-                config.pending_owner
-            );
         }
 
         if let Some(boot_config) = config.boot {
