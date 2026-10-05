@@ -189,18 +189,18 @@ func main() {
 		fmt.Println("  (MetaMask: Settings → Advanced → Show hex data; priority fee ≥ 2 gwei.)")
 		fmt.Printf("\nThen: go run ./cmd/upgrade/ --network %s --proxy %s --check %s --verify\n", n.Name, t.proxy.Hex(), impl.Hex())
 	default:
-		t.timelock(owner, impl, upgradeData, *proposer)
+		t.timelock(owner, current, impl, upgradeData, *proposer)
 	}
 }
 
 // timelock prints the two transactions an OpenZeppelin TimelockController needs.
-func (t *ctxT) timelock(tl, impl common.Address, upgradeData []byte, proposer string) {
+func (t *ctxT) timelock(tl, current, impl common.Address, upgradeData []byte, proposer string) {
 	out, err := reg.Call(t.ctx, t.c, t.tl, tl, common.Address{}, "getMinDelay")
 	if err != nil {
 		reg.Fatalf("the beacon owner %s is a contract but not a TimelockController (getMinDelay: %v) — route the upgradeTo call through it by hand", tl.Hex(), err)
 	}
 	delay := out[0].(*big.Int)
-	salt := saltFor(impl)
+	salt := saltFor(current, impl)
 	var zero [32]byte
 	schedule, _ := t.tl.Pack("schedule", t.beaconAt, big.NewInt(0), upgradeData, zero, salt, delay)
 	execute, _ := t.tl.Pack("execute", t.beaconAt, big.NewInt(0), upgradeData, zero, salt)
@@ -224,7 +224,7 @@ func (t *ctxT) timelock(tl, impl common.Address, upgradeData []byte, proposer st
 	printTx(tl, schedule, t.n.ChainID)
 	fmt.Printf("  Step 2 — execute, from an EXECUTOR, no earlier than %s after step 1 lands:\n", time.Duration(delay.Int64())*time.Second)
 	printTx(tl, execute, t.n.ChainID)
-	fmt.Printf("  Operation id %s — --check reports where it stands.\n", t.opID(tl, impl, upgradeData).Hex())
+	fmt.Printf("  Operation id %s — --check reports where it stands.\n", t.opID(tl, current, impl, upgradeData).Hex())
 	fmt.Printf("\nThen: go run ./cmd/upgrade/ --network %s --proxy %s --check %s --verify\n", t.n.Name, t.proxy.Hex(), impl.Hex())
 }
 
@@ -235,7 +235,9 @@ func (t *ctxT) check(impl, owner common.Address) {
 		fmt.Printf("\n✗ the beacon still points at %s — the upgrade has not landed\n", now.Hex())
 		if isC, _ := reg.IsContract(t.ctx, t.c, owner); isC {
 			upgradeData, _ := t.beacon.ABI.Pack("upgradeTo", impl)
-			id := t.opID(owner, impl, upgradeData)
+			// Not switched yet, so the beacon still holds the implementation the
+			// operation was scheduled from — the other half of the salt.
+			id := t.opID(owner, now, impl, upgradeData)
 			if out, err := reg.Call(t.ctx, t.c, t.tl, owner, common.Address{}, "getTimestamp", id); err == nil {
 				switch ts := out[0].(*big.Int); {
 				case ts.Sign() == 0:
@@ -256,14 +258,36 @@ func (t *ctxT) check(impl, owner common.Address) {
 	}
 	fmt.Printf("\n✓ beacon → %s, version %s\n", impl.Hex(), t.version(t.proxy))
 
-	raw, err := os.ReadFile(t.state)
-	if err != nil {
-		fmt.Printf("(no snapshot at %s — state not compared)\n", t.state)
-		t.verifyImpl(impl)
-		return
+	// What the upgrade itself changed is the difference between the block before
+	// the switch and the block of the switch. Comparing against a snapshot taken
+	// when the upgrade was PREPARED would also count everything that happened in
+	// between — a day of ordinary activity behind a timelock. The file is the
+	// fallback for an RPC that prunes history (the 0G testnet RPC does).
+	var before, after []string
+	var basis string
+	if n, ok := t.upgradeBlock(impl); ok {
+		b, errB := t.snapshotAt(new(big.Int).Sub(n, big.NewInt(1)))
+		a, errA := t.snapshotAt(n)
+		if errB == nil && errA == nil {
+			before, after = b, a
+			basis = fmt.Sprintf("blocks %s and %s, around the switch", new(big.Int).Sub(n, big.NewInt(1)), n)
+		} else {
+			fmt.Printf("(the RPC cannot serve the state at block %s — comparing against %s instead)\n", n, t.state)
+		}
 	}
-	before := strings.Split(strings.TrimSpace(string(raw)), "\n")
-	after := t.snapshot()
+	if before == nil {
+		raw, err := os.ReadFile(t.state)
+		if err != nil {
+			fmt.Printf("(no snapshot at %s — state not compared)\n", t.state)
+			t.verifyImpl(impl)
+			return
+		}
+		before = strings.Split(strings.TrimSpace(string(raw)), "\n")
+		if after, err = t.snapshotAt(nil); err != nil {
+			reg.Fatalf("snapshot: %v", err)
+		}
+		basis = t.state + " and now"
+	}
 	var diff []string
 	for i := range before {
 		if i >= len(after) || before[i] != after[i] {
@@ -274,10 +298,10 @@ func (t *ctxT) check(impl, owner common.Address) {
 		}
 	}
 	if len(diff) > 0 {
-		fmt.Printf("✗ state differs from %s:\n%s\n", t.state, strings.Join(diff, "\n"))
+		fmt.Printf("✗ state differs between %s:\n%s\n", basis, strings.Join(diff, "\n"))
 		os.Exit(1)
 	}
-	fmt.Printf("✓ state unchanged across the upgrade (%d values from %s)\n", len(before), t.state)
+	fmt.Printf("✓ state unchanged across the upgrade (%d values, %s)\n", len(before), basis)
 	t.verifyImpl(impl)
 }
 
@@ -295,25 +319,77 @@ func (t *ctxT) verifyImpl(impl common.Address) {
 	}
 }
 
-// snapshot: every value an upgrade must not change.
+// snapshot: every value an upgrade must not change, now.
 func (t *ctxT) snapshot() []string {
-	var lines []string
-	add := func(label, method string, args ...any) {
-		out, err := reg.Call(t.ctx, t.c, t.registry.ABI, t.proxy, common.Address{}, method, args...)
-		if err != nil {
-			reg.Fatalf("snapshot %s: %v", label, err)
-		}
-		lines = append(lines, fmt.Sprintf("%s %v", label, out))
-	}
-	add("admin", "admin")
-	add("minStakeAmount", "minStakeAmount")
-	add("lockPeriod", "lockPeriod")
-	for _, a := range t.apps {
-		add("app["+a+"]", "getAppInfo", a)
-		add("nodes["+a+"]", "getNodeList", a)
-		add("ack["+a+"]", "getAckVersion", a)
+	lines, err := t.snapshotAt(nil)
+	if err != nil {
+		reg.Fatalf("snapshot: %v", err)
 	}
 	return lines
+}
+
+// snapshotAt reads the same values at a block (nil = latest).
+func (t *ctxT) snapshotAt(block *big.Int) ([]string, error) {
+	var lines []string
+	add := func(label, method string, args ...any) error {
+		out, err := reg.CallAt(t.ctx, t.c, t.registry.ABI, t.proxy, block, method, args...)
+		if err != nil {
+			return fmt.Errorf("%s: %w", label, err)
+		}
+		lines = append(lines, fmt.Sprintf("%s %v", label, out))
+		return nil
+	}
+	if err := add("admin", "admin"); err != nil {
+		return nil, err
+	}
+	if err := add("minStakeAmount", "minStakeAmount"); err != nil {
+		return nil, err
+	}
+	if err := add("lockPeriod", "lockPeriod"); err != nil {
+		return nil, err
+	}
+	for _, a := range t.apps {
+		for _, q := range [][2]string{{"app[" + a + "]", "getAppInfo"}, {"nodes[" + a + "]", "getNodeList"}, {"ack[" + a + "]", "getAckVersion"}} {
+			if err := add(q[0], q[1], a); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return lines, nil
+}
+
+// upgradeBlock finds the block of the beacon's Upgraded(impl) event, searching
+// back from the head. Not found (or the RPC refuses the range) is ok=false.
+func (t *ctxT) upgradeBlock(impl common.Address) (*big.Int, bool) {
+	head, err := t.c.BlockNumber(t.ctx)
+	if err != nil {
+		return nil, false
+	}
+	topic := crypto.Keccak256Hash([]byte("Upgraded(address)"))
+	const step, limit = 100_000, 5_000_000
+	for to := head; to+limit > head && to > 0; {
+		from := uint64(0)
+		if to > step {
+			from = to - step + 1
+		}
+		logs, err := t.c.FilterLogs(t.ctx, ethereum.FilterQuery{
+			FromBlock: new(big.Int).SetUint64(from),
+			ToBlock:   new(big.Int).SetUint64(to),
+			Addresses: []common.Address{t.beaconAt},
+			Topics:    [][]common.Hash{{topic}, {common.BytesToHash(impl.Bytes())}},
+		})
+		if err != nil {
+			return nil, false
+		}
+		if len(logs) > 0 {
+			return new(big.Int).SetUint64(logs[len(logs)-1].BlockNumber), true
+		}
+		if from == 0 {
+			break
+		}
+		to = from - 1
+	}
+	return nil, false
 }
 
 func (t *ctxT) addr(a abi.ABI, at common.Address, method string) common.Address {
@@ -332,19 +408,21 @@ func (t *ctxT) version(at common.Address) string {
 	return fmt.Sprintf("%q", out[0])
 }
 
-func (t *ctxT) opID(tl, impl common.Address, upgradeData []byte) common.Hash {
+func (t *ctxT) opID(tl, current, impl common.Address, upgradeData []byte) common.Hash {
 	var zero [32]byte
-	out, err := reg.Call(t.ctx, t.c, t.tl, tl, common.Address{}, "hashOperation", t.beaconAt, big.NewInt(0), upgradeData, zero, saltFor(impl))
+	out, err := reg.Call(t.ctx, t.c, t.tl, tl, common.Address{}, "hashOperation", t.beaconAt, big.NewInt(0), upgradeData, zero, saltFor(current, impl))
 	if err != nil {
 		return common.Hash{}
 	}
 	return common.Hash(out[0].([32]byte))
 }
 
-// saltFor is deterministic per implementation, so --check can find the
-// operation again without being told the salt.
-func saltFor(impl common.Address) [32]byte {
-	return crypto.Keccak256Hash([]byte("TappRegistry.upgradeTo:" + strings.ToLower(impl.Hex())))
+// saltFor is deterministic per (from, to) switch, so --check can find the
+// operation again without being told the salt. Including the implementation
+// switched FROM keeps a later roll-back to a previously used implementation
+// from colliding with that earlier, already executed, operation.
+func saltFor(current, impl common.Address) [32]byte {
+	return crypto.Keccak256Hash([]byte("TappRegistry.upgradeTo:" + strings.ToLower(current.Hex()) + "->" + strings.ToLower(impl.Hex())))
 }
 
 func printTx(to common.Address, data []byte, chainID int64) {

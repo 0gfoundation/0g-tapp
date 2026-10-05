@@ -136,6 +136,18 @@ func RegisterKeyFlags(fs *flag.FlagSet) *KeyFlags {
 }
 
 func (k *KeyFlags) Load() (*ecdsa.PrivateKey, error) {
+	// More than one source is refused rather than ranked: with an owner key left
+	// in the environment and a throwaway on the command line, any precedence rule
+	// signs with the wrong one for someone.
+	set := 0
+	for _, on := range []bool{k.keystore != "", os.Getenv("PRIVATE_KEY") != "", k.key != ""} {
+		if on {
+			set++
+		}
+	}
+	if set > 1 {
+		return nil, errors.New("more than one signing key given (--keystore, PRIVATE_KEY, --key): pass exactly one")
+	}
 	switch {
 	case k.keystore != "":
 		raw, err := os.ReadFile(k.keystore)
@@ -268,6 +280,20 @@ func Call(ctx context.Context, c *ethclient.Client, a abi.ABI, to, from common.A
 		return nil, err
 	}
 	out, err := c.CallContract(ctx, ethereum.CallMsg{From: from, To: &to, Data: data}, nil)
+	if err != nil {
+		return nil, err
+	}
+	return a.Unpack(method, out)
+}
+
+// CallAt is Call against the state at a given block (nil = latest). Public RPCs
+// that prune history answer an error for old blocks; callers fall back.
+func CallAt(ctx context.Context, c *ethclient.Client, a abi.ABI, to common.Address, block *big.Int, method string, args ...any) ([]any, error) {
+	data, err := a.Pack(method, args...)
+	if err != nil {
+		return nil, err
+	}
+	out, err := c.CallContract(ctx, ethereum.CallMsg{To: &to, Data: data}, block)
 	if err != nil {
 		return nil, err
 	}

@@ -162,7 +162,9 @@ anvil fork. A command refuses an RPC that is not on the network's chain.
 Keys: `--keystore <file>` (a foundry/geth keystore — `~/.foundry/keystores/<name>`;
 password prompted, or `--password-file`), or `PRIVATE_KEY` in the environment.
 `--key 0x…` still works for throwaway keys, with a warning: it is visible in the
-process list and the shell history.
+process list and the shell history. Exactly one source: giving two is refused, so
+an owner key left in the environment can never be used in place of the throwaway
+named on the command line.
 
 ### Deploy (first time)
 
@@ -172,10 +174,12 @@ PRIVATE_KEY=0x<throwaway> go run ./cmd/deploy/ --network testnet \
   --beacon-owner 0x<timelock or wallet> --admin 0x<wallet>
 ```
 
-The deploy key needs gas and nothing else: `--beacon-owner` (who may upgrade) and
-`--admin` (stake parameters) are handed over as soon as the contracts exist, and read
-back. On mainnet both are required — a deploy key left holding them could replace
-the registry's code. Output lists the proxy (`TAPP_REGISTRY_CONTRACT`), beacon,
+The deploy key needs gas and nothing else. The beacon is created with
+`--beacon-owner` (who may upgrade) as its owner, so that power never passes through
+the deploy key; `--admin` (stake parameters) is handed over straight after, since
+`initialize()` records its caller. Both are read back and must match. On mainnet
+both are required and `--beacon-owner` must be a contract (the timelock) — checked
+before anything is deployed, so a typo costs nothing. Output lists the proxy (`TAPP_REGISTRY_CONTRACT`), beacon,
 implementation and the authority in force.
 
 ### Upgrade
@@ -194,11 +198,15 @@ The key only pays for putting the new implementation on chain. The switch
 | a wallet (testnet: `0x73443d…`) | the exact transaction is printed for the owner to sign elsewhere — wallet, hardware key — after simulating it **as** the owner |
 | a TimelockController (mainnet) | the schedule and execute transactions are printed, with the delay read from it; `--proposer <addr>` simulates the schedule as that proposer |
 
-Before anything changes it snapshots the registry (admin, stake parameters, and for
-`--apps` — default `0g-kms` — app info, node list, ack version) to
-`upgrade-state.<proxy>.txt`; `--check <impl>` then confirms the beacon moved and every
-value is unchanged, or, for a timelock, whether the operation is unscheduled,
-pending (until when) or ready. `--impl <addr>` re-prints the switch for an
+`--check <impl>` confirms the beacon moved and that the switch itself changed
+nothing: the registry's admin, stake parameters, and for `--apps` (default
+`0g-kms`) app info, node list and ack version, read at the block before the
+switch and the block of it — so a day of ordinary activity behind a timelock is not
+mistaken for a change. An RPC that prunes history (the 0G testnet's) cannot answer
+for old blocks; then the snapshot taken when the upgrade was prepared
+(`upgrade-state.<proxy>.txt`) is compared with now. Before the switch, for a
+timelock, it reports whether the operation is unscheduled, pending (until when) or
+ready. `--impl <addr>` re-prints the switch for an
 implementation already deployed.
 
 Rehearse on a fork first — it costs nothing and runs the real state:

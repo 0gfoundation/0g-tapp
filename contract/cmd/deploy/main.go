@@ -7,11 +7,13 @@
 //	  --stake 1000000000000000000 --lock 86400 \
 //	  [--beacon-owner 0x<timelock|wallet>] [--admin 0x<wallet>] [--verify]
 //
-// The deploy key needs gas and nothing else. It starts out owning the beacon
-// (upgrades) and being the registry admin (stake parameters); --beacon-owner and
-// --admin move both away as soon as the contracts exist. On mainnet both are
-// REQUIRED: a deploy key left holding them is a key that can replace the
-// registry's code. Point --beacon-owner at the timelock there.
+// The deploy key needs gas and nothing else. The beacon is CREATED with
+// --beacon-owner as its owner — the upgrade power never passes through the
+// deploy key. The registry admin (stake parameters) starts as the deploy key,
+// because initialize() records its caller, and is moved to --admin straight
+// after. Both are read back and must be what was asked for. On mainnet both are
+// REQUIRED, and --beacon-owner must be a contract (the timelock): a typo there
+// would hand the power to replace the registry's code to whoever holds that key.
 package main
 
 import (
@@ -60,12 +62,25 @@ func main() {
 		reg.Fatalf("%v", err)
 	}
 	deployer := reg.Address(key)
+	wantOwner, wantAdmin := deployer, deployer
+	if *beaconOwner != "" {
+		wantOwner = common.HexToAddress(*beaconOwner)
+	}
+	if *admin != "" {
+		wantAdmin = common.HexToAddress(*admin)
+	}
 
 	ctx, cancel := reg.Ctx()
 	defer cancel()
 	c, err := reg.Dial(ctx, n)
 	if err != nil {
 		reg.Fatalf("%v", err)
+	}
+	// Checked before anything is deployed, so a mistake costs nothing.
+	if n.RequireAuthorityHandoff {
+		if isC, err := reg.IsContract(ctx, c, wantOwner); err != nil || !isC {
+			reg.Fatalf("--beacon-owner %s has no code on %s: there it must be the timelock, not a wallet", wantOwner.Hex(), n.Name)
+		}
 	}
 	auth, err := reg.Transactor(ctx, c, key, n.ChainID)
 	if err != nil {
@@ -99,27 +114,18 @@ func main() {
 		return addr
 	}
 
-	fmt.Println("\n[1/4] contracts")
+	fmt.Println("\n[1/3] contracts")
 	implAddr := deploy("implementation", impl)
-	beaconAddr := deploy("beacon", beacon, implAddr, deployer)
+	beaconAddr := deploy("beacon", beacon, implAddr, wantOwner)
 	initData, err := impl.ABI.Pack("initialize", minStake, big.NewInt(*lock))
 	if err != nil {
 		reg.Fatalf("pack initialize: %v", err)
 	}
 	proxyAddr := deploy("proxy", proxy, beaconAddr, initData)
 
-	fmt.Println("\n[2/4] beacon owner")
-	if *beaconOwner != "" && common.HexToAddress(*beaconOwner) != deployer {
-		if err := reg.Send(ctx, c, auth, beacon.ABI, beaconAddr, "transferOwnership", common.HexToAddress(*beaconOwner)); err != nil {
-			reg.Fatalf("%v", err)
-		}
-	} else {
-		fmt.Println("  kept by the deploy key")
-	}
-
-	fmt.Println("\n[3/4] registry admin")
-	if *admin != "" && common.HexToAddress(*admin) != deployer {
-		if err := reg.Send(ctx, c, auth, impl.ABI, proxyAddr, "transferAdmin", common.HexToAddress(*admin)); err != nil {
+	fmt.Println("\n[2/3] registry admin")
+	if wantAdmin != deployer {
+		if err := reg.Send(ctx, c, auth, impl.ABI, proxyAddr, "transferAdmin", wantAdmin); err != nil {
 			reg.Fatalf("%v", err)
 		}
 	} else {
@@ -127,7 +133,7 @@ func main() {
 	}
 
 	// Read back rather than trust the transactions: this is what is in force.
-	fmt.Println("\n[4/4] read back")
+	fmt.Println("\n[3/3] read back")
 	ownerNow, err := reg.Call(ctx, c, beacon.ABI, beaconAddr, common.Address{}, "owner")
 	if err != nil {
 		reg.Fatalf("beacon.owner(): %v", err)
@@ -140,6 +146,13 @@ func main() {
 	if err != nil {
 		reg.Fatalf("version(): %v", err)
 	}
+	if got := ownerNow[0].(common.Address); got != wantOwner {
+		reg.Fatalf("beacon owner is %s, expected %s", got.Hex(), wantOwner.Hex())
+	}
+	if got := adminNow[0].(common.Address); got != wantAdmin {
+		reg.Fatalf("registry admin is %s, expected %s", got.Hex(), wantAdmin.Hex())
+	}
+	fmt.Println("  owner and admin are as requested")
 
 	fmt.Printf(`
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
