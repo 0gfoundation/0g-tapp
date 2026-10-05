@@ -563,14 +563,36 @@ Register your app and TEE nodes on the TappRegistry contract using `tapp-cli`. T
 
 ### Register during start (recommended)
 
-`start-app --register-onchain` idempotently registers the app BEFORE its
-containers start: the server pulls the images and computes all hashes first
-(measure-only), the CLI submits the transaction, and only after it confirms are
-the containers started. Safe to re-run:
+`start-app --register-onchain` brings the chain in line with this deployment
+BEFORE its containers start — one command for a first deploy, a restart, a
+machine replacement and an upgrade. The server pulls the images and computes all
+hashes first (measure-only), the CLI submits what the chain needs, and only after
+it confirms are the containers started (so a node whose volume key comes from the
+KMS is on the node list when it asks). Safe to re-run; it writes nothing when the
+chain already matches.
 
-- app not registered on-chain → `registerApp` (this node becomes the first node)
-- registered, but this node's signer not in the node list → `addNode`
-- signer already a node → skip registration, just start
+**Each node's record says what that node runs.** A deployment rewrites only this
+node's compose and mount files — stored as the node's own override where they
+differ from the app's default — and never another node's. So every node can be
+checked against its own record at any moment, including half-way through a
+rolling upgrade, and nodes that legitimately differ (each KMS node has its own
+`kms.toml`) need nothing special.
+
+The app-level declaration is the default for new nodes. It follows the deployment
+only in a **single-node** app, where the two are the same thing; in a multi-node
+app it moves with an explicit `update-onchain` once every node runs the new code.
+Images are the one exception to "per node": the registry keeps them per app only,
+so new images on one node of several are reported, not written — pin images by
+digest in the compose file and the compose hash covers them per node.
+
+The signer:
+  - app not registered → `registerApp` (this node becomes the first node)
+  - signer already a node → its record is corrected if needed, otherwise nothing
+  - signer absent, exactly one other node → `updateNode`, **replacing** it (a
+    restart re-derives the signer, so the address on chain is a dead instance)
+  - signer absent, several other nodes → `addNode`; pass `--old-signer` to replace
+    a specific one instead
+  - `--add-node` → `addNode` regardless: how a one-node app scales out to two
 
 ```bash
 tapp-cli -s http://<tapp>:50051 -k 0x<deployer-key> start-app \
@@ -593,7 +615,8 @@ tapp-cli -s http://<tapp>:50051 -k 0x<deployer-key> register-onchain \
   --contract 0x<TappRegistry> \
   --stake-wei 1000000000000000000
 
-# Update app hashes after redeployment
+# Set the app-level declaration (the default for new nodes) to what this node
+# runs — e.g. after every node of a multi-node app has been upgraded
 tapp-cli -s http://<tapp>:50051 -k 0x<deployer-key> update-onchain \
   --app-id my-app \
   --rpc-url https://evmrpc-testnet.0g.ai \

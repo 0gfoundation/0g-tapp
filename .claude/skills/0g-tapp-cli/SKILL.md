@@ -1,7 +1,7 @@
 ---
 name: 0g-tapp-cli
 description: Use this skill when the user wants to deploy, manage, or troubleshoot applications on a 0G Tapp (Trusted Application Platform) server using tapp-cli. Covers start/stop apps, on-chain registration, registry login, check task status, view logs, and manage docker compose deployments across multiple remote TEE servers.
-version: 1.14.0
+version: 1.15.0
 author: 0G Labs
 tags: [0g, tapp, tee, docker, deployment, cli, onchain]
 ---
@@ -45,12 +45,18 @@ tapp-cli -s <server> -k 0x<key> docker-login -r <registry-host> -u <user> -p <pa
 tapp-cli -s <server> -k 0x<key> start-app -f docker-compose.yaml --app-id <id>   # async → task-id
 tapp-cli -s <server> -k 0x<key> start-app -f <compose> --app-id <id> \
   --register-onchain --rpc-url <rpc> --contract 0x<reg> --stake-wei 1000000000000000000
-  # ↑ idempotent register-BEFORE-start: pulls+measures first, tx confirms, THEN containers start.
-  #   not registered→registerApp; signer already a node→skip; signer absent + exactly ONE other
-  #   node→updateNode REPLACING it (a restart re-derives the signer, so the on-chain one is a
-  #   dead instance); signer absent + several others→addNode, since which one died is unknowable
-  #   — pass --old-signer 0x<addr> to say. A stated --old-signer that is not a node is an ERROR,
-  #   never a silent fallback to addNode.
+  # ↑ syncs the chain BEFORE start (pulls+measures first, txs confirm, THEN containers start);
+  #   ONE command for first deploy / restart / machine swap / upgrade. Writes nothing if in sync.
+  #   Each node's record = what THAT node runs: rewrites only this node's compose + mount
+  #   files (override where they differ from the app default); never another node's, so a
+  #   rolling upgrade stays consistent node by node. App declaration follows only in a
+  #   single-node app; multi-node → `update-onchain` once all nodes run the new code.
+  #   New images on one of several nodes → warning only (images are per-app on chain;
+  #   pin by digest in compose to cover them per node). Signer: not registered→registerApp;
+  #   already a node→fix record if needed; absent + exactly ONE other node→updateNode REPLACING
+  #   it (restart re-derives the signer); absent + several→addNode — pass --old-signer 0x<addr>
+  #   to replace one (a stated one that is not a node is an ERROR). --add-node = scale out
+  #   (a one-node app would otherwise treat the new signer as a replacement).
   #   Requires a server with measure_only support; older servers → CLI aborts ("Server did not return measurements").
 tapp-cli -s <server> -k 0x<key> get-task-status --task-id <task-id>
 tapp-cli -s <server> -k 0x<key> stop-app --app-id <id>
@@ -190,7 +196,7 @@ A failed task prints the docker compose `Stderr:` (the actual root cause). A com
 # Preferred for new deploys: start-app --register-onchain (see Core Commands) registers
 # BEFORE containers start and is idempotent. The commands below register a RUNNING app.
 register-onchain    --app-id <id> --rpc-url <rpc> --contract 0x<reg> --stake-wei 1000000000000000000  # 1 0G
-update-onchain      --app-id <id> --rpc-url <rpc> --contract 0x<reg>                                   # re-fetch hashes after redeploy
+update-onchain      --app-id <id> --rpc-url <rpc> --contract 0x<reg>                                   # set the app default (for new nodes) to what this node runs
 add-node-onchain    --app-id <id> --rpc-url <rpc> --contract 0x<reg> --stake-wei <wei>                 # -s = new node
 update-node-onchain --app-id <id> --rpc-url <rpc> --contract 0x<reg> [--old-signer 0x..] [--new-signer 0x..] [--tee-url ..]
 update-trust-anchors --kbs-urls <urls> --scan-url https://.. --scan-pubkey 0x..   # v0.5.0+, owner-only, measured
@@ -226,9 +232,8 @@ docker run --rm --entrypoint cast ghcr.io/foundry-rs/foundry:latest send 0x<reg>
 
 ## Restart + re-sync on-chain
 
-Restart = `stop-app` then `start-app`. After a restart that's already registered on-chain, **re-sync** because:
-- **TEE signer may change on restart** (it's ephemeral; sometimes stable, sometimes not). Compare `get-app-key` vs `getNodeList`. If different → `update-node-onchain --old-signer <onchain> --new-signer <current>`.
-- If images/compose/env changed → `update-onchain` to refresh hashes.
+Restart / redeploy / upgrade = `stop-app` then `start-app ... --register-onchain`: it replaces a changed signer and rewrites this node's record to what it now runs, in one go (single-node app: the app declaration too). Multi-node upgrade: redeploy each node, then one `update-onchain` to move the app default.
+- Without `--register-onchain` (app already running), re-sync by hand: signer changed (compare `get-app-key` vs `getNodeList`) → `update-node-onchain --old-signer <onchain> --new-signer <current>`; code changed → `update-onchain`.
 
 Always verify after: container status `running` + (for crash-loopers) tail logs.
 

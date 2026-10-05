@@ -226,6 +226,11 @@ tapp-cli \
 
 ### Update app hashes (after redeployment)
 
+`start-app --register-onchain` keeps each node's record equal to what that node
+runs (its own override where it differs from the app default) and, in a
+single-node app, the app declaration too. In a multi-node app the app-level
+default moves with `update-onchain`, below.
+
 `update-onchain` updates the app-level shared defaults (compose/volumes/images). If a
 specific node diverges from the defaults, set its per-node override with
 `update-node-onchain` (same old/new signer to keep the node; it fetches that node's

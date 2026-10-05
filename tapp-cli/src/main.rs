@@ -184,19 +184,25 @@ enum Commands {
         #[arg(short, long)]
         app_id: String,
 
-        /// Idempotently ensure the app is registered on-chain BEFORE it starts.
+        /// Bring the chain in line with this deployment BEFORE it starts — one
+        /// command for first deploy, restart, machine replacement and upgrade.
         /// Images are pulled and measured first; containers only start after the
-        /// transaction is confirmed.
+        /// transactions are confirmed.
         ///
-        /// What it does depends on what the chain already says:
-        ///   not registered                  -> registerApp
-        ///   this node's signer already a node -> nothing
-        ///   signer absent, one other node   -> updateNode, replacing it
-        ///   signer absent, several others   -> addNode (which one died is not
-        ///                                     knowable here; say so with --old-signer)
+        /// Each node's record says what that node runs: this deployment rewrites
+        /// only this node's compose and mount files (as overrides where they differ
+        /// from the app default), never another node's. The app declaration follows
+        /// only in a single-node app; otherwise it moves with update-onchain.
+        /// The signer is matched against the node list:
+        ///   not registered                    -> registerApp
+        ///   this node's signer already a node -> fix its record if needed
+        ///   signer absent, one other node     -> updateNode, replacing it
+        ///   signer absent, several others     -> addNode (which one died is not
+        ///                                       knowable here; say so with --old-signer)
         ///
         /// The replace case is the common one: a restart re-derives the signer, so
-        /// the address on chain belongs to an instance that no longer exists.
+        /// the address on chain belongs to an instance that no longer exists. To
+        /// grow a one-node app to two, pass --add-node.
         #[arg(long, requires_all = ["rpc_url", "contract", "stake_wei"])]
         register_onchain: bool,
 
@@ -218,6 +224,12 @@ enum Commands {
         /// quietly add a node the operator never asked for.
         #[arg(long, requires = "register_onchain")]
         old_signer: Option<String>,
+
+        /// Add this node alongside the existing ones instead of replacing one —
+        /// scaling out. Without it, a one-node app treats a new signer as that
+        /// node's replacement.
+        #[arg(long, requires = "register_onchain", conflicts_with = "old_signer")]
+        add_node: bool,
     },
 
     /// Stop a running application
@@ -858,6 +870,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             contract,
             stake_wei,
             old_signer,
+            add_node,
         } => {
             let private_key = require_private_key(&cli.private_key)?;
             if register_onchain {
@@ -871,6 +884,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     stake_wei.unwrap(),
                     &private_key,
                     old_signer.as_deref(),
+                    add_node,
                 )
                 .await?;
             }
@@ -1418,12 +1432,16 @@ async fn wait_for_task(
     }
 }
 
-/// Idempotently make sure the app is registered on-chain BEFORE it starts:
-/// - app not registered            -> measure + registerApp (this node = first node)
-/// - registered, signer not a node -> measure + addNode
-/// - signer already a node         -> no-op
-/// "Measure" = a measure_only StartApp: the server pulls images and computes
-/// compose/volumes/image hashes without starting containers.
+/// Bring the chain in line with this deployment BEFORE the app starts, so a node
+/// whose volume key comes from the KMS is already on the node list when it asks.
+///
+/// Each node's record says what that node runs; a deployment rewrites only its
+/// own (see [`plan_chain_sync`]). The signer not on the node list replaces a node
+/// (a restart re-derives it), or is added with --add-node.
+///
+/// "Measure" = a measure_only StartApp: the server pulls images and computes the
+/// hashes without starting containers.
+#[allow(clippy::too_many_arguments)]
 async fn ensure_registered_onchain(
     server: &str,
     compose_file: &PathBuf,
@@ -1433,43 +1451,34 @@ async fn ensure_registered_onchain(
     stake_wei: u128,
     private_key: &str,
     old_signer: Option<&str>,
+    add_node: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use ethers::signers::Signer;
     use ethers::types::{Address, U256};
     use tapp_common::onchain::{self, OnchainParams};
 
     let signer = fetch_signer_address(server, app_id).await?;
     let owner = onchain::get_app_owner(&rpc_url, &contract, app_id).await?;
-
-    let is_first_node = if owner == Address::zero() {
-        true
-    } else {
-        let key_bytes = hex::decode(private_key.trim_start_matches("0x"))
-            .map_err(|e| format!("Invalid private key: {}", e))?;
-        let wallet = ethers::signers::LocalWallet::from_bytes(&key_bytes)
-            .map_err(|e| format!("Invalid private key: {}", e))?;
-        if owner != wallet.address() {
+    let registered = owner != Address::zero();
+    if registered {
+        let me = wallet_address(private_key)?;
+        if owner != me {
             return Err(format!(
                 "App {} is owned by 0x{:x} on-chain, but the provided key is 0x{:x}",
-                app_id,
-                owner,
-                wallet.address()
+                app_id, owner, me
             )
             .into());
         }
-        let nodes = onchain::get_node_list(&rpc_url, &contract, app_id).await?;
-        if nodes.contains(&signer) {
-            println!(
-                "✓ Already registered on-chain (signer 0x{:x} is in the node list), skipping",
-                signer
-            );
-            return Ok(());
-        }
-        false
+    }
+    let stated_old = match old_signer {
+        Some(s) => Some(
+            s.parse::<Address>()
+                .map_err(|e| format!("--old-signer is not an address: {}", e))?,
+        ),
+        None => None,
     };
 
     // Measure without starting: pull images, compute hashes
-    println!("⏳ Measuring app before on-chain registration (pulling images)...");
+    println!("⏳ Measuring app before on-chain sync (pulling images)...");
     let task_id = send_start_app(server, compose_file, app_id, private_key, true).await?;
     let measured = wait_for_task(server, &task_id, 900).await?;
 
@@ -1482,51 +1491,73 @@ async fn ensure_registered_onchain(
                 .into(),
         );
     }
+    let deployed = Deployed {
+        compose: onchain::hex_to_bytes(&measured.compose_hash)?,
+        volumes: onchain::combine_map_hashes(&measured.volumes_hash),
+        images: onchain::map_to_bytes_array(&measured.image_hash),
+    };
 
-    let compose_hash = onchain::hex_to_bytes(&measured.compose_hash)?;
-    let volumes_hash = onchain::combine_map_hashes(&measured.volumes_hash);
-    let image_hashes = onchain::map_to_bytes_array(&measured.image_hash);
-
-    let params = OnchainParams { rpc_url: rpc_url.clone(), contract: contract.clone(), private_key: private_key.to_owned() };
-    if is_first_node {
-        let tx = onchain::register_app(
-            &params,
-            app_id,
-            compose_hash,
-            volumes_hash,
-            image_hashes,
-            signer,
-            server, // recorded on-chain as the node's evidence URL
-            U256::from(stake_wei),
-        )
-        .await?;
-        println!("✓ App registered on-chain");
-        println!("  Signer Address: 0x{:x}", signer);
-        println!("  Tx Hash: 0x{:x}", tx);
-    } else {
-        // Store a per-node override only when it differs from the app-level default
-        let (compose_override, volumes_override) =
-            node_override_hashes(&rpc_url, &contract, app_id, compose_hash, volumes_hash).await?;
-
-        // A signer that is not in the node list is usually not a new machine — it is this
-        // machine after a restart, which re-derives the signer. Adding would leave the dead
-        // address registered, holding its stake, and being fetched for evidence it can no
-        // longer produce; every restart would add another. Replacing keeps the slot and moves
-        // the stake, which is what the KMS runbook already tells operators to do by hand.
-        //
-        // Only when the chain shows exactly one other node, though: with several, which one
-        // this replaces is not knowable from here, and guessing moves someone else's stake.
-        // Then adding is the safe reading, and an operator who meant to replace can say so
-        // with update-node-onchain --old-signer.
-        let stated = match old_signer {
-            Some(s) => Some(
-                s.parse::<Address>()
-                    .map_err(|e| format!("--old-signer is not an address: {}", e))?,
-            ),
-            None => None,
+    let chain = if registered {
+        let (app_compose, app_volumes) =
+            onchain::get_app_default_hashes(&rpc_url, &contract, app_id).await?;
+        let app_images = onchain::get_app_image_hashes(&rpc_url, &contract, app_id).await?;
+        let nodes = onchain::get_node_list(&rpc_url, &contract, app_id).await?;
+        let this_node = if nodes.contains(&signer) {
+            let (tee_url, compose, volumes) =
+                onchain::get_node(&rpc_url, &contract, app_id, signer).await?;
+            Some(NodeOnChain { tee_url, compose, volumes })
+        } else {
+            None
         };
-        match node_being_replaced(&rpc_url, &contract, app_id, signer, stated).await {
-            Ok(Some(old)) => {
+        Some(ChainApp { app_compose, app_volumes, app_images, nodes, this_node })
+    } else {
+        None
+    };
+
+    let steps = plan_chain_sync(chain.as_ref(), &deployed, signer, stated_old, add_node, app_id)?;
+    if steps.is_empty() {
+        println!("✓ On-chain registration already matches this deployment");
+        return Ok(());
+    }
+
+    let params = OnchainParams {
+        rpc_url: rpc_url.clone(),
+        contract: contract.clone(),
+        private_key: private_key.to_owned(),
+    };
+    for step in steps {
+        match step {
+            SyncStep::RegisterApp => {
+                let tx = onchain::register_app(
+                    &params,
+                    app_id,
+                    deployed.compose.clone(),
+                    deployed.volumes.clone(),
+                    deployed.images.clone(),
+                    signer,
+                    server, // recorded on-chain as the node's evidence URL
+                    U256::from(stake_wei),
+                )
+                .await?;
+                println!("✓ App registered on-chain");
+                println!("  Signer Address: 0x{:x}", signer);
+                println!("  Tx Hash: 0x{:x}", tx);
+            }
+            SyncStep::UpdateAppCode { keep_volumes } => {
+                let before = chain.as_ref().map(|c| c.app_compose.clone()).unwrap_or_default();
+                let tx = onchain::update_app(
+                    &params,
+                    app_id,
+                    deployed.compose.clone(),
+                    keep_volumes,
+                    deployed.images.clone(),
+                )
+                .await?;
+                println!("✓ App code declaration updated on-chain (single-node app: it is this node's code)");
+                println!("  Compose: 0x{} -> 0x{}", short_hex(&before), short_hex(&deployed.compose));
+                println!("  Tx Hash: 0x{:x}", tx);
+            }
+            SyncStep::ReplaceNode { old, compose_override, volumes_override } => {
                 let tx = onchain::update_node(
                     &params,
                     app_id,
@@ -1541,37 +1572,207 @@ async fn ensure_registered_onchain(
                 println!("  Old Signer: 0x{:x}", old);
                 println!("  New Signer: 0x{:x}", signer);
                 println!("  Tx Hash: 0x{:x}", tx);
-                return Ok(());
             }
-            Ok(None) => {}
-            // Falling through to addNode is the safe reading of "I could not work out which
-            // node this replaces" — but it is the wrong reading of "you told me which, and it
-            // was not one". The first is the tool declining to guess; the second is the
-            // operator's instruction failing, and carrying on would register a node they were
-            // specifically trying not to create.
-            Err(e) if stated.is_some() => return Err(e),
+            SyncStep::AddNode { compose_override, volumes_override } => {
+                let tx = onchain::add_node(
+                    &params,
+                    app_id,
+                    signer,
+                    server,
+                    compose_override,
+                    volumes_override,
+                    U256::from(stake_wei),
+                )
+                .await?;
+                println!("✓ Node added on-chain");
+                println!("  Signer Address: 0x{:x}", signer);
+                println!("  Tx Hash: 0x{:x}", tx);
+            }
+            SyncStep::RefreshNode { tee_url, compose_override, volumes_override } => {
+                let tx = onchain::update_node(
+                    &params,
+                    app_id,
+                    signer,
+                    signer,
+                    tee_url,
+                    compose_override,
+                    volumes_override,
+                )
+                .await?;
+                println!("✓ This node's on-chain record updated to what it now runs");
+                println!("  Tx Hash: 0x{:x}", tx);
+            }
+            SyncStep::ImagesDifferFromApp => {
+                println!(
+                    "⚠️  This deployment's images differ from the app's on-chain image list. The \
+                     registry keeps images per app, not per node, so they were not recorded \
+                     here; once every node runs them, run update-onchain. (Pinning images by \
+                     digest in the compose file makes each node's compose hash cover them.)"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// What this deployment measured, in the registry's encoding.
+struct Deployed {
+    compose: Vec<u8>,
+    volumes: Vec<u8>,
+    images: Vec<Vec<u8>>,
+}
+
+/// A node's record as getNode returns it: EFFECTIVE values (override or app default).
+struct NodeOnChain {
+    tee_url: String,
+    compose: Vec<u8>,
+    volumes: Vec<u8>,
+}
+
+/// The parts of a registered app the sync decides on.
+struct ChainApp {
+    app_compose: Vec<u8>,
+    app_volumes: Vec<u8>,
+    app_images: Vec<Vec<u8>>,
+    nodes: Vec<ethers::types::Address>,
+    /// Present when this node's signer is already on the node list.
+    this_node: Option<NodeOnChain>,
+}
+
+#[derive(Debug, PartialEq)]
+enum SyncStep {
+    RegisterApp,
+    /// The app's declaration becomes this deployment's code (single-node apps
+    /// only); the app-level mount-file default is passed back unchanged.
+    UpdateAppCode { keep_volumes: Vec<u8> },
+    ReplaceNode {
+        old: ethers::types::Address,
+        compose_override: Vec<u8>,
+        volumes_override: Vec<u8>,
+    },
+    AddNode { compose_override: Vec<u8>, volumes_override: Vec<u8> },
+    /// Same signer, record rewritten to what this node now runs.
+    RefreshNode { tee_url: String, compose_override: Vec<u8>, volumes_override: Vec<u8> },
+    /// Images differ from the app's list in a multi-node app. The registry keeps
+    /// images per app only, so this node's cannot be recorded without changing
+    /// every other node's declaration — reported, not written.
+    ImagesDifferFromApp,
+}
+
+/// Decide what the chain needs, from what it says and what was deployed. Pure, so
+/// every case is testable without a node or a chain.
+///
+/// Each node's record says what THAT node runs: a deployment rewrites its own
+/// compose and mount files (as an override when they differ from the app
+/// default) and never touches another node's. That keeps every node checkable
+/// against its own record, including mid-way through a rolling upgrade. The
+/// app-level declaration is the default for new nodes; it follows the
+/// deployment only when the app has a single node, where the two are the same
+/// thing — anywhere else it moves by an explicit update-onchain.
+fn plan_chain_sync(
+    chain: Option<&ChainApp>,
+    deployed: &Deployed,
+    signer: ethers::types::Address,
+    stated_old: Option<ethers::types::Address>,
+    add_node: bool,
+    app_id: &str,
+) -> Result<Vec<SyncStep>, String> {
+    let Some(chain) = chain else {
+        return Ok(vec![SyncStep::RegisterApp]);
+    };
+
+    enum Target<'a> {
+        Existing(&'a NodeOnChain),
+        Replace(ethers::types::Address),
+        Add,
+    }
+    let target = match &chain.this_node {
+        Some(node) => Target::Existing(node),
+        None if add_node => Target::Add,
+        None => match pick_replaced_node(&chain.nodes, signer, app_id, stated_old) {
+            Ok(Some(old)) => Target::Replace(old),
+            Ok(None) => Target::Add,
+            // "You told me which, and it was not one" is the operator's instruction
+            // failing; carrying on would create a node they were trying not to.
+            Err(e) if stated_old.is_some() => return Err(e),
             Err(e) => {
                 println!("ℹ️  {}", e);
                 println!("   Adding this node instead; pass --old-signer to replace one instead.");
+                Target::Add
             }
-        }
+        },
+    };
+    // Whether the app has exactly one node once this deployment is recorded.
+    let single = match target {
+        Target::Existing(_) | Target::Replace(_) => chain.nodes.len() == 1,
+        Target::Add => false,
+    };
 
-        let tx = onchain::add_node(
-            &params,
-            app_id,
-            signer,
-            server,
-            compose_override,
-            volumes_override,
-            U256::from(stake_wei),
-        )
-        .await?;
-        println!("✓ Node added on-chain");
-        println!("  Signer Address: 0x{:x}", signer);
-        println!("  Tx Hash: 0x{:x}", tx);
+    // Image order on chain follows service names, but compare as sets so an app
+    // registered by other tooling is not "changed" just for being sorted differently.
+    let sorted = |v: &[Vec<u8>]| {
+        let mut v = v.to_vec();
+        v.sort();
+        v
+    };
+    let images_differ = sorted(&deployed.images) != sorted(&chain.app_images);
+    let code_differs = deployed.compose != chain.app_compose || images_differ;
+
+    let mut steps = Vec::new();
+    let mut app_compose = chain.app_compose.clone();
+    if single && code_differs {
+        steps.push(SyncStep::UpdateAppCode { keep_volumes: chain.app_volumes.clone() });
+        app_compose = deployed.compose.clone();
     }
 
-    Ok(())
+    let override_of = |deployed: &[u8], default: &[u8]| {
+        if deployed == default {
+            Vec::new()
+        } else {
+            deployed.to_vec()
+        }
+    };
+    let compose_override = override_of(&deployed.compose, &app_compose);
+    let volumes_override = override_of(&deployed.volumes, &chain.app_volumes);
+
+    match target {
+        Target::Existing(node) => {
+            // getNode returns EFFECTIVE values: a compose that differs from the
+            // current default is the node's own override, which an app update does
+            // not move; otherwise the node follows the (possibly updated) default.
+            let has_compose_override = node.compose != chain.app_compose;
+            let compose_after = if has_compose_override {
+                node.compose.clone()
+            } else {
+                app_compose.clone()
+            };
+            if compose_after != deployed.compose || node.volumes != deployed.volumes {
+                steps.push(SyncStep::RefreshNode {
+                    tee_url: node.tee_url.clone(),
+                    compose_override,
+                    volumes_override,
+                });
+            }
+        }
+        Target::Replace(old) => {
+            steps.push(SyncStep::ReplaceNode { old, compose_override, volumes_override })
+        }
+        Target::Add => steps.push(SyncStep::AddNode { compose_override, volumes_override }),
+    }
+
+    if !single && images_differ {
+        steps.push(SyncStep::ImagesDifferFromApp);
+    }
+    Ok(steps)
+}
+
+fn short_hex(b: &[u8]) -> String {
+    let h = hex::encode(b);
+    if h.len() > 16 {
+        format!("{}…", &h[..16])
+    } else {
+        h
+    }
 }
 
 async fn stop_app(
@@ -3619,6 +3820,239 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    // ─── plan_chain_sync ──────────────────────────────────────────────────────
+
+    mod chain_sync {
+        use super::super::*;
+        use ethers::types::Address;
+
+        fn a(n: u64) -> Address {
+            Address::from_low_u64_be(n)
+        }
+        fn deployed(compose: &[u8], volumes: &[u8], images: &[&[u8]]) -> Deployed {
+            Deployed {
+                compose: compose.to_vec(),
+                volumes: volumes.to_vec(),
+                images: images.iter().map(|i| i.to_vec()).collect(),
+            }
+        }
+        /// An app declaring compose `c`, mount files `v`, image `img`, with `nodes`.
+        fn app(c: &[u8], v: &[u8], img: &[u8], nodes: &[u64]) -> ChainApp {
+            ChainApp {
+                app_compose: c.to_vec(),
+                app_volumes: v.to_vec(),
+                app_images: vec![img.to_vec()],
+                nodes: nodes.iter().map(|n| a(*n)).collect(),
+                this_node: None,
+            }
+        }
+        fn with_this_node(mut chain: ChainApp, compose: &[u8], volumes: &[u8]) -> ChainApp {
+            chain.this_node = Some(NodeOnChain {
+                tee_url: "https://me:50052".into(),
+                compose: compose.to_vec(),
+                volumes: volumes.to_vec(),
+            });
+            chain
+        }
+        fn plan(chain: Option<&ChainApp>, d: &Deployed, me: u64) -> Vec<SyncStep> {
+            plan_chain_sync(chain, d, a(me), None, false, "app").unwrap()
+        }
+
+        fn none() -> Vec<u8> {
+            vec![]
+        }
+        fn existing(chain: ChainApp, compose: &[u8], volumes: &[u8]) -> ChainApp {
+            with_this_node(chain, compose, volumes)
+        }
+        fn refresh(compose_override: &[u8], volumes_override: &[u8]) -> SyncStep {
+            SyncStep::RefreshNode {
+                tee_url: "https://me:50052".into(),
+                compose_override: compose_override.to_vec(),
+                volumes_override: volumes_override.to_vec(),
+            }
+        }
+
+        #[test]
+        fn first_deploy_registers() {
+            assert_eq!(plan(None, &deployed(b"c", b"v", &[b"i"]), 1), vec![SyncStep::RegisterApp]);
+        }
+
+        #[test]
+        fn a_restart_replaces_the_only_node_and_touches_nothing_else() {
+            let chain = app(b"c", b"v", b"i", &[7]);
+            assert_eq!(
+                plan(Some(&chain), &deployed(b"c", b"v", &[b"i"]), 1),
+                vec![SyncStep::ReplaceNode { old: a(7), compose_override: none(), volumes_override: none() }]
+            );
+        }
+
+        #[test]
+        fn a_redeploy_that_changes_nothing_writes_nothing() {
+            let chain = existing(app(b"c", b"v", b"i", &[1]), b"c", b"v");
+            assert!(plan(Some(&chain), &deployed(b"c", b"v", &[b"i"]), 1).is_empty());
+        }
+
+        // ── single-node app: the app declaration IS the node's code ──────────
+
+        #[test]
+        fn single_node_new_code_updates_the_app_declaration() {
+            let chain = existing(app(b"c1", b"v", b"i1", &[1]), b"c1", b"v");
+            assert_eq!(
+                plan(Some(&chain), &deployed(b"c2", b"v", &[b"i2"]), 1),
+                vec![SyncStep::UpdateAppCode { keep_volumes: b"v".to_vec() }]
+            );
+        }
+
+        #[test]
+        fn single_node_new_image_alone_updates_the_app_declaration() {
+            let chain = existing(app(b"c", b"v", b"i1", &[1]), b"c", b"v");
+            assert_eq!(
+                plan(Some(&chain), &deployed(b"c", b"v", &[b"i2"]), 1),
+                vec![SyncStep::UpdateAppCode { keep_volumes: b"v".to_vec() }]
+            );
+        }
+
+        #[test]
+        fn single_node_restart_with_new_code_updates_the_app_and_replaces_the_node() {
+            let chain = app(b"c1", b"v", b"i", &[7]);
+            assert_eq!(
+                plan(Some(&chain), &deployed(b"c2", b"v", &[b"i"]), 1),
+                vec![
+                    SyncStep::UpdateAppCode { keep_volumes: b"v".to_vec() },
+                    SyncStep::ReplaceNode { old: a(7), compose_override: none(), volumes_override: none() },
+                ]
+            );
+        }
+
+        /// An override left by older tooling on a single-node app is folded into
+        /// the app declaration and cleared.
+        #[test]
+        fn single_node_upgrade_on_a_pinned_node_updates_the_app_and_unpins() {
+            let chain = existing(app(b"c1", b"v", b"i", &[1]), b"pinned", b"v");
+            assert_eq!(
+                plan(Some(&chain), &deployed(b"c2", b"v", &[b"i"]), 1),
+                vec![SyncStep::UpdateAppCode { keep_volumes: b"v".to_vec() }, refresh(b"", b"")]
+            );
+        }
+
+        #[test]
+        fn image_order_alone_is_not_a_change() {
+            let mut chain = existing(app(b"c", b"v", b"x", &[1]), b"c", b"v");
+            chain.app_images = vec![b"b".to_vec(), b"a".to_vec()];
+            assert!(plan(Some(&chain), &deployed(b"c", b"v", &[b"a", b"b"]), 1).is_empty());
+        }
+
+        // ── multi-node app: each node records its own code ───────────────────
+
+        /// Rolling upgrade, first node: its own record moves to c2; the app
+        /// declaration — the other nodes' record — does not.
+        #[test]
+        fn upgrading_one_node_of_several_records_it_on_that_node_only() {
+            let chain = existing(app(b"c1", b"v", b"i", &[1, 2, 3]), b"c1", b"v");
+            assert_eq!(
+                plan(Some(&chain), &deployed(b"c2", b"v", &[b"i"]), 1),
+                vec![refresh(b"c2", b"")]
+            );
+        }
+
+        #[test]
+        fn redeploying_what_a_node_already_records_writes_nothing() {
+            let chain = existing(app(b"c1", b"v", b"i", &[1, 2]), b"c2", b"v");
+            assert!(plan(Some(&chain), &deployed(b"c2", b"v", &[b"i"]), 1).is_empty());
+        }
+
+        /// A node that recorded its own code goes back to following the app when it
+        /// is redeployed with the app's code again.
+        #[test]
+        fn returning_to_the_app_code_clears_the_nodes_own_record() {
+            let chain = existing(app(b"c1", b"v", b"i", &[1, 2]), b"c2", b"v");
+            assert_eq!(
+                plan(Some(&chain), &deployed(b"c1", b"v", &[b"i"]), 1),
+                vec![refresh(b"", b"")]
+            );
+        }
+
+        #[test]
+        fn new_images_on_one_of_several_nodes_are_reported_not_written() {
+            let chain = existing(app(b"c", b"v", b"i1", &[1, 2]), b"c", b"v");
+            assert_eq!(
+                plan(Some(&chain), &deployed(b"c", b"v", &[b"i2"]), 1),
+                vec![SyncStep::ImagesDifferFromApp]
+            );
+        }
+
+        /// KMS-style: same code, this node's own kms.toml.
+        #[test]
+        fn a_node_specific_mount_file_is_the_nodes_own_record() {
+            let chain = app(b"c", b"toml-1", b"i", &[7, 8]);
+            let d = deployed(b"c", b"toml-2", &[b"i"]);
+            let steps = plan_chain_sync(Some(&chain), &d, a(2), Some(a(8)), false, "app").unwrap();
+            assert_eq!(
+                steps,
+                vec![SyncStep::ReplaceNode {
+                    old: a(8),
+                    compose_override: none(),
+                    volumes_override: b"toml-2".to_vec()
+                }]
+            );
+        }
+
+        #[test]
+        fn redeploying_a_node_with_its_own_mount_file_writes_nothing() {
+            let chain = existing(app(b"c", b"toml-1", b"i", &[1, 2]), b"c", b"toml-2");
+            assert!(plan(Some(&chain), &deployed(b"c", b"toml-2", &[b"i"]), 2).is_empty());
+        }
+
+        #[test]
+        fn replacing_a_node_of_several_with_new_code_records_it_on_the_new_node() {
+            let chain = app(b"c1", b"v", b"i", &[7, 8]);
+            let steps = plan_chain_sync(
+                Some(&chain), &deployed(b"c2", b"v", &[b"i"]), a(1), Some(a(7)), false, "app",
+            )
+            .unwrap();
+            assert_eq!(
+                steps,
+                vec![SyncStep::ReplaceNode { old: a(7), compose_override: b"c2".to_vec(), volumes_override: none() }]
+            );
+        }
+
+        // ── signer handling ──────────────────────────────────────────────────
+
+        /// The trap this flag exists for: with one node on chain, a new signer is
+        /// read as its replacement unless the operator says "add". Adding makes
+        /// the app multi-node, so new code is the new node's own record.
+        #[test]
+        fn add_node_scales_out_and_never_moves_the_app_declaration() {
+            let chain = app(b"c1", b"v", b"i", &[7]);
+            let steps = plan_chain_sync(
+                Some(&chain), &deployed(b"c2", b"v", &[b"i"]), a(1), None, true, "app",
+            )
+            .unwrap();
+            assert_eq!(
+                steps,
+                vec![SyncStep::AddNode { compose_override: b"c2".to_vec(), volumes_override: none() }]
+            );
+        }
+
+        #[test]
+        fn several_nodes_and_no_old_signer_adds_rather_than_guesses() {
+            let chain = app(b"c", b"v", b"i", &[7, 8]);
+            assert_eq!(
+                plan(Some(&chain), &deployed(b"c", b"v", &[b"i"]), 1),
+                vec![SyncStep::AddNode { compose_override: none(), volumes_override: none() }]
+            );
+        }
+
+        #[test]
+        fn an_old_signer_that_is_not_a_node_is_an_error() {
+            let chain = app(b"c", b"v", b"i", &[7, 8]);
+            assert!(plan_chain_sync(
+                Some(&chain), &deployed(b"c", b"v", &[b"i"]), a(1), Some(a(9)), false, "app",
+            )
+            .is_err());
+        }
+    }
 
     /// The server rebuilds exactly this string from the body it received
     /// (`build_sign_message_v2` in tapp-server's signature_auth.rs). Any drift
