@@ -578,9 +578,11 @@ checked against its own record at any moment, including half-way through a
 rolling upgrade, and nodes that legitimately differ (each KMS node has its own
 `kms.toml`) need nothing special.
 
-The app-level declaration is the default for new nodes. It follows the deployment
-only in a **single-node** app, where the two are the same thing; in a multi-node
-app it moves with an explicit `update-onchain` once every node runs the new code.
+The app-level declaration is the default for new nodes. Its code (compose and
+images) follows the deployment only in a **single-node** app, where the two are the
+same thing; in a multi-node app it moves with an explicit `update-onchain` once every
+node runs the new code. Mount files never move the app default — a node whose files
+differ always records them as its own override.
 Images are the one exception to "per node": the registry keeps them per app only,
 so new images on one node of several are reported, not written — pin images by
 digest in the compose file and the compose hash covers them per node.
@@ -593,6 +595,10 @@ The signer:
   - signer absent, several other nodes → `addNode`; pass `--old-signer` to replace
     a specific one instead
   - `--add-node` → `addNode` regardless: how a one-node app scales out to two
+
+Rewriting a node's record goes through `updateNode`, which also resets the node's
+on-chain `addedAt` to that block. Nothing in tapp reads it, but it means "when this
+record was last written", not "when this machine joined".
 
 ```bash
 tapp-cli -s http://<tapp>:50051 -k 0x<deployer-key> start-app \

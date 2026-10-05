@@ -1720,7 +1720,8 @@ fn plan_chain_sync(
 
     let mut steps = Vec::new();
     let mut app_compose = chain.app_compose.clone();
-    if single && code_differs {
+    let app_moves = single && code_differs;
+    if app_moves {
         steps.push(SyncStep::UpdateAppCode { keep_volumes: chain.app_volumes.clone() });
         app_compose = deployed.compose.clone();
     }
@@ -1746,7 +1747,12 @@ fn plan_chain_sync(
             } else {
                 app_compose.clone()
             };
-            if compose_after != deployed.compose || node.volumes != deployed.volumes {
+            // When the app declaration moves, the node's record is always rewritten
+            // too. getNode cannot show a raw override that happens to equal the
+            // current default (after update-onchain moved the default onto it, say),
+            // yet that override would keep pinning the node to the old code once
+            // the default moves on. One extra transaction, only on upgrades.
+            if app_moves || compose_after != deployed.compose || node.volumes != deployed.volumes {
                 steps.push(SyncStep::RefreshNode {
                     tee_url: node.tee_url.clone(),
                     compose_override,
@@ -3948,11 +3954,11 @@ mod tests {
         // ── single-node app: the app declaration IS the node's code ──────────
 
         #[test]
-        fn single_node_new_code_updates_the_app_declaration() {
+        fn single_node_new_code_updates_the_app_declaration_and_the_node() {
             let chain = existing(app(b"c1", b"v", b"i1", &[1]), b"c1", b"v");
             assert_eq!(
                 plan(Some(&chain), &deployed(b"c2", b"v", &[b"i2"]), 1),
-                vec![SyncStep::UpdateAppCode { keep_volumes: b"v".to_vec() }]
+                vec![SyncStep::UpdateAppCode { keep_volumes: b"v".to_vec() }, refresh(b"", b"")]
             );
         }
 
@@ -3961,7 +3967,20 @@ mod tests {
             let chain = existing(app(b"c", b"v", b"i1", &[1]), b"c", b"v");
             assert_eq!(
                 plan(Some(&chain), &deployed(b"c", b"v", &[b"i2"]), 1),
-                vec![SyncStep::UpdateAppCode { keep_volumes: b"v".to_vec() }]
+                vec![SyncStep::UpdateAppCode { keep_volumes: b"v".to_vec() }, refresh(b"", b"")]
+            );
+        }
+
+        /// The review's case: a rolling upgrade left a raw override c2 on the node,
+        /// update-onchain then moved the default onto c2, so getNode shows the
+        /// node "following" c2 — the override is invisible. Upgrading the now
+        /// single node to c3 must still clear it, or it keeps pinning c2.
+        #[test]
+        fn an_invisible_override_is_cleared_when_the_app_moves() {
+            let chain = existing(app(b"c2", b"v", b"i", &[1]), b"c2", b"v");
+            assert_eq!(
+                plan(Some(&chain), &deployed(b"c3", b"v", &[b"i"]), 1),
+                vec![SyncStep::UpdateAppCode { keep_volumes: b"v".to_vec() }, refresh(b"", b"")]
             );
         }
 

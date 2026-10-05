@@ -49,8 +49,9 @@ tapp-cli -s <server> -k 0x<key> start-app -f <compose> --app-id <id> \
   #   ONE command for first deploy / restart / machine swap / upgrade. Writes nothing if in sync.
   #   Each node's record = what THAT node runs: rewrites only this node's compose + mount
   #   files (override where they differ from the app default); never another node's, so a
-  #   rolling upgrade stays consistent node by node. App declaration follows only in a
-  #   single-node app; multi-node → `update-onchain` once all nodes run the new code.
+  #   rolling upgrade stays consistent node by node. App declaration (compose/images) follows
+  #   only in a single-node app; multi-node → `update-onchain` once all nodes run the new
+  #   code. Mount files are always the node's own override. Each rewrite resets addedAt.
   #   New images on one of several nodes → warning only (images are per-app on chain;
   #   pin by digest in compose to cover them per node). Signer: not registered→registerApp;
   #   already a node→fix record if needed; absent + exactly ONE other node→updateNode REPLACING
