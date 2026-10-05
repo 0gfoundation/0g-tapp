@@ -135,7 +135,7 @@ tapp-cli -s <server> -k 0x<new-key>   accept-owner                         # nom
 ### Request signing (v0.9.0+)
 - tapp-cli >= 0.9.0 signs `Method:0x<sha256(encoded request)>:timestamp` with header `x-signature-version: 2` — the signature covers the request body, so a request altered in flight is refused. Window **±10 min**; every signature is **single-use**.
 - Against tapp-server < 0.9.0 this shows up as `Insufficient permission for this operation` (old server cannot read v2): add the global flag `--legacy-sign`. Never automatic.
-- Legacy `Method:timestamp` (no header) is still accepted by default (±2 min, single-use, logged `AUTH_LEGACY_SIGNATURE`); a node with `[server.permission] require_signed_body = true` refuses it. `examples/*.sh` still sign legacy.
+- tapp-server >= 0.9.0 accepts **only** body-bound signatures; legacy `Method:timestamp` is refused ("accepts only body-bound signatures"). Old tapp-cli cannot manage a 0.9.0 node — upgrade it.
 
 ### Server health & whitelist
 ```bash
@@ -284,7 +284,7 @@ Each app gets its **own encrypted volume** (LUKS; key derived per-app by the KMS
 |---|---|
 | `PermissionDenied` | wrong key, or server is UNCLAIMED (v0.3.0+ canonical image) — run `claim-config` first; or tapp-cli >= 0.9.0 against tapp-server < 0.9.0 — add `--legacy-sign` |
 | `this signature was already used` | a signature is single-use (v0.9.0+); just re-run the command (it signs afresh) |
-| `this node requires body-bound signatures` | node has `require_signed_body = true`; upgrade tapp-cli to >= 0.9.0 (or drop `--legacy-sign`) |
+| `this node accepts only body-bound signatures` | tapp-server >= 0.9.0 with an old tapp-cli, or `--legacy-sign` given — upgrade tapp-cli / drop the flag |
 | `unauthorized: authentication required` (pull) | registry token expired → `docker-login` with fresh token, retry |
 | `required variable TAPP_REGISTRY is missing` (compose interpolation) | that var absent from the uploaded `.env` |
 | container stuck `restarting` | `get-app-logs --service <svc>` → missing env var / mount file |

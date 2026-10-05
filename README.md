@@ -369,11 +369,6 @@ enabled = true
 #
 # Whitelist: use `tapp-cli add-to-whitelist` after claiming (each change is a
 # measured runtime event). The old initial_whitelist config was removed.
-#
-# Refuse legacy signatures that do not cover the request body (see "Request
-# signing"). Off by default so pre-0.9.0 CLIs keep working; turn it on once
-# every operator of this node has upgraded.
-# require_signed_body = true
 
 [boot]
 socket_path = "/var/run/docker.sock"
@@ -538,7 +533,7 @@ an app completely means both transfers.
 ### Request signing
 
 Every signed RPC carries `x-signature` (EIP-191 `personal_sign`, 65-byte r‖s‖v),
-`x-timestamp`, and since 0.9.0 `x-signature-version: 2`. Version 2 signs
+`x-timestamp` and `x-signature-version: 2`, and signs
 
 ```
 <Method>:0x<sha256 of the encoded protobuf request>:<unix timestamp>
@@ -549,14 +544,15 @@ hashes as received, so a request altered in flight no longer recovers to the
 owner. Each signature is accepted **once** (replays are refused) within **±10
 minutes** of its timestamp.
 
-Without the version header the legacy message `<Method>:<timestamp>` is accepted,
-with a ±2 minute window and the same single-use rule. It authorises the method
-with *any* body, so it stays narrow and every acceptance is logged as
-`AUTH_LEGACY_SIGNATURE`; `require_signed_body = true` refuses it outright.
-tapp-cli >= 0.9.0 signs version 2 by default; `--legacy-sign` is for older
-servers (which report a version-2 signature as "Insufficient permission") and is
+tapp-server >= 0.9.0 accepts **only** this form. The older `<Method>:<timestamp>`
+message authorised the method with *any* body, so an observed signature could
+carry a different request; it is refused (`AUTH_LEGACY_SIGNATURE_REFUSED`).
+
+tapp-cli >= 0.9.0 signs this form. To manage a tapp-server < 0.9.0 (which reports
+a body-bound signature as "Insufficient permission"), pass `--legacy-sign`. It is
 never chosen automatically, since falling back on failure would hand anyone able
-to make a request fail the weaker signature.
+to make a request fail the weaker signature. The scripts under `examples/` sign
+the body-bound form too (`sign_message.py` takes the request JSON).
 
 ## On-chain Registration
 

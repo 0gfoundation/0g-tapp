@@ -253,44 +253,6 @@ fi
 echo "✅ All dependencies satisfied"
 echo ""
 
-# Create Python script for signature generation
-cat > /tmp/sign_message.py << 'PYTHON_SCRIPT'
-#!/usr/bin/env python3
-import sys
-import time
-from eth_account import Account
-from eth_account.messages import encode_defunct
-
-if len(sys.argv) != 3:
-    print("Usage: sign_message.py <method_name> <private_key>", file=sys.stderr)
-    sys.exit(1)
-
-method_name = sys.argv[1]
-private_key = sys.argv[2]
-
-# Remove 0x prefix if present
-if private_key.startswith('0x'):
-    private_key = private_key[2:]
-
-# Create account
-account = Account.from_key('0x' + private_key)
-
-# Get current timestamp
-timestamp = int(time.time())
-
-# Build message: "MethodName:timestamp"
-message = f"{method_name}:{timestamp}"
-
-# Sign message (EIP-191)
-encoded_message = encode_defunct(text=message)
-signed = account.sign_message(encoded_message)
-
-# Output: signature,timestamp,address
-print(f"{signed.signature.hex()},{timestamp},{account.address}")
-PYTHON_SCRIPT
-
-chmod +x /tmp/sign_message.py
-
 echo "======================================"
 echo "ListWhitelist Request"
 echo "======================================"
@@ -324,6 +286,7 @@ set +e  # Don't exit on error
 response=$(grpcurl -plaintext \
     -H "x-signature: $SIGNATURE" \
     -H "x-timestamp: $TIMESTAMP" \
+    -H "x-signature-version: 2" \
     -import-path "$SCRIPT_DIR/../proto" \
     -proto tapp_service.proto \
     -d '{}' \

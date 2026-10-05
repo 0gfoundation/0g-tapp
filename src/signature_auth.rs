@@ -5,22 +5,13 @@ use sha3::{Digest, Keccak256};
 /// Ethereum signature format: 65 bytes (r: 32 bytes, s: 32 bytes, v: 1 byte)
 const SIGNATURE_LENGTH: usize = 65;
 
-/// Maximum timestamp difference allowed (120 seconds)
+/// How far a request's signed timestamp may be from now, either direction.
 ///
-/// This is the LEGACY window, for signatures that do not bind the request body
-/// ("method:timestamp"). It stays tight because such a signature is good for the
-/// method with ANY body — widening it widens what an interceptor can do with it.
-pub const MAX_TIMESTAMP_DIFF: i64 = 120;
-
-/// Window for body-bound signatures ("method:0x<sha256(body)>:timestamp").
-///
-/// Wider than the legacy window on purpose: a body-bound signature authorises one
-/// specific request content and (with the replay guard) at most one execution, so
-/// the only thing a longer validity buys an attacker is choosing WHEN that exact
-/// request lands. What it buys operators is tolerance for clock drift and slow
-/// manual flows, which is what used to produce spurious "timestamp outside
-/// acceptable window" failures.
-pub const SIGNED_BODY_MAX_TIMESTAMP_DIFF: i64 = 600;
+/// Wide on purpose: a signature binds one specific request body and (with the
+/// replay guard) at most one execution, so the only thing a longer validity buys
+/// an attacker is choosing WHEN that exact request lands. What it buys operators
+/// is tolerance for clock drift and slow manual flows.
+pub const MAX_TIMESTAMP_DIFF: i64 = 600;
 
 /// Recover EVM address from signature
 ///
@@ -87,19 +78,15 @@ pub fn verify_evm_signature(
     Ok(recovered_address.to_lowercase() == normalized_expected.to_lowercase())
 }
 
-/// Verify timestamp is within acceptable range (legacy window)
-pub fn verify_timestamp(timestamp: i64) -> Result<bool> {
-    Ok(verify_timestamp_within(timestamp, MAX_TIMESTAMP_DIFF))
-}
-
-/// Verify timestamp is within `window` seconds of now, either direction.
-pub fn verify_timestamp_within(timestamp: i64, window: i64) -> bool {
+/// Whether `timestamp` is within [`MAX_TIMESTAMP_DIFF`] of now.
+pub fn verify_timestamp(timestamp: i64) -> bool {
     let now = chrono::Utc::now().timestamp();
-    (now - timestamp).abs() <= window
+    (now - timestamp).abs() <= MAX_TIMESTAMP_DIFF
 }
 
-/// Build the LEGACY message format for signing: "method_name:timestamp".
-/// Binds the method and the moment, NOT the request content.
+/// "method_name:timestamp" — the message this server signs when IT calls the
+/// KMS (`GetSecretResource:<ts>`, the KMS's auth format). Inbound RPCs are not
+/// accepted in this form; they use [`build_sign_message_v2`].
 pub fn build_sign_message(method_name: &str, timestamp: i64) -> String {
     format!("{}:{}", method_name, timestamp)
 }
@@ -135,14 +122,13 @@ pub struct ReplayGuard {
 
 impl ReplayGuard {
     /// Admit a signature exactly once. `signed_ts` is the timestamp inside the
-    /// signed message; `window` the widest window this signature validates under.
-    /// Returns false when the signature was already used.
-    pub fn admit(&self, signature_hex: &str, signed_ts: i64, window: i64) -> bool {
+    /// signed message. Returns false when the signature was already used.
+    pub fn admit(&self, signature_hex: &str, signed_ts: i64) -> bool {
         let digest: [u8; 32] = Keccak256::digest(signature_hex.trim().as_bytes()).into();
         let now = chrono::Utc::now().timestamp();
         let mut seen = self.seen.lock().unwrap_or_else(|p| p.into_inner());
         // Prune whatever can no longer validate anyway (small slack for clock skew).
-        seen.retain(|_, ts| (now - *ts).abs() <= window + 60);
+        seen.retain(|_, ts| (now - *ts).abs() <= MAX_TIMESTAMP_DIFF + 60);
         seen.insert(digest, signed_ts).is_none()
     }
 }
@@ -264,20 +250,13 @@ mod tests {
     fn test_verify_timestamp() {
         let now = chrono::Utc::now().timestamp();
 
-        // Current timestamp should be valid
-        assert!(verify_timestamp(now).unwrap());
-
-        // 2 minutes ago should be valid
-        assert!(verify_timestamp(now - 120).unwrap());
-
-        // 2 minutes in future should be valid
-        assert!(verify_timestamp(now + 120).unwrap());
-
-        // 10 minutes ago should be invalid
-        assert!(!verify_timestamp(now - 600).unwrap());
-
-        // 10 minutes in future should be invalid
-        assert!(!verify_timestamp(now + 600).unwrap());
+        assert!(verify_timestamp(now));
+        // Up to 10 minutes either way is accepted…
+        assert!(verify_timestamp(now - 590));
+        assert!(verify_timestamp(now + 590));
+        // …and beyond that refused.
+        assert!(!verify_timestamp(now - 700));
+        assert!(!verify_timestamp(now + 700));
     }
 
     #[test]

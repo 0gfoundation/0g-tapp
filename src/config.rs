@@ -218,13 +218,6 @@ pub struct PermissionConfig {
     /// reboot, matching the RTMR lifetime (reboot = re-claim, re-measured).
     #[serde(default = "default_owner_state_path")]
     pub owner_state_path: PathBuf,
-
-    /// Refuse legacy signatures ("method:timestamp"), accepting only
-    /// body-bound ones ("method:0x<sha256(body)>:timestamp", tapp-cli >= 0.9.0).
-    /// Off by default so older CLIs keep working; turn it on once every
-    /// operator of the node has upgraded.
-    #[serde(default)]
-    pub require_signed_body: bool,
 }
 
 /// On-chain configuration

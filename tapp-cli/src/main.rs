@@ -3716,6 +3716,12 @@ mod tests {
             ..Default::default()
         });
         let expected_hash = hex::encode(sha2::Sha256::digest(req.get_ref().encode_to_vec()));
+        // Fixed vector shared with examples/sign_message.py, whose own protobuf
+        // encoder must produce the same bytes for the same request.
+        assert_eq!(
+            expected_hash,
+            "39fef2e2e8466a84cb5f0cec06023957f2b8b354defa0bdd3a2a9e065d08260d"
+        );
         assert_eq!(
             sign_message_for(&req, "StartApp", 1700000000, false),
             format!("StartApp:0x{expected_hash}:1700000000")

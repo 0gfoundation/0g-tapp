@@ -53,23 +53,27 @@ done
 
 TARGET_ADDRESS="$TARGET_HOST:$TARGET_PORT"
 
-echo "Generating signature..."
-SIGN_OUTPUT=$(python3 "$SCRIPT_DIR/sign_message.py" "ClaimOwner" "$PRIVATE_KEY")
-SIGNATURE=$(echo "$SIGN_OUTPUT" | cut -d',' -f1)
-TIMESTAMP=$(echo "$SIGN_OUTPUT" | cut -d',' -f2)
-SIGNER_ADDRESS=$(echo "$SIGN_OUTPUT" | cut -d',' -f3)
-
-echo "Claiming config of $TARGET_ADDRESS as $SIGNER_ADDRESS ..."
-KBS_ARRAY=$(echo "$KBS_URLS" | tr ',' '\n' | jq -R . | jq -s .)
+KBS_ARRAY=$(echo "$KBS_URLS" | tr ',' '\n' | grep -v '^$' | jq -R . | jq -s .)
 request=$(jq -n \
   --arg chain_rpc_url "$CHAIN_RPC_URL" \
   --arg chain_contract_address "$CHAIN_CONTRACT" \
   --argjson kbs_node_urls "$KBS_ARRAY" \
   '{chain_rpc_url:$chain_rpc_url,chain_contract_address:$chain_contract_address,kbs_node_urls:$kbs_node_urls}')
 
+# Sign the exact request: the signer becomes the owner, so the signature must
+# be over the method the server checks (ClaimConfig) and the body it receives.
+echo "Generating signature..."
+SIGN_OUTPUT=$(printf "%s" "$request" | python3 "$SCRIPT_DIR/sign_message.py" "ClaimConfig" "$PRIVATE_KEY" -)
+SIGNATURE=$(echo "$SIGN_OUTPUT" | cut -d',' -f1)
+TIMESTAMP=$(echo "$SIGN_OUTPUT" | cut -d',' -f2)
+SIGNER_ADDRESS=$(echo "$SIGN_OUTPUT" | cut -d',' -f3)
+
+echo "Claiming config of $TARGET_ADDRESS as $SIGNER_ADDRESS ..."
+
 response=$(echo "$request" | grpcurl -plaintext \
   -H "x-signature: $SIGNATURE" \
   -H "x-timestamp: $TIMESTAMP" \
+  -H "x-signature-version: 2" \
   -import-path "$SCRIPT_DIR/../proto" \
   -proto tapp_service.proto \
   -d @ \

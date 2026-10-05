@@ -1,8 +1,7 @@
 use crate::config::PermissionConfig;
 use crate::permission::{Permission, PermissionManager};
 use crate::signature_auth::{
-    build_sign_message, build_sign_message_v2, recover_evm_address, verify_timestamp_within,
-    ReplayGuard, MAX_TIMESTAMP_DIFF, SIGNED_BODY_MAX_TIMESTAMP_DIFF,
+    build_sign_message_v2, recover_evm_address, verify_timestamp, ReplayGuard, MAX_TIMESTAMP_DIFF,
 };
 use sha2::Digest;
 use std::sync::Arc;
@@ -21,22 +20,19 @@ pub struct AuthLayer {
     /// Signatures already used, shared across both listeners (TCP and socket) —
     /// one execution per signature, whichever path it arrives on.
     replay: Arc<ReplayGuard>,
-    /// When set, legacy "method:timestamp" signatures are refused. Off by
-    /// default: old CLIs must keep working until a fleet is known-upgraded.
-    require_signed_body: bool,
 }
 
 impl AuthLayer {
     pub fn new(config: Option<PermissionConfig>) -> Self {
-        let (permission_manager, enabled, require_signed_body) = if let Some(cfg) = config {
+        let (permission_manager, enabled) = if let Some(cfg) = config {
             if cfg.enabled {
                 let pm = PermissionManager::new(cfg.owner_address.clone());
-                (Some(Arc::new(pm)), true, cfg.require_signed_body)
+                (Some(Arc::new(pm)), true)
             } else {
-                (None, false, false)
+                (None, false)
             }
         } else {
-            (None, false, false)
+            (None, false)
         };
         // NOTE: main.rs always uses with_permission_manager; this path only
         // serves tests and keeps the claim/persistence wiring out of the layer.
@@ -45,19 +41,14 @@ impl AuthLayer {
             permission_manager,
             enabled,
             replay: Arc::new(ReplayGuard::default()),
-            require_signed_body,
         }
     }
 
-    pub fn with_permission_manager(
-        permission_manager: Arc<PermissionManager>,
-        require_signed_body: bool,
-    ) -> Self {
+    pub fn with_permission_manager(permission_manager: Arc<PermissionManager>) -> Self {
         Self {
             permission_manager: Some(permission_manager),
             enabled: true,
             replay: Arc::new(ReplayGuard::default()),
-            require_signed_body,
         }
     }
 }
@@ -71,7 +62,6 @@ impl<S> Layer<S> for AuthLayer {
             permission_manager: self.permission_manager.clone(),
             enabled: self.enabled,
             replay: self.replay.clone(),
-            require_signed_body: self.require_signed_body,
         }
     }
 }
@@ -83,7 +73,6 @@ pub struct AuthMiddleware<S> {
     permission_manager: Option<Arc<PermissionManager>>,
     enabled: bool,
     replay: Arc<ReplayGuard>,
-    require_signed_body: bool,
 }
 
 impl<S> Service<http::Request<BoxBody>> for AuthMiddleware<S>
@@ -106,7 +95,6 @@ where
         let permission_manager = self.permission_manager.clone();
         let enabled = self.enabled;
         let replay = self.replay.clone();
-        let require_signed_body = self.require_signed_body;
 
         Box::pin(async move {
             // Extract method name from URI path
@@ -167,11 +155,22 @@ where
             }
 
             // Extract headers needed for validation
-            let signature = req
+            let Some(signature) = req
                 .headers()
                 .get("x-signature")
                 .and_then(|v| v.to_str().ok())
-                .map(|s| s.to_string());
+                .map(|s| s.to_string())
+            else {
+                warn!(
+                    method = %method_name,
+                    event = "AUTH_MISSING_SIGNATURE",
+                    "Signature missing in request"
+                );
+                return Ok(Status::unauthenticated(
+                    "Missing signature. Please provide 'x-signature' in metadata",
+                )
+                .into_http());
+            };
 
             let timestamp_str = req
                 .headers()
@@ -179,26 +178,24 @@ where
                 .and_then(|v| v.to_str().ok())
                 .map(|s| s.to_string());
 
-            // "2" = the signature covers the request body. Absent = legacy, which
-            // covers only the method and the moment. The version is declared rather
-            // than guessed: ECDSA recovery always yields SOME address, so trying
-            // both message formats could not tell which one the client meant.
+            // Only body-bound signatures ("x-signature-version: 2") are accepted.
+            // The legacy "method:timestamp" message authorised the method with ANY
+            // body, so an observed signature could carry a different request.
             let body_bound = req
                 .headers()
                 .get("x-signature-version")
                 .and_then(|v| v.to_str().ok())
                 .map(|v| v.trim() == "2")
                 .unwrap_or(false);
-
-            if !body_bound && require_signed_body {
+            if !body_bound {
                 warn!(
                     method = %method_name,
                     event = "AUTH_LEGACY_SIGNATURE_REFUSED",
                     "Refused a signature that does not cover the request body"
                 );
                 return Ok(Status::unauthenticated(
-                    "this node requires body-bound signatures (x-signature-version: 2); \
-                     upgrade tapp-cli to >= 0.9.0",
+                    "this node accepts only body-bound signatures (x-signature-version: 2): \
+                     use tapp-cli >= 0.9.0, without --legacy-sign",
                 )
                 .into_http());
             }
@@ -206,50 +203,42 @@ where
             // Hash exactly the bytes that will be decoded — the server's own view of
             // the request, not a re-encoding of it. The body is buffered, hashed and
             // handed on unchanged.
-            let body_hash = if body_bound {
-                let (parts, body) = req.into_parts();
-                let bytes = match http_body_util::BodyExt::collect(http_body_util::Limited::new(
-                    body,
-                    MAX_SIGNED_BODY_BYTES,
-                ))
-                .await
-                {
-                    Ok(c) => c.to_bytes(),
-                    Err(e) => {
-                        warn!(method = %method_name, error = %e, "Could not read request body");
-                        return Ok(Status::invalid_argument(format!(
-                            "could not read the request body: {e}"
-                        ))
-                        .into_http());
-                    }
-                };
-                let hash = match unary_message_hash(&bytes) {
-                    Ok(h) => h,
-                    Err(e) => return Ok(Status::invalid_argument(e).into_http()),
-                };
-                req = http::Request::from_parts(
-                    parts,
-                    tonic::body::boxed(http_body_util::Full::new(bytes)),
-                );
-                Some(hash)
-            } else {
-                None
+            let (parts, body) = req.into_parts();
+            let bytes = match http_body_util::BodyExt::collect(http_body_util::Limited::new(
+                body,
+                MAX_SIGNED_BODY_BYTES,
+            ))
+            .await
+            {
+                Ok(c) => c.to_bytes(),
+                Err(e) => {
+                    warn!(method = %method_name, error = %e, "Could not read request body");
+                    return Ok(Status::invalid_argument(format!(
+                        "could not read the request body: {e}"
+                    ))
+                    .into_http());
+                }
             };
+            let body_hash = match unary_message_hash(&bytes) {
+                Ok(h) => h,
+                Err(e) => return Ok(Status::invalid_argument(e).into_http()),
+            };
+            req = http::Request::from_parts(
+                parts,
+                tonic::body::boxed(http_body_util::Full::new(bytes)),
+            );
 
             // Validate signature
-            let (signer_address, signed_ts, window) =
-                match validate_signature(signature.as_deref(), timestamp_str, &method_name, body_hash) {
+            let (signer_address, signed_ts) =
+                match validate_signature(&signature, timestamp_str, &method_name, &body_hash) {
                     Ok(v) => v,
-                    Err(status) => {
-                        let response = status.into_http();
-                        return Ok(response);
-                    }
+                    Err(status) => return Ok(status.into_http()),
                 };
 
             // One execution per signature. Checked after recovery so unsigned noise
             // cannot fill the guard, before permission so a replay is refused as a
             // replay rather than reported as whatever the original request was.
-            if !replay.admit(signature.as_deref().unwrap_or_default(), signed_ts, window) {
+            if !replay.admit(&signature, signed_ts) {
                 warn!(
                     method = %method_name,
                     signer = %signer_address,
@@ -260,15 +249,6 @@ where
                     "this signature was already used; sign the request again",
                 )
                 .into_http());
-            }
-
-            if !body_bound {
-                warn!(
-                    method = %method_name,
-                    signer = %signer_address,
-                    event = "AUTH_LEGACY_SIGNATURE",
-                    "Accepted a legacy signature that does not cover the request body"
-                );
             }
 
             // Get user permission level
@@ -492,27 +472,14 @@ fn unary_message_hash(body: &[u8]) -> Result<[u8; 32], String> {
     Ok(sha2::Sha256::digest(&body[5..]).into())
 }
 
-/// Validate signature and return `(signer address, signed timestamp, window)`.
-///
-/// `body_hash` selects the format: `Some` = body-bound
-/// (`method:0x<sha256>:timestamp`, wide window), `None` = legacy
-/// (`method:timestamp`, narrow window).
+/// Validate a body-bound signature (`method:0x<sha256(body)>:timestamp`) and
+/// return `(signer address, signed timestamp)`.
 fn validate_signature(
-    signature: Option<&str>,
+    sig: &str,
     timestamp_str: Option<String>,
     method_name: &str,
-    body_hash: Option<[u8; 32]>,
-) -> Result<(String, i64, i64), Status> {
-    // Check signature
-    let sig = signature.ok_or_else(|| {
-        warn!(
-            method = %method_name,
-            event = "AUTH_MISSING_SIGNATURE",
-            "Signature missing in request"
-        );
-        Status::unauthenticated("Missing signature. Please provide 'x-signature' in metadata")
-    })?;
-
+    body_hash: &[u8; 32],
+) -> Result<(String, i64), Status> {
     let ts_str = timestamp_str.ok_or_else(|| {
         warn!(
             method = %method_name,
@@ -532,14 +499,8 @@ fn validate_signature(
         Status::invalid_argument("Invalid timestamp format")
     })?;
 
-    let window = if body_hash.is_some() {
-        SIGNED_BODY_MAX_TIMESTAMP_DIFF
-    } else {
-        MAX_TIMESTAMP_DIFF
-    };
-
     // Verify timestamp is within acceptable window
-    if !verify_timestamp_within(timestamp, window) {
+    if !verify_timestamp(timestamp) {
         warn!(
             method = %method_name,
             timestamp = %timestamp,
@@ -548,15 +509,12 @@ fn validate_signature(
         );
         return Err(Status::unauthenticated(format!(
             "Timestamp outside acceptable window (±{} seconds)",
-            window
+            MAX_TIMESTAMP_DIFF
         )));
     }
 
     // Build the message that should have been signed
-    let message = match &body_hash {
-        Some(h) => build_sign_message_v2(method_name, h, timestamp),
-        None => build_sign_message(method_name, timestamp),
-    };
+    let message = build_sign_message_v2(method_name, body_hash, timestamp);
 
     // Recover signer address from signature
     let signer_address = recover_evm_address(&message, sig).map_err(|e| {
@@ -575,7 +533,7 @@ fn validate_signature(
         "Successfully recovered signer address"
     );
 
-    Ok((signer_address, timestamp, window))
+    Ok((signer_address, timestamp))
 }
 
 /// The signed-body path end to end, through the real middleware: real signatures,
@@ -633,7 +591,7 @@ mod signed_body_tests {
     /// What the inner service saw: the body bytes and the authenticated signer.
     type Seen = Arc<Mutex<Option<(Vec<u8>, Option<String>)>>>;
 
-    fn middleware(require_signed_body: bool) -> (AuthMiddleware<impl Service<
+    fn middleware() -> (AuthMiddleware<impl Service<
         http::Request<BoxBody>,
         Response = http::Response<BoxBody>,
         Error = std::convert::Infallible,
@@ -654,7 +612,7 @@ mod signed_body_tests {
             }
         });
         let pm = Arc::new(PermissionManager::new(Some(address_of(&KEY))));
-        let layer = AuthLayer::with_permission_manager(pm, require_signed_body);
+        let layer = AuthLayer::with_permission_manager(pm);
         (layer.layer(inner), seen)
     }
 
@@ -691,7 +649,7 @@ mod signed_body_tests {
 
     #[tokio::test]
     async fn a_body_bound_signature_from_the_owner_passes_and_the_body_arrives_intact() {
-        let (mut svc, seen) = middleware(false);
+        let (mut svc, seen) = middleware();
         let msg = start_app("services: {}");
         let ts = chrono::Utc::now().timestamp();
         let sig = signed_v2(&KEY, "StartApp", &msg, ts);
@@ -709,7 +667,7 @@ mod signed_body_tests {
 
     #[tokio::test]
     async fn a_body_swapped_in_flight_is_refused() {
-        let (mut svc, seen) = middleware(false);
+        let (mut svc, seen) = middleware();
         let signed_for = start_app("services: {web: {image: nginx}}");
         let ts = chrono::Utc::now().timestamp();
         let sig = signed_v2(&KEY, "StartApp", &signed_for, ts);
@@ -727,7 +685,7 @@ mod signed_body_tests {
 
     #[tokio::test]
     async fn a_signature_is_good_for_one_execution() {
-        let (mut svc, _) = middleware(false);
+        let (mut svc, _) = middleware();
         let msg = start_app("services: {}");
         let ts = chrono::Utc::now().timestamp();
         let sig = signed_v2(&KEY, "StartApp", &msg, ts);
@@ -740,51 +698,42 @@ mod signed_body_tests {
     }
 
     #[tokio::test]
-    async fn the_body_bound_window_is_ten_minutes_and_legacy_stays_at_two() {
-        let (mut svc, _) = middleware(false);
+    async fn the_window_is_ten_minutes() {
+        let (mut svc, _) = middleware();
         let msg = start_app("services: {}");
         let body = frame(&msg.encode_to_vec());
         let now = chrono::Utc::now().timestamp();
 
-        // Body-bound, 8 minutes old: accepted.
         let ts = now - 480;
         let sig = signed_v2(&KEY, "StartApp", &msg, ts);
         let resp = svc.call(request("StartApp", body.clone(), &sig, ts, Some("2"))).await.unwrap();
-        assert_eq!(grpc_status(&resp), None);
+        assert_eq!(grpc_status(&resp), None, "8 minutes old is inside the window");
 
-        // Body-bound, 11 minutes old: refused.
         let ts = now - 660;
         let sig = signed_v2(&KEY, "StartApp", &msg, ts);
-        let resp = svc.call(request("StartApp", body.clone(), &sig, ts, Some("2"))).await.unwrap();
-        assert_eq!(grpc_status(&resp), Some(tonic::Code::Unauthenticated as i32));
-
-        // Legacy, 3 minutes old: refused — the wide window is only for bound bodies.
-        let ts = now - 180;
-        let sig = personal_sign(&KEY, &build_sign_message("StartApp", ts));
-        let resp = svc.call(request("StartApp", body, &sig, ts, None)).await.unwrap();
+        let resp = svc.call(request("StartApp", body, &sig, ts, Some("2"))).await.unwrap();
         assert_eq!(grpc_status(&resp), Some(tonic::Code::Unauthenticated as i32));
     }
 
+    /// The legacy message authorised the method with any body. Even a valid one
+    /// from the owner is refused — and refused before the body is read.
     #[tokio::test]
-    async fn legacy_signatures_work_by_default_and_are_refused_when_required() {
+    async fn a_legacy_signature_is_refused_even_from_the_owner() {
+        let (mut svc, seen) = middleware();
         let msg = start_app("services: {}");
-        let body = frame(&msg.encode_to_vec());
         let ts = chrono::Utc::now().timestamp();
-
-        let (mut lenient, _) = middleware(false);
-        let sig = personal_sign(&KEY, &build_sign_message("StartApp", ts));
-        let resp = lenient.call(request("StartApp", body.clone(), &sig, ts, None)).await.unwrap();
-        assert_eq!(grpc_status(&resp), None, "old CLIs keep working until the switch is flipped");
-
-        let (mut strict, _) = middleware(true);
-        let sig = personal_sign(&KEY, &build_sign_message("StartApp", ts + 1));
-        let resp = strict.call(request("StartApp", body, &sig, ts + 1, None)).await.unwrap();
+        let sig = personal_sign(&KEY, &format!("StartApp:{ts}"));
+        let resp = svc
+            .call(request("StartApp", frame(&msg.encode_to_vec()), &sig, ts, None))
+            .await
+            .unwrap();
         assert_eq!(grpc_status(&resp), Some(tonic::Code::Unauthenticated as i32));
+        assert!(seen.lock().unwrap().is_none());
     }
 
     #[tokio::test]
     async fn a_body_bound_signature_from_someone_else_holds_no_permission() {
-        let (mut svc, _) = middleware(false);
+        let (mut svc, _) = middleware();
         let msg = start_app("services: {}");
         let ts = chrono::Utc::now().timestamp();
         let sig = signed_v2(&OTHER_KEY, "StartApp", &msg, ts);
