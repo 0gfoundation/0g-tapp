@@ -106,30 +106,47 @@ pub fn build_sign_message_v2(method_name: &str, body_hash: &[u8; 32], timestamp:
 // Replay guard
 // ============================================================================
 
-/// Remembers signatures for as long as their timestamp could still validate, so
-/// each one authorises at most ONE execution. Without this, any observed
-/// signature could be resubmitted for the width of the window — harmless for an
+/// Remembers authorised requests for as long as their timestamp could still
+/// validate, so each one executes at most ONCE. Without this, any observed
+/// request could be resubmitted for the width of the window — harmless for an
 /// idempotent read, not for StartApp.
 ///
-/// Memory is bounded by (ops per window) — these are operator actions, not
-/// traffic, so the map stays tiny. A legitimate retry is unaffected: the CLI
-/// signs afresh on every call.
+/// Keyed on what was signed (signer + message), never on the signature's
+/// spelling: one signature has many encodings that all recover to the same
+/// signer — with or without 0x, either hex case, v as 27/28 or 0/1 — and a key
+/// on the header string would admit each of them once more.
+///
+/// Only requests that passed the permission check are recorded, so memory is
+/// bounded by authorised operations per window — operator actions, not
+/// traffic. A legitimate retry is unaffected: the CLI signs afresh on every
+/// call (a new timestamp, so a new message).
 #[derive(Default)]
 pub struct ReplayGuard {
-    /// keccak256(signature bytes) → the signed timestamp.
+    /// keccak256(signer ‖ 0x00 ‖ message) → the signed timestamp.
     seen: std::sync::Mutex<std::collections::HashMap<[u8; 32], i64>>,
 }
 
 impl ReplayGuard {
-    /// Admit a signature exactly once. `signed_ts` is the timestamp inside the
-    /// signed message. Returns false when the signature was already used.
-    pub fn admit(&self, signature_hex: &str, signed_ts: i64) -> bool {
-        let digest: [u8; 32] = Keccak256::digest(signature_hex.trim().as_bytes()).into();
+    /// Admit a signed request exactly once. `signer` is the recovered address,
+    /// `message` the exact string that was signed, `signed_ts` the timestamp
+    /// inside it. Returns false when that request was already admitted.
+    pub fn admit(&self, signer: &str, message: &str, signed_ts: i64) -> bool {
+        let mut h = Keccak256::new();
+        h.update(signer.to_lowercase().as_bytes());
+        h.update([0u8]);
+        h.update(message.as_bytes());
+        let digest: [u8; 32] = h.finalize().into();
         let now = chrono::Utc::now().timestamp();
         let mut seen = self.seen.lock().unwrap_or_else(|p| p.into_inner());
         // Prune whatever can no longer validate anyway (small slack for clock skew).
         seen.retain(|_, ts| (now - *ts).abs() <= MAX_TIMESTAMP_DIFF + 60);
         seen.insert(digest, signed_ts).is_none()
+    }
+
+    /// How many requests are currently remembered.
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.seen.lock().unwrap_or_else(|p| p.into_inner()).len()
     }
 }
 

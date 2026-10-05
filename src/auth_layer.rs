@@ -235,22 +235,6 @@ where
                     Err(status) => return Ok(status.into_http()),
                 };
 
-            // One execution per signature. Checked after recovery so unsigned noise
-            // cannot fill the guard, before permission so a replay is refused as a
-            // replay rather than reported as whatever the original request was.
-            if !replay.admit(&signature, signed_ts) {
-                warn!(
-                    method = %method_name,
-                    signer = %signer_address,
-                    event = "AUTH_SIGNATURE_REPLAYED",
-                    "Refused a signature that was already used"
-                );
-                return Ok(Status::unauthenticated(
-                    "this signature was already used; sign the request again",
-                )
-                .into_http());
-            }
-
             // Get user permission level
             let user_permission = pm.get_permission(&signer_address).await;
 
@@ -275,6 +259,24 @@ where
                     Status::permission_denied("Insufficient permission for this operation")
                         .into_http();
                 return Ok(response);
+            }
+
+            // One execution per signed request. Recorded only once permission has
+            // passed: any 65 bytes recover to SOME address, so admitting earlier
+            // would let anyone grow the guard with requests that were never going
+            // to run. Keyed on signer + signed message, not the signature string.
+            let signed_message = build_sign_message_v2(&method_name, &body_hash, signed_ts);
+            if !replay.admit(&signer_address, &signed_message, signed_ts) {
+                warn!(
+                    method = %method_name,
+                    signer = %signer_address,
+                    event = "AUTH_SIGNATURE_REPLAYED",
+                    "Refused a signature that was already used"
+                );
+                return Ok(Status::unauthenticated(
+                    "this signature was already used; sign the request again",
+                )
+                .into_http());
             }
 
             info!(
@@ -690,6 +692,57 @@ mod signed_body_tests {
         assert_eq!(grpc_status(&first), None);
         let replay = svc.call(request("StartApp", body, &sig, ts, Some("2"))).await.unwrap();
         assert_eq!(grpc_status(&replay), Some(tonic::Code::Unauthenticated as i32));
+    }
+
+    /// One signature has many spellings that recover to the same signer. Every one
+    /// of them is the same request, and must be refused as a replay.
+    #[tokio::test]
+    async fn a_re_encoded_signature_is_still_a_replay() {
+        let (mut svc, _) = middleware();
+        let msg = start_app("services: {}");
+        let ts = chrono::Utc::now().timestamp();
+        let sig = signed_v2(&KEY, "StartApp", &msg, ts);
+        let body = frame(&msg.encode_to_vec());
+
+        let first = svc.call(request("StartApp", body.clone(), &sig, ts, Some("2"))).await.unwrap();
+        assert_eq!(grpc_status(&first), None);
+
+        let hex = sig.trim_start_matches("0x");
+        let v = u8::from_str_radix(&hex[128..], 16).unwrap();
+        let variants = [
+            hex.to_string(),                                       // no 0x
+            format!("0x{}", hex.to_uppercase()),                   // other case
+            format!("0x{}{:02x}", &hex[..128], v - 27),            // v as 0/1
+        ];
+        for variant in variants {
+            let resp = svc
+                .call(request("StartApp", body.clone(), &variant, ts, Some("2")))
+                .await
+                .unwrap();
+            assert_eq!(
+                grpc_status(&resp),
+                Some(tonic::Code::Unauthenticated as i32),
+                "{variant} is the same signature and must be refused as a replay"
+            );
+        }
+    }
+
+    /// Any 65 bytes recover to SOME address, so a request that fails permission
+    /// must not be remembered — otherwise anyone could grow the guard at will.
+    #[tokio::test]
+    async fn a_request_refused_for_permission_leaves_nothing_in_the_guard() {
+        let (mut svc, _) = middleware();
+        let msg = start_app("services: {}");
+        let ts = chrono::Utc::now().timestamp();
+        for key in [OTHER_KEY, [11u8; 32], [13u8; 32]] {
+            let sig = signed_v2(&key, "StartApp", &msg, ts);
+            let resp = svc
+                .call(request("StartApp", frame(&msg.encode_to_vec()), &sig, ts, Some("2")))
+                .await
+                .unwrap();
+            assert_eq!(grpc_status(&resp), Some(tonic::Code::PermissionDenied as i32));
+        }
+        assert_eq!(svc.replay.len(), 0);
     }
 
     #[tokio::test]
