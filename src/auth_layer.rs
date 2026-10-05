@@ -265,8 +265,16 @@ where
             // passed: any 65 bytes recover to SOME address, so admitting earlier
             // would let anyone grow the guard with requests that were never going
             // to run. Keyed on signer + signed message, not the signature string.
+            //
+            // Authenticated methods are not recorded at all: there "permission" is
+            // any valid signature, which any 65 bytes are, so recording them would
+            // reopen exactly that growth. Their only member, ClaimConfig, needs no
+            // guard — a claim succeeds once, and every later copy is refused by the
+            // handler as already claimed.
             let signed_message = build_sign_message_v2(&method_name, &body_hash, signed_ts);
-            if !replay.admit(&signer_address, &signed_message, signed_ts) {
+            if method_permission != MethodPermission::Authenticated
+                && !replay.admit(&signer_address, &signed_message, signed_ts)
+            {
                 warn!(
                     method = %method_name,
                     signer = %signer_address,
@@ -742,6 +750,27 @@ mod signed_body_tests {
                 .unwrap();
             assert_eq!(grpc_status(&resp), Some(tonic::Code::PermissionDenied as i32));
         }
+        assert_eq!(svc.replay.len(), 0);
+    }
+
+    /// ClaimConfig takes any valid signature at this layer — which any 65 bytes
+    /// are — so recording it would let anyone grow the guard through it.
+    #[tokio::test]
+    async fn claim_config_never_enters_the_guard() {
+        let (mut svc, seen) = middleware();
+        let msg = crate::proto::ClaimConfigRequest::default();
+        let hash: [u8; 32] = sha2::Sha256::digest(msg.encode_to_vec()).into();
+        let ts = chrono::Utc::now().timestamp();
+        for key in [OTHER_KEY, [11u8; 32], [13u8; 32]] {
+            let sig = personal_sign(&key, &build_sign_message_v2("ClaimConfig", &hash, ts));
+            let resp = svc
+                .call(request("ClaimConfig", frame(&msg.encode_to_vec()), &sig, ts, Some("2")))
+                .await
+                .unwrap();
+            // Reaches the handler, which decides whether the node is claimable.
+            assert_eq!(grpc_status(&resp), None);
+        }
+        assert!(seen.lock().unwrap().is_some());
         assert_eq!(svc.replay.len(), 0);
     }
 
