@@ -4,7 +4,7 @@
 // Run `forge build` in contract/ first. Usage:
 //
 //	PRIVATE_KEY=0x<throwaway> go run ./cmd/upgrade/ --network testnet
-//	go run ./cmd/upgrade/ --network testnet --check 0x<new implementation>
+//	go run ./cmd/upgrade/ --network testnet --check 0x<new implementation> [--verify]
 //
 // Deploying an implementation needs no authority, so the key here only pays gas.
 // The switch (beacon.upgradeTo) is the owner's, and what happens depends on what
@@ -38,6 +38,7 @@ import (
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethclient"
 
+	"github.com/0gfoundation/0g-tapp/contract/cmd/internal/explorer"
 	reg "github.com/0gfoundation/0g-tapp/contract/cmd/internal/registry"
 )
 
@@ -64,6 +65,7 @@ type ctxT struct {
 	beaconAt common.Address
 	apps     []string
 	state    string
+	verify   bool
 }
 
 func main() {
@@ -76,6 +78,7 @@ func main() {
 	appsFlag := fs.String("apps", "0g-kms", "comma-separated app ids whose records are snapshotted")
 	stateFile := fs.String("state-file", "", "snapshot file (default upgrade-state.<proxy>.txt)")
 	proposer := fs.String("proposer", "", "timelock only: an address holding PROPOSER_ROLE, to simulate the schedule call as")
+	verify := fs.Bool("verify", false, "once the switch is confirmed, verify the new implementation on the explorer")
 	_ = fs.Parse(os.Args[1:])
 
 	n, err := netFlags.Resolve()
@@ -107,6 +110,7 @@ func main() {
 			t.apps = append(t.apps, a)
 		}
 	}
+	t.verify = *verify
 	t.state = *stateFile
 	if t.state == "" {
 		t.state = "upgrade-state." + t.proxy.Hex() + ".txt"
@@ -183,7 +187,7 @@ func main() {
 		fmt.Printf("  Simulated as the owner: succeeds. Send this FROM %s:\n\n", owner.Hex())
 		printTx(t.beaconAt, upgradeData, n.ChainID)
 		fmt.Println("  (MetaMask: Settings → Advanced → Show hex data; priority fee ≥ 2 gwei.)")
-		fmt.Printf("\nThen: go run ./cmd/upgrade/ --network %s --check %s\n", n.Name, impl.Hex())
+		fmt.Printf("\nThen: go run ./cmd/upgrade/ --network %s --proxy %s --check %s --verify\n", n.Name, t.proxy.Hex(), impl.Hex())
 	default:
 		t.timelock(owner, impl, upgradeData, *proposer)
 	}
@@ -221,7 +225,7 @@ func (t *ctxT) timelock(tl, impl common.Address, upgradeData []byte, proposer st
 	fmt.Printf("  Step 2 — execute, from an EXECUTOR, no earlier than %s after step 1 lands:\n", time.Duration(delay.Int64())*time.Second)
 	printTx(tl, execute, t.n.ChainID)
 	fmt.Printf("  Operation id %s — --check reports where it stands.\n", t.opID(tl, impl, upgradeData).Hex())
-	fmt.Printf("\nThen: go run ./cmd/upgrade/ --network %s --check %s\n", t.n.Name, impl.Hex())
+	fmt.Printf("\nThen: go run ./cmd/upgrade/ --network %s --proxy %s --check %s --verify\n", t.n.Name, t.proxy.Hex(), impl.Hex())
 }
 
 // check: did the switch land, and is everything else as it was?
@@ -255,6 +259,7 @@ func (t *ctxT) check(impl, owner common.Address) {
 	raw, err := os.ReadFile(t.state)
 	if err != nil {
 		fmt.Printf("(no snapshot at %s — state not compared)\n", t.state)
+		t.verifyImpl(impl)
 		return
 	}
 	before := strings.Split(strings.TrimSpace(string(raw)), "\n")
@@ -273,6 +278,21 @@ func (t *ctxT) check(impl, owner common.Address) {
 		os.Exit(1)
 	}
 	fmt.Printf("✓ state unchanged across the upgrade (%d values from %s)\n", len(before), t.state)
+	t.verifyImpl(impl)
+}
+
+// verifyImpl verifies the new implementation once the switch is confirmed. The
+// beacon and proxy did not change, so there is nothing else to verify.
+func (t *ctxT) verifyImpl(impl common.Address) {
+	if !t.verify {
+		fmt.Printf("Next: go run ./cmd/verify/ --network %s --proxy %s\n", t.n.Name, t.proxy.Hex())
+		return
+	}
+	fmt.Println("\nVerifying the new implementation on the explorer...")
+	if explorer.New(t.n, t.c).All(t.ctx, explorer.Implementation(impl)) > 0 {
+		fmt.Printf("Retry: go run ./cmd/verify/ --network %s --proxy %s\n", t.n.Name, t.proxy.Hex())
+		os.Exit(1)
+	}
 }
 
 // snapshot: every value an upgrade must not change.

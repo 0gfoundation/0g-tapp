@@ -24,7 +24,8 @@ upgrades apply immediately, which is intended for a dev chain).
 |----------|---------|
 | TappRegistry Implementation (initial) | `0xaeddc6b6A6b9d4a9513Cc2322bbb78DFF97DA459` |
 | TappRegistry Implementation (getNode resolves inherit) | `0x6987fD9afe6e2430bF5AD85cfBC8c63487d4e4BD` |
-| **TappRegistry Implementation (current, v0.1.0 — adds `version()`)** | `0x9Ea52Ef383e8eA3fe7F0890309D3C62b2FC1Ac2B` |
+| TappRegistry Implementation (v0.1.0 — adds `version()`) | `0x9Ea52Ef383e8eA3fe7F0890309D3C62b2FC1Ac2B` |
+| **TappRegistry Implementation (current, v0.2.0 — app-owner transfer)** | `0xa10a561C3Bf2c2dE3013845Cc2ed3eb5a218D3b8` |
 | UpgradeableBeacon | `0x1Cd7544068AdC525b9Cb21cC13aF25D95a53645E` |
 | **BeaconProxy (stable)** | `0x2Ce80374318B1d7Fb3345724457a182E0ad165c9` |
 
@@ -33,10 +34,11 @@ upgrades apply immediately, which is intended for a dev chain).
 | Date | New Implementation | Upgrade Tx | Notes |
 |------|--------------------|-----------|-------|
 | 2026-07-07 | `0x9Ea52Ef383e8eA3fe7F0890309D3C62b2FC1Ac2B` | `0x8a003a1a05c381f59bf213c19e2340b63094ad3230d84e0f42ac9c71d7f84505` | Add `version()` view (baseline `0.1.0`); storage layout unchanged, source-verified |
+| 2026-10-05 | `0xa10a561C3Bf2c2dE3013845Cc2ed3eb5a218D3b8` | `0x9541c3bb9c413bc8844f23066405a0671623833627a43c34304981576e5a2445` | `0.2.0`: two-step app-owner transfer. One new slot from `__gap`; `cmd/upgrade --check` confirmed 15 values unchanged (admin, stake parameters, and 0g-kms / 0g-agentic-id / 0g-agentic-id-sandbox-provider / 0g-tappscan records). Source-verified |
 
 **`getNode` returns 5 fields** — `(teeUrl, addedAt, stakeAmount, composeHash, volumesHash)`.
 Sanity check you are talking to this registry: `cast call <proxy> "version()(string)"`
-returns `"0.1.0"`.
+returns `"0.2.0"`.
 
 e2e exercised on app `0g-kms`: register-onchain (app-level default + first node
 inherit), add-node-onchain (per-node override), update-node-onchain — all verified
@@ -83,10 +85,10 @@ proposer key. Direct `beacon.upgradeTo` no longer works — only the timelock ca
 
 ---
 
-## Pending: implementation 0.2.0 (app ownership transfer)
+## Implementation 0.2.0 (app ownership transfer)
 
-Source is on `dev`; **not yet deployed on either network** — both proxies still
-answer `version()` = `"0.1.0"`. Adds a two-step app-owner transfer:
+**Testnet: deployed 2026-10-05** (see its upgrades table). **Mainnet: pending** —
+the proxy still answers `version()` = `"0.1.0"`. Adds a two-step app-owner transfer:
 
 | Function | Who | Effect |
 |---|---|---|

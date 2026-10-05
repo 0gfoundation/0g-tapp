@@ -5,7 +5,7 @@
 //
 //	PRIVATE_KEY=0x<throwaway> go run ./cmd/deploy/ --network testnet \
 //	  --stake 1000000000000000000 --lock 86400 \
-//	  [--beacon-owner 0x<timelock|wallet>] [--admin 0x<wallet>]
+//	  [--beacon-owner 0x<timelock|wallet>] [--admin 0x<wallet>] [--verify]
 //
 // The deploy key needs gas and nothing else. It starts out owning the beacon
 // (upgrades) and being the registry admin (stake parameters); --beacon-owner and
@@ -23,6 +23,7 @@ import (
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
 
+	"github.com/0gfoundation/0g-tapp/contract/cmd/internal/explorer"
 	reg "github.com/0gfoundation/0g-tapp/contract/cmd/internal/registry"
 )
 
@@ -34,6 +35,7 @@ func main() {
 	lock := fs.Int64("lock", 86400, "lockPeriod in seconds")
 	beaconOwner := fs.String("beacon-owner", "", "who may upgrade (the timelock on mainnet); default: keep the deploy key")
 	admin := fs.String("admin", "", "registry admin (stake parameters); default: keep the deploy key")
+	verify := fs.Bool("verify", false, "verify the three contracts on the explorer once deployed")
 	_ = fs.Parse(os.Args[1:])
 
 	n, err := netFlags.Resolve()
@@ -152,9 +154,20 @@ minStakeAmount          : %s wei
 lockPeriod              : %d s
 
 %s/address/%s
-Next: go run ./cmd/verify/ --network %s --proxy %s
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 `, n.Name, proxyAddr.Hex(), beaconAddr.Hex(), implAddr.Hex(), version[0],
 		ownerNow[0].(common.Address).Hex(), adminNow[0].(common.Address).Hex(),
-		minStake, *lock, n.Explorer, proxyAddr.Hex(), n.Name, proxyAddr.Hex())
+		minStake, *lock, n.Explorer, proxyAddr.Hex())
+
+	if !*verify {
+		fmt.Printf("Next: go run ./cmd/verify/ --network %s --proxy %s\n", n.Name, proxyAddr.Hex())
+		return
+	}
+	// A failed verification leaves the deployment exactly as it is; it can be
+	// retried with cmd/verify, so it is reported rather than treated as fatal.
+	fmt.Println("\nVerifying on the explorer...")
+	if explorer.New(n, c).All(ctx, explorer.Implementation(implAddr), explorer.Beacon(beaconAddr), explorer.Proxy(proxyAddr)) > 0 {
+		fmt.Printf("Retry: go run ./cmd/verify/ --network %s --proxy %s\n", n.Name, proxyAddr.Hex())
+		os.Exit(1)
+	}
 }
