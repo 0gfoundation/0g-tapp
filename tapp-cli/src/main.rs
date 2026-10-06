@@ -203,7 +203,7 @@ enum Commands {
         /// The replace case is the common one: a restart re-derives the signer, so
         /// the address on chain belongs to an instance that no longer exists. To
         /// grow a one-node app to two, pass --add-node.
-        #[arg(long, requires_all = ["rpc_url", "contract", "stake_wei"])]
+        #[arg(long, verbatim_doc_comment, requires_all = ["rpc_url", "contract", "stake_wei"])]
         register_onchain: bool,
 
         /// Ethereum RPC URL (with --register-onchain)
