@@ -599,7 +599,7 @@ tapp-cli verify-app \
   --contract 0x<TappRegistry>
   # --reference-values <dir>         # pinned/offline values instead of the published ones
   # --as-endpoint https://host:port  # CoCo-AS gRPC; TLS now, so give the scheme
-  # --as-pubkey 0x<sha256>           # pin the AS's attested TLS key
+  # --as-pubkey 0x<sha256>           # pin the AS's TLS key (or TAPP_AS_PUBKEY); current value in docs/TAPPSCAN.md
 
 # direct mode (single node, not yet registered): prints attested values verbatim
 tapp-cli -s http://<tapp>:50051 verify-app --app-id my-app
@@ -612,6 +612,14 @@ if fetched directly, and the quote must echo the random challenge sent for it
 (`fresh : ✓`). An old quote is genuine too, so passing one off as new is the one thing a
 relay could do, and the echo is what rules it out; a quote echoing a different challenge
 fails whichever way it came. `docs/verify_app.py` does all of the above the same way.
+
+The AS is trusted for the quote, so **pin it** (`--as-pubkey`, or `TAPP_AS_PUBKEY` once;
+the current value is in [`docs/TAPPSCAN.md`](docs/TAPPSCAN.md)). Unpinned, anyone on the
+path could forge every verdict: verify-app warns and never reports better than ⚠️. A
+**dev** image's boot chain is reported ⚠️, not ✅ — dev builds can carry an SSH key into
+the TD. "✅" means the boot chain matches a published image's digests; firmware
+(MRTD/RTMR0) is not compared yet. verify-app **exits non-zero** on a reconcile FAIL or an
+unpublished image, so scripts and CI can use it; warnings do not change the exit status.
 
 List the apps a server is currently running (read-only, no key needed):
 

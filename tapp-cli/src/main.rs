@@ -246,17 +246,19 @@ enum Commands {
         /// TappRegistry contract address 0x… (chain mode)
         #[arg(long)]
         contract: Option<String>,
-        /// CoCo Attestation Service gRPC endpoint (host:port)
-        #[arg(long, default_value = "https://35.253.66.70:50004")]
+        /// CoCo Attestation Service gRPC endpoint (https://host:port; a bare host:port is
+        /// plaintext)
+        #[arg(long, env = "TAPP_AS_ENDPOINT", default_value = "https://35.253.66.70:50004")]
         as_endpoint: String,
 
-        /// sha256 of the AS's TLS public key (`0x…`), for a TLS endpoint.
+        /// sha256 of the AS's TLS public key (`0x…`). The current value for the default AS
+        /// is in docs/TAPPSCAN.md; it changes when that TEE restarts.
         ///
         /// The AS is a TEE serving a self-signed certificate, so this REPLACES
         /// certificate-authority validation rather than adding to it. Without it the
         /// connection is encrypted but unauthenticated — anyone on the path can return any
-        /// verdict — and the output says so rather than refusing to run.
-        #[arg(long)]
+        /// verdict — so the output warns and the result is never better than ⚠️.
+        #[arg(long, env = "TAPP_AS_PUBKEY")]
         as_pubkey: Option<String>,
         /// AS policy id to enforce (enables boot-chain check). Empty = AS default
         /// policy (no boot-chain check). E.g. --policy-ids 0g-tapp-v0.1.0-dev
@@ -1773,6 +1775,19 @@ async fn verify_app_cmd(
     // on it; that verdict is shown beside the one reached here from the published values.
     let show_policy = !policy_ids.is_empty();
 
+    // The token is read, not signature-checked: the pinned channel is the only thing that
+    // makes "the AS said so" true. Unpinned, every verdict below could come from whoever
+    // sits on the path, so it is said up front and the result is capped at ⚠️.
+    let as_pinned = as_endpoint.starts_with("https://") && as_pubkey.is_some_and(|k| !k.is_empty());
+    if !as_pinned {
+        println!(
+            "⚠️  The AS at {} is NOT authenticated (no --as-pubkey / TAPP_AS_PUBKEY): anyone on \
+             the path could forge the quote and boot-chain verdicts below. The current pin for \
+             the default AS is in docs/TAPPSCAN.md.\n",
+            as_endpoint
+        );
+    }
+
     let loaded = match reference_values {
         Some(dir) => refvalues::from_dir(std::path::Path::new(dir)),
         None => {
@@ -1823,8 +1838,16 @@ async fn verify_app_cmd(
         if !d.note.is_empty() {
             println!("  note        : {}", d.note);
         }
-        println!("\nBoot chain {} ; TCB {}", boot_chain_summary([&d.boot_chain]), d.tcb_status);
+        println!(
+            "\nBoot chain {} ; TCB {}{}",
+            boot_chain_summary([&d.boot_chain]),
+            d.tcb_status,
+            if as_pinned { "" } else { " ; AS unauthenticated ⚠️" }
+        );
         println!("(direct mode shows what the node attests; register on-chain + use --contract to reconcile)");
+        if !d.replay_ok || matches!(d.boot_chain, refvalues::BootChain::Unknown { .. }) {
+            std::process::exit(1);
+        }
         return Ok(());
     }
 
@@ -1900,11 +1923,18 @@ async fn verify_app_cmd(
             n.tcb_status
         );
     }
+    let chains: Vec<_> = verdict.nodes.iter().filter(|n| n.reachable).map(|n| &n.boot_chain).collect();
     println!(
-        "\nResult: reconciliation {} ; boot chain {}",
+        "\nResult: reconciliation {} ; boot chain {}{}",
         if all_ok { "ALL PASS ✅" } else { "has failures ❌" },
-        boot_chain_summary(verdict.nodes.iter().filter(|n| n.reachable).map(|n| &n.boot_chain))
+        boot_chain_summary(chains.iter().copied()),
+        if as_pinned { "" } else { " ; AS unauthenticated ⚠️" }
     );
+    // Scripts and CI read the exit status: a definite failure is non-zero. Warnings (an
+    // unpinned AS, a dev image, nothing to compare against) are printed, not failed.
+    if !all_ok || chains.iter().any(|c| matches!(c, refvalues::BootChain::Unknown { .. })) {
+        std::process::exit(1);
+    }
     Ok(())
 }
 
@@ -1936,6 +1966,11 @@ fn print_boot_chain(
     use tapp_common::refvalues::BootChain;
     let label = format!("{}{:<width$}", indent, "boot chain");
     match chain {
+        BootChain::Matched(image) if tapp_common::refvalues::is_dev_image(image) => println!(
+            "{}: ⚠️ {} — a dev image (can carry an SSH key into the TD)",
+            label,
+            image.trim_end_matches(".json")
+        ),
         BootChain::Matched(image) => println!("{}: ✓ {}", label, image.trim_end_matches(".json")),
         BootChain::Unknown { closest } => {
             println!("{}: ✗ matches no published image", label);
@@ -1956,6 +1991,9 @@ fn print_boot_chain(
 fn boot_chain_word(chain: &tapp_common::refvalues::BootChain) -> String {
     use tapp_common::refvalues::BootChain;
     match chain {
+        BootChain::Matched(image) if tapp_common::refvalues::is_dev_image(image) => {
+            format!("⚠️ dev image {}", image.trim_end_matches(".json"))
+        }
         BootChain::Matched(image) => format!("✓ {}", image.trim_end_matches(".json")),
         BootChain::Unknown { .. } => "✗ unpublished image".to_string(),
         BootChain::NotChecked => "? not checked".to_string(),
@@ -1967,12 +2005,20 @@ fn boot_chain_summary<'a>(
 ) -> &'static str {
     use tapp_common::refvalues::BootChain;
     let chains: Vec<_> = chains.into_iter().collect();
+    // "Matches a published image's boot-chain digests", deliberately not "runs a published
+    // image": firmware (MRTD/RTMR0) is not compared, and an extra boot-services
+    // application ahead of a published UKI would still match.
     if chains.iter().any(|c| matches!(c, BootChain::Unknown { .. })) {
-        "has nodes on an unpublished image ❌"
+        "has nodes matching no published image ❌"
     } else if chains.is_empty() || chains.iter().any(|c| matches!(c, BootChain::NotChecked)) {
         "not checked ⚠️"
+    } else if chains
+        .iter()
+        .any(|c| matches!(c, BootChain::Matched(l) if tapp_common::refvalues::is_dev_image(l)))
+    {
+        "matches published digests, but of a dev image ⚠️"
     } else {
-        "every node runs a published image ✅"
+        "every node matches a published image's boot-chain digests ✅"
     }
 }
 

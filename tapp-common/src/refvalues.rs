@@ -421,6 +421,18 @@ pub enum BootChain {
     Unknown { closest: Option<(String, usize, usize)> },
 }
 
+/// A development image: a set labelled `…/dev.json` or under a `dev/` directory. Those are
+/// the builds that can carry a baked-in SSH key (`DEV_SSH_PUBKEY`) — a shell inside the TD
+/// — so matching one is not the same as running an audited production image.
+pub fn is_dev_image(label: &str) -> bool {
+    let p = Path::new(label);
+    p.file_stem().and_then(|s| s.to_str()) == Some("dev")
+        || p.parent()
+            .into_iter()
+            .flat_map(|d| d.components())
+            .any(|c| c.as_os_str() == "dev")
+}
+
 pub fn identify(measured: &Measured, sets: Option<&[RefSet]>) -> BootChain {
     let Some(sets) = sets else { return BootChain::NotChecked };
     let matches = match_sets(measured, sets);
@@ -492,6 +504,16 @@ mod tests {
         let s = parse_set("a.json", br#"{"measurement.uki.SHA-384":["u1"],"other":["x"]}"#).unwrap();
         assert_eq!(s.values.keys().collect::<Vec<_>>(), vec![ANY_BSA]);
         assert!(parse_set("README.json", br#"{"note":["x"]}"#).is_none());
+    }
+
+    #[test]
+    fn dev_images_are_told_apart_from_production() {
+        for dev in ["gcp/uki/v0.8.0/dev.json", "uki/v0.8.0-r3/dev.json", "gcp/grub/v0.2.0/dev/ea695c.json"] {
+            assert!(is_dev_image(dev), "{dev}");
+        }
+        for prod in ["gcp/uki/v0.8.0/prod.json", "uki/v0.8.0-r2/prod.json", "gcp/uki/devtools/prod.json"] {
+            assert!(!is_dev_image(prod), "{prod}");
+        }
     }
 
     #[test]

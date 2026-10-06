@@ -8,8 +8,9 @@ the published reference values, reconcile the evidence with the chain. The same 
 Requires: cast (foundry), tapp-cli, grpcurl, and attestation.proto alongside this file.
 Usage: python3 verify_app.py <app_id>
 
-Environment overrides: CAST, TAPP_CLI, REGISTRY, RPC_URL, AS_ENDPOINT, REFERENCE_VALUES,
-RELAY. Two TappRegistry deployments exist and an app lives on exactly one of them, so
+Environment overrides: CAST, TAPP_CLI, REGISTRY, RPC_URL, AS_ENDPOINT, AS_PUBKEY,
+REFERENCE_VALUES, RELAY. AS_PUBKEY pins the AS's TLS key (current value in TAPPSCAN.md);
+without it the AS is unauthenticated and the verdict says so. Exits non-zero on a FAIL. Two TappRegistry deployments exist and an app lives on exactly one of them, so
 REGISTRY has to name the right one. See contract/CONTRACTS.md.
 
 The AS is relied on for the quote's signature chain, TCB and the event-log replay. The
@@ -31,6 +32,7 @@ R     = os.environ.get("RPC_URL", "https://evmrpc-testnet.0g.ai")
 # host:port = plaintext. The AS serves a self-signed certificate, so the TLS here is
 # encryption without authentication (tapp-cli verify-app --as-pubkey pins it).
 AS    = os.environ.get("AS_ENDPOINT", "https://35.253.66.70:50004")
+AS_PUBKEY = os.environ.get("AS_PUBKEY", "").lower().removeprefix("0x")
 RELAYS = {"0x2ce80374318b1d7fb3345724457a182e0ad165c9": "https://tappscan.0g.ai",          # testnet
           "0x54874f536301c993922dd95097e3902e7fbfe612": "https://tappscan.0g.ai/mainnet"}  # mainnet
 RELAY = os.environ.get("RELAY", RELAYS.get(C.lower(), "")).rstrip("/")
@@ -148,6 +150,29 @@ def identify(m, sets):
             best = (label, hits, len(vals))
     return None, best
 
+def as_key_sha256():
+    """sha256 of the AS's TLS public key (SPKI DER), as tapp-cli --as-pubkey compares it."""
+    hostport = AS.split("://", 1)[-1]
+    out = subprocess.run(
+        f"openssl s_client -connect {hostport} </dev/null 2>/dev/null | openssl x509 -pubkey -noout"
+        " | openssl pkey -pubin -outform der | openssl dgst -sha256",
+        shell=True, capture_output=True, text=True, timeout=30).stdout
+    return out.strip().split()[-1].lower() if out.strip() else ""
+
+# The token is read, not signature-checked, so the channel is what makes "the AS said so"
+# true. grpcurl cannot pin; the key is compared just before, which is weaker (another
+# connection) but catches a substituted endpoint.
+AS_AUTH = False
+if AS.startswith("https://") and AS_PUBKEY:
+    seen = as_key_sha256()
+    if seen != AS_PUBKEY:
+        print(f"FAIL: the AS at {AS} presents key {seen or '(none)'}, not the pinned {AS_PUBKEY}")
+        sys.exit(1)
+    AS_AUTH = True
+else:
+    print(f"WARNING: the AS at {AS} is NOT authenticated (set AS_PUBKEY; current value in "
+          "docs/TAPPSCAN.md) — anyone on the path could forge the verdicts below\n")
+
 try:
     REF_SETS, ref_src = load_refs()
     print(f"reference values: {ref_src} — {len(REF_SETS)} published image(s)\n")
@@ -251,7 +276,10 @@ for signer in nodes:
         if REF_SETS is not None:
             label, near = identify(measured, REF_SETS)
             boot_ok = label is not None
-            boot = (f"ok {label.removesuffix('.json')}" if boot_ok else
+            dev = boot_ok and ("dev" in os.path.dirname(label).split("/")
+                               or os.path.splitext(os.path.basename(label))[0] == "dev")
+            boot = (f"WARN {label.removesuffix('.json')} is a dev image (can carry an SSH key)" if dev else
+                    f"ok {label.removesuffix('.json')}" if boot_ok else
                     "FAIL matches no published image"
                     + (f" (closest {near[0].removesuffix('.json')}, {near[1]}/{near[2]})" if near else ""))
         print(f"  3. AS: quote ok  tcb_status={tcb}  advisories={len(adv)}  "
@@ -341,4 +369,6 @@ for signer in nodes:
     print(f"  => reconcile {'PASS' if node_ok else 'FAIL'} ; boot chain {boot} ; TCB {tcb}")
 
 print(f"\n### verdict: reconcile {'PASS on every node' if all_ok else 'FAILED on at least one node'}"
-      f" ; boot chain {'not checked' if boot_all is None else 'every node runs a published image' if boot_all else 'FAILED'}")
+      f" ; boot chain {'not checked' if boot_all is None else 'every node matches a published image' if boot_all else 'FAILED'}"
+      + ("" if AS_AUTH else " ; AS unauthenticated"))
+sys.exit(0 if all_ok and boot_all is not False else 1)
