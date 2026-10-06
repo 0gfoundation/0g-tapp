@@ -82,12 +82,15 @@ impl ClaimedRuntimeConfig {
     }
 
     /// Written whole and renamed into place, so a crash mid-write leaves the previous
-    /// version rather than half of a new one.
+    /// version rather than half of a new one. The temporary name is unique per write:
+    /// two overlapping writes sharing one could rename each other's half-written file.
     pub fn save(&self, path: &std::path::Path) -> std::io::Result<()> {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let tmp = path.with_extension("json.tmp");
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = path.with_extension(format!("json.{}.{}.tmp", std::process::id(), seq));
         std::fs::write(&tmp, serde_json::to_vec(self).map_err(std::io::Error::other)?)?;
         std::fs::rename(&tmp, path)
     }
@@ -142,6 +145,13 @@ fn validate_scan_anchor(url: &str, pin: &str) -> Result<Option<(String, String)>
         url.to_string(),
         format!("0x{}", hex_part.to_lowercase()),
     )))
+}
+
+/// Retry settings for every KMS client this process builds — at startup, on a claim, on a
+/// trust-anchor update, on resume — so the same cluster behaves the same whichever path
+/// built the client.
+fn kbs_retry(config: &TappConfig) -> config::RetryConfig {
+    config.kbs.as_ref().map(|k| k.retry.clone()).unwrap_or_default()
 }
 
 /// The KMS app id whose attested keys are the ones to accept.
@@ -533,10 +543,9 @@ impl TappServiceImpl {
                     "Resumed the config claimed earlier this boot"
                 );
                 if !claimed.kbs_node_urls.is_empty() {
-                    let retry = config.kbs.as_ref().map(|k| k.retry.clone()).unwrap_or_default();
                     *kms_client.write().await = Some(kms_client_with_anchor(
                         claimed.kbs_node_urls.clone(),
-                        &retry,
+                        &kbs_retry(&config),
                         &claimed.scan_url,
                         &claimed.scan_public_key,
                     ));
@@ -697,6 +706,18 @@ impl TappService for TappServiceImpl {
         // before a task exists.
         let mode = boot::volume::data_mode(&req_inner.compose_content)
             .map_err(Status::invalid_argument)?;
+        if let Some(state_file) = self.config.server.permission.as_ref().map(|p| &p.owner_state_path) {
+            let state_dir = state_file.parent().unwrap_or(state_file);
+            let socket = self.config.server.unix_socket_path.as_deref().map(std::path::Path::new);
+            let exposures = boot::compose_lint::state_dir_exposures(
+                &req_inner.compose_content,
+                state_dir,
+                socket,
+            );
+            if !exposures.is_empty() {
+                return Err(Status::invalid_argument(exposures.join("; ")));
+            }
+        }
         let data_plan = if req_inner.measure_only {
             // Measure-only returns before any data directory is provisioned.
             boot::DataPlan::Ram
@@ -1634,7 +1655,7 @@ impl TappService for TappServiceImpl {
             );
             *self.kms_client.write().await = Some(kms_client_with_anchor(
                 effective_kbs.clone(),
-                &Default::default(),
+                &kbs_retry(&self.config),
                 &scan_url,
                 &scan_public_key,
             ));
@@ -1762,7 +1783,7 @@ impl TappService for TappServiceImpl {
             );
             *self.kms_client.write().await = Some(kms_client_with_anchor(
                 resulting.kbs_node_urls.clone(),
-                &Default::default(),
+                &kbs_retry(&self.config),
                 &resulting.scan_url,
                 &resulting.scan_public_key,
             ));
@@ -2673,7 +2694,32 @@ mod claimed_config_persistence {
         assert_eq!(back.tls_key_source, "kms");
         assert_eq!(back.scan_url, claimed().scan_url);
         assert_eq!(back.scan_public_key, claimed().scan_public_key);
-        assert!(!path.with_extension("json.tmp").exists());
+        // Nothing but the file itself is left behind.
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn overlapping_saves_never_leave_a_torn_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("claimed_config.json");
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let mut c = claimed();
+                    c.scan_url = format!("https://scan-{i}.example");
+                    for _ in 0..50 {
+                        c.save(&path).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let back = ClaimedRuntimeConfig::load(&path).unwrap().unwrap();
+        assert!(back.scan_url.starts_with("https://scan-"));
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     #[test]
