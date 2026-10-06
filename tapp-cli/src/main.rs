@@ -232,9 +232,11 @@ enum Commands {
         add_node: bool,
 
         /// Where this node's evidence is fetched from, recorded on chain as its teeUrl
-        /// (with --register-onchain). Default: --server if https, else the node's TLS
-        /// listener https://<host>:50052. Give one for a DNS name, a TLS front, or a
-        /// private address only the scan can reach.
+        /// (with --register-onchain). A node already on chain — or the one this replaces —
+        /// keeps its recorded teeUrl; only the legacy http://<host>:50051 form moves, to
+        /// https://<host>:50052. A new record gets --server if https, else the node's TLS
+        /// listener https://<host>:50052. Give one to change it: a DNS name, a TLS front,
+        /// or a private address only the scan can reach.
         #[arg(long, requires = "register_onchain")]
         tee_url: Option<String>,
     },
@@ -1493,23 +1495,50 @@ fn serves_tls_listener(version: &str) -> bool {
     major > 0 || minor >= 8
 }
 
+/// A recorded teeUrl in the legacy plaintext form, `http://<host>:50051`, moved to that
+/// same host's TLS listener. `None` for anything else: a recorded URL that is not the
+/// legacy form was someone's choice, and is kept.
+fn migrate_legacy_tee_url(recorded: &str) -> Option<String> {
+    let rest = recorded.trim().trim_end_matches('/').strip_prefix("http://")?;
+    let host = rest.strip_suffix(":50051")?;
+    (!host.is_empty() && !host.contains('/')).then(|| format!("https://{}:50052", host))
+}
+
+/// The teeUrl a NEW record of this node would get, and whether the node serves the TLS
+/// listener (which a legacy record may only be migrated to when it does).
+///
+/// A bad `--tee-url` fails here. A `--server` that cannot be derived from (this machine)
+/// comes back as `Err` inside the tuple instead: it only matters if a new record is
+/// actually written, and redeploying an app already on chain from the node itself, over
+/// 127.0.0.1, must keep working.
 async fn node_evidence_url(
     server: &str,
     explicit: Option<&str>,
-) -> Result<String, Box<dyn std::error::Error>> {
-    let version = if explicit.is_none() && server.trim().starts_with("http://") {
-        let mut client = create_client(server).await?;
-        Some(
-            client
-                .get_tapp_info(Request::new(GetTappInfoRequest {}))
-                .await?
-                .into_inner()
-                .version,
-        )
-    } else {
-        None
-    };
-    Ok(evidence_url_for(server, explicit, version.as_deref())?)
+) -> Result<(Result<String, String>, bool), Box<dyn std::error::Error>> {
+    let mut client = create_client(server).await?;
+    let version = client
+        .get_tapp_info(Request::new(GetTappInfoRequest {}))
+        .await?
+        .into_inner()
+        .version;
+    let url = evidence_url_for(server, explicit, Some(&version));
+    if explicit.is_some() {
+        url.clone()?;
+    }
+    Ok((url, serves_tls_listener(&version)))
+}
+
+/// What to record for a node that already has a record, when `--tee-url` was not given:
+/// what is there. A DNS name, a front or a private address was chosen by someone, and a
+/// run from wherever the operator happens to be must not silently move it. The legacy
+/// plaintext form is the one exception, moved to the same host's :50052 when served.
+fn kept_tee_url(recorded: &str, tls_listener: bool) -> String {
+    if tls_listener {
+        if let Some(migrated) = migrate_legacy_tee_url(recorded) {
+            return migrated;
+        }
+    }
+    recorded.to_string()
 }
 
 /// Bring the chain in line with this deployment BEFORE the app starts, so a node
@@ -1538,7 +1567,8 @@ async fn ensure_registered_onchain(
     use tapp_common::onchain::{self, OnchainParams};
 
     // Before anything is measured or sent: a --server that names this machine fails here.
-    let tee_url = node_evidence_url(server, tee_url).await?;
+    let explicit_tee_url = tee_url.is_some();
+    let (tee_url, tls_listener) = node_evidence_url(server, tee_url).await?;
     let signer = fetch_signer_address(server, app_id).await?;
     let owner = onchain::get_app_owner(&rpc_url, &contract, app_id).await?;
     let registered = owner != Address::zero();
@@ -1579,6 +1609,8 @@ async fn ensure_registered_onchain(
         volumes: onchain::combine_map_hashes(&measured.volumes_hash),
         images: onchain::map_to_bytes_array(&measured.image_hash),
         tee_url,
+        explicit_tee_url,
+        tls_listener,
     };
 
     let chain = if registered {
@@ -1586,14 +1618,17 @@ async fn ensure_registered_onchain(
             onchain::get_app_default_hashes(&rpc_url, &contract, app_id).await?;
         let app_images = onchain::get_app_image_hashes(&rpc_url, &contract, app_id).await?;
         let nodes = onchain::get_node_list(&rpc_url, &contract, app_id).await?;
-        let this_node = if nodes.contains(&signer) {
+        let mut this_node = None;
+        let mut tee_urls = std::collections::HashMap::new();
+        for n in &nodes {
             let (tee_url, compose, volumes) =
-                onchain::get_node(&rpc_url, &contract, app_id, signer).await?;
-            Some(NodeOnChain { tee_url, compose, volumes })
-        } else {
-            None
-        };
-        Some(ChainApp { app_compose, app_volumes, app_images, nodes, this_node })
+                onchain::get_node(&rpc_url, &contract, app_id, *n).await?;
+            if *n == signer {
+                this_node = Some(NodeOnChain { tee_url: tee_url.clone(), compose, volumes });
+            }
+            tee_urls.insert(*n, tee_url);
+        }
+        Some(ChainApp { app_compose, app_volumes, app_images, nodes, this_node, tee_urls })
     } else {
         None
     };
@@ -1611,7 +1646,7 @@ async fn ensure_registered_onchain(
     };
     for step in steps {
         match step {
-            SyncStep::RegisterApp => {
+            SyncStep::RegisterApp { tee_url } => {
                 let tx = onchain::register_app(
                     &params,
                     app_id,
@@ -1619,13 +1654,13 @@ async fn ensure_registered_onchain(
                     deployed.volumes.clone(),
                     deployed.images.clone(),
                     signer,
-                    &deployed.tee_url,
+                    &tee_url,
                     U256::from(stake_wei),
                 )
                 .await?;
                 println!("✓ App registered on-chain");
                 println!("  Signer Address: 0x{:x}", signer);
-                println!("  TEE URL: {}", deployed.tee_url);
+                println!("  TEE URL: {}", tee_url);
                 println!("  Tx Hash: 0x{:x}", tx);
             }
             SyncStep::UpdateAppCode { keep_volumes } => {
@@ -1642,13 +1677,14 @@ async fn ensure_registered_onchain(
                 println!("  Compose: 0x{} -> 0x{}", short_hex(&before), short_hex(&deployed.compose));
                 println!("  Tx Hash: 0x{:x}", tx);
             }
-            SyncStep::ReplaceNode { old, compose_override, volumes_override } => {
+            SyncStep::ReplaceNode { old, tee_url, compose_override, volumes_override } => {
+                let before = chain.as_ref().and_then(|c| c.tee_urls.get(&old).cloned());
                 let tx = onchain::update_node(
                     &params,
                     app_id,
                     old,
                     signer,
-                    deployed.tee_url.clone(),
+                    tee_url.clone(),
                     compose_override,
                     volumes_override,
                 )
@@ -1656,14 +1692,21 @@ async fn ensure_registered_onchain(
                 println!("✓ Node signer replaced on-chain (stake and slot preserved)");
                 println!("  Old Signer: 0x{:x}", old);
                 println!("  New Signer: 0x{:x}", signer);
+                match before {
+                    Some(b) if b != tee_url => println!("  teeUrl: {} -> {}", b, tee_url),
+                    _ => println!(
+                        "  teeUrl: {} (kept from the node replaced; --tee-url if this one is reached elsewhere)",
+                        tee_url
+                    ),
+                }
                 println!("  Tx Hash: 0x{:x}", tx);
             }
-            SyncStep::AddNode { compose_override, volumes_override } => {
+            SyncStep::AddNode { tee_url, compose_override, volumes_override } => {
                 let tx = onchain::add_node(
                     &params,
                     app_id,
                     signer,
-                    &deployed.tee_url,
+                    &tee_url,
                     compose_override,
                     volumes_override,
                     U256::from(stake_wei),
@@ -1671,6 +1714,7 @@ async fn ensure_registered_onchain(
                 .await?;
                 println!("✓ Node added on-chain");
                 println!("  Signer Address: 0x{:x}", signer);
+                println!("  TEE URL: {}", tee_url);
                 println!("  Tx Hash: 0x{:x}", tx);
             }
             SyncStep::RefreshNode { tee_url, compose_override, volumes_override } => {
@@ -1680,14 +1724,14 @@ async fn ensure_registered_onchain(
                     app_id,
                     signer,
                     signer,
-                    tee_url,
+                    tee_url.clone(),
                     compose_override,
                     volumes_override,
                 )
                 .await?;
                 println!("✓ This node's on-chain record updated to what it now runs");
-                if let Some(before) = before.filter(|b| *b != deployed.tee_url) {
-                    println!("  teeUrl: {} -> {}", before, deployed.tee_url);
+                if let Some(before) = before.filter(|b| *b != tee_url) {
+                    println!("  teeUrl: {} -> {}", before, tee_url);
                 }
                 println!("  Tx Hash: 0x{:x}", tx);
             }
@@ -1709,7 +1753,23 @@ struct Deployed {
     compose: Vec<u8>,
     volumes: Vec<u8>,
     images: Vec<Vec<u8>>,
-    tee_url: String,
+    /// `--tee-url`, or derived from `--server` — what a NEW record gets. `Err` when it
+    /// cannot be derived (a --server on this machine), which only fails a new record.
+    tee_url: Result<String, String>,
+    /// `--tee-url` was given: it then replaces whatever is recorded.
+    explicit_tee_url: bool,
+    /// The node serves the :50052 TLS listener, so a legacy record may move there.
+    tls_listener: bool,
+}
+
+impl Deployed {
+    /// The teeUrl for a slot that already has `recorded`.
+    fn tee_url_over(&self, recorded: &str) -> String {
+        match &self.tee_url {
+            Ok(u) if self.explicit_tee_url => u.clone(),
+            _ => kept_tee_url(recorded, self.tls_listener),
+        }
+    }
 }
 
 /// A node's record as getNode returns it: EFFECTIVE values (override or app default).
@@ -1727,20 +1787,23 @@ struct ChainApp {
     nodes: Vec<ethers::types::Address>,
     /// Present when this node's signer is already on the node list.
     this_node: Option<NodeOnChain>,
+    /// Every current node's recorded teeUrl — a replacement keeps the one it replaces.
+    tee_urls: std::collections::HashMap<ethers::types::Address, String>,
 }
 
 #[derive(Debug, PartialEq)]
 enum SyncStep {
-    RegisterApp,
+    RegisterApp { tee_url: String },
     /// The app's declaration becomes this deployment's code (single-node apps
     /// only); the app-level mount-file default is passed back unchanged.
     UpdateAppCode { keep_volumes: Vec<u8> },
     ReplaceNode {
         old: ethers::types::Address,
+        tee_url: String,
         compose_override: Vec<u8>,
         volumes_override: Vec<u8>,
     },
-    AddNode { compose_override: Vec<u8>, volumes_override: Vec<u8> },
+    AddNode { tee_url: String, compose_override: Vec<u8>, volumes_override: Vec<u8> },
     /// Same signer, record rewritten to what this node now runs.
     RefreshNode { tee_url: String, compose_override: Vec<u8>, volumes_override: Vec<u8> },
     /// Images differ from the app's list in a multi-node app. The registry keeps
@@ -1768,7 +1831,7 @@ fn plan_chain_sync(
     app_id: &str,
 ) -> Result<Vec<SyncStep>, String> {
     let Some(chain) = chain else {
-        return Ok(vec![SyncStep::RegisterApp]);
+        return Ok(vec![SyncStep::RegisterApp { tee_url: deployed.tee_url.clone()? }]);
     };
 
     enum Target<'a> {
@@ -1842,24 +1905,33 @@ fn plan_chain_sync(
             // current default (after update-onchain moved the default onto it, say),
             // yet that override would keep pinning the node to the old code once
             // the default moves on. One extra transaction, only on upgrades.
-            // A teeUrl that moved (to the :50052 listener, a DNS name, a private address)
-            // is part of the record too: the scan fetches evidence from it.
+            // The teeUrl is part of the record too — the scan fetches evidence from it —
+            // but only an explicit --tee-url or the legacy-form migration moves it.
+            let tee_url = deployed.tee_url_over(&node.tee_url);
             if app_moves
                 || compose_after != deployed.compose
                 || node.volumes != deployed.volumes
-                || node.tee_url != deployed.tee_url
+                || node.tee_url != tee_url
             {
                 steps.push(SyncStep::RefreshNode {
-                    tee_url: deployed.tee_url.clone(),
+                    tee_url,
                     compose_override,
                     volumes_override,
                 });
             }
         }
         Target::Replace(old) => {
-            steps.push(SyncStep::ReplaceNode { old, compose_override, volumes_override })
+            let tee_url = match chain.tee_urls.get(&old) {
+                Some(recorded) => deployed.tee_url_over(recorded),
+                None => deployed.tee_url.clone()?,
+            };
+            steps.push(SyncStep::ReplaceNode { old, tee_url, compose_override, volumes_override })
         }
-        Target::Add => steps.push(SyncStep::AddNode { compose_override, volumes_override }),
+        Target::Add => steps.push(SyncStep::AddNode {
+            tee_url: deployed.tee_url.clone()?,
+            compose_override,
+            volumes_override,
+        }),
     }
 
     if !single && images_differ {
@@ -3410,7 +3482,7 @@ async fn register_onchain(
     use ethers::types::U256;
     use tapp_common::onchain::OnchainParams;
 
-    let tee_url = node_evidence_url(server, tee_url).await?;
+    let tee_url = node_evidence_url(server, tee_url).await?.0?;
     let (compose_hash, volumes_hash, image_hashes) = fetch_app_hashes(server, &app_id).await?;
     let signer_address = fetch_signer_address(server, &app_id).await?;
 
@@ -3482,6 +3554,7 @@ async fn add_node_onchain(
         let fetched = fetch_signer_address(server, &app_id).await?;
         (fetched, node_evidence_url(server, tee_url_arg.as_deref()).await?)
     };
+    let tee_url = tee_url.0?;
 
     // This node's own compose/volumes (fetched from the node being added). Store a
     // per-node override only when it differs from the app-level default; otherwise
@@ -3637,6 +3710,9 @@ async fn update_node_onchain(
         let fetched = fetch_signer_address(server, &app_id).await?;
         (fetched, node_evidence_url(server, tee_url_arg.as_deref()).await?)
     };
+    let (derived_tee_url, tls_listener) = tee_url;
+    let explicit_tee_url = tee_url_arg.is_some();
+    let derived_tee_url = derived_tee_url.unwrap_or_default(); // only read when explicit
 
     // `--server` names the node that is *taking over* — that is where the new signer is read
     // from. The one being replaced is dead by definition after a restart, so asking the same
@@ -3674,19 +3750,25 @@ async fn update_node_onchain(
         }
     };
 
+    // The slot's recorded teeUrl stays unless --tee-url says otherwise (or it is the legacy
+    // plaintext form), the same rule as start-app --register-onchain.
+    let (cur_url, cur_compose, cur_volumes) =
+        tapp_common::onchain::get_node(&rpc_url, &contract, &app_id, old_signer_addr).await?;
+    let tee_url = if explicit_tee_url {
+        derived_tee_url
+    } else {
+        kept_tee_url(&cur_url, tls_listener)
+    };
+
     // refresh this node's compose/volumes from its server; store as a per-node override
     // only when it differs from the app-level default (else empty = inherit).
     let (node_compose, node_volumes, _image_hashes) = fetch_app_hashes(server, &app_id).await?;
-    if in_place {
-        let (cur_url, cur_compose, cur_volumes) =
-            tapp_common::onchain::get_node(&rpc_url, &contract, &app_id, new_signer).await?;
-        if cur_url == tee_url && cur_compose == node_compose && cur_volumes == node_volumes {
-            println!("✓ Nothing to update: this node's record already matches (teeUrl {})", cur_url);
-            return Ok(());
-        }
-        if cur_url != tee_url {
-            println!("  teeUrl: {} -> {}", cur_url, tee_url);
-        }
+    if in_place && cur_url == tee_url && cur_compose == node_compose && cur_volumes == node_volumes {
+        println!("✓ Nothing to update: this node's record already matches (teeUrl {})", cur_url);
+        return Ok(());
+    }
+    if cur_url != tee_url {
+        println!("  teeUrl: {} -> {}", cur_url, tee_url);
     }
     let (compose_hash, volumes_hash) =
         node_override_hashes(&rpc_url, &contract, &app_id, node_compose, node_volumes).await?;
@@ -3998,7 +4080,9 @@ mod tests {
                 compose: compose.to_vec(),
                 volumes: volumes.to_vec(),
                 images: images.iter().map(|i| i.to_vec()).collect(),
-                tee_url: "https://me:50052".into(),
+                tee_url: Ok("https://me:50052".into()),
+                explicit_tee_url: false,
+                tls_listener: true,
             }
         }
         /// An app declaring compose `c`, mount files `v`, image `img`, with `nodes`.
@@ -4009,6 +4093,7 @@ mod tests {
                 app_images: vec![img.to_vec()],
                 nodes: nodes.iter().map(|n| a(*n)).collect(),
                 this_node: None,
+                tee_urls: nodes.iter().map(|n| (a(*n), format!("https://n{}.example:50052", n))).collect(),
             }
         }
         fn with_this_node(mut chain: ChainApp, compose: &[u8], volumes: &[u8]) -> ChainApp {
@@ -4021,6 +4106,75 @@ mod tests {
         }
         fn plan(chain: Option<&ChainApp>, d: &Deployed, me: u64) -> Vec<SyncStep> {
             plan_chain_sync(chain, d, a(me), None, false, "app").unwrap()
+        }
+
+        #[test]
+        fn a_recorded_tee_url_is_kept_unless_told_otherwise() {
+            // Recorded as a DNS name; this run comes from inside the VPC, so the URL
+            // derived from --server is a private address. Without --tee-url the record
+            // must not move — outside verifiers would be pointed at the private address.
+            let mut chain = existing(app(b"c", b"v", b"img", &[1]), b"c", b"v");
+            chain.this_node.as_mut().unwrap().tee_url = "https://node.example.com:50052".into();
+            let mut d = deployed(b"c", b"v", &[b"img"]);
+            d.tee_url = Ok("https://10.0.0.5:50052".into());
+            assert!(plan(Some(&chain), &d, 1).is_empty());
+
+            // Saying so moves it.
+            d.explicit_tee_url = true;
+            assert_eq!(
+                plan(Some(&chain), &d, 1),
+                vec![SyncStep::RefreshNode {
+                    tee_url: "https://10.0.0.5:50052".into(),
+                    compose_override: none(),
+                    volumes_override: none(),
+                }]
+            );
+        }
+
+        #[test]
+        fn a_replacement_keeps_the_slots_tee_url_and_migrates_only_the_legacy_form() {
+            let mut chain = app(b"c", b"v", b"img", &[7]);
+            let mut d = deployed(b"c", b"v", &[b"img"]);
+            d.tee_url = Ok("https://10.0.0.5:50052".into());
+            // A chosen URL stays with the slot.
+            assert!(matches!(
+                &plan(Some(&chain), &d, 1)[..],
+                [SyncStep::ReplaceNode { tee_url, .. }] if tee_url == "https://n7.example:50052"
+            ));
+            // The legacy plaintext form moves to the same host's TLS listener ...
+            chain.tee_urls.insert(a(7), "http://34.1.2.3:50051".into());
+            assert!(matches!(
+                &plan(Some(&chain), &d, 1)[..],
+                [SyncStep::ReplaceNode { tee_url, .. }] if tee_url == "https://34.1.2.3:50052"
+            ));
+            // ... but only when this node serves it.
+            d.tls_listener = false;
+            assert!(matches!(
+                &plan(Some(&chain), &d, 1)[..],
+                [SyncStep::ReplaceNode { tee_url, .. }] if tee_url == "http://34.1.2.3:50051"
+            ));
+        }
+
+        #[test]
+        fn a_server_on_this_machine_fails_only_a_new_record() {
+            // Redeploying from the node itself (--server http://127.0.0.1:50051) keeps the
+            // recorded teeUrl, so nothing needs deriving ...
+            let chain = existing(app(b"c", b"v", b"img", &[1]), b"c", b"v");
+            let mut d = deployed(b"c2", b"v", &[b"img"]);
+            d.tee_url = Err("--server is reached locally".into());
+            assert!(plan_chain_sync(Some(&chain), &d, a(1), None, false, "app").is_ok());
+            // ... but a registration has nothing to keep, and says so.
+            assert!(plan_chain_sync(None, &d, a(1), None, false, "app").is_err());
+            assert!(plan_chain_sync(Some(&app(b"c", b"v", b"img", &[7])), &d, a(1), None, true, "app").is_err());
+        }
+
+        #[test]
+        fn only_the_exact_legacy_form_is_migrated() {
+            assert_eq!(migrate_legacy_tee_url("http://34.1.2.3:50051").as_deref(), Some("https://34.1.2.3:50052"));
+            assert_eq!(migrate_legacy_tee_url("http://node.example:50051/").as_deref(), Some("https://node.example:50052"));
+            for kept in ["https://node.example:50052", "http://node.example:8080", "https://front.example", "http://node.example"] {
+                assert_eq!(migrate_legacy_tee_url(kept), None, "{kept}");
+            }
         }
 
         #[test]
@@ -4058,7 +4212,7 @@ mod tests {
 
         #[test]
         fn first_deploy_registers() {
-            assert_eq!(plan(None, &deployed(b"c", b"v", &[b"i"]), 1), vec![SyncStep::RegisterApp]);
+            assert_eq!(plan(None, &deployed(b"c", b"v", &[b"i"]), 1), vec![SyncStep::RegisterApp { tee_url: "https://me:50052".into() }]);
         }
 
         #[test]
@@ -4066,7 +4220,7 @@ mod tests {
             let chain = app(b"c", b"v", b"i", &[7]);
             assert_eq!(
                 plan(Some(&chain), &deployed(b"c", b"v", &[b"i"]), 1),
-                vec![SyncStep::ReplaceNode { old: a(7), compose_override: none(), volumes_override: none() }]
+                vec![SyncStep::ReplaceNode { old: a(7), tee_url: "https://n7.example:50052".into(), compose_override: none(), volumes_override: none() }]
             );
         }
 
@@ -4116,7 +4270,7 @@ mod tests {
                 plan(Some(&chain), &deployed(b"c2", b"v", &[b"i"]), 1),
                 vec![
                     SyncStep::UpdateAppCode { keep_volumes: b"v".to_vec() },
-                    SyncStep::ReplaceNode { old: a(7), compose_override: none(), volumes_override: none() },
+                    SyncStep::ReplaceNode { old: a(7), tee_url: "https://n7.example:50052".into(), compose_override: none(), volumes_override: none() },
                 ]
             );
         }
@@ -4188,6 +4342,7 @@ mod tests {
                 steps,
                 vec![SyncStep::ReplaceNode {
                     old: a(8),
+                    tee_url: "https://n8.example:50052".into(),
                     compose_override: none(),
                     volumes_override: b"toml-2".to_vec()
                 }]
@@ -4209,7 +4364,7 @@ mod tests {
             .unwrap();
             assert_eq!(
                 steps,
-                vec![SyncStep::ReplaceNode { old: a(7), compose_override: b"c2".to_vec(), volumes_override: none() }]
+                vec![SyncStep::ReplaceNode { old: a(7), tee_url: "https://n7.example:50052".into(), compose_override: b"c2".to_vec(), volumes_override: none() }]
             );
         }
 
@@ -4227,7 +4382,7 @@ mod tests {
             .unwrap();
             assert_eq!(
                 steps,
-                vec![SyncStep::AddNode { compose_override: b"c2".to_vec(), volumes_override: none() }]
+                vec![SyncStep::AddNode { tee_url: "https://me:50052".into(), compose_override: b"c2".to_vec(), volumes_override: none() }]
             );
         }
 
@@ -4236,7 +4391,7 @@ mod tests {
             let chain = app(b"c", b"v", b"i", &[7, 8]);
             assert_eq!(
                 plan(Some(&chain), &deployed(b"c", b"v", &[b"i"]), 1),
-                vec![SyncStep::AddNode { compose_override: none(), volumes_override: none() }]
+                vec![SyncStep::AddNode { tee_url: "https://me:50052".into(), compose_override: none(), volumes_override: none() }]
             );
         }
 
