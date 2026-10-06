@@ -230,6 +230,13 @@ enum Commands {
         /// node's replacement.
         #[arg(long, requires = "register_onchain", conflicts_with = "old_signer")]
         add_node: bool,
+
+        /// Where this node's evidence is fetched from, recorded on chain as its teeUrl
+        /// (with --register-onchain). Default: --server if https, else the node's TLS
+        /// listener https://<host>:50052. Give one for a DNS name, a TLS front, or a
+        /// private address only the scan can reach.
+        #[arg(long, requires = "register_onchain")]
+        tee_url: Option<String>,
     },
 
     /// Stop a running application
@@ -604,7 +611,7 @@ enum Commands {
 
     /// Register app on-chain after starting it.
     /// Fetches compose/volume/image hashes and signerAddress from --server, registers them.
-    /// The --server URL is also recorded on-chain as the node's evidence URL.
+    /// The node's evidence URL (teeUrl) is --tee-url, or derived from --server (see start-app).
     RegisterOnchain {
         /// Application ID
         #[arg(short, long)]
@@ -621,6 +628,11 @@ enum Commands {
         /// Stake amount in wei (must be >= minStakeAmount)
         #[arg(long)]
         stake_wei: u128,
+
+        /// Where this node's evidence is fetched from (teeUrl). Default: --server if
+        /// https, else https://<host>:50052.
+        #[arg(long)]
+        tee_url: Option<String>,
     },
 
     /// Update app hashes on-chain after redeployment (fetches updated hashes from --server)
@@ -640,7 +652,7 @@ enum Commands {
 
     /// Add a node to an existing on-chain app.
     /// Connect to the new node via --server to fetch its signerAddress automatically.
-    /// The --server URL is recorded on-chain as the node's evidence URL.
+    /// The node's evidence URL (teeUrl) is --tee-url, or derived from --server (see start-app).
     AddNodeOnchain {
         /// Application ID
         #[arg(short, long)]
@@ -662,7 +674,8 @@ enum Commands {
         #[arg(long)]
         signer_address: Option<String>,
 
-        /// TEE URL of the new node (optional; defaults to --server URL)
+        /// Where the new node's evidence is fetched from (teeUrl). Default: --server if
+        /// https, else https://<host>:50052
         #[arg(long)]
         tee_url: Option<String>,
     },
@@ -865,6 +878,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             stake_wei,
             old_signer,
             add_node,
+            tee_url,
         } => {
             let private_key = require_private_key(&cli.private_key)?;
             if register_onchain {
@@ -879,6 +893,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     &private_key,
                     old_signer.as_deref(),
                     add_node,
+                    tee_url.as_deref(),
                 )
                 .await?;
             }
@@ -1068,9 +1083,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             rpc_url,
             contract,
             stake_wei,
+            tee_url,
         } => {
             let private_key = require_private_key(&cli.private_key)?;
-            register_onchain(&cli.server, app_id, rpc_url, contract, stake_wei, private_key).await?;
+            register_onchain(&cli.server, app_id, rpc_url, contract, stake_wei, private_key, tee_url.as_deref()).await?;
         }
         Commands::UpdateOnchain {
             app_id,
@@ -1422,6 +1438,80 @@ async fn wait_for_task(
     }
 }
 
+/// Where a node's evidence is fetched from, as recorded on chain (its teeUrl).
+///
+/// An explicit `--tee-url` wins: a DNS name, a TLS front, or a private address only the
+/// scan can reach. Otherwise it follows `--server`. An https URL is used as given — it is
+/// the encrypted endpoint already, or a front for it. A plaintext one becomes the node's
+/// own TLS listener, `https://<host>:50052`: `:50051` is meant to be open to nobody but
+/// the node itself (#141), and what is recorded is what the scan will call. A node older
+/// than that listener keeps the plaintext URL. `--server` naming this machine (a socket,
+/// localhost) is refused: that address means nothing to anyone reading the chain.
+fn evidence_url_for(server: &str, explicit: Option<&str>, version: Option<&str>) -> Result<String, String> {
+    if let Some(u) = explicit {
+        let u = u.trim().trim_end_matches('/');
+        if !(u.starts_with("https://") || u.starts_with("http://")) {
+            return Err(format!("--tee-url must be an http(s) URL, got {:?}", u));
+        }
+        return Ok(u.to_string());
+    }
+    let s = server.trim().trim_end_matches('/');
+    let local = || {
+        format!(
+            "--server {} is reached locally; the chain needs the address others reach this \
+             node at — pass --tee-url",
+            s
+        )
+    };
+    let (scheme, rest) = s.split_once("://").ok_or_else(local)?;
+    let authority = rest.split('/').next().unwrap_or(rest);
+    let host = if authority.starts_with('[') {
+        authority.split_inclusive(']').next().unwrap_or(authority)
+    } else {
+        authority.rsplit_once(':').map(|(h, _)| h).unwrap_or(authority)
+    };
+    if scheme == "unix" || host == "localhost" || host.starts_with("127.") || host == "[::1]" {
+        return Err(local());
+    }
+    match scheme {
+        "https" => Ok(s.to_string()),
+        "http" if version.is_some_and(serves_tls_listener) => Ok(format!("https://{}:50052", host)),
+        "http" => Ok(s.to_string()),
+        other => Err(format!("--server scheme {:?} is not http(s)", other)),
+    }
+}
+
+/// tapp-server 0.8.0 added the TLS listener on :50052.
+fn serves_tls_listener(version: &str) -> bool {
+    let mut parts = version.trim().trim_start_matches('v').split('.');
+    let major: u64 = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+    let minor: u64 = parts
+        .next()
+        .and_then(|p| p.split(|c: char| !c.is_ascii_digit()).next())
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(0);
+    major > 0 || minor >= 8
+}
+
+async fn node_evidence_url(
+    server: &str,
+    explicit: Option<&str>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let version = if explicit.is_none() && server.trim().starts_with("http://") {
+        let mut client = create_client(server).await?;
+        Some(
+            client
+                .get_tapp_info(Request::new(GetTappInfoRequest {}))
+                .await?
+                .into_inner()
+                .version,
+        )
+    } else {
+        None
+    };
+    Ok(evidence_url_for(server, explicit, version.as_deref())?)
+}
+
 /// Bring the chain in line with this deployment BEFORE the app starts, so a node
 /// whose volume key comes from the KMS is already on the node list when it asks.
 ///
@@ -1442,10 +1532,13 @@ async fn ensure_registered_onchain(
     private_key: &str,
     old_signer: Option<&str>,
     add_node: bool,
+    tee_url: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use ethers::types::{Address, U256};
     use tapp_common::onchain::{self, OnchainParams};
 
+    // Before anything is measured or sent: a --server that names this machine fails here.
+    let tee_url = node_evidence_url(server, tee_url).await?;
     let signer = fetch_signer_address(server, app_id).await?;
     let owner = onchain::get_app_owner(&rpc_url, &contract, app_id).await?;
     let registered = owner != Address::zero();
@@ -1485,6 +1578,7 @@ async fn ensure_registered_onchain(
         compose: onchain::hex_to_bytes(&measured.compose_hash)?,
         volumes: onchain::combine_map_hashes(&measured.volumes_hash),
         images: onchain::map_to_bytes_array(&measured.image_hash),
+        tee_url,
     };
 
     let chain = if registered {
@@ -1525,12 +1619,13 @@ async fn ensure_registered_onchain(
                     deployed.volumes.clone(),
                     deployed.images.clone(),
                     signer,
-                    server, // recorded on-chain as the node's evidence URL
+                    &deployed.tee_url,
                     U256::from(stake_wei),
                 )
                 .await?;
                 println!("✓ App registered on-chain");
                 println!("  Signer Address: 0x{:x}", signer);
+                println!("  TEE URL: {}", deployed.tee_url);
                 println!("  Tx Hash: 0x{:x}", tx);
             }
             SyncStep::UpdateAppCode { keep_volumes } => {
@@ -1553,7 +1648,7 @@ async fn ensure_registered_onchain(
                     app_id,
                     old,
                     signer,
-                    server.to_string(),
+                    deployed.tee_url.clone(),
                     compose_override,
                     volumes_override,
                 )
@@ -1568,7 +1663,7 @@ async fn ensure_registered_onchain(
                     &params,
                     app_id,
                     signer,
-                    server,
+                    &deployed.tee_url,
                     compose_override,
                     volumes_override,
                     U256::from(stake_wei),
@@ -1579,6 +1674,7 @@ async fn ensure_registered_onchain(
                 println!("  Tx Hash: 0x{:x}", tx);
             }
             SyncStep::RefreshNode { tee_url, compose_override, volumes_override } => {
+                let before = chain.as_ref().and_then(|c| c.this_node.as_ref()).map(|n| n.tee_url.clone());
                 let tx = onchain::update_node(
                     &params,
                     app_id,
@@ -1590,6 +1686,9 @@ async fn ensure_registered_onchain(
                 )
                 .await?;
                 println!("✓ This node's on-chain record updated to what it now runs");
+                if let Some(before) = before.filter(|b| *b != deployed.tee_url) {
+                    println!("  teeUrl: {} -> {}", before, deployed.tee_url);
+                }
                 println!("  Tx Hash: 0x{:x}", tx);
             }
             SyncStep::ImagesDifferFromApp => {
@@ -1605,11 +1704,12 @@ async fn ensure_registered_onchain(
     Ok(())
 }
 
-/// What this deployment measured, in the registry's encoding.
+/// What this deployment measured, in the registry's encoding, and where its evidence is.
 struct Deployed {
     compose: Vec<u8>,
     volumes: Vec<u8>,
     images: Vec<Vec<u8>>,
+    tee_url: String,
 }
 
 /// A node's record as getNode returns it: EFFECTIVE values (override or app default).
@@ -1742,9 +1842,15 @@ fn plan_chain_sync(
             // current default (after update-onchain moved the default onto it, say),
             // yet that override would keep pinning the node to the old code once
             // the default moves on. One extra transaction, only on upgrades.
-            if app_moves || compose_after != deployed.compose || node.volumes != deployed.volumes {
+            // A teeUrl that moved (to the :50052 listener, a DNS name, a private address)
+            // is part of the record too: the scan fetches evidence from it.
+            if app_moves
+                || compose_after != deployed.compose
+                || node.volumes != deployed.volumes
+                || node.tee_url != deployed.tee_url
+            {
                 steps.push(SyncStep::RefreshNode {
-                    tee_url: node.tee_url.clone(),
+                    tee_url: deployed.tee_url.clone(),
                     compose_override,
                     volumes_override,
                 });
@@ -3299,10 +3405,12 @@ async fn register_onchain(
     contract: String,
     stake_wei: u128,
     private_key: String,
+    tee_url: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use ethers::types::U256;
     use tapp_common::onchain::OnchainParams;
 
+    let tee_url = node_evidence_url(server, tee_url).await?;
     let (compose_hash, volumes_hash, image_hashes) = fetch_app_hashes(server, &app_id).await?;
     let signer_address = fetch_signer_address(server, &app_id).await?;
 
@@ -3315,13 +3423,14 @@ async fn register_onchain(
         volumes_hash,
         image_hashes,
         signer_address,
-        server, // the server URL is recorded on-chain as the node's evidence URL
+        &tee_url,
         U256::from(stake_wei),
     )
     .await?;
 
     println!("✓ App registered on-chain");
     println!("  App ID: {}", app_id);
+    println!("  TEE URL: {}", tee_url);
     println!("  Signer Address: 0x{}", hex::encode(signer_address));
     println!("  Tx Hash: 0x{:x}", tx);
 
@@ -3368,10 +3477,10 @@ async fn add_node_onchain(
     let (signer, tee_url) = if let Some(addr) = signer_arg {
         let parsed = Address::from_str(addr.trim_start_matches("0x"))
             .map_err(|_| format!("Invalid signer address: {}", addr))?;
-        (parsed, tee_url_arg.unwrap_or_else(|| server.to_string()))
+        (parsed, node_evidence_url(server, tee_url_arg.as_deref()).await?)
     } else {
         let fetched = fetch_signer_address(server, &app_id).await?;
-        (fetched, tee_url_arg.unwrap_or_else(|| server.to_string()))
+        (fetched, node_evidence_url(server, tee_url_arg.as_deref()).await?)
     };
 
     // This node's own compose/volumes (fetched from the node being added). Store a
@@ -3523,10 +3632,10 @@ async fn update_node_onchain(
     let (new_signer, tee_url) = if let Some(addr) = new_signer_arg {
         let parsed = Address::from_str(addr.trim_start_matches("0x"))
             .map_err(|_| format!("Invalid new signer address: {}", addr))?;
-        (parsed, tee_url_arg.unwrap_or_else(|| server.to_string()))
+        (parsed, node_evidence_url(server, tee_url_arg.as_deref()).await?)
     } else {
         let fetched = fetch_signer_address(server, &app_id).await?;
-        (fetched, tee_url_arg.unwrap_or_else(|| server.to_string()))
+        (fetched, node_evidence_url(server, tee_url_arg.as_deref()).await?)
     };
 
     // `--server` names the node that is *taking over* — that is where the new signer is read
@@ -3544,22 +3653,41 @@ async fn update_node_onchain(
     // Both the stated and the inferred address go through the same check. A stated one used
     // to be taken on trust and only found wrong when the contract reverted with "old node not
     // found" — a paid-for round trip to learn something the node list already said.
-    let old_signer_addr = match node_being_replaced(&rpc_url, &contract, &app_id, new_signer, stated)
-        .await?
-    {
-        Some(old) => old,
-        None => {
-            println!(
-                "✓ Nothing to update: 0x{:x} is already the only node on chain for {}",
-                new_signer, app_id
-            );
-            return Ok(());
+    // A signer that is already a node is not replacing anyone: its own record is rewritten
+    // in place (old == new, which the contract allows) — how a teeUrl moves, e.g. to the
+    // node's :50052 listener. Treating it as a replacement used to answer "nothing to
+    // update" for a one-node app, and pick ANOTHER node to replace in a two-node one.
+    let nodes = tapp_common::onchain::get_node_list(&rpc_url, &contract, &app_id).await?;
+    let in_place = stated.is_none() && nodes.contains(&new_signer);
+    let old_signer_addr = if in_place {
+        new_signer
+    } else {
+        match node_being_replaced(&rpc_url, &contract, &app_id, new_signer, stated).await? {
+            Some(old) => old,
+            None => {
+                println!(
+                    "✓ Nothing to update: 0x{:x} is already the only node on chain for {}",
+                    new_signer, app_id
+                );
+                return Ok(());
+            }
         }
     };
 
     // refresh this node's compose/volumes from its server; store as a per-node override
     // only when it differs from the app-level default (else empty = inherit).
     let (node_compose, node_volumes, _image_hashes) = fetch_app_hashes(server, &app_id).await?;
+    if in_place {
+        let (cur_url, cur_compose, cur_volumes) =
+            tapp_common::onchain::get_node(&rpc_url, &contract, &app_id, new_signer).await?;
+        if cur_url == tee_url && cur_compose == node_compose && cur_volumes == node_volumes {
+            println!("✓ Nothing to update: this node's record already matches (teeUrl {})", cur_url);
+            return Ok(());
+        }
+        if cur_url != tee_url {
+            println!("  teeUrl: {} -> {}", cur_url, tee_url);
+        }
+    }
     let (compose_hash, volumes_hash) =
         node_override_hashes(&rpc_url, &contract, &app_id, node_compose, node_volumes).await?;
 
@@ -3870,6 +3998,7 @@ mod tests {
                 compose: compose.to_vec(),
                 volumes: volumes.to_vec(),
                 images: images.iter().map(|i| i.to_vec()).collect(),
+                tee_url: "https://me:50052".into(),
             }
         }
         /// An app declaring compose `c`, mount files `v`, image `img`, with `nodes`.
@@ -3892,6 +4021,25 @@ mod tests {
         }
         fn plan(chain: Option<&ChainApp>, d: &Deployed, me: u64) -> Vec<SyncStep> {
             plan_chain_sync(chain, d, a(me), None, false, "app").unwrap()
+        }
+
+        #[test]
+        fn a_node_whose_tee_url_moved_rewrites_only_that() {
+            // Same code, recorded at the old plaintext port: the record moves to where the
+            // scan will now find the node, and nothing else changes.
+            let mut chain = existing(app(b"c", b"v", b"img", &[1]), b"c", b"v");
+            chain.this_node.as_mut().unwrap().tee_url = "http://me:50051".into();
+            assert_eq!(
+                plan(Some(&chain), &deployed(b"c", b"v", &[b"img"]), 1),
+                vec![SyncStep::RefreshNode {
+                    tee_url: "https://me:50052".into(),
+                    compose_override: none(),
+                    volumes_override: none(),
+                }]
+            );
+            // Already there: nothing to send.
+            let chain = existing(app(b"c", b"v", b"img", &[1]), b"c", b"v");
+            assert!(plan(Some(&chain), &deployed(b"c", b"v", &[b"img"]), 1).is_empty());
         }
 
         fn none() -> Vec<u8> {
@@ -4309,5 +4457,56 @@ mod replaced_node {
         // a(5) is not a node, rather than quietly getting a(1).
         assert_eq!(infer(&[a(1)], a(2)).unwrap(), Some(a(1)));
         assert!(pick_replaced_node(&[a(1)], a(2), "app", Some(a(5))).is_err());
+    }
+}
+
+#[cfg(test)]
+mod evidence_url_tests {
+    use super::*;
+
+    #[test]
+    fn a_plaintext_server_is_recorded_as_its_tls_listener() {
+        assert_eq!(
+            evidence_url_for("http://34.61.248.117:50051", None, Some("0.9.0")).unwrap(),
+            "https://34.61.248.117:50052"
+        );
+        assert_eq!(
+            evidence_url_for("http://node.example:50051/", None, Some("v0.8.1")).unwrap(),
+            "https://node.example:50052"
+        );
+    }
+
+    #[test]
+    fn a_node_without_the_listener_keeps_its_plaintext_url() {
+        assert_eq!(
+            evidence_url_for("http://10.0.0.5:50051", None, Some("0.7.1")).unwrap(),
+            "http://10.0.0.5:50051"
+        );
+        // Unknown version: not guessed into a port that may not exist.
+        assert_eq!(
+            evidence_url_for("http://10.0.0.5:50051", None, None).unwrap(),
+            "http://10.0.0.5:50051"
+        );
+    }
+
+    #[test]
+    fn https_and_an_explicit_url_are_taken_as_given() {
+        assert_eq!(
+            evidence_url_for("https://front.example", None, None).unwrap(),
+            "https://front.example"
+        );
+        assert_eq!(
+            evidence_url_for("http://1.2.3.4:50051", Some("https://10.128.15.233:50052/"), Some("0.9.0")).unwrap(),
+            "https://10.128.15.233:50052"
+        );
+        assert!(evidence_url_for("http://1.2.3.4:50051", Some("10.0.0.1:50052"), None).is_err());
+    }
+
+    #[test]
+    fn a_server_reached_locally_needs_an_explicit_url() {
+        for local in ["http://127.0.0.1:50051", "https://localhost:50052", "/run/tapp/tapp.sock", "unix:///run/tapp/tapp.sock", "http://[::1]:50051"] {
+            assert!(evidence_url_for(local, None, Some("0.9.0")).is_err(), "{local}");
+            assert!(evidence_url_for(local, Some("https://node.example:50052"), None).is_ok(), "{local}");
+        }
     }
 }

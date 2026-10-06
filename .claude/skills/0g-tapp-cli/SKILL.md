@@ -190,7 +190,7 @@ A failed task prints the docker compose `Stderr:` (the actual root cause). A com
 
 ## On-chain Commands (TappRegistry)
 
-`--server` is also recorded on-chain as the node's `teeUrl` (the `:50051` URL). Key must be the app owner (see Keys above).
+The node's on-chain `teeUrl` is `--tee-url`, else derived from `--server`: `https://…` as given; `http://host:50051` → `https://host:50052` (tapp-server ≥ 0.8.0); `127.0.0.1`/socket `--server` → refused, pass `--tee-url`. `:50051` should stay closed to all but the node (#141). A node in the scan's VPC may register a private `https://10.x.x.x:50052` — only the scan reaches it, others verify through the scan relay. `start-app --register-onchain` / `update-node-onchain` rewrite a node's `teeUrl` in place when it differs (same signer). Key must be the app owner (see Keys above).
 
 ```bash
 # Preferred for new deploys: start-app --register-onchain (see Core Commands) registers
@@ -205,7 +205,7 @@ withdraw            --rpc-url <rpc> --contract 0x<reg>                          
 withdraw-balance    --app-id <id> --rpc-url <rpc> --contract 0x<reg>                        # withdraw app balance to owner
 ```
 - `remove-node-onchain` accepts `--signer-address 0x<addr>` to provide the signer directly when the node is unreachable (can't connect to `--server`).
-- `update-node-onchain`: new signer auto-fetched from `--server` unless `--new-signer` given; `--tee-url` defaults to the `--server` URL. Pass `--old-signer` explicitly when replacing a node on a different host.
+- `update-node-onchain`: new signer auto-fetched from `--server` unless `--new-signer` given; `--tee-url` defaults as above. When that signer is **already a node**, its own record is rewritten in place (how a `teeUrl` moves) — "Nothing to update" if it already matches. Pass `--old-signer` explicitly when replacing a node on a different host.
 - **Handing an app over** — only the registry owner transfers; machines are replaced, never transferred (TappRegistry >= 0.2.0):
   1. `transfer-app-ownership --app-id <id> --rpc-url <rpc> --contract 0x<reg> --new-owner 0x<new>` (owner key; `--cancel` withdraws), then `accept-app-ownership --app-id <id> --rpc-url <rpc> --contract 0x<reg>` (nominee key). Two steps because a wrong address would strand the app for good.
   2. On each machine the new owner has claimed: `start-app ... --register-onchain` (+ `--old-signer` if the app has several nodes) — replaces the old node in place via updateNode (stake carried, never zero nodes, works for `encrypted` apps).

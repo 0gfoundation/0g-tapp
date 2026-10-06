@@ -556,7 +556,9 @@ the body-bound form too (`sign_message.py` takes the request JSON).
 
 ## On-chain Registration
 
-Register your app and TEE nodes on the TappRegistry contract using `tapp-cli`. These commands require `--private-key` (the deployer's Ethereum private key) and `--server` (the tapp gRPC endpoint, used both as the gRPC target and as the on-chain `teeUrl`).
+Register your app and TEE nodes on the TappRegistry contract using `tapp-cli`. These commands require `--private-key` (the deployer's Ethereum private key) and `--server` (the tapp gRPC endpoint).
+
+The node's on-chain `teeUrl` — where the scan and `verify-app` fetch its evidence — is `--tee-url` when given, otherwise derived from `--server`: an `https://` server is recorded as given; an `http://` one becomes the node's TLS listener `https://<host>:50052` (tapp-server ≥ 0.8.0; older nodes keep the plaintext URL); a `--server` reached locally (`127.0.0.1`, a socket) is refused without `--tee-url`. `:50051` is meant to stay closed to everyone but the node (#141). `--tee-url` takes a DNS name, a TLS front, or a **private address** — a node in the scan's VPC can register `https://10.x.x.x:50052`, which only the scan reaches; everyone else verifies it through the scan relay. `start-app --register-onchain` and `update-node-onchain` move an existing node's `teeUrl` when it differs (signer unchanged, nothing else touched).
 
 ### Register during start (recommended)
 
