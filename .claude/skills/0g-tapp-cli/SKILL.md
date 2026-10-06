@@ -57,6 +57,7 @@ tapp-cli -s <server> -k 0x<key> start-app -f <compose> --app-id <id> \
   #   already a node→fix record if needed; absent + exactly ONE other node→updateNode REPLACING
   #   it (restart re-derives the signer); absent + several→addNode — pass --old-signer 0x<addr>
   #   to replace one (a stated one that is not a node is an ERROR). --add-node = scale out
+  #   Signer-keyed apps (0g-sandbox vouchers): restart with --add-node, settle, then remove the old node
   #   (a one-node app would otherwise treat the new signer as a replacement).
   #   Requires a server with measure_only support; older servers → CLI aborts ("Server did not return measurements").
 tapp-cli -s <server> -k 0x<key> get-task-status --task-id <task-id>
@@ -190,7 +191,7 @@ A failed task prints the docker compose `Stderr:` (the actual root cause). A com
 
 ## On-chain Commands (TappRegistry)
 
-The node's on-chain `teeUrl` is `--tee-url` when given; otherwise a node already on chain (or the one it replaces) **keeps its recorded value** — only legacy `http://host:50051` auto-moves to `https://host:50052` (tapp-server ≥ 0.8.0). A **new** record is derived from `--server` (`https://…` as given; `http://host:50051` → `https://host:50052`); a `127.0.0.1`/socket `--server` then needs `--tee-url`. `:50051` should stay closed to all but the node (#141). A node in the scan's VPC may register a private `https://10.x.x.x:50052` — only the scan reaches it, others verify through the scan relay. To move a `teeUrl`, pass `--tee-url` to `start-app --register-onchain` / `update-node-onchain` (rewritten in place, same signer). Key must be the app owner (see Keys above).
+The node's on-chain `teeUrl` is `--tee-url` when given; otherwise a node already on chain **keeps its recorded value** — only legacy `http://host:50051` auto-moves to `https://host:50052` (tapp-server ≥ 0.8.0). A **replacement** keeps the replaced slot's value only if it reaches this node (asked for the app's signer: the restart case); on another machine it is derived from `--server`, printed. A **new** record is derived from `--server` (`https://…` as given; `http://host:50051` → `https://host:50052`); a `127.0.0.1`/socket `--server` then needs `--tee-url`. `:50051` should stay closed to all but the node (#141). A node in the scan's VPC may register a private `https://10.x.x.x:50052` — only the scan reaches it, others verify through the scan relay. To move a `teeUrl`, pass `--tee-url` to `start-app --register-onchain` / `update-node-onchain` (rewritten in place, same signer). Key must be the app owner (see Keys above).
 
 ```bash
 # Preferred for new deploys: start-app --register-onchain (see Core Commands) registers

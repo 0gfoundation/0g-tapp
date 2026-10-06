@@ -558,7 +558,7 @@ the body-bound form too (`sign_message.py` takes the request JSON).
 
 Register your app and TEE nodes on the TappRegistry contract using `tapp-cli`. These commands require `--private-key` (the deployer's Ethereum private key) and `--server` (the tapp gRPC endpoint).
 
-The node's on-chain `teeUrl` — where the scan and `verify-app` fetch its evidence — is `--tee-url` when given. Otherwise a node already on chain (or the one it replaces) **keeps its recorded `teeUrl`**: a DNS name, front or private address was someone's choice, and a run from wherever the operator happens to be must not move it. The one automatic move is the legacy `http://<host>:50051` → `https://<host>:50052` when the node serves the TLS listener (tapp-server ≥ 0.8.0). A **new** record is derived from `--server`: `https://` as given, `http://` → `https://<host>:50052`; a `--server` reached locally (`127.0.0.1`, a socket) cannot be derived from, so a new record then needs `--tee-url`. Every change is printed. `:50051` is meant to stay closed to everyone but the node (#141). `--tee-url` takes a DNS name, a TLS front, or a **private address** — a node in the scan's VPC can register `https://10.x.x.x:50052`, which only the scan reaches; everyone else verifies it through the scan relay. To move a node's `teeUrl`, pass `--tee-url` to `start-app --register-onchain` or `update-node-onchain` (signer unchanged, nothing else touched).
+The node's on-chain `teeUrl` — where the scan and `verify-app` fetch its evidence — is `--tee-url` when given. Otherwise a node already on chain **keeps its recorded `teeUrl`**: a DNS name, front or private address was someone's choice, and a run from wherever the operator happens to be must not move it. A **replacement** keeps the replaced slot's `teeUrl` only if it reaches *this* node — it is asked for the app's signer — which is the restart case; a replacement on another machine (a new owner taking over, a dead machine replaced) gets one derived from `--server` instead, and says so. The one automatic move is the legacy `http://<host>:50051` → `https://<host>:50052` when the node serves the TLS listener (tapp-server ≥ 0.8.0). A **new** record is derived from `--server`: `https://` as given, `http://` → `https://<host>:50052`; a `--server` reached locally (`127.0.0.1`, a socket) cannot be derived from, so a new record then needs `--tee-url`. Every change is printed. `:50051` is meant to stay closed to everyone but the node (#141). `--tee-url` takes a DNS name, a TLS front, or a **private address** — a node in the scan's VPC can register `https://10.x.x.x:50052`, which only the scan reaches; everyone else verifies it through the scan relay. To move a node's `teeUrl`, pass `--tee-url` to `start-app --register-onchain` or `update-node-onchain` (signer unchanged, nothing else touched).
 
 ### Register during start (recommended)
 
@@ -594,6 +594,9 @@ The signer:
   - signer absent, several other nodes → `addNode`; pass `--old-signer` to replace
     a specific one instead
   - `--add-node` → `addNode` regardless: how a one-node app scales out to two
+  - **Apps whose external contracts key on the signer** (0g-sandbox's vouchers, for
+    one) should restart with `--add-node`, let the old signer's obligations settle,
+    then `remove-node-onchain` it. A one-step replacement skips that settling.
 
 Rewriting a node's record goes through `updateNode`, which also resets the node's
 on-chain `addedAt` to that block. Nothing in tapp reads it, but it means "when this

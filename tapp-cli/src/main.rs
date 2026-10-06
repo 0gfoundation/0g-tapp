@@ -1528,6 +1528,66 @@ async fn node_evidence_url(
     Ok((url, serves_tls_listener(&version)))
 }
 
+/// The signer a teeUrl answers with for `app_id`, or `None` when it does not answer in
+/// time. Any certificate is accepted: this only asks "is that this node?", and what it
+/// learns is compared against a signer already in hand.
+async fn signer_reached_at(url: &str, app_id: &str) -> Option<ethers::types::Address> {
+    let ask = async {
+        let mut client = if url.starts_with("https://") {
+            TappServiceClient::new(tapp_common::pinned_tls::grpc_channel(url, Vec::new()).await.ok()?)
+        } else {
+            TappServiceClient::connect(url.to_string()).await.ok()?
+        };
+        let resp = client
+            .get_app_key(Request::new(GetAppKeyRequest {
+                app_id: app_id.to_owned(),
+                key_type: "ethereum".to_string(),
+                additional_data: vec![],
+                kbs_resource_uri: String::new(),
+                x25519: false,
+            }))
+            .await
+            .ok()?
+            .into_inner();
+        (resp.success && resp.eth_address.len() == 20)
+            .then(|| ethers::types::Address::from_slice(&resp.eth_address))
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(8), ask).await.ok().flatten()
+}
+
+/// The teeUrl for a node that REPLACES another. The slot's record is kept only if it
+/// reaches this node: after a restart it does (same machine, new signer), but a
+/// replacement on another machine — a new owner taking over, a dead machine replaced —
+/// would otherwise point verifiers, and the KMS's admission, at the machine it replaced.
+async fn tee_url_for_replacement(
+    kept: String,
+    derived: &Result<String, String>,
+    explicit: bool,
+    app_id: &str,
+    signer: ethers::types::Address,
+) -> Result<String, String> {
+    if explicit || derived.as_ref() == Ok(&kept) {
+        return Ok(kept);
+    }
+    if signer_reached_at(&kept, app_id).await == Some(signer) {
+        return Ok(kept);
+    }
+    match derived {
+        Ok(d) => {
+            println!(
+                "  teeUrl {} (the replaced node's) does not reach this node; recording {} — \
+                 --tee-url to choose another",
+                kept, d
+            );
+            Ok(d.clone())
+        }
+        Err(e) => Err(format!(
+            "the replaced node's teeUrl {} does not reach this node, and {}",
+            kept, e
+        )),
+    }
+}
+
 /// What to record for a node that already has a record, when `--tee-url` was not given:
 /// what is there. A DNS name, a front or a private address was chosen by someone, and a
 /// run from wherever the operator happens to be must not silently move it. The legacy
@@ -1679,6 +1739,14 @@ async fn ensure_registered_onchain(
             }
             SyncStep::ReplaceNode { old, tee_url, compose_override, volumes_override } => {
                 let before = chain.as_ref().and_then(|c| c.tee_urls.get(&old).cloned());
+                let tee_url = tee_url_for_replacement(
+                    tee_url,
+                    &deployed.tee_url,
+                    deployed.explicit_tee_url,
+                    app_id,
+                    signer,
+                )
+                .await?;
                 let tx = onchain::update_node(
                     &params,
                     app_id,
@@ -3712,7 +3780,7 @@ async fn update_node_onchain(
     };
     let (derived_tee_url, tls_listener) = tee_url;
     let explicit_tee_url = tee_url_arg.is_some();
-    let derived_tee_url = derived_tee_url.unwrap_or_default(); // only read when explicit
+
 
     // `--server` names the node that is *taking over* — that is where the new signer is read
     // from. The one being replaced is dead by definition after a restart, so asking the same
@@ -3754,10 +3822,21 @@ async fn update_node_onchain(
     // plaintext form), the same rule as start-app --register-onchain.
     let (cur_url, cur_compose, cur_volumes) =
         tapp_common::onchain::get_node(&rpc_url, &contract, &app_id, old_signer_addr).await?;
+    // Explicit: as given (validated already). In place: the record, legacy form migrated.
+    // A replacement: the replaced slot's record only if it reaches this node.
     let tee_url = if explicit_tee_url {
-        derived_tee_url
-    } else {
+        derived_tee_url?
+    } else if in_place {
         kept_tee_url(&cur_url, tls_listener)
+    } else {
+        tee_url_for_replacement(
+            kept_tee_url(&cur_url, tls_listener),
+            &derived_tee_url,
+            false,
+            &app_id,
+            new_signer,
+        )
+        .await?
     };
 
     // refresh this node's compose/volumes from its server; store as a per-node override
