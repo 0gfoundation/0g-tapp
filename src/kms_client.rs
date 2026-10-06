@@ -150,19 +150,29 @@ mod onchain_visibility_tests {
     /// The 404 body the KMS serves for an app it cannot see on-chain yet, verbatim from a
     /// testnet node (`https://136.83.14.240:9443`) during a `start-app --register-onchain`
     /// whose registration had landed on chain seconds earlier.
-    const NOT_YET: &str = r#"{"error":"app not found on-chain: r2-probe"}"#;
+    const APP_NOT_YET: &str = r#"{"error":"app not found on-chain: r2-probe"}"#;
+    /// The 401 body for a signer the KMS's cached node list does not have, as 0g-kms builds
+    /// it (`KmsError::InvalidSignature`, src/server.rs): what a node meets right after a
+    /// restart replaced it on chain.
+    const SIGNER_NOT_YET: &str = r#"{"error":"invalid signature: recovered address 0x2da59224845da5c33e114d2d428c9dc68c4ee0e3 not in on-chain signer list for app tapp-kmssync-test"}"#;
 
     #[test]
-    fn the_transient_404_is_recognised_and_other_4xx_are_not() {
-        assert!(is_not_onchain_yet(NOT_YET));
+    fn the_transient_answers_are_recognised_and_other_4xx_are_not() {
+        assert_eq!(not_onchain_yet(APP_NOT_YET).map(|n| n.0), Some("this app"));
+        assert_eq!(not_onchain_yet(SIGNER_NOT_YET).map(|n| n.0), Some("this node's signer"));
 
-        // Everything else must keep failing fast. A signature the KMS rejects, an app whose
-        // attestation does not vouch for this node, a malformed request — none of these change
-        // by waiting, and waiting on them would turn a clear error into a two-minute hang.
-        assert!(!is_not_onchain_yet(r#"{"error":"invalid signature"}"#));
-        assert!(!is_not_onchain_yet(r#"{"error":"node not registered for app"}"#));
-        assert!(!is_not_onchain_yet(r#"{"error":"bad request"}"#));
-        assert!(!is_not_onchain_yet(""));
+        // Everything else must keep failing fast — the KMS's own other bodies (0g-kms
+        // src/error.rs). None of these change by waiting, and waiting on them would turn a
+        // clear error into a two-minute hang.
+        for fails_fast in [
+            r#"{"error":"invalid signature: invalid signature hex"}"#,
+            r#"{"error":"invalid timestamp: request timestamp too old"}"#,
+            r#"{"error":"attestation required: no verified evidence for this signer"}"#,
+            r#"{"error":"bad request: missing field"}"#,
+            "",
+        ] {
+            assert!(not_onchain_yet(fails_fast).is_none(), "{fails_fast}");
+        }
     }
 
     #[test]
@@ -178,6 +188,13 @@ mod onchain_visibility_tests {
         );
         // And it is a different budget from the node-error retries, which are seconds.
         assert!(d.onchain_wait_ms > d.max_delay_ms);
+        // Signed once, retried with that signature: past the KMS's 300s timestamp tolerance
+        // the last attempts would fail on an expired signature, not on visibility.
+        assert!(
+            d.onchain_wait_ms <= 270_000,
+            "onchain_wait_ms is {}ms; it must leave room under the KMS's 300s timestamp tolerance",
+            d.onchain_wait_ms
+        );
     }
 }
 
@@ -318,20 +335,31 @@ pub struct KmsClient {
     pins: Option<tokio::sync::Mutex<PinSource>>,
 }
 
-/// The KMS answered 404 because its cached view of the chain does not have this app yet.
+/// The KMS's cached view of the chain does not have what was just written yet: the app (a
+/// registration), or this node's signer in it (a node replaced after a restart, or added).
 /// Distinguished from every other 4xx because it resolves on its own, given time.
 #[derive(Debug, thiserror::Error)]
-#[error("the KMS has not seen this app on-chain yet")]
-struct NotOnChainYet;
+#[error("the KMS has not seen {0} on-chain yet")]
+struct NotOnChainYet(&'static str);
 
-/// Recognise that one condition in the KMS's 404 body: `{"error":"app not found on-chain: <id>"}`.
+/// Recognise the two conditions in the KMS's answer that only waiting resolves:
 ///
-/// Matching the KMS's prose is not something to be pleased about, but it is the only signal on
-/// the wire — the status code alone cannot separate "not registered" from "not visible yet".
-/// Kept deliberately narrow so that a wording change on the KMS side becomes a visible
-/// regression (the wait stops happening) rather than a silent mismatch that retries everything.
-fn is_not_onchain_yet(body: &str) -> bool {
-    body.contains("app not found on-chain")
+/// - 404 `{"error":"app not found on-chain: <id>"}` — no nodes for the app at all;
+/// - 401 `{"error":"invalid signature: recovered address 0x… not in on-chain signer list for
+///   app <id>"}` — the app is there, this signer is not. That is what a node meets right after
+///   `updateNode` (a restart re-derives the signer) or `addNode`.
+///
+/// The KMS cannot tell "not visible yet" from "never registered" in either, so neither can
+/// this; the deadline message says both. Matching the KMS's prose is the only signal on the
+/// wire, and it is pinned in tests so a wording change on either side shows up as a failure.
+fn not_onchain_yet(body: &str) -> Option<NotOnChainYet> {
+    if body.contains("app not found on-chain") {
+        Some(NotOnChainYet("this app"))
+    } else if body.contains("not in on-chain signer list") {
+        Some(NotOnChainYet("this node's signer"))
+    } else {
+        None
+    }
 }
 
 impl KmsClient {
@@ -435,10 +463,8 @@ impl KmsClient {
         pinned_client(keys)
     }
 
-    /// Request the encrypted secret from the KMS cluster.
-    /// Tries each node in order and returns on the first success.
     /// Fetch key material, waiting out the window in which the KMS has not yet seen a
-    /// just-landed on-chain registration.
+    /// just-landed on-chain registration, replacement or addition.
     ///
     /// The KMS authorises from the chain and caches that view for about 30 seconds, so an app
     /// registered moments ago is genuinely on-chain and genuinely absent from the KMS's answer.
@@ -466,16 +492,18 @@ impl KmsClient {
             {
                 Ok(v) => return Ok(v),
                 Err(e) if e.downcast_ref::<NotOnChainYet>().is_some() => {
+                    let what = e.downcast_ref::<NotOnChainYet>().map(|n| n.0).unwrap_or("this app");
                     let left = deadline.saturating_duration_since(std::time::Instant::now());
                     if left.is_zero() {
-                        // Say what is actually known: the app was not visible to the KMS for the
-                        // whole window. Whether it is registered at all is the caller's next
+                        // Say what is actually known: the KMS did not see it for the whole
+                        // window. Whether it is registered at all is the caller's next
                         // question, and the old message answered it for them, wrongly.
                         return Err(anyhow!(
-                            "the KMS did not see app '{}' on-chain within {}s. If it was \
-                             registered just now, the registration may still be propagating — \
-                             retry. If it was never registered, register it first \
+                            "the KMS did not see {} of '{}' on-chain within {}s. If it was \
+                             registered or replaced just now, the change may still be \
+                             propagating — retry. If it never was, register it first \
                              (start-app --register-onchain).",
+                            what,
                             app_id,
                             self.onchain_wait_ms / 1000
                         ));
@@ -485,7 +513,8 @@ impl KmsClient {
                         app_id,
                         wait_s = nap.as_secs(),
                         remaining_s = left.as_secs(),
-                        "app not visible to the KMS yet (on-chain view is cached); waiting"
+                        what,
+                        "not visible to the KMS yet (its on-chain view is cached); waiting"
                     );
                     tokio::time::sleep(nap).await;
                     delay = (delay * 2).min(std::time::Duration::from_secs(30));
@@ -551,9 +580,9 @@ impl KmsClient {
                         // registered. Signalled up to the caller, which waits and retries the
                         // whole request -- retrying this node would be pointless, since every
                         // node reads the same chain and will answer the same way.
-                        if is_not_onchain_yet(&body) {
-                            tracing::warn!(url = %url, "KMS has not seen this app on-chain yet");
-                            return Err(NotOnChainYet.into());
+                        if let Some(not_yet) = not_onchain_yet(&body) {
+                            tracing::warn!(url = %url, "{}", not_yet);
+                            return Err(not_yet.into());
                         }
                         // Don't retry on client errors (4xx) — request won't change
                         if status.is_client_error() {

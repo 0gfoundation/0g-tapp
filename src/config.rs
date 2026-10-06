@@ -263,14 +263,19 @@ pub struct RetryConfig {
     #[serde(default = "default_max_delay")]
     pub max_delay_ms: u64,
 
-    /// How long to keep retrying while the KMS reports an app as absent from the chain.
+    /// How long to keep retrying while the KMS reports an app, or this node's signer in it,
+    /// as absent from the chain.
     ///
     /// A different kind of wait from the three fields above, which cover a node being down or
-    /// erroring and are measured in seconds. This one waits out the KMS's cached view of the
-    /// chain (~30s), which is why the default is minutes: an app registered moments ago is
-    /// genuinely on-chain and genuinely invisible to the KMS, and `start-app --register-onchain`
-    /// lands inside exactly that window. 120s is four times the cache, leaving room for block
-    /// propagation and for the KMS's own RPC to catch up.
+    /// erroring and are measured in seconds. This one waits out the KMS's view of the chain:
+    /// cached ~30s, behind an RPC that has been seen to lag far longer (one registration became
+    /// visible after 219s). An app registered, or a node replaced, moments ago is genuinely
+    /// on-chain and genuinely invisible to the KMS, and `start-app --register-onchain` lands
+    /// inside exactly that window.
+    ///
+    /// Bounded above by the KMS's timestamp tolerance (300s): the request is signed once and
+    /// retried with that signature, so a wait past the tolerance would end in an expired
+    /// signature instead of the answer it was waiting for.
     #[serde(default = "default_onchain_wait")]
     pub onchain_wait_ms: u64,
 }
@@ -327,7 +332,7 @@ fn default_max_delay() -> u64 {
 }
 
 fn default_onchain_wait() -> u64 {
-    120_000
+    240_000
 }
 
 fn default_docker_socket() -> String {
