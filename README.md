@@ -619,7 +619,15 @@ path could forge every verdict: verify-app warns and never reports better than �
 **dev** image's boot chain is reported ⚠️, not ✅ — dev builds can carry an SSH key into
 the TD. "✅" means the boot chain matches a published image's digests; firmware
 (MRTD/RTMR0) is not compared yet. verify-app **exits non-zero** on a reconcile FAIL or an
-unpublished image, so scripts and CI can use it; warnings do not change the exit status.
+unpublished image, so scripts and CI can use it: **0** everything checked and clean, **1** a
+failure, **2** passed with a warning (unpinned AS, dev image, a TCB trailing Intel's latest,
+reference values unavailable).
+
+The **platform** line reads the TD itself out of the AS token, as the AS policy used to:
+a TD launched with **DEBUG** fails whatever else passes (its host can read and write its
+memory — on bare metal the operator launches the TD), and so does a revoked TCB. A TCB
+that merely trails Intel's latest (`OutOfDate`, `SWHardeningNeeded`, …) warns: clouds
+roll firmware out behind Intel, and the outstanding advisories are listed.
 
 List the apps a server is currently running (read-only, no key needed):
 

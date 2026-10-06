@@ -10,7 +10,8 @@ Usage: python3 verify_app.py <app_id>
 
 Environment overrides: CAST, TAPP_CLI, REGISTRY, RPC_URL, AS_ENDPOINT, AS_PUBKEY,
 REFERENCE_VALUES, RELAY. AS_PUBKEY pins the AS's TLS key (current value in TAPPSCAN.md);
-without it the AS is unauthenticated and the verdict says so. Exits non-zero on a FAIL. Two TappRegistry deployments exist and an app lives on exactly one of them, so
+without it the AS is unauthenticated and the verdict says so. Exit status: 0 clean, 1 a
+failure, 2 passed with a warning (unpinned AS, dev image, lagging TCB, values unavailable). Two TappRegistry deployments exist and an app lives on exactly one of them, so
 REGISTRY has to name the right one. See contract/CONTRACTS.md.
 
 The AS is relied on for the quote's signature chain, TCB and the event-log replay. The
@@ -150,25 +151,37 @@ def identify(m, sets):
             best = (label, hits, len(vals))
     return None, best
 
+AS_CERT = "/tmp/_as_cert.pem"
+
 def as_key_sha256():
-    """sha256 of the AS's TLS public key (SPKI DER), as tapp-cli --as-pubkey compares it."""
+    """sha256 of the AS's TLS public key (SPKI DER), as tapp-cli --as-pubkey compares it.
+    The certificate is kept: the AS call below trusts exactly it, so the call is bound to
+    the key checked here rather than to whatever answers a second connection."""
     hostport = AS.split("://", 1)[-1]
-    out = subprocess.run(
-        f"openssl s_client -connect {hostport} </dev/null 2>/dev/null | openssl x509 -pubkey -noout"
-        " | openssl pkey -pubin -outform der | openssl dgst -sha256",
-        shell=True, capture_output=True, text=True, timeout=30).stdout
-    return out.strip().split()[-1].lower() if out.strip() else ""
+    pem = subprocess.run(f"openssl s_client -connect {hostport} </dev/null 2>/dev/null | openssl x509",
+                         shell=True, capture_output=True, text=True, timeout=30).stdout
+    if "BEGIN CERTIFICATE" not in pem:
+        return "", ""
+    open(AS_CERT, "w").write(pem)
+    digest = subprocess.run(f"openssl x509 -in {AS_CERT} -pubkey -noout | openssl pkey -pubin -outform der"
+                            " | openssl dgst -sha256", shell=True, capture_output=True, text=True).stdout
+    name = subprocess.run(["openssl", "x509", "-in", AS_CERT, "-noout", "-subject", "-nameopt", "multiline"],
+                          capture_output=True, text=True).stdout
+    cn = re.search(r"commonName\s*=\s*(\S+)", name)
+    return digest.strip().split()[-1].lower(), cn.group(1) if cn else ""
 
 # The token is read, not signature-checked, so the channel is what makes "the AS said so"
-# true. grpcurl cannot pin; the key is compared just before, which is weaker (another
-# connection) but catches a substituted endpoint.
+# true. grpcurl cannot pin a key, but it can trust one certificate: the one whose key was
+# just compared, so the call cannot be answered by anything else.
 AS_AUTH = False
+AS_TLS_ARGS = "-insecure"
 if AS.startswith("https://") and AS_PUBKEY:
-    seen = as_key_sha256()
+    seen, as_name = as_key_sha256()
     if seen != AS_PUBKEY:
         print(f"FAIL: the AS at {AS} presents key {seen or '(none)'}, not the pinned {AS_PUBKEY}")
         sys.exit(1)
     AS_AUTH = True
+    AS_TLS_ARGS = f"-cacert {AS_CERT}" + (f" -servername {as_name}" if as_name else "")
 else:
     print(f"WARNING: the AS at {AS} is NOT authenticated (set AS_PUBKEY; current value in "
           "docs/TAPPSCAN.md) — anyone on the path could forge the verdicts below\n")
@@ -197,6 +210,7 @@ if not nodes:
 
 all_ok = True
 boot_all = None
+warned = not AS_AUTH
 for signer in nodes:
     print(f"\n## node {signer}")
     # getNode returns this node's EFFECTIVE compose/volumes: its own per-node override if
@@ -251,13 +265,14 @@ for signer in nodes:
             {"tee": "tdx", "evidence": base64.urlsafe_b64encode(raw).rstrip(b'=').decode()}]}
     open("/tmp/_as_req.json", "w").write(json.dumps(req))
     out = subprocess.run(
-        f"grpcurl {'-insecure' if AS.startswith('https://') else '-plaintext'} "
+        f"grpcurl {AS_TLS_ARGS if AS.startswith('https://') else '-plaintext'} "
         f"-import-path {os.path.dirname(PROTO)} -proto {PROTO} "
         f"-d @ {AS.split('://', 1)[-1]} attestation.AttestationService/AttestationEvaluate < /tmp/_as_req.json",
         shell=True, capture_output=True, text=True, timeout=90)
     tm = re.search(r'"attestationToken":\s*"([^"]+)"', out.stdout)
     as_status = tcb = as_report_data = None
-    boot = "not checked"; boot_ok = None; replay_ok = False
+    boot = "not checked"; boot_ok = None; replay_ok = False; dev = False
+    platform = "FAIL no AS verdict"; platform_ok = False; platform_warn = False
     if tm:
         pl = tm.group(1).split('.')[1]; pl += '=' * (-len(pl) % 4)
         claims = json.loads(base64.urlsafe_b64decode(pl))
@@ -265,6 +280,20 @@ for signer in nodes:
         as_status = sm.get("ear.status")
         tdx = sm.get("ear.veraison.annotated-evidence", {}).get("tdx", {})
         tcb = tdx.get("tcb_status"); adv = tdx.get("advisory_ids", [])
+        # DEBUG opens the TD's memory to its host: a failure whatever else passes. A TCB
+        # trailing Intel's latest is common on clouds: a warning. Revoked: a failure.
+        debug = (tdx.get("td_attributes") or {}).get("debug")
+        if debug is None:
+            raw_attr = ((tdx.get("quote") or {}).get("body") or {}).get("td_attributes", "")
+            debug = bool(int(raw_attr[:2], 16) & 1) if raw_attr[:2] else None
+        if debug is not False:
+            platform = "FAIL TD DEBUG on (or unreadable): its host can read its memory"
+        elif tcb == "Revoked":
+            platform = "FAIL platform TCB revoked"
+        elif tcb != "UpToDate":
+            platform, platform_ok, platform_warn = f"WARN TCB {tcb} (advisories {adv})", True, True
+        else:
+            platform, platform_ok = "ok debug off, TCB up to date", True
         qb = (tdx.get("quote", {}) or {}).get("body", {}) or {}
         as_report_data = qb.get("report_data")     # AS aligns this per quote version
         logs = tdx.get("uefi_event_logs") or []
@@ -285,6 +314,7 @@ for signer in nodes:
         print(f"  3. AS: quote ok  tcb_status={tcb}  advisories={len(adv)}  "
               f"event log {'replays' if replay_ok else 'does NOT replay'}")
         print(f"     boot chain: {boot}")
+        print(f"     platform: {platform}")
         if not boot_ok:
             uki = "grub" not in measured
             for c, ds in sorted(measured.items()):
@@ -364,11 +394,12 @@ for signer in nodes:
     # And nothing read from an event log that does not replay can be believed.
     node_ok = all([sig_ok, cmp_ok, vol_ok, img_ok, replay_ok]) and fresh is not False \
         and (fresh is True or not relayed)
-    all_ok &= node_ok
+    all_ok &= node_ok and platform_ok
+    warned = warned or platform_warn or dev or boot_ok is None
     boot_all = boot_ok if boot_all is None else (boot_all and boot_ok if boot_ok is not None else boot_all)
-    print(f"  => reconcile {'PASS' if node_ok else 'FAIL'} ; boot chain {boot} ; TCB {tcb}")
+    print(f"  => reconcile {'PASS' if node_ok else 'FAIL'} ; boot chain {boot} ; platform {platform}")
 
 print(f"\n### verdict: reconcile {'PASS on every node' if all_ok else 'FAILED on at least one node'}"
       f" ; boot chain {'not checked' if boot_all is None else 'every node matches a published image' if boot_all else 'FAILED'}"
       + ("" if AS_AUTH else " ; AS unauthenticated"))
-sys.exit(0 if all_ok and boot_all is not False else 1)
+sys.exit(1 if not all_ok or boot_all is False else 2 if warned else 0)

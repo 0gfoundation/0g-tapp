@@ -1818,6 +1818,7 @@ async fn verify_app_cmd(
         println!("  signer      : {}  (attested in report_data)", d.signer);
         print_tls_binding(&d.tls_public_key, "  ", 12);
         print_as_line(&d.tcb_status, d.advisories, d.replay_ok, "  ", 12);
+        print_platform(&d.platform(), "  ", 12);
         if show_policy {
             println!("  AS policy   : ear.status={}", d.ear_status);
             if let Some(l) = boot_chain_line(d.boot_executables, true) {
@@ -1838,17 +1839,21 @@ async fn verify_app_cmd(
         if !d.note.is_empty() {
             println!("  note        : {}", d.note);
         }
+        let platform = d.platform();
         println!(
-            "\nBoot chain {} ; TCB {}{}",
+            "\nBoot chain {} ; platform {}{}",
             boot_chain_summary([&d.boot_chain]),
-            d.tcb_status,
+            platform_word(&platform),
             if as_pinned { "" } else { " ; AS unauthenticated ⚠️" }
         );
         println!("(direct mode shows what the node attests; register on-chain + use --contract to reconcile)");
-        if !d.replay_ok || matches!(d.boot_chain, refvalues::BootChain::Unknown { .. }) {
-            std::process::exit(1);
-        }
-        return Ok(());
+        let failed = !d.replay_ok
+            || matches!(d.boot_chain, refvalues::BootChain::Unknown { .. })
+            || matches!(platform, tapp_common::verify::Platform::Fail(_));
+        let warned = !as_pinned
+            || boot_chain_warns(&d.boot_chain)
+            || matches!(platform, tapp_common::verify::Platform::Warn(_));
+        std::process::exit(exit_status(failed, warned));
     }
 
     // Chain mode.
@@ -1878,6 +1883,7 @@ async fn verify_app_cmd(
             continue;
         }
         print_as_line(&n.tcb_status, n.advisories, n.replay_ok, "    ", 11);
+        print_platform(&n.platform(), "    ", 11);
         if show_policy {
             println!("    AS policy  : ear.status={}", n.ear_status);
             if let Some(l) = boot_chain_line(n.boot_executables, true) {
@@ -1917,25 +1923,36 @@ async fn verify_app_cmd(
             println!("    note       : {}", n.note);
         }
         println!(
-            "    => reconcile {} ; boot chain {} ; TCB {}",
+            "    => reconcile {} ; boot chain {} ; platform {}",
             if reconciled { "PASS" } else { "FAIL" },
             boot_chain_word(&n.boot_chain),
-            n.tcb_status
+            platform_word(&n.platform())
         );
     }
-    let chains: Vec<_> = verdict.nodes.iter().filter(|n| n.reachable).map(|n| &n.boot_chain).collect();
+    let reached: Vec<_> = verdict.nodes.iter().filter(|n| n.reachable).collect();
+    let chains: Vec<_> = reached.iter().map(|n| &n.boot_chain).collect();
+    let platforms: Vec<_> = reached.iter().map(|n| n.platform()).collect();
+    let platform_summary = if platforms.iter().any(|p| matches!(p, tapp_common::verify::Platform::Fail(_))) {
+        "has failures ❌"
+    } else if platforms.iter().any(|p| matches!(p, tapp_common::verify::Platform::Warn(_))) {
+        "TCB advisories outstanding ⚠️"
+    } else {
+        "debug off, TCB up to date ✅"
+    };
     println!(
-        "\nResult: reconciliation {} ; boot chain {}{}",
+        "\nResult: reconciliation {} ; boot chain {} ; platform {}{}",
         if all_ok { "ALL PASS ✅" } else { "has failures ❌" },
         boot_chain_summary(chains.iter().copied()),
+        platform_summary,
         if as_pinned { "" } else { " ; AS unauthenticated ⚠️" }
     );
-    // Scripts and CI read the exit status: a definite failure is non-zero. Warnings (an
-    // unpinned AS, a dev image, nothing to compare against) are printed, not failed.
-    if !all_ok || chains.iter().any(|c| matches!(c, refvalues::BootChain::Unknown { .. })) {
-        std::process::exit(1);
-    }
-    Ok(())
+    let failed = !all_ok
+        || chains.iter().any(|c| matches!(c, refvalues::BootChain::Unknown { .. }))
+        || platforms.iter().any(|p| matches!(p, tapp_common::verify::Platform::Fail(_)));
+    let warned = !as_pinned
+        || chains.iter().any(|c| boot_chain_warns(c))
+        || platforms.iter().any(|p| matches!(p, tapp_common::verify::Platform::Warn(_)));
+    std::process::exit(exit_status(failed, warned));
 }
 
 /// What the AS is relied on for: the quote's signature chain (a token at all), platform
@@ -1953,6 +1970,30 @@ fn print_as_line(tcb_status: &str, advisories: usize, replay_ok: bool, indent: &
         advisories,
         if replay_ok { "replays ✓" } else { "does NOT replay ✗" }
     );
+}
+
+/// TD debug and TCB, from the token — what a policy used to enforce.
+fn print_platform(p: &tapp_common::verify::Platform, indent: &str, width: usize) {
+    use tapp_common::verify::Platform;
+    let label = format!("{}{:<width$}", indent, "platform");
+    match p {
+        Platform::Ok => println!("{}: ✓ debug off, TCB up to date", label),
+        Platform::Warn(w) => println!("{}: ⚠️ debug off, {} — an Intel advisory is outstanding", label, w),
+        Platform::Fail(f) => println!("{}: ✗ {}", label, f),
+    }
+}
+
+/// How a run ends, for scripts: 0 everything checked and clean, 1 a definite failure,
+/// 2 passed but with something a careful caller wants to know (unpinned AS, dev image,
+/// a lagging TCB, a boot chain that could not be compared).
+fn exit_status(failed: bool, warned: bool) -> i32 {
+    if failed {
+        1
+    } else if warned {
+        2
+    } else {
+        0
+    }
 }
 
 /// The boot chain against the published reference values, with the measured digests
@@ -1985,6 +2026,25 @@ fn print_boot_chain(
     }
     if !matches!(chain, BootChain::Matched(_)) && !measured.is_empty() {
         print_boot_measurements(measured, indent);
+    }
+}
+
+fn platform_word(p: &tapp_common::verify::Platform) -> String {
+    use tapp_common::verify::Platform;
+    match p {
+        Platform::Ok => "✓".to_string(),
+        Platform::Warn(w) => format!("⚠️ {}", w),
+        Platform::Fail(f) => format!("✗ {}", f),
+    }
+}
+
+/// A boot chain that passed with a caveat: a dev image, or nothing to compare against.
+fn boot_chain_warns(chain: &tapp_common::refvalues::BootChain) -> bool {
+    use tapp_common::refvalues::BootChain;
+    match chain {
+        BootChain::NotChecked => true,
+        BootChain::Matched(l) => tapp_common::refvalues::is_dev_image(l),
+        BootChain::Unknown { .. } => false,
     }
 }
 
@@ -3756,5 +3816,18 @@ mod replaced_node {
         // a(5) is not a node, rather than quietly getting a(1).
         assert_eq!(infer(&[a(1)], a(2)).unwrap(), Some(a(1)));
         assert!(pick_replaced_node(&[a(1)], a(2), "app", Some(a(5))).is_err());
+    }
+}
+
+#[cfg(test)]
+mod exit_status_tests {
+    use super::exit_status;
+
+    #[test]
+    fn a_failure_outranks_a_warning() {
+        assert_eq!(exit_status(false, false), 0);
+        assert_eq!(exit_status(false, true), 2);
+        assert_eq!(exit_status(true, true), 1);
+        assert_eq!(exit_status(true, false), 1);
     }
 }

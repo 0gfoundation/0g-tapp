@@ -57,10 +57,16 @@ pub struct NodeVerdict {
     pub replay_ok: bool,
     /// The boot chain against the published reference values.
     pub boot_chain: crate::refvalues::BootChain,
+    /// The TD's DEBUG attribute, from the AS token.
+    pub td_debug: Option<bool>,
     pub note: String,
 }
 
 impl NodeVerdict {
+    pub fn platform(&self) -> Platform {
+        platform(&self.tcb_status, self.td_debug)
+    }
+
     /// A quote that echoes some other challenge is never accepted. Through a relay,
     /// freshness must also be PROVEN: replaying an old, genuine quote is the one thing
     /// a relay can do, and the echoed challenge is the only thing that rules it out.
@@ -457,6 +463,50 @@ pub struct AsVerdict {
     pub measured: crate::refvalues::Measured,
     /// Event-log entries the AS found not to hash to their extended digest.
     pub replay_mismatches: usize,
+    /// The TD's DEBUG attribute; `None` when the token does not carry it.
+    pub td_debug: Option<bool>,
+}
+
+/// What the platform itself allows, from the AS token: a policy used to check this, and
+/// the local verdict must not lose it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Platform {
+    /// Debug off, TCB up to date.
+    Ok,
+    /// Usable, but with an Intel advisory outstanding (a TCB other than UpToDate):
+    /// common on clouds, whose firmware trails Intel's releases.
+    Warn(String),
+    /// The TD's memory is open to its host (DEBUG), the platform key is revoked, or the
+    /// debug attribute could not be read at all.
+    Fail(String),
+}
+
+/// DEBUG lets the host read and write the TD's memory: whoever launches the TD — the
+/// operator on bare metal — can, so nothing attested inside it means anything. A TCB
+/// that trails Intel's latest is a warning, not a failure: clouds lag, and failing every
+/// node over it would teach people to ignore the check. Revoked is a failure.
+pub fn platform(tcb_status: &str, td_debug: Option<bool>) -> Platform {
+    match td_debug {
+        Some(true) => return Platform::Fail("TD runs with DEBUG: its host can read and write its memory".into()),
+        None => return Platform::Fail("TD attributes not in the AS token: DEBUG cannot be ruled out".into()),
+        Some(false) => {}
+    }
+    match tcb_status {
+        "UpToDate" => Platform::Ok,
+        "Revoked" => Platform::Fail("platform TCB is revoked".into()),
+        other => Platform::Warn(format!("TCB {}", other)),
+    }
+}
+
+/// The DEBUG bit, parsed by the AS or read from the raw TDATTRIBUTES (bit 0 of the first,
+/// little-endian byte) when only that is present.
+fn td_debug_of(tdx: &serde_json::Value) -> Option<bool> {
+    if let Some(d) = tdx["td_attributes"]["debug"].as_bool() {
+        return Some(d);
+    }
+    let hex_attrs = tdx["quote"]["body"]["td_attributes"].as_str()?;
+    let first = u8::from_str_radix(hex_attrs.get(0..2)?, 16).ok()?;
+    Some(first & 1 == 1)
 }
 
 /// A bare `host:port` means plaintext, which is what the shared AS speaks today. An endpoint
@@ -560,6 +610,7 @@ async fn verify_with_as(
         executables,
         measured: crate::refvalues::boot_digests(&logs),
         replay_mismatches: crate::refvalues::replay_mismatches(&logs),
+        td_debug: td_debug_of(tdx),
     })
 }
 
@@ -707,7 +758,14 @@ pub struct DirectVerdict {
     pub trust_anchors: Option<TrustAnchors>,
     pub replay_ok: bool,
     pub boot_chain: crate::refvalues::BootChain,
+    pub td_debug: Option<bool>,
     pub note: String,
+}
+
+impl DirectVerdict {
+    pub fn platform(&self) -> Platform {
+        platform(&self.tcb_status, self.td_debug)
+    }
 }
 
 pub async fn verify_node_direct(
@@ -733,6 +791,7 @@ pub async fn verify_node_direct(
         trust_anchors: None,
         replay_ok: false,
         boot_chain: crate::refvalues::BootChain::NotChecked,
+        td_debug: None,
         note: String::new(),
     };
 
@@ -758,6 +817,7 @@ pub async fn verify_node_direct(
             v.boot_measurements = av.measured.as_reference_pairs();
             v.boot_chain = crate::refvalues::identify(&av.measured, refs);
             v.replay_ok = av.replay_mismatches == 0;
+            v.td_debug = av.td_debug;
         }
         Err(e) => v.note = format!("{}AS: {}", v.note, e),
     }
@@ -834,6 +894,7 @@ pub async fn verify_app(
             relayed_by: None,
             replay_ok: false,
             boot_chain: crate::refvalues::BootChain::NotChecked,
+            td_debug: None,
             note: String::new(),
         };
 
@@ -902,6 +963,7 @@ pub async fn verify_app(
                 v.boot_measurements = av.measured.as_reference_pairs();
                 v.boot_chain = crate::refvalues::identify(&av.measured, refs);
                 v.replay_ok = av.replay_mismatches == 0;
+                v.td_debug = av.td_debug;
                 if !v.replay_ok {
                     v.note = format!(
                         "{}{} measured tapp events do not hash to what was extended; ",
@@ -1185,8 +1247,36 @@ mod relay_tests {
             relayed_by: relayed.then(|| "https://tappscan.0g.ai".to_string()),
             replay_ok: true,
             boot_chain: crate::refvalues::BootChain::NotChecked,
+            td_debug: Some(false),
             note: String::new(),
         }
+    }
+
+    #[test]
+    fn a_debug_td_fails_whatever_else_passes() {
+        assert!(matches!(platform("UpToDate", Some(true)), Platform::Fail(_)));
+        // Unknown is not "probably fine": the attribute must be read to be ruled out.
+        assert!(matches!(platform("UpToDate", None), Platform::Fail(_)));
+    }
+
+    #[test]
+    fn a_trailing_tcb_warns_and_a_revoked_one_fails() {
+        assert_eq!(platform("UpToDate", Some(false)), Platform::Ok);
+        for lagging in ["OutOfDate", "SWHardeningNeeded", "ConfigurationNeeded", "OutOfDateConfigurationNeeded"] {
+            assert!(matches!(platform(lagging, Some(false)), Platform::Warn(_)), "{lagging}");
+        }
+        assert!(matches!(platform("Revoked", Some(false)), Platform::Fail(_)));
+    }
+
+    #[test]
+    fn the_debug_bit_is_read_parsed_or_raw() {
+        let parsed = serde_json::json!({"td_attributes": {"debug": true}});
+        assert_eq!(td_debug_of(&parsed), Some(true));
+        // TDATTRIBUTES as seen on test-tapp (SEPT_VE_DISABLE only), then with DEBUG set.
+        let raw = |h: &str| serde_json::json!({"quote": {"body": {"td_attributes": h}}});
+        assert_eq!(td_debug_of(&raw("0000001000000000")), Some(false));
+        assert_eq!(td_debug_of(&raw("0100001000000000")), Some(true));
+        assert_eq!(td_debug_of(&serde_json::json!({})), None);
     }
 
     #[test]
