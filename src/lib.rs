@@ -47,7 +47,13 @@ pub const NAME: &str = env!("CARGO_PKG_NAME");
 
 /// Runtime configuration set via ClaimConfig (owner/chain/kbs).
 /// Separate from the static TappConfig so get-tapp-info can show live values.
-#[derive(Debug, Clone, Default)]
+///
+/// Persisted beside the claimed owner (see [`ClaimedRuntimeConfig::save`]): the owner
+/// alone surviving a process restart left the node owned but with its trust anchor, KMS
+/// cluster and TLS key source back at config.toml's values — while this boot's event log
+/// still recorded the claimed ones.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct ClaimedRuntimeConfig {
     pub chain_rpc_url: String,
     pub chain_contract_address: String,
@@ -64,6 +70,39 @@ pub struct ClaimedRuntimeConfig {
     /// checked", and callers must not conflate them.
     pub scan_url: String,
     pub scan_public_key: String,
+}
+
+impl ClaimedRuntimeConfig {
+    /// Where the claimed config of this boot lives: next to the claimed owner, so on the
+    /// same tmpfs with the same lifetime — a VM reboot clears both, together with the RTMRs
+    /// that recorded them.
+    pub fn state_path(config: &TappConfig) -> Option<std::path::PathBuf> {
+        let permission = config.server.permission.as_ref()?;
+        Some(permission.owner_state_path.with_file_name("claimed_config.json"))
+    }
+
+    /// Written whole and renamed into place, so a crash mid-write leaves the previous
+    /// version rather than half of a new one.
+    pub fn save(&self, path: &std::path::Path) -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, serde_json::to_vec(self).map_err(std::io::Error::other)?)?;
+        std::fs::rename(&tmp, path)
+    }
+
+    /// `Ok(None)` when nothing was claimed this boot (or by a tapp-server that did not
+    /// persist it).
+    pub fn load(path: &std::path::Path) -> std::io::Result<Option<Self>> {
+        match std::fs::read(path) {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .map(Some)
+                .map_err(std::io::Error::other),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
 }
 
 /// Reject anything that is not a usable (url, pin) pair, or accept "both empty" as
@@ -225,6 +264,17 @@ async fn kms_derive_with(
 }
 
 impl TappServiceImpl {
+    /// Best effort, like the owner's: failing it costs the next process restart its
+    /// claimed config, which get-tapp-info then shows, not the claim itself.
+    async fn persist_claimed_config(&self) {
+        let Some(path) = ClaimedRuntimeConfig::state_path(&self.config) else {
+            return;
+        };
+        if let Err(e) = self.claimed_runtime_config.read().await.save(&path) {
+            tracing::warn!(error = %e, path = %path.display(), "Failed to persist claimed config");
+        }
+    }
+
     /// See [`kms_derive_with`].
     async fn kms_derive(&self, app_id: &str, material: &str) -> Result<Vec<u8>, Status> {
         kms_derive_with(&self.kms_client, &self.app_key_service, app_id, material).await
@@ -460,7 +510,7 @@ impl TappServiceImpl {
         })));
 
         // Initialize runtime config from static config (pre-baked values visible immediately)
-        let claimed_runtime_config = Arc::new(tokio::sync::RwLock::new(ClaimedRuntimeConfig {
+        let mut runtime = ClaimedRuntimeConfig {
             chain_rpc_url: config.chain.as_ref().map(|c| c.rpc_url.clone()).unwrap_or_default(),
             chain_contract_address: config.chain.as_ref().map(|c| c.contract_address.clone()).unwrap_or_default(),
             kbs_node_urls: config.kbs.as_ref().map(|k| k.node_urls.clone()).unwrap_or_default(),
@@ -469,7 +519,42 @@ impl TappServiceImpl {
             // image. See ClaimedRuntimeConfig.
             scan_url: String::new(),
             scan_public_key: String::new(),
-        }));
+        };
+
+        // A process restart within this boot resumes the claimed config, and the KMS
+        // client built from it, exactly as the claim left them. Not measured again: the
+        // claim_config / update_trust_anchors events are already in this boot's event log.
+        match ClaimedRuntimeConfig::state_path(&config).map(|p| ClaimedRuntimeConfig::load(&p)) {
+            Some(Ok(Some(claimed))) => {
+                info!(
+                    kbs_nodes = claimed.kbs_node_urls.len(),
+                    tls_key_source = %claimed.tls_key_source,
+                    scan_url = %claimed.scan_url,
+                    "Resumed the config claimed earlier this boot"
+                );
+                if !claimed.kbs_node_urls.is_empty() {
+                    let retry = config.kbs.as_ref().map(|k| k.retry.clone()).unwrap_or_default();
+                    *kms_client.write().await = Some(kms_client_with_anchor(
+                        claimed.kbs_node_urls.clone(),
+                        &retry,
+                        &claimed.scan_url,
+                        &claimed.scan_public_key,
+                    ));
+                }
+                runtime = claimed;
+            }
+            Some(Ok(None)) | None => {}
+            // Starting on config.toml's values is not a silent downgrade: without the
+            // claimed anchor the KMS client refuses unverified nodes, and get-tapp-info
+            // shows what is in force. Refusing to start would leave the node unmanageable
+            // until a reboot.
+            Some(Err(e)) => error!(
+                error = %e,
+                "Could not read the config claimed earlier this boot; running with config.toml \
+                 values. Re-apply the trust anchors with update-trust-anchors."
+            ),
+        }
+        let claimed_runtime_config = Arc::new(tokio::sync::RwLock::new(runtime));
 
         info!("All TAPP service components initialized successfully");
 
@@ -1559,6 +1644,7 @@ impl TappService for TappServiceImpl {
         if let Err(e) = pm.persist_owner().await {
             tracing::warn!(error = %e, "Failed to persist claimed owner");
         }
+        self.persist_claimed_config().await;
 
         info!(
             owner = %owner,
@@ -1661,6 +1747,7 @@ impl TappService for TappServiceImpl {
 
         let kbs_changed = !req.kbs_node_urls.is_empty();
         *self.claimed_runtime_config.write().await = resulting.clone();
+        self.persist_claimed_config().await;
 
         // Replace the KMS client so the new cluster takes effect on the next request
         // rather than at the next restart.
@@ -2558,5 +2645,82 @@ mod tests {
         assert_eq!(padded.len(), 10);
         assert_eq!(&padded[0..5], b"hello");
         assert_eq!(&padded[5..], &[0u8; 5]);
+    }
+}
+
+#[cfg(test)]
+mod claimed_config_persistence {
+    use super::*;
+
+    fn claimed() -> ClaimedRuntimeConfig {
+        ClaimedRuntimeConfig {
+            kbs_node_urls: vec!["https://kms-1:9443".into(), "https://kms-2:9443".into()],
+            tls_key_source: "kms".into(),
+            scan_url: "https://scan.example".into(),
+            scan_public_key: format!("0x{}", "ab".repeat(32)),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_restart_reads_back_exactly_what_was_claimed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("claimed_config.json");
+        claimed().save(&path).unwrap();
+
+        let back = ClaimedRuntimeConfig::load(&path).unwrap().unwrap();
+        assert_eq!(back.kbs_node_urls, claimed().kbs_node_urls);
+        assert_eq!(back.tls_key_source, "kms");
+        assert_eq!(back.scan_url, claimed().scan_url);
+        assert_eq!(back.scan_public_key, claimed().scan_public_key);
+        assert!(!path.with_extension("json.tmp").exists());
+    }
+
+    #[test]
+    fn nothing_claimed_this_boot_is_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(ClaimedRuntimeConfig::load(&dir.path().join("claimed_config.json"))
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn a_file_from_another_version_still_loads() {
+        // A binary upgrade within the boot is a process restart too: fields it does not
+        // know are ignored, fields it misses take their defaults.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("claimed_config.json");
+        std::fs::write(
+            &path,
+            r#"{"retired_field":"x","scan_url":"https://scan.example","tls_key_source":"kms"}"#,
+        )
+        .unwrap();
+        let back = ClaimedRuntimeConfig::load(&path).unwrap().unwrap();
+        assert_eq!(back.scan_url, "https://scan.example");
+        assert_eq!(back.tls_key_source, "kms");
+        assert!(back.kbs_node_urls.is_empty());
+    }
+
+    #[test]
+    fn a_damaged_file_is_reported_not_taken_as_nothing_claimed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("claimed_config.json");
+        std::fs::write(&path, b"{\"scan_url\":").unwrap();
+        assert!(ClaimedRuntimeConfig::load(&path).is_err());
+    }
+
+    #[test]
+    fn it_lives_beside_the_claimed_owner() {
+        // Same directory as the owner, so the same tmpfs and the same lifetime: a reboot
+        // must clear the config together with the owner and the RTMRs that recorded both.
+        let config: TappConfig = toml::from_str(
+            "[server.permission]\nenabled = true\nowner_state_path = \"/run/tapp/claimed_owner\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            ClaimedRuntimeConfig::state_path(&config).unwrap(),
+            std::path::PathBuf::from("/run/tapp/claimed_config.json")
+        );
+        assert!(ClaimedRuntimeConfig::state_path(&TappConfig::default()).is_none());
     }
 }

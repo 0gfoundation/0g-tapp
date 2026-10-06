@@ -1,7 +1,7 @@
 ---
 name: 0g-tapp-cli
 description: Use this skill when the user wants to deploy, manage, or troubleshoot applications on a 0G Tapp (Trusted Application Platform) server using tapp-cli. Covers start/stop apps, on-chain registration, registry login, check task status, view logs, and manage docker compose deployments across multiple remote TEE servers.
-version: 1.13.0
+version: 1.13.1
 author: 0G Labs
 tags: [0g, tapp, tee, docker, deployment, cli, onchain]
 ---
@@ -120,6 +120,7 @@ Owner-only, and **every call is extended into the runtime measurement** carrying
 
 **What the node then does** (v0.5.0+): before fetching key material it pins the verifier against `--scan-pubkey`, asks it for the KMS app's attested keys, and pins the KMS node against that set. No path degrades to unverified — if the verifier is unreachable and nothing is cached, it refuses. A pin mismatch triggers one refresh (a rebooted node has legitimately re-derived its key) then rejects.
 - After VM reboot the server is UNCLAIMED again and must be claimed again.
+- A tapp-server **process** restart (same boot) keeps the claim: owner, KMS cluster, TLS key source and trust anchors all resume (tapp-server 0.8.1+; before it only the owner did, and the anchors had to be re-applied with `update-trust-anchors` — the symptom is `get-tapp-info` showing no verifier on a node you anchored).
 
 ### Server health & whitelist
 ```bash

@@ -482,9 +482,11 @@ cannot invent one.
   `claim_config` event (same mechanism as `start_app`), so verifiers see WHO owns
   the node in the attestation evidence and can reconcile it with the on-chain
   registration — the owner moved from the golden values into the runtime event log.
-- **Restart-safe**: the claimed owner is persisted under `/run` (tmpfs) — a
-  tapp-server process restart cannot reopen the claim; a VM reboot clears both
-  the state and the RTMRs, so a rebooted node is claimable (and re-measured) again.
+- **Restart-safe**: the claimed owner and the claimed config (KMS cluster, TLS key
+  source, trust anchors, including later `update-trust-anchors`) are persisted under
+  `/run` (tmpfs) — a tapp-server process restart cannot reopen the claim and resumes
+  the node as claimed; a VM reboot clears both the state and the RTMRs, so a rebooted
+  node is claimable (and re-measured) again.
 - **Hijack window**: practically closed — don't expose :50051 before claiming
   (cloud firewall), and claim right after boot. Even if raced, the intruder's
   address is indelibly measured, your own claim fails immediately (instant
