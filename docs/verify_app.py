@@ -1,20 +1,24 @@
 #!/usr/bin/env python3
 """
 tapp node verifier. The only input is an app_id; everything else is automatic:
-read the chain, fetch evidence, verify the quote at the AS, reconcile the two.
-Mirrors steps 1-4 of docs/EVIDENCE_AND_AS_VERIFICATION.md.
+read the chain, fetch evidence, verify the quote at the AS, compare the boot chain with
+the published reference values, reconcile the evidence with the chain. The same logic as
+`tapp-cli verify-app` (tapp-common/src/verify.rs, refvalues.rs).
 
 Requires: cast (foundry), tapp-cli, grpcurl, and attestation.proto alongside this file.
 Usage: python3 verify_app.py <app_id>
 
-Environment overrides: CAST, TAPP_CLI, REGISTRY, RPC_URL, AS_ENDPOINT, SCAN.
-SCAN=https://tappscan.0g.ai fetches each node's evidence through that scan instead of
-from its teeUrl, for nodes whose port is open only to the scan and their operators.
-The scan is not trusted: the evidence is checked the same way, and each quote must
-echo the random challenge sent for it.
-Two TappRegistry deployments exist and an app lives on exactly one of them, so
+Environment overrides: CAST, TAPP_CLI, REGISTRY, RPC_URL, AS_ENDPOINT, REFERENCE_VALUES,
+RELAY. Two TappRegistry deployments exist and an app lives on exactly one of them, so
 REGISTRY has to name the right one. See contract/CONTRACTS.md.
-"""
+
+The AS is relied on for the quote's signature chain, TCB and the event-log replay. The
+boot chain is compared HERE against the published reference values
+(0gfoundation/0g-tapp@dev:verifier/reference-values, or REFERENCE_VALUES=<dir>).
+
+A node whose port is closed to you is reached through its registry's scan relay (RELAY
+overrides it). Transport only: the evidence is checked exactly the same way, and the
+quote must echo the random challenge sent for it."""
 import sys, os, json, base64, struct, subprocess, re, binascii, hashlib, secrets
 import urllib.parse, urllib.request, urllib.error
 
@@ -27,7 +31,10 @@ R     = os.environ.get("RPC_URL", "https://evmrpc-testnet.0g.ai")
 # host:port = plaintext. The AS serves a self-signed certificate, so the TLS here is
 # encryption without authentication (tapp-cli verify-app --as-pubkey pins it).
 AS    = os.environ.get("AS_ENDPOINT", "https://35.253.66.70:50004")
-SCAN  = os.environ.get("SCAN", "").rstrip("/")               # relay; empty = fetch from teeUrl
+RELAYS = {"0x2ce80374318b1d7fb3345724457a182e0ad165c9": "https://tappscan.0g.ai",          # testnet
+          "0x54874f536301c993922dd95097e3902e7fbfe612": "https://tappscan.0g.ai/mainnet"}  # mainnet
+RELAY = os.environ.get("RELAY", RELAYS.get(C.lower(), "")).rstrip("/")
+REFS  = os.environ.get("REFERENCE_VALUES", "")
 PROTO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "attestation.proto")
 ALG   = {4: 20, 0xb: 32, 0xc: 48, 0xd: 64}
 print(f"### verifying app_id = {APP}\n")
@@ -52,6 +59,102 @@ def split_top(s):                       # split on top-level commas, respecting 
         parts.append(cur.strip())
     return parts
 
+# ───────── 0. reference values: what an audited image measures ─────────
+ANY_BSA = "_any_bsa"   # a UKI digest is compared against ANY boot-services application
+
+def parse_set(raw):
+    try:
+        d = json.loads(raw)
+    except ValueError:
+        return None
+    vals = {}
+    for k, v in (d.items() if isinstance(d, dict) else []):
+        m = re.fullmatch(r"measurement\.(.+)\.SHA-384", k)
+        v = [x for x in (v if isinstance(v, list) else []) if x]
+        if m and v:
+            vals[ANY_BSA if m.group(1) == "uki" else m.group(1)] = v
+    return vals or None
+
+def load_refs():
+    sets = {}
+    if REFS:
+        for root, _, files in os.walk(REFS):
+            for f in files:
+                if f.endswith(".json"):
+                    p = os.path.join(root, f)
+                    if (v := parse_set(open(p, "rb").read())):
+                        sets[os.path.relpath(p, REFS)] = v
+        return sets, REFS
+    repo, ref, path = "0gfoundation/0g-tapp", "dev", "verifier/reference-values"
+    def get(url, accept):
+        req = urllib.request.Request(url, headers={"Accept": accept, "User-Agent": "verify_app.py"})
+        if os.environ.get("GITHUB_TOKEN"):
+            req.add_header("Authorization", "Bearer " + os.environ["GITHUB_TOKEN"])
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.read()
+    commit = get(f"https://api.github.com/repos/{repo}/commits/{ref}", "application/vnd.github.sha").decode().strip()
+    cache = os.path.join(os.path.expanduser("~/.cache"), "tapp-cli/reference-values", commit)  # shared with tapp-cli
+    if not os.path.isdir(cache):
+        tree = json.loads(get(f"https://api.github.com/repos/{repo}/git/trees/{commit}?recursive=1",
+                              "application/vnd.github+json"))
+        if tree.get("truncated"):
+            raise RuntimeError("tree came back truncated")
+        tmp = cache + ".tmp"
+        for e in tree["tree"]:
+            rel = e["path"].removeprefix(path + "/")
+            if e["type"] == "blob" and e["path"].startswith(path + "/") and rel.endswith(".json"):
+                raw = get(f"https://raw.githubusercontent.com/{repo}/{commit}/{e['path']}", "*/*")
+                os.makedirs(os.path.dirname(os.path.join(tmp, rel)), exist_ok=True)
+                open(os.path.join(tmp, rel), "wb").write(raw)
+        os.rename(tmp, cache)
+    for root, _, files in os.walk(cache):
+        for f in files:
+            p = os.path.join(root, f)
+            if (v := parse_set(open(p, "rb").read())):
+                sets[os.path.relpath(p, cache)] = v
+    return sets, f"{repo}@{ref} ({commit[:12]}):{path}"
+
+def boot_digests(logs):
+    """Same selection rules as tapp-common/src/refvalues.rs and verifier/policy.rego."""
+    m = {}
+    add = lambda c, d: m.setdefault(c, set()).add(d)
+    for e in logs:
+        d = next((x.get("digest") for x in e.get("digests", []) if x.get("alg") == "SHA-384"), None)
+        if not d:
+            continue
+        det = e.get("details") or {}
+        if e.get("type_name") == "EV_EFI_BOOT_SERVICES_APPLICATION":
+            add(ANY_BSA, d)
+            paths = " ".join(x for x in det.get("device_paths", []) if isinstance(x, str)).lower()
+            if "shimx64.efi" in paths: add("shim", d)
+            elif "grubx64.efi" in paths: add("grub", d)
+        elif e.get("type_name") == "EV_IPL":
+            st = det.get("string") or ""
+            if st.startswith("kernel_cmdline:"): add("kernel_cmdline", d)
+            elif st.startswith("/vmlinuz"): add("kernel", d)
+            elif st.startswith("/initrd"): add("initrd", d)
+    return m
+
+def identify(m, sets):
+    """(matched label, closest (label, hits, of)) — exhaustive, like tapp-cli."""
+    fmt = "grub" if "grub" in m else "uki"
+    best = None
+    for label, vals in sorted(sets.items()):
+        hits = sum(1 for c, allowed in vals.items() if m.get(c, set()) & set(allowed))
+        if hits == len(vals):
+            return label, None
+        same_fmt = ("grub" if ("grub" in vals or "shim" in vals) else "uki") == fmt
+        if same_fmt and hits and (best is None or hits > best[1]):
+            best = (label, hits, len(vals))
+    return None, best
+
+try:
+    REF_SETS, ref_src = load_refs()
+    print(f"reference values: {ref_src} — {len(REF_SETS)} published image(s)\n")
+except Exception as e:
+    REF_SETS = None
+    print(f"reference values: unavailable ({e}) — the boot chain is NOT checked\n")
+
 # ───────── 1. read the registration off the chain ─────────
 print("## 1. chain")
 ai = cast_call("getAppInfo(string)((bytes,bytes,bytes[],address,uint256))", APP)
@@ -68,6 +171,7 @@ if not nodes:
     print("FAIL: app is not on chain, stopping."); sys.exit(1)
 
 all_ok = True
+boot_all = None
 for signer in nodes:
     print(f"\n## node {signer}")
     # getNode returns this node's EFFECTIVE compose/volumes: its own per-node override if
@@ -88,27 +192,34 @@ for signer in nodes:
     # challenge a replayed cached quote is indistinguishable from a new one. Must be
     # random — never a counter or a clock.
     nonce = secrets.token_bytes(16)
-    if SCAN:
-        url = (f"{SCAN}/api/apps/{urllib.parse.quote(APP, safe='')}/nodes/{signer}/evidence"
+    raw = relayed = None
+    try:
+        ev = subprocess.run([CLI, "-s", teeUrl, "get-evidence", "--app-id", APP,
+                             "--nonce", nonce.hex()],
+                            capture_output=True, text=True, timeout=30)
+        m = re.search(r'Evidence \(hex\): ([0-9a-f]+)', ev.stdout)
+        direct_err = None if m else (ev.stdout + ev.stderr).strip()[:160]
+        raw = binascii.unhexlify(m.group(1)) if m else None
+    except subprocess.TimeoutExpired:
+        direct_err = "no answer within 30s"
+    if raw is None and RELAY:
+        # The node's port may be open only to the scan. Transport only: the bytes are
+        # checked below exactly as if fetched directly, challenge included.
+        url = (f"{RELAY}/api/apps/{urllib.parse.quote(APP, safe='')}/nodes/{signer}/evidence"
                f"?nonce=0x{nonce.hex()}")
         try:
             with urllib.request.urlopen(url, timeout=90) as resp:
                 raw = base64.b64decode(json.load(resp)["evidence"])
+            relayed = RELAY
         except (urllib.error.URLError, KeyError, ValueError) as e:
             detail = e.read().decode(errors="replace").strip() if isinstance(e, urllib.error.HTTPError) else e
-            print(f"  2. FAIL fetching evidence through {SCAN}: {str(detail)[:160]}")
-            all_ok = False; continue
-    else:
-        ev = subprocess.run([CLI, "-s", teeUrl, "get-evidence", "--app-id", APP,
-                             "--nonce", nonce.hex()],
-                            capture_output=True, text=True, timeout=90)
-        m = re.search(r'Evidence \(hex\): ([0-9a-f]+)', ev.stdout)
-        if not m:
-            print(f"  2. FAIL fetching evidence: {(ev.stdout + ev.stderr).strip()[:160]}")
-            all_ok = False; continue
-        raw = binascii.unhexlify(m.group(1))
+            direct_err = f"{direct_err}; relayed by {RELAY}: {str(detail)[:160]}"
+    if raw is None:
+        print(f"  2. FAIL fetching evidence: {direct_err}")
+        all_ok = False; continue
     j = json.loads(raw)
-    print(f"  2. ok, evidence ({len(raw)} B)" + (f", relayed by {SCAN}" if SCAN else ""))
+    print(f"  2. ok, evidence ({len(raw)} B)"
+          + (f" — the node did not answer here; relayed by {relayed} (transport only)" if relayed else ""))
 
     # ───────── 3. verify quote signature + TCB (CoCo-AS gRPC 50004) ─────────
     req = {"verification_requests": [
@@ -121,6 +232,7 @@ for signer in nodes:
         shell=True, capture_output=True, text=True, timeout=90)
     tm = re.search(r'"attestationToken":\s*"([^"]+)"', out.stdout)
     as_status = tcb = as_report_data = None
+    boot = "not checked"; boot_ok = None; replay_ok = False
     if tm:
         pl = tm.group(1).split('.')[1]; pl += '=' * (-len(pl) % 4)
         claims = json.loads(base64.urlsafe_b64decode(pl))
@@ -130,7 +242,26 @@ for signer in nodes:
         tcb = tdx.get("tcb_status"); adv = tdx.get("advisory_ids", [])
         qb = (tdx.get("quote", {}) or {}).get("body", {}) or {}
         as_report_data = qb.get("report_data")     # AS aligns this per quote version
-        print(f"  3. AS: ear.status={as_status}  tcb_status={tcb}  advisories={len(adv)}")
+        logs = tdx.get("uefi_event_logs") or []
+        # Only tapp's own events must replay: a firmware event's digest is of the file it
+        # loaded, so the AS's per-event flag is false there on every healthy node.
+        replay_ok = not any((e.get("details") or {}).get("data", {}).get("domain") == "tapp.0g.com"
+                            and e.get("digest_matches_event") is False for e in logs)
+        measured = boot_digests(logs)
+        if REF_SETS is not None:
+            label, near = identify(measured, REF_SETS)
+            boot_ok = label is not None
+            boot = (f"ok {label.removesuffix('.json')}" if boot_ok else
+                    "FAIL matches no published image"
+                    + (f" (closest {near[0].removesuffix('.json')}, {near[1]}/{near[2]})" if near else ""))
+        print(f"  3. AS: quote ok  tcb_status={tcb}  advisories={len(adv)}  "
+              f"event log {'replays' if replay_ok else 'does NOT replay'}")
+        print(f"     boot chain: {boot}")
+        if not boot_ok:
+            uki = "grub" not in measured
+            for c, ds in sorted(measured.items()):
+                if c != ANY_BSA or uki:
+                    print(f"       measurement.{'uki' if c == ANY_BSA else c}.SHA-384: {sorted(ds)}")
     else:
         print(f"  3. FAIL, no token from AS: {(out.stdout + out.stderr).strip()[:160]}")
 
@@ -202,11 +333,12 @@ for signer in nodes:
     # A challenge that was not echoed means this quote was not produced for this request,
     # which is as hard a failure as a measurement that does not reconcile. Through a relay
     # freshness must be PROVEN: replaying an old, genuine quote is what a relay could do.
-    node_ok = all([sig_ok, cmp_ok, vol_ok, img_ok]) and fresh is not False \
-        and (fresh is True or not SCAN)
-    quote_ok = (as_status == "affirming")
+    # And nothing read from an event log that does not replay can be believed.
+    node_ok = all([sig_ok, cmp_ok, vol_ok, img_ok, replay_ok]) and fresh is not False \
+        and (fresh is True or not relayed)
     all_ok &= node_ok
-    print(f"  => reconcile {'PASS' if node_ok else 'FAIL'} ; "
-          f"quote {'trusted' if quote_ok else f'NOT trusted ({as_status}/{tcb})'}")
+    boot_all = boot_ok if boot_all is None else (boot_all and boot_ok if boot_ok is not None else boot_all)
+    print(f"  => reconcile {'PASS' if node_ok else 'FAIL'} ; boot chain {boot} ; TCB {tcb}")
 
-print(f"\n### verdict: reconcile {'PASS on every node' if all_ok else 'FAILED on at least one node'}")
+print(f"\n### verdict: reconcile {'PASS on every node' if all_ok else 'FAILED on at least one node'}"
+      f" ; boot chain {'not checked' if boot_all is None else 'every node runs a published image' if boot_all else 'FAILED'}")

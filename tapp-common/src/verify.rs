@@ -50,8 +50,13 @@ pub struct NodeVerdict {
     /// Whether the quote echoed the challenge sent for it: `Some(false)` means it was
     /// produced for some other request, `None` that the server predates the field.
     pub fresh: Option<bool>,
-    /// The evidence came through a scan rather than from the node itself.
-    pub relayed: bool,
+    /// The relay the evidence came through, when the node did not answer directly.
+    pub relayed_by: Option<String>,
+    /// The AS replayed the event log and every entry hashes to what was extended — the
+    /// condition for believing anything read from it (start_app, claim_config).
+    pub replay_ok: bool,
+    /// The boot chain against the published reference values.
+    pub boot_chain: crate::refvalues::BootChain,
     pub note: String,
 }
 
@@ -64,8 +69,9 @@ impl NodeVerdict {
             && self.compose_ok
             && self.volumes_ok
             && self.image_ok
+            && self.replay_ok
             && self.fresh != Some(false)
-            && (!self.relayed || self.fresh == Some(true))
+            && (self.relayed_by.is_none() || self.fresh == Some(true))
     }
 }
 
@@ -266,86 +272,6 @@ fn latest_successful_start(cc_eventlog_b64: &str, app_id: &str) -> Result<Option
     Ok(last)
 }
 
-/// ASCII view of (possibly UTF-16LE) event data: drop NULs, lowercase.
-fn event_data_ascii(data: &[u8]) -> String {
-    data.iter()
-        .filter(|&&b| b != 0)
-        .map(|&b| (b as char).to_ascii_lowercase())
-        .collect()
-}
-
-/// Parse the cc_eventlog and return the boot-chain component digests that AS
-/// policies compare against reference values — the SAME selection rules as
-/// verifier/policy.rego:
-///   shim           EV_EFI_BOOT_SERVICES_APPLICATION, device_path ~ shimx64.efi
-///   grub           EV_EFI_BOOT_SERVICES_APPLICATION, device_path ~ grubx64.efi
-///   uki            EV_EFI_BOOT_SERVICES_APPLICATION, device_path ~ bootx64.efi (UKI boot)
-///   kernel         EV_IPL, string contains vmlinuz
-///   initrd         EV_IPL, string contains initrd
-///   kernel_cmdline EV_IPL, string starts with "kernel_cmdline:"
-/// Returns (component, sha384_hex) pairs in eventlog order.
-fn extract_boot_measurements(cc_eventlog_b64: &str) -> Result<Vec<(String, String)>> {
-    const EV_IPL: usize = 0xd;
-    const EV_EFI_BSA: usize = 0x8000_0003;
-
-    let log = B64.decode(cc_eventlog_b64).map_err(|e| anyhow!("eventlog b64: {}", e))?;
-    let u32le = |b: &[u8]| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize;
-
-    // skip SpecID event
-    let mut o = 8 + 20;
-    if o + 4 > log.len() { return Ok(vec![]); }
-    let ds = u32le(&log[o..o + 4]);
-    o += 4 + ds;
-
-    let mut results: Vec<(String, String)> = Vec::new();
-
-    while o + 12 <= log.len() {
-        let _pcr = u32le(&log[o..o + 4]); o += 4;
-        let et = u32le(&log[o..o + 4]); o += 4;
-        let cnt = u32le(&log[o..o + 4]); o += 4;
-
-        let mut sha384: Option<String> = None;
-        for _ in 0..cnt {
-            if o + 2 > log.len() { return Ok(results); }
-            let alg = u16::from_le_bytes([log[o], log[o + 1]]);
-            let sz = alg_size(alg);
-            o += 2;
-            if alg == 0xc && o + sz <= log.len() {
-                sha384 = Some(hex::encode(&log[o..o + sz]));
-            }
-            o += sz;
-        }
-        if o + 4 > log.len() { break; }
-        let dl = u32le(&log[o..o + 4]); o += 4;
-        if o + dl > log.len() { break; }
-        let data = &log[o..o + dl];
-        o += dl;
-
-        let Some(h) = sha384 else { continue };
-        let text = event_data_ascii(data);
-
-        let component = match et {
-            EV_EFI_BSA => {
-                if text.contains("shimx64.efi") { Some("shim") }
-                else if text.contains("grubx64.efi") { Some("grub") }
-                else if text.contains("bootx64.efi") { Some("uki") }
-                else { None }
-            }
-            EV_IPL => {
-                if text.starts_with("kernel_cmdline:") { Some("kernel_cmdline") }
-                else if text.contains("vmlinuz") { Some("kernel") }
-                else if text.contains("initrd") { Some("initrd") }
-                else { None }
-            }
-            _ => None,
-        };
-        if let Some(c) = component {
-            results.push((c.to_string(), h));
-        }
-    }
-    Ok(results)
-}
-
 /// Parse the cc_eventlog and extract the claimed owner from `claim_config` events.
 /// Returns:
 ///   Ok(Some(owner)) — all claim_config events agree, returns the (normalized) owner
@@ -526,8 +452,11 @@ pub struct AsVerdict {
     /// AR4SI executables trust claim (== EXECUTABLES_MATCHED when the boot chain matched
     /// the policy reference values); None if the policy set no executables / no policy applied.
     pub executables: Option<i64>,
-    /// Unused — boot measurements now come from eventlog parsing, not AS token.
-    pub boot_measurements: Vec<(String, String)>,
+    /// Boot-chain digests from the token's parsed event log — signed by the AS, unlike the
+    /// raw event log in the evidence.
+    pub measured: crate::refvalues::Measured,
+    /// Event-log entries the AS found not to hash to their extended digest.
+    pub replay_mismatches: usize,
 }
 
 /// A bare `host:port` means plaintext, which is what the shared AS speaks today. An endpoint
@@ -622,8 +551,16 @@ async fn verify_with_as(
     let tdx = &cpu0["ear.veraison.annotated-evidence"]["tdx"];
     let tcb = tdx["tcb_status"].as_str().unwrap_or("unknown").to_string();
     let adv = tdx["advisory_ids"].as_array().map(|a| a.len()).unwrap_or(0);
+    let logs = tdx["uefi_event_logs"].as_array().cloned().unwrap_or_default();
 
-    Ok(AsVerdict { ear_status, tcb_status: tcb, advisories: adv, executables, boot_measurements: vec![] })
+    Ok(AsVerdict {
+        ear_status,
+        tcb_status: tcb,
+        advisories: adv,
+        executables,
+        measured: crate::refvalues::boot_digests(&logs),
+        replay_mismatches: crate::refvalues::replay_mismatches(&logs),
+    })
 }
 
 /// A fresh challenge. Random per call, never a counter or a timestamp: the point is that
@@ -635,20 +572,53 @@ fn fresh_nonce() -> Vec<u8> {
     n
 }
 
-async fn fetch_evidence(tee_url: &str, app_id: &str, nonce: &[u8]) -> Result<Vec<u8>> {
+/// How long a node gets to accept a connection before it counts as unreachable. A port
+/// closed by a firewall usually drops rather than refuses, which would otherwise hang
+/// for minutes.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// Where a fetch failed: before the node answered (worth trying the relay) or after
+/// (the node itself said no, and a relay would only repeat it).
+enum FetchError {
+    Unreachable(anyhow::Error),
+    Failed(anyhow::Error),
+}
+
+impl From<FetchError> for anyhow::Error {
+    fn from(e: FetchError) -> Self {
+        match e {
+            FetchError::Unreachable(e) | FetchError::Failed(e) => e,
+        }
+    }
+}
+
+async fn fetch_evidence(tee_url: &str, app_id: &str, nonce: &[u8]) -> Result<Vec<u8>, FetchError> {
     // An https teeUrl (the node's :50052 TLS listener serves a per-boot
     // self-signed cert) gets encryption without authentication: evidence is
     // Intel-signed and carries our nonce, so the channel needs no identity of
     // its own — the same reasoning as the pinless AS connection above.
-    let mut client = if tee_url.starts_with("https://") {
-        let channel = crate::pinned_tls::grpc_channel(tee_url, Vec::new())
-            .await
-            .map_err(|e| anyhow!("connect {}: {}", tee_url, e))?;
-        TappServiceClient::new(channel)
-    } else {
-        TappServiceClient::connect(tee_url.to_string())
-            .await
-            .map_err(|e| anyhow!("connect {}: {}", tee_url, e))?
+    let connect = async {
+        if tee_url.starts_with("https://") {
+            crate::pinned_tls::grpc_channel(tee_url, Vec::new())
+                .await
+                .map(TappServiceClient::new)
+                .map_err(|e| anyhow!("connect {}: {}", tee_url, e))
+        } else {
+            TappServiceClient::connect(tee_url.to_string())
+                .await
+                .map_err(|e| anyhow!("connect {}: {}", tee_url, e))
+        }
+    };
+    let mut client = match tokio::time::timeout(CONNECT_TIMEOUT, connect).await {
+        Ok(Ok(c)) => c,
+        Ok(Err(e)) => return Err(FetchError::Unreachable(e)),
+        Err(_) => {
+            return Err(FetchError::Unreachable(anyhow!(
+                "connect {}: no answer within {}s",
+                tee_url,
+                CONNECT_TIMEOUT.as_secs()
+            )))
+        }
     };
     let resp = client
         .get_evidence(tonic::Request::new(GetEvidenceRequest {
@@ -656,9 +626,20 @@ async fn fetch_evidence(tee_url: &str, app_id: &str, nonce: &[u8]) -> Result<Vec
             nonce: nonce.to_vec(),
         }))
         .await
-        .map_err(|e| anyhow!("{}", e))?
+        .map_err(|e| FetchError::Failed(anyhow!("{}", e)))?
         .into_inner();
     Ok(resp.evidence)
+}
+
+/// The scan that relays evidence for nodes of a known registry. A node whose port is
+/// closed to the caller is reached through it — transport only: what comes back is
+/// checked here exactly as if fetched directly, challenge included.
+pub fn known_relay(contract: &str) -> Option<&'static str> {
+    match contract.to_ascii_lowercase().as_str() {
+        "0x2ce80374318b1d7fb3345724457a182e0ad165c9" => Some("https://tappscan.0g.ai"),
+        "0x54874f536301c993922dd95097e3902e7fbfe612" => Some("https://tappscan.0g.ai/mainnet"),
+        _ => None,
+    }
 }
 
 /// Path segments are escaped, so an app id cannot reach any other endpoint of the scan.
@@ -724,6 +705,8 @@ pub struct DirectVerdict {
     pub claimed_owner: Option<String>,
     /// Trust anchors in force per the event log — see NodeVerdict.
     pub trust_anchors: Option<TrustAnchors>,
+    pub replay_ok: bool,
+    pub boot_chain: crate::refvalues::BootChain,
     pub note: String,
 }
 
@@ -733,6 +716,7 @@ pub async fn verify_node_direct(
     as_endpoint: &str,
     as_pubkey: Option<&str>,
     policy_ids: &[String],
+    refs: Option<&[crate::refvalues::RefSet]>,
 ) -> Result<DirectVerdict> {
     let mut v = DirectVerdict {
         server: server.to_string(),
@@ -747,6 +731,8 @@ pub async fn verify_node_direct(
         images: Vec::new(),
         claimed_owner: None,
         trust_anchors: None,
+        replay_ok: false,
+        boot_chain: crate::refvalues::BootChain::NotChecked,
         note: String::new(),
     };
 
@@ -769,7 +755,9 @@ pub async fn verify_node_direct(
             v.tcb_status = av.tcb_status;
             v.advisories = av.advisories;
             v.boot_executables = av.executables;
-            v.boot_measurements = av.boot_measurements;
+            v.boot_measurements = av.measured.as_reference_pairs();
+            v.boot_chain = crate::refvalues::identify(&av.measured, refs);
+            v.replay_ok = av.replay_mismatches == 0;
         }
         Err(e) => v.note = format!("{}AS: {}", v.note, e),
     }
@@ -777,11 +765,6 @@ pub async fn verify_node_direct(
     if let Ok(Some(m)) = latest_successful_start(cc_b64, app_id) {
         v.compose_hash = m.compose_hash;
         v.images = m.image_hash.into_values().collect();
-    }
-
-    // boot measurements from eventlog (not from AS — no policy needed)
-    if let Ok(measurements) = extract_boot_measurements(cc_b64) {
-        v.boot_measurements = measurements;
     }
 
     // claim_config owner — direct mode: print without chain comparison
@@ -799,8 +782,10 @@ pub async fn verify_node_direct(
 
 /// Verify every node of `app_id`: read chain, fetch evidence from each node's teeUrl,
 /// verify the quote via CoCo-AS, and reconcile evidence against on-chain values.
-/// Chain-mode verification of every node of `app_id`. `via_scan` fetches the evidence
-/// through that scan's relay instead of from each node's teeUrl.
+/// Chain-mode verification of every node of `app_id`. A node that does not answer on its
+/// teeUrl is reached through `relay` (default: the scan for this registry, see
+/// [`known_relay`]). `refs` are the published reference values; `None` leaves the boot
+/// chain unchecked rather than failed.
 pub async fn verify_app(
     rpc_url: &str,
     contract: &str,
@@ -808,8 +793,10 @@ pub async fn verify_app(
     as_endpoint: &str,
     as_pubkey: Option<&str>,
     policy_ids: &[String],
-    via_scan: Option<&str>,
+    relay: Option<&str>,
+    refs: Option<&[crate::refvalues::RefSet]>,
 ) -> Result<AppVerdict> {
+    let relay = relay.or_else(|| known_relay(contract));
     let signers = onchain::get_node_list(rpc_url, contract, app_id).await?;
     if signers.is_empty() {
         return Err(anyhow!("app '{}' has no registered nodes on-chain", app_id));
@@ -844,7 +831,9 @@ pub async fn verify_app(
             owner_claim: None,
             trust_anchors: None,
             fresh: None,
-            relayed: via_scan.is_some(),
+            relayed_by: None,
+            replay_ok: false,
+            boot_chain: crate::refvalues::BootChain::NotChecked,
             note: String::new(),
         };
 
@@ -862,9 +851,19 @@ pub async fn verify_app(
 
         // ② fetch evidence, with a challenge so a cached blob is distinguishable
         let nonce = fresh_nonce();
-        let fetched = match via_scan {
-            Some(scan) => fetch_evidence_via_scan(scan, app_id, &v.signer, &nonce).await,
-            None => fetch_evidence(&tee_url, app_id, &nonce).await,
+        let fetched = match fetch_evidence(&tee_url, app_id, &nonce).await {
+            Ok(b) => Ok(b),
+            Err(FetchError::Unreachable(e)) => match relay {
+                // The node never saw this challenge, so it is still fresh to use.
+                Some(r) => {
+                    v.relayed_by = Some(r.to_string());
+                    fetch_evidence_via_scan(r, app_id, &v.signer, &nonce)
+                        .await
+                        .map_err(|re| anyhow!("{}; relayed by {}: {}", e, r, re))
+                }
+                None => Err(e),
+            },
+            Err(FetchError::Failed(e)) => Err(e),
         };
         let raw = match fetched {
             Ok(b) => b,
@@ -900,6 +899,15 @@ pub async fn verify_app(
                 v.tcb_status = av.tcb_status;
                 v.advisories = av.advisories;
                 v.boot_executables = av.executables;
+                v.boot_measurements = av.measured.as_reference_pairs();
+                v.boot_chain = crate::refvalues::identify(&av.measured, refs);
+                v.replay_ok = av.replay_mismatches == 0;
+                if !v.replay_ok {
+                    v.note = format!(
+                        "{}{} measured tapp events do not hash to what was extended; ",
+                        v.note, av.replay_mismatches
+                    );
+                }
             }
             Err(e) => v.note = format!("{}AS: {}", v.note, e),
         }
@@ -917,11 +925,6 @@ pub async fn verify_app(
             }
             Ok(None) => v.note = format!("{}no successful start_app in eventlog", v.note),
             Err(e) => v.note = format!("{}eventlog parse: {}", v.note, e),
-        }
-
-        // boot measurements from eventlog (shown by the CLI when no policy selected)
-        if let Ok(measurements) = extract_boot_measurements(cc_b64) {
-            v.boot_measurements = measurements;
         }
 
         // ④c reconcile claim_config owner vs on-chain app owner
@@ -1179,7 +1182,9 @@ mod relay_tests {
             owner_claim: None,
             trust_anchors: None,
             fresh,
-            relayed,
+            relayed_by: relayed.then(|| "https://tappscan.0g.ai".to_string()),
+            replay_ok: true,
+            boot_chain: crate::refvalues::BootChain::NotChecked,
             note: String::new(),
         }
     }
@@ -1201,6 +1206,27 @@ mod relay_tests {
     fn fetched_directly_an_old_server_still_passes() {
         assert!(node(None, false).reconciled());
         assert!(node(Some(true), false).reconciled());
+    }
+
+    #[test]
+    fn an_event_log_that_does_not_replay_proves_nothing_read_from_it() {
+        let mut n = node(Some(true), false);
+        n.replay_ok = false;
+        assert!(!n.reconciled());
+    }
+
+    #[test]
+    fn each_known_registry_has_its_own_relay() {
+        assert_eq!(
+            known_relay("0x2Ce80374318B1d7Fb3345724457a182E0ad165c9"),
+            Some("https://tappscan.0g.ai")
+        );
+        assert_eq!(
+            known_relay("0x54874F536301c993922Dd95097e3902e7FBfe612"),
+            Some("https://tappscan.0g.ai/mainnet")
+        );
+        // The relay only serves nodes of the registry it scans; a different one gets none.
+        assert_eq!(known_relay("0x5f0d9c243048F5a55468472c6F090184E2E333c7"), None);
     }
 
     #[test]

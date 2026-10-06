@@ -17,7 +17,7 @@ tower = "0.4"
 http = "1.0"
 
 # Async runtime (Mutex etc.)
-tokio = { version = "1.0", features = ["sync", "net"] }
+tokio = { version = "1.0", features = ["sync", "net", "time"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -43,6 +43,8 @@ x25519-dalek = { version = "2.0", features = ["static_secrets"] }
 rand = "0.8.5"
 # Evidence relayed by a scan, for nodes whose port is closed to the caller.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# Where fetched reference values are cached, per commit.
+dirs = "5.0"
 
 # Logging (used by app_key, onchain, verify)
 tracing = "0.1"
@@ -59,3 +61,6 @@ chrono = { version = "0.4", features = ["serde"] }
 
 [build-dependencies]
 tonic-build = "0.12"
+
+[dev-dependencies]
+tempfile = "3.23.0"

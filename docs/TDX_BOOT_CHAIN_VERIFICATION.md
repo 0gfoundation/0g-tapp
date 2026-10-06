@@ -107,7 +107,9 @@ values and sets the AR4SI `executables` claim (3 = matched).
     registration time, registered under id `0g-tapp-<version>-<env>` —
     `verifier/register-shared-as.sh <version> <env> [as-endpoint]`.
 - Client: `tapp-cli verify-app --as-endpoint <as>:50004 --policy-ids 0g-tapp-<version>-<env>`
-  (e.g. `0g-tapp-v0.1.0-dev`).
+  (e.g. `0g-tapp-v0.1.0-dev`) adds the AS policy's verdict. Since tapp-cli 0.9.0 the client
+  needs no policy for the boot chain: it compares the AS's signed token against the
+  published reference values itself, like tappscan.
 
 ## 6. rootfs
 
