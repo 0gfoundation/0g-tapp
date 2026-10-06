@@ -47,12 +47,25 @@ pub struct NodeVerdict {
     /// a node believes is the operator's decision, but it is measured, so it is auditable —
     /// and a node with none configured cannot check KMS node identity at all.
     pub trust_anchors: Option<TrustAnchors>,
+    /// Whether the quote echoed the challenge sent for it: `Some(false)` means it was
+    /// produced for some other request, `None` that the server predates the field.
+    pub fresh: Option<bool>,
+    /// The evidence came through a scan rather than from the node itself.
+    pub relayed: bool,
     pub note: String,
 }
 
 impl NodeVerdict {
+    /// A quote that echoes some other challenge is never accepted. Through a relay,
+    /// freshness must also be PROVEN: replaying an old, genuine quote is the one thing
+    /// a relay can do, and the echoed challenge is the only thing that rules it out.
     pub fn reconciled(&self) -> bool {
-        self.signer_ok && self.compose_ok && self.volumes_ok && self.image_ok
+        self.signer_ok
+            && self.compose_ok
+            && self.volumes_ok
+            && self.image_ok
+            && self.fresh != Some(false)
+            && (!self.relayed || self.fresh == Some(true))
     }
 }
 
@@ -648,6 +661,49 @@ async fn fetch_evidence(tee_url: &str, app_id: &str, nonce: &[u8]) -> Result<Vec
     Ok(resp.evidence)
 }
 
+/// Path segments are escaped, so an app id cannot reach any other endpoint of the scan.
+fn relay_url(scan: &str, app_id: &str, signer: &str, nonce: &[u8]) -> Result<reqwest::Url> {
+    let mut url = reqwest::Url::parse(scan).map_err(|e| anyhow!("scan url {}: {}", scan, e))?;
+    url.path_segments_mut()
+        .map_err(|_| anyhow!("scan url {} cannot take a path", scan))?
+        .pop_if_empty()
+        .extend(["api", "apps", app_id, "nodes", signer, "evidence"]);
+    url.query_pairs_mut()
+        .append_pair("nonce", &format!("0x{}", hex::encode(nonce)));
+    Ok(url)
+}
+
+/// Fetch a node's evidence through a scan's relay
+/// (`GET {scan}/api/apps/{app}/nodes/{signer}/evidence?nonce=…`), for nodes whose port
+/// is open only to the scan and their operators. Nothing in the answer is trusted but
+/// the evidence bytes, and those are checked exactly as if fetched directly — the
+/// challenge included, which is what keeps the relay from passing off an old quote.
+async fn fetch_evidence_via_scan(
+    scan: &str,
+    app_id: &str,
+    signer: &str,
+    nonce: &[u8],
+) -> Result<Vec<u8>> {
+    let url = relay_url(scan, app_id, signer, nonce)?;
+    let resp = reqwest::get(url.clone())
+        .await
+        .map_err(|e| anyhow!("scan {}: {}", url, e))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(anyhow!("scan answered {}: {}", status, body.trim()));
+    }
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| anyhow!("scan response: {}", e))?;
+    let evidence = body["evidence"]
+        .as_str()
+        .ok_or_else(|| anyhow!("scan response has no evidence"))?;
+    B64.decode(evidence)
+        .map_err(|e| anyhow!("scan evidence b64: {}", e))
+}
+
 /// Direct (no-chain) verification of a single server: fetch evidence, verify the quote
 /// via CoCo-AS, and report what the node attests. No on-chain reconciliation — used when
 /// the app is not (yet) registered on-chain, or to check one node directly.
@@ -743,6 +799,8 @@ pub async fn verify_node_direct(
 
 /// Verify every node of `app_id`: read chain, fetch evidence from each node's teeUrl,
 /// verify the quote via CoCo-AS, and reconcile evidence against on-chain values.
+/// Chain-mode verification of every node of `app_id`. `via_scan` fetches the evidence
+/// through that scan's relay instead of from each node's teeUrl.
 pub async fn verify_app(
     rpc_url: &str,
     contract: &str,
@@ -750,6 +808,7 @@ pub async fn verify_app(
     as_endpoint: &str,
     as_pubkey: Option<&str>,
     policy_ids: &[String],
+    via_scan: Option<&str>,
 ) -> Result<AppVerdict> {
     let signers = onchain::get_node_list(rpc_url, contract, app_id).await?;
     if signers.is_empty() {
@@ -784,6 +843,8 @@ pub async fn verify_app(
             boot_measurements: Vec::new(),
             owner_claim: None,
             trust_anchors: None,
+            fresh: None,
+            relayed: via_scan.is_some(),
             note: String::new(),
         };
 
@@ -801,7 +862,11 @@ pub async fn verify_app(
 
         // ② fetch evidence, with a challenge so a cached blob is distinguishable
         let nonce = fresh_nonce();
-        let raw = match fetch_evidence(&tee_url, app_id, &nonce).await {
+        let fetched = match via_scan {
+            Some(scan) => fetch_evidence_via_scan(scan, app_id, &v.signer, &nonce).await,
+            None => fetch_evidence(&tee_url, app_id, &nonce).await,
+        };
+        let raw = match fetched {
             Ok(b) => b,
             Err(e) => {
                 v.note = format!("get-evidence failed: {}", e);
@@ -825,6 +890,7 @@ pub async fn verify_app(
         let attested = read_report_data(&j, quote_b64, &nonce);
         v.signer_ok = attested.is(signer.as_bytes());
         v.tls_public_key = attested.tls_public_key.clone();
+        v.fresh = attested.fresh;
         v.note = attested.note.clone();
 
         // ③ AS quote verification
@@ -1088,5 +1154,74 @@ mod tests {
         assert!(!a.is(&SIGNER));
         assert!(!a.is(&[0x22; 20]), "the swapped signer must not be believed either");
         assert!(a.note.contains("does not hash"), "got {}", a.note);
+    }
+}
+
+#[cfg(test)]
+mod relay_tests {
+    use super::*;
+
+    fn node(fresh: Option<bool>, relayed: bool) -> NodeVerdict {
+        NodeVerdict {
+            signer: "0x11".into(),
+            tee_url: String::new(),
+            reachable: true,
+            ear_status: "affirming".into(),
+            tcb_status: "UpToDate".into(),
+            advisories: 0,
+            signer_ok: true,
+            tls_public_key: String::new(),
+            compose_ok: true,
+            volumes_ok: true,
+            image_ok: true,
+            boot_executables: None,
+            boot_measurements: Vec::new(),
+            owner_claim: None,
+            trust_anchors: None,
+            fresh,
+            relayed,
+            note: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_quote_made_for_another_request_never_passes() {
+        assert!(!node(Some(false), false).reconciled());
+        assert!(!node(Some(false), true).reconciled());
+    }
+
+    #[test]
+    fn through_a_relay_freshness_must_be_proven() {
+        assert!(node(Some(true), true).reconciled());
+        // An old server cannot echo a challenge, so a relay could be replaying its quote.
+        assert!(!node(None, true).reconciled());
+    }
+
+    #[test]
+    fn fetched_directly_an_old_server_still_passes() {
+        assert!(node(None, false).reconciled());
+        assert!(node(Some(true), false).reconciled());
+    }
+
+    #[test]
+    fn the_relay_url_names_the_node_and_carries_the_challenge() {
+        let u = relay_url("https://tappscan.0g.ai", "0g-kms", "0xabc", &[0x01, 0xff]).unwrap();
+        assert_eq!(
+            u.as_str(),
+            "https://tappscan.0g.ai/api/apps/0g-kms/nodes/0xabc/evidence?nonce=0x01ff"
+        );
+        // A base with a path (the mainnet instance) keeps it; a trailing slash adds nothing.
+        let u = relay_url("https://tappscan.0g.ai/mainnet/", "a", "0x1", &[0x02]).unwrap();
+        assert_eq!(
+            u.as_str(),
+            "https://tappscan.0g.ai/mainnet/api/apps/a/nodes/0x1/evidence?nonce=0x02"
+        );
+    }
+
+    #[test]
+    fn an_app_id_cannot_steer_the_request_elsewhere() {
+        let u = relay_url("https://scan", "../../keys", "0x1", &[0x00]).unwrap();
+        assert!(u.path().starts_with("/api/apps/"), "{}", u);
+        assert!(!u.path().contains("/keys/") && u.path().contains("%2F"), "{}", u);
     }
 }

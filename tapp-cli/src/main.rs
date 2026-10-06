@@ -232,6 +232,8 @@ enum Commands {
     /// fetch each node's evidence, verify the quote via CoCo-AS, and reconcile against the
     /// chain. Direct mode (no --contract, uses --server): verify one node's evidence + quote
     /// and show what it attests, without on-chain reconciliation (for un-registered apps).
+    /// With --via-scan, chain mode fetches the evidence through a scan instead of from the
+    /// nodes, for nodes whose port is open only to the scan and their operators.
     VerifyApp {
         /// Application ID
         #[arg(long)]
@@ -258,6 +260,12 @@ enum Commands {
         /// policy (no boot-chain check). E.g. --policy-ids 0g-tapp-v0.1.0-dev
         #[arg(long)]
         policy_ids: Vec<String>,
+        /// Fetch each node's evidence through this scan (e.g. https://tappscan.0g.ai)
+        /// instead of from its teeUrl (chain mode). The scan is not trusted: the evidence
+        /// is checked exactly as if fetched directly, and each quote must echo the random
+        /// challenge sent for it, so an old quote cannot be passed off as new.
+        #[arg(long, requires = "contract")]
+        via_scan: Option<String>,
     },
     /// List all apps currently on the server
     ListApps,
@@ -807,8 +815,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::GetAppInfo { app_id } => {
             get_app_info(&cli.server, app_id).await?;
         }
-        Commands::VerifyApp { app_id, rpc_url, contract, as_endpoint, as_pubkey, policy_ids } => {
-            verify_app_cmd(&cli.server, &app_id, rpc_url, contract, &as_endpoint, as_pubkey.as_deref(), &policy_ids).await?;
+        Commands::VerifyApp { app_id, rpc_url, contract, as_endpoint, as_pubkey, policy_ids, via_scan } => {
+            verify_app_cmd(&cli.server, &app_id, rpc_url, contract, &as_endpoint, as_pubkey.as_deref(), &policy_ids, via_scan.as_deref()).await?;
         }
         Commands::ListApps => {
             list_apps(&cli.server).await?;
@@ -1752,6 +1760,7 @@ async fn verify_app_cmd(
     as_endpoint: &str,
     as_pubkey: Option<&str>,
     policy_ids: &[String],
+    via_scan: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // boot-chain line is meaningful only when WE selected a policy (otherwise the AS
     // default policy's executables claim is not our boot-chain check).
@@ -1793,7 +1802,7 @@ async fn verify_app_cmd(
     // Chain mode.
     let rpc_url = rpc_url.ok_or("chain mode requires --rpc-url (or omit --contract for direct mode)")?;
     let contract = contract.unwrap();
-    let verdict = tapp_common::verify::verify_app(&rpc_url, &contract, app_id, as_endpoint, as_pubkey, policy_ids).await?;
+    let verdict = tapp_common::verify::verify_app(&rpc_url, &contract, app_id, as_endpoint, as_pubkey, policy_ids, via_scan).await?;
 
     let yn = |b: bool| if b { "✓" } else { "✗" };
     println!("Verifying app: {}  ({} node(s))", verdict.app_id, verdict.nodes.len());
@@ -1804,6 +1813,9 @@ async fn verify_app_cmd(
         all_ok &= reconciled;
         println!("\n  node {}", n.signer);
         println!("    teeUrl     : {}", n.tee_url);
+        if let Some(scan) = via_scan {
+            println!("    evidence   : relayed by {}", scan);
+        }
         if !n.reachable {
             println!("    ✗ unreachable / {}", n.note);
             all_ok = false;
@@ -1821,6 +1833,15 @@ async fn verify_app_cmd(
         println!(
             "    reconcile  : signer{} compose{} volumes{} image{} owner{}",
             yn(n.signer_ok), yn(n.compose_ok), yn(n.volumes_ok), yn(n.image_ok), owner_str
+        );
+        println!(
+            "    fresh      : {}",
+            match n.fresh {
+                Some(true) => "✓ the quote echoes the challenge sent for it",
+                Some(false) => "✗ the quote echoes a different challenge — not produced for this request",
+                None if n.relayed => "✗ unproven (server predates challenges) — a relay could be replaying it",
+                None => "? unproven (server predates challenges)",
+            }
         );
         print_tls_binding(&n.tls_public_key, "    ", 11);
         if let Some(Err(claimed)) = &n.owner_claim {

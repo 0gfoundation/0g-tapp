@@ -600,7 +600,18 @@ tapp-cli verify-app \
 
 # direct mode (single node, not yet registered): prints attested values verbatim
 tapp-cli -s http://<tapp>:50051 verify-app --app-id my-app
+
+# nodes whose port is open only to the scan and their operators: fetch through the scan
+tapp-cli verify-app --app-id my-app --rpc-url … --contract 0x<TappRegistry> \
+  --via-scan https://tappscan.0g.ai
 ```
+
+`--via-scan` trusts the scan with nothing. The evidence is checked exactly as if it had
+been fetched directly, and each quote must echo the random challenge sent for it
+(`fresh : ✓`): an old quote is genuine too, so passing one off as new is the one
+thing a relay could do, and the echo is what rules it out. A quote that echoes a
+different challenge fails in either mode. `docs/verify_app.py` does the same with
+`SCAN=https://tappscan.0g.ai`.
 
 List the apps a server is currently running (read-only, no key needed):
 

@@ -7,18 +7,27 @@ Mirrors steps 1-4 of docs/EVIDENCE_AND_AS_VERIFICATION.md.
 Requires: cast (foundry), tapp-cli, grpcurl, and attestation.proto alongside this file.
 Usage: python3 verify_app.py <app_id>
 
-Environment overrides: CAST, TAPP_CLI, REGISTRY, RPC_URL, AS_ENDPOINT.
+Environment overrides: CAST, TAPP_CLI, REGISTRY, RPC_URL, AS_ENDPOINT, SCAN.
+SCAN=https://tappscan.0g.ai fetches each node's evidence through that scan instead of
+from its teeUrl, for nodes whose port is open only to the scan and their operators.
+The scan is not trusted: the evidence is checked the same way, and each quote must
+echo the random challenge sent for it.
 Two TappRegistry deployments exist and an app lives on exactly one of them, so
 REGISTRY has to name the right one. See contract/CONTRACTS.md.
 """
 import sys, os, json, base64, struct, subprocess, re, binascii, hashlib, secrets
+import urllib.parse, urllib.request, urllib.error
 
 APP   = sys.argv[1] if len(sys.argv) > 1 else "0g-agentic-id-attestor"
 CAST  = os.environ.get("CAST", "cast")
 CLI   = os.environ.get("TAPP_CLI", "tapp-cli")
 C     = os.environ.get("REGISTRY", "0x2Ce80374318B1d7Fb3345724457a182E0ad165c9")  # TappRegistry (0G testnet)
 R     = os.environ.get("RPC_URL", "https://evmrpc-testnet.0g.ai")
-AS    = os.environ.get("AS_ENDPOINT", "35.253.66.70:50004")   # CoCo-AS gRPC, verifies evidence
+# CoCo-AS gRPC, verifies evidence. Same rule as tapp-cli: https:// = TLS, a bare
+# host:port = plaintext. The AS serves a self-signed certificate, so the TLS here is
+# encryption without authentication (tapp-cli verify-app --as-pubkey pins it).
+AS    = os.environ.get("AS_ENDPOINT", "https://35.253.66.70:50004")
+SCAN  = os.environ.get("SCAN", "").rstrip("/")               # relay; empty = fetch from teeUrl
 PROTO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "attestation.proto")
 ALG   = {4: 20, 0xb: 32, 0xc: 48, 0xd: 64}
 print(f"### verifying app_id = {APP}\n")
@@ -79,25 +88,36 @@ for signer in nodes:
     # challenge a replayed cached quote is indistinguishable from a new one. Must be
     # random — never a counter or a clock.
     nonce = secrets.token_bytes(16)
-    ev = subprocess.run([CLI, "-s", teeUrl, "get-evidence", "--app-id", APP,
-                         "--nonce", nonce.hex()],
-                        capture_output=True, text=True, timeout=90)
-    m = re.search(r'Evidence \(hex\): ([0-9a-f]+)', ev.stdout)
-    if not m:
-        print(f"  2. FAIL fetching evidence: {(ev.stdout + ev.stderr).strip()[:160]}")
-        all_ok = False; continue
-    hexstr = m.group(1)
-    raw = binascii.unhexlify(hexstr)
+    if SCAN:
+        url = (f"{SCAN}/api/apps/{urllib.parse.quote(APP, safe='')}/nodes/{signer}/evidence"
+               f"?nonce=0x{nonce.hex()}")
+        try:
+            with urllib.request.urlopen(url, timeout=90) as resp:
+                raw = base64.b64decode(json.load(resp)["evidence"])
+        except (urllib.error.URLError, KeyError, ValueError) as e:
+            detail = e.read().decode(errors="replace").strip() if isinstance(e, urllib.error.HTTPError) else e
+            print(f"  2. FAIL fetching evidence through {SCAN}: {str(detail)[:160]}")
+            all_ok = False; continue
+    else:
+        ev = subprocess.run([CLI, "-s", teeUrl, "get-evidence", "--app-id", APP,
+                             "--nonce", nonce.hex()],
+                            capture_output=True, text=True, timeout=90)
+        m = re.search(r'Evidence \(hex\): ([0-9a-f]+)', ev.stdout)
+        if not m:
+            print(f"  2. FAIL fetching evidence: {(ev.stdout + ev.stderr).strip()[:160]}")
+            all_ok = False; continue
+        raw = binascii.unhexlify(m.group(1))
     j = json.loads(raw)
-    print(f"  2. ok, evidence ({len(raw)} B)")
+    print(f"  2. ok, evidence ({len(raw)} B)" + (f", relayed by {SCAN}" if SCAN else ""))
 
     # ───────── 3. verify quote signature + TCB (CoCo-AS gRPC 50004) ─────────
     req = {"verification_requests": [
             {"tee": "tdx", "evidence": base64.urlsafe_b64encode(raw).rstrip(b'=').decode()}]}
     open("/tmp/_as_req.json", "w").write(json.dumps(req))
     out = subprocess.run(
-        f"grpcurl -plaintext -import-path {os.path.dirname(PROTO)} -proto {PROTO} "
-        f"-d @ {AS} attestation.AttestationService/AttestationEvaluate < /tmp/_as_req.json",
+        f"grpcurl {'-insecure' if AS.startswith('https://') else '-plaintext'} "
+        f"-import-path {os.path.dirname(PROTO)} -proto {PROTO} "
+        f"-d @ {AS.split('://', 1)[-1]} attestation.AttestationService/AttestationEvaluate < /tmp/_as_req.json",
         shell=True, capture_output=True, text=True, timeout=90)
     tm = re.search(r'"attestationToken":\s*"([^"]+)"', out.stdout)
     as_status = tcb = as_report_data = None
@@ -180,8 +200,10 @@ for signer in nodes:
         print( "                | openssl dgst -sha256")
 
     # A challenge that was not echoed means this quote was not produced for this request,
-    # which is as hard a failure as a measurement that does not reconcile.
-    node_ok = all([sig_ok, cmp_ok, vol_ok, img_ok]) and fresh is not False
+    # which is as hard a failure as a measurement that does not reconcile. Through a relay
+    # freshness must be PROVEN: replaying an old, genuine quote is what a relay could do.
+    node_ok = all([sig_ok, cmp_ok, vol_ok, img_ok]) and fresh is not False \
+        and (fresh is True or not SCAN)
     quote_ok = (as_status == "affirming")
     all_ok &= node_ok
     print(f"  => reconcile {'PASS' if node_ok else 'FAIL'} ; "

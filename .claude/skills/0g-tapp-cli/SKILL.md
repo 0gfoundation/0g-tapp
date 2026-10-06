@@ -1,7 +1,7 @@
 ---
 name: 0g-tapp-cli
 description: Use this skill when the user wants to deploy, manage, or troubleshoot applications on a 0G Tapp (Trusted Application Platform) server using tapp-cli. Covers start/stop apps, on-chain registration, registry login, check task status, view logs, and manage docker compose deployments across multiple remote TEE servers.
-version: 1.13.0
+version: 1.14.0
 author: 0G Labs
 tags: [0g, tapp, tee, docker, deployment, cli, onchain]
 ---
@@ -64,6 +64,7 @@ tapp-cli -s <server> get-app-key --app-id <id> [--x25519]         # TEE-derived 
 tapp-cli -s <server> get-app-csr --app-id <id> --domain api.example.com --out my.csr  # v0.6.0+, PUBLIC (TCP, no key)
 tapp-cli -s <server> verify-app --app-id <id> [--policy-ids <id>]                    # direct: AS-verify this node's evidence+quote, show attested values (no chain)
 tapp-cli verify-app --app-id <id> --rpc-url <rpc> --contract 0x<reg> [--policy-ids <id>]  # chain: verify all nodes + reconcile vs on-chain
+tapp-cli verify-app --app-id <id> --rpc-url <rpc> --contract 0x<reg> --via-scan https://tappscan.0g.ai  # v0.9.0+, chain mode with evidence relayed by the scan (node port closed to you); each quote must echo our random challenge (`fresh : ✓`), else FAIL
 tapp-cli -s <server> -k 0x<key> get-tapp-info                     # server version + Owner Address (no key needed)
 tapp-cli -s <server> -k 0x<key> prune-images [--all]              # delete UNUSED images (--all removes all unused, not just dangling)
 tapp-cli -s <server> -k 0x<key> get-service-logs -f <file> [-n 100] # tapp-server's own logs (-n limits lines; no -f lists files)
@@ -280,7 +281,7 @@ Each app gets its **own encrypted volume** (LUKS; key derived per-app by the KMS
 
 Prove a tapp node is genuinely running the registered code in a real TEE. **Only input is `app_id`**; everything else is automatic. Full detail: `docs/EVIDENCE_AND_AS_VERIFICATION.md`.
 
-**One-shot script** (does all 4 steps below): `python3 docs/verify_app.py <app_id>` — needs `cast` (foundry), `tapp-cli`, `grpcurl`, and `docs/attestation.proto` alongside it. The manual steps below are what it automates.
+**One-shot script** (does all 4 steps below): `python3 docs/verify_app.py <app_id>` — needs `cast` (foundry), `tapp-cli`, `grpcurl`, and `docs/attestation.proto` alongside it. The manual steps below are what it automates. `SCAN=https://tappscan.0g.ai` fetches the evidence through the scan instead (the challenge must then be echoed); `AS_ENDPOINT` follows tapp-cli's rule (`https://` = TLS, bare `host:port` = plaintext).
 
 ```
 app_id
