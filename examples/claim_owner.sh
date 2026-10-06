@@ -1,14 +1,14 @@
 #!/bin/bash
 
 # Claim this tapp: set owner + runtime config in one measured step.
-# The signer becomes the tapp owner; chain and KBS config are applied
+# The signer becomes the tapp owner; the KBS config is applied
 # immediately. The full config is extended into the runtime measurement
 # (claim_config event) so verifiers see it in the evidence.
 #
 # Usage:
 #   export TAPP_OWNER_PRIVATE_KEY="0x..."
 #   ./claim_owner.sh [--host HOST] [--port PORT] [--private-key KEY] \
-#     [--chain-rpc-url URL] [--chain-contract 0x...] [--kbs-urls "url1,url2"]
+#     [--kbs-urls "url1,url2"]
 #
 # Tip: prefer `tapp-cli claim-config` — it also verifies the claim end-to-end.
 
@@ -19,8 +19,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TARGET_HOST="localhost"
 TARGET_PORT="50051"
 PRIVATE_KEY="${TAPP_OWNER_PRIVATE_KEY:-}"
-CHAIN_RPC_URL=""
-CHAIN_CONTRACT=""
 KBS_URLS=""
 
 while [[ $# -gt 0 ]]; do
@@ -28,12 +26,10 @@ while [[ $# -gt 0 ]]; do
     --host) TARGET_HOST="$2"; shift 2 ;;
     --port) TARGET_PORT="$2"; shift 2 ;;
     --private-key) PRIVATE_KEY="$2"; shift 2 ;;
-    --chain-rpc-url) CHAIN_RPC_URL="$2"; shift 2 ;;
-    --chain-contract) CHAIN_CONTRACT="$2"; shift 2 ;;
     --kbs-urls) KBS_URLS="$2"; shift 2 ;;
     --help|-h)
       echo "Usage: $0 [--host HOST] [--port PORT] [--private-key KEY]"
-      echo "         [--chain-rpc-url URL] [--chain-contract 0x...] [--kbs-urls url1,url2]"
+      echo "         [--kbs-urls url1,url2]"
       echo "Claims this tapp (owner + runtime config); the signer becomes owner."
       echo "Private key from --private-key or TAPP_OWNER_PRIVATE_KEY env var."
       exit 0
@@ -69,11 +65,7 @@ if ! [[ "$SERVER_VERSION" =~ ^v?([0-9]+)\.([0-9]+) ]] \
 fi
 
 KBS_ARRAY=$(echo "$KBS_URLS" | tr ',' '\n' | grep -v '^$' | jq -R . | jq -s .)
-request=$(jq -n \
-  --arg chain_rpc_url "$CHAIN_RPC_URL" \
-  --arg chain_contract_address "$CHAIN_CONTRACT" \
-  --argjson kbs_node_urls "$KBS_ARRAY" \
-  '{chain_rpc_url:$chain_rpc_url,chain_contract_address:$chain_contract_address,kbs_node_urls:$kbs_node_urls}')
+request=$(jq -n --argjson kbs_node_urls "$KBS_ARRAY" '{kbs_node_urls:$kbs_node_urls}')
 
 # Sign the exact request: the signer becomes the owner, so the signature must
 # be over the method the server checks (ClaimConfig) and the body it receives.

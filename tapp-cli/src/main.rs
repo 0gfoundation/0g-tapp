@@ -425,22 +425,16 @@ enum Commands {
         service_name: String,
     },
 
-    /// Add address to whitelist (owner only)
     /// Claim this tapp: set owner + runtime config in one measured step.
     ///
-    /// The signer becomes the tapp owner. Optionally supply chain and KBS
-    /// config (dynamic mode: image ships empty, first ClaimConfig call
+    /// The signer becomes the tapp owner. Optionally supply the KMS cluster, TLS key
+    /// source and verifier (dynamic mode: image ships empty, first ClaimConfig call
     /// configures everything). Succeeds exactly once per boot; the full config
     /// is extended into the runtime measurement so verifiers see it.
+    ///
+    /// There is no chain to claim: a node is not tied to one registry. Registration is
+    /// done per command (`--rpc-url/--contract`), so one node can be on several chains.
     ClaimConfig {
-        /// On-chain TappRegistry RPC URL (optional)
-        #[arg(long)]
-        chain_rpc_url: Option<String>,
-
-        /// TappRegistry contract address (optional)
-        #[arg(long)]
-        chain_contract: Option<String>,
-
         /// KMS cluster node URLs, comma-separated (optional)
         /// e.g. "http://kms-1:9091,http://kms-2:9091"
         #[arg(long)]
@@ -960,8 +954,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             stop_service(&cli.server, app_id, service_name, private_key).await?;
         }
         Commands::ClaimConfig {
-            chain_rpc_url,
-            chain_contract,
             kbs_urls,
             tls_key_source,
             scan_url,
@@ -971,8 +963,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             claim_config(
                 &cli.server,
                 private_key,
-                chain_rpc_url.unwrap_or_default(),
-                chain_contract.unwrap_or_default(),
                 split_urls(kbs_urls),
                 tls_key_source,
                 scan_url.unwrap_or_default(),
@@ -2716,8 +2706,6 @@ async fn update_trust_anchors(
 async fn claim_config(
     server: &str,
     private_key: String,
-    chain_rpc_url: String,
-    chain_contract_address: String,
     kbs_node_urls: Vec<String>,
     tls_key_source: Option<String>,
     scan_url: String,
@@ -2758,8 +2746,6 @@ async fn claim_config(
     }
 
     let mut request = Request::new(ClaimConfigRequest {
-        chain_rpc_url: chain_rpc_url.clone(),
-        chain_contract_address: chain_contract_address.clone(),
         kbs_node_urls: kbs_node_urls.clone(),
         tls_key_source: tls_key_source.clone().unwrap_or_default(),
         scan_url: scan_url.clone(),
@@ -2783,9 +2769,6 @@ async fn claim_config(
 
     println!("✓ Tapp config claimed");
     println!("  Owner:    {}", result.owner_address);
-    if !chain_contract_address.is_empty() {
-        println!("  Chain:    {} @ {}", chain_contract_address, chain_rpc_url);
-    }
     if !kbs_node_urls.is_empty() {
         println!("  KBS:      {}", kbs_node_urls.join(", "));
     }
@@ -3042,12 +3025,6 @@ async fn get_tapp_info(server: &str) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(boot_config) = config.boot {
             println!("\nBoot:");
             println!("  AA Config Path: {}", boot_config.aa_config_path);
-        }
-
-        if let Some(chain) = config.chain {
-            println!("\nChain:");
-            println!("  RPC URL: {}", chain.rpc_url);
-            println!("  Contract: {}", chain.contract_address);
         }
 
         if config.kbs_enabled {

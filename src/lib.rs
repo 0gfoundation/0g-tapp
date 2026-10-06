@@ -45,12 +45,10 @@ pub use proto::{
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const NAME: &str = env!("CARGO_PKG_NAME");
 
-/// Runtime configuration set via ClaimConfig (owner/chain/kbs).
+/// Runtime configuration set via ClaimConfig (owner/kbs/TLS/scan).
 /// Separate from the static TappConfig so get-tapp-info can show live values.
 #[derive(Debug, Clone, Default)]
 pub struct ClaimedRuntimeConfig {
-    pub chain_rpc_url: String,
-    pub chain_contract_address: String,
     pub kbs_node_urls: Vec<String>,
     /// Empty means "not claimed" — fall back to config.toml, which is the pre-baked mode.
     pub tls_key_source: String,
@@ -268,7 +266,7 @@ impl TappServiceImpl {
         &self,
         app_id: &str,
     ) -> Result<(config::TlsKeySource, Vec<u8>), Status> {
-        // Claimed value wins over the pre-baked one, same as chain and KBS config.
+        // Claimed value wins over the pre-baked one, same as the KBS config.
         let source = match self
             .claimed_runtime_config
             .read()
@@ -461,8 +459,6 @@ impl TappServiceImpl {
 
         // Initialize runtime config from static config (pre-baked values visible immediately)
         let claimed_runtime_config = Arc::new(tokio::sync::RwLock::new(ClaimedRuntimeConfig {
-            chain_rpc_url: config.chain.as_ref().map(|c| c.rpc_url.clone()).unwrap_or_default(),
-            chain_contract_address: config.chain.as_ref().map(|c| c.contract_address.clone()).unwrap_or_default(),
             kbs_node_urls: config.kbs.as_ref().map(|k| k.node_urls.clone()).unwrap_or_default(),
             tls_key_source: config.server.tls_key_source.as_str().to_string(),
             // No static counterpart on purpose: these are claimed, never baked into the
@@ -492,7 +488,7 @@ impl TappServiceImpl {
 /// awaiting the ClaimConfig RPC). Sources, in order of resolution:
 ///
 /// - config `owner_address` (legacy baked-in mode) — measured as a
-///   `claim_config` event the first time it takes effect in a boot (chain/kbs
+///   `claim_config` event the first time it takes effect in a boot (kbs
 ///   values from the same config are included in the measurement data);
 /// - the owner persisted by a previous tapp-server process of the SAME boot
 ///   (restored silently: its claim_config event is already in this boot's
@@ -504,8 +500,6 @@ pub async fn establish_owner_at_startup(
     pm: &Arc<permission::PermissionManager>,
     measurement_service: &Arc<measurement_service::MeasurementService>,
     config_owner: Option<&str>,
-    chain_rpc_url: &str,
-    chain_contract_address: &str,
     kbs_node_urls: &[String],
 ) -> Result<Option<String>, String> {
     let config_owner =
@@ -534,8 +528,6 @@ pub async fn establish_owner_at_startup(
             let measurement_data = serde_json::json!({
                 "operation": measurement_service::OPERATION_NAME_CLAIM_CONFIG,
                 "owner": owner,
-                "chain_rpc_url": chain_rpc_url,
-                "chain_contract_address": chain_contract_address,
                 "kbs_node_urls": kbs_node_urls,
                 "timestamp": utils::current_timestamp()
             })
@@ -1202,30 +1194,10 @@ impl TappService for TappServiceImpl {
             None
         };
 
-        // Chain: prefer runtime (from claim), fall back to static config
-        let live_chain_rpc = if !runtime.chain_rpc_url.is_empty() {
-            runtime.chain_rpc_url.clone()
-        } else {
-            self.config.chain.as_ref().map(|c| c.rpc_url.clone()).unwrap_or_default()
-        };
-        let live_chain_contract = if !runtime.chain_contract_address.is_empty() {
-            runtime.chain_contract_address.clone()
-        } else {
-            self.config.chain.as_ref().map(|c| c.contract_address.clone()).unwrap_or_default()
-        };
         // Trust anchors have no config.toml fallback by design — see ClaimedRuntimeConfig.
         let scan_url = runtime.scan_url.clone();
         let scan_public_key = runtime.scan_public_key.clone();
         drop(runtime);
-
-        let chain_config = if !live_chain_rpc.is_empty() || !live_chain_contract.is_empty() {
-            Some(ChainConfigInfo {
-                rpc_url: live_chain_rpc,
-                contract_address: live_chain_contract,
-            })
-        } else {
-            None
-        };
 
         // Build complete config info
         let config_info = TappConfigInfo {
@@ -1234,7 +1206,6 @@ impl TappService for TappServiceImpl {
             boot: Some(boot_config),
             kbs: kbs_config,
             kbs_enabled,
-            chain: chain_config,
             scan_url: scan_url.clone(),
             scan_public_key: scan_public_key.clone(),
         };
@@ -1480,7 +1451,7 @@ impl TappService for TappServiceImpl {
         let (scan_url, scan_public_key) = scan.unwrap_or_default();
 
         // Extend runtime measurement — includes the full config so verifiers
-        // see owner + chain + kbs in one event. On failure the claim is rolled
+        // see owner + kbs + TLS + scan anchor in one event. On failure the claim is rolled
         // back so the tapp stays claimable.
         // The cluster the node will actually use, not just what this request named: the KMS
         // client is only replaced when the request supplies urls, so a claim that supplies
@@ -1501,8 +1472,6 @@ impl TappService for TappServiceImpl {
         let measurement_data = serde_json::json!({
             "operation": measurement_service::OPERATION_NAME_CLAIM_CONFIG,
             "owner": owner,
-            "chain_rpc_url": req.chain_rpc_url,
-            "chain_contract_address": req.chain_contract_address,
             "kbs_node_urls": effective_kbs,
             "tls_key_source": tls_key_source.as_str(),
             "scan_url": scan_url,
@@ -1528,8 +1497,6 @@ impl TappService for TappServiceImpl {
 
         // Store runtime config so get-tapp-info can show live values.
         *self.claimed_runtime_config.write().await = ClaimedRuntimeConfig {
-            chain_rpc_url: req.chain_rpc_url.clone(),
-            chain_contract_address: req.chain_contract_address.clone(),
             kbs_node_urls: effective_kbs.clone(),
             tls_key_source: tls_key_source.as_str().to_string(),
             scan_url: scan_url.clone(),
@@ -1562,7 +1529,6 @@ impl TappService for TappServiceImpl {
 
         info!(
             owner = %owner,
-            chain_contract = %req.chain_contract_address,
             kbs_nodes = req.kbs_node_urls.len(),
             event = "CONFIG_CLAIMED",
             "Tapp config claimed and measurement extended"
@@ -1622,8 +1588,6 @@ impl TappService for TappServiceImpl {
                     .unwrap_or_default()
             };
             ClaimedRuntimeConfig {
-                chain_rpc_url: current.chain_rpc_url.clone(),
-                chain_contract_address: current.chain_contract_address.clone(),
                 tls_key_source: current.tls_key_source.clone(),
                 kbs_node_urls,
                 scan_url,

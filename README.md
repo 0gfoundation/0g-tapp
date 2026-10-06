@@ -351,7 +351,7 @@ unix_socket_mode = "0660"
 
 # Where app TLS private keys come from: "local" (default, bound to this instance,
 # changes every boot) or "kms" (stable across restarts and shared by every node of
-# the app, needs [kbs] and [chain]). See "App TLS certificates" above.
+# the app, needs [kbs] and the app registered on chain). See "App TLS certificates" above.
 tls_key_source = "local"
 
 # Optional CA for app TLS certificates. Unset, GetAppTlsCert self-signs — which is
@@ -389,12 +389,11 @@ node_urls = [
     "https://kms-node-1:9443",
     "https://kms-node-2:9443",
 ]
-
-# Optional: on-chain TappRegistry integration
-[chain]
-rpc_url = "https://evmrpc-testnet.0g.ai"
-contract_address = "0x..."
 ```
+
+There is no `[chain]` section (an old one is ignored). A node is not tied to one
+registry: every on-chain command takes `--rpc-url`/`--contract`, so the same node can
+be registered on testnet and mainnet at once.
 
 ## Claiming Ownership (runtime owner claim)
 
@@ -406,11 +405,9 @@ claims it:
 ```bash
 tapp-cli -s http://<tapp>:50051 -k 0x<your-key> claim-config
 
-# Or claim and configure in one call — chain, KMS cluster and TLS key source are
-# all optional here if already present in config.toml:
+# Or claim and configure in one call — KMS cluster and TLS key source are
+# optional here if already present in config.toml:
 tapp-cli -s http://<tapp>:50051 -k 0x<your-key> claim-config \
-  --chain-rpc-url https://evmrpc-testnet.0g.ai \
-  --chain-contract 0x<TappRegistry> \
   --kbs-urls "https://kms-1:9443,https://kms-2:9443" \
   --tls-key-source kms \
   --scan-url https://scan.example \

@@ -99,15 +99,14 @@ tapp-cli -s <server> -k 0x<key> docker-logout                    # logout from D
 # Must run before any owner-level op on a freshly booted canonical image:
 tapp-cli -s <server> -k 0x<key> claim-config                                # claim owner only
 tapp-cli -s <server> -k 0x<key> claim-config \
-  --chain-rpc-url https://evmrpc-testnet.0g.ai \
-  --chain-contract 0x<TappRegistry> \
   --kbs-urls "https://kms-1:9443,https://kms-2:9443" \
-  --tls-key-source kms                                                       # claim + set chain + KMS + TLS key source
+  --tls-key-source kms                                                       # claim + set KMS + TLS key source
 ```
 - First-come-first-served, exactly once per boot. CLI verifies result end-to-end.
-- `--chain-*`, `--kbs-urls` and `--tls-key-source` optional if already baked into config.toml.
+- `--kbs-urls` and `--tls-key-source` optional if already baked into config.toml.
+- No chain is claimed (`--chain-rpc-url`/`--chain-contract` were removed in tapp-cli 0.9.0 and are now rejected; tapp-server 0.9.0 ignores them from older CLIs). A node is not tied to one registry — on-chain commands take `--rpc-url`/`--contract`, so one node can be registered on testnet and mainnet.
 - **What to put in `--kbs-urls`**: the deployed cluster endpoints per network are in `docs/KMS.md` — mainnet and testnet both run app_id `0g-kms` but are two clusters with two masters; the doc's group pubkeys are how you check you reached the right one.
-- `--tls-key-source local|kms` (v0.4.0+, default `local`) — decides whether app TLS keys survive a restart, see App TLS certificates above. Must be decided at claim time; `kms` on a node with no KMS/chain config will fail when a cert is requested.
+- `--tls-key-source local|kms` (v0.4.0+, default `local`) — decides whether app TLS keys survive a restart, see App TLS certificates above. Must be decided at claim time; `kms` on a node with no KMS config, or whose app is not registered on chain, will fail when a cert is requested.
 - `--scan-url https://… --scan-pubkey 0x…` (v0.5.0+) — which verifier this node believes about KMS node identity, and its pinned key. Both or neither. See Trust anchors below.
 
 ### Trust anchors — which KMS cluster, and which verifier (v0.5.0+)
