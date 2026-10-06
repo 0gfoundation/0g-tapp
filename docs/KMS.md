@@ -96,8 +96,10 @@ That makes the on-chain node list the entire authorization model:
   KMS refusals after a reboot are this, not a network problem.
 - The KMS sees the chain through a cache (~30s) and its own RPC, so a change
   that just landed — a registration, a replaced or added node — is invisible to
-  it for a while. tapp-server waits that out: a key request the KMS answers with
-  "app not found on-chain" or "not in on-chain signer list" is retried for up to
+  it for a while — and with attested admission on, so is the verifier it asks.
+  tapp-server waits that out: a key request the KMS answers with "app not found
+  on-chain", "not in on-chain signer list" or "not registered on-chain per
+  verifier" (then also its 30s-damped repeat) is retried for up to
   `[kbs.retry] onchain_wait_ms` (240s) before failing. The KMS cannot tell "not
   visible yet" from "never registered", so a request for an app that was never
   registered also takes that long to fail.
