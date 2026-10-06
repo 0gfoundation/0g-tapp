@@ -1670,6 +1670,13 @@ fn print_trust_anchors(
             );
         }
     }
+    if a.resumed_differently {
+        println!(
+            "{}{}✗ a restarted tapp-server took over DIFFERENT anchors than the claim or last \
+             update set — its state file was changed in between",
+            indent, pad
+        );
+    }
     if a.revisions > 0 {
         println!(
             "{}{}revised {} time{} since the claim — every change is in the event log above",
@@ -1832,6 +1839,9 @@ async fn verify_app_cmd(
             println!("    owner      : ? no claim_config event in eventlog");
         }
         print_trust_anchors(n.trust_anchors.as_ref(), "    ", 11);
+        if n.trust_anchors.as_ref().is_some_and(|a| a.resumed_differently) {
+            all_ok = false;
+        }
         if show_boot {
             if let Some(l) = boot_chain_line(n.boot_executables, show_boot) {
                 println!("    {}", l);

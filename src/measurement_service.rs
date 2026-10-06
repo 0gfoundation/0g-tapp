@@ -22,6 +22,11 @@ pub const OPERATION_NAME_CLAIM_CONFIG: &str = "claim_config";
 /// `claim_config` so a verifier can tell the original claim from a later revision, and
 /// carries the resulting state in full so the newest event alone is the current answer.
 pub const OPERATION_NAME_UPDATE_TRUST_ANCHORS: &str = "update_trust_anchors";
+/// A tapp-server process taking over the claim an earlier process of this boot made, with
+/// the owner and runtime config it read back from tmpfs. Those files sit outside the
+/// measurement, so what they hold when read is measured here: a file swapped in between
+/// shows up as an owner or anchors that differ from the claim / last update before it.
+pub const OPERATION_NAME_CLAIM_RESUMED: &str = "claim_resumed";
 pub const OPERATION_NAME_GET_SECRET_RESOURCE: &str = "get_secret_resource";
 
 pub struct MeasurementService {

@@ -563,6 +563,26 @@ impl TappServiceImpl {
                  values. Re-apply the trust anchors with update-trust-anchors."
             ),
         }
+        // Measure what was taken over: the owner and config read back from tmpfs are
+        // otherwise only as trustworthy as that directory. One event, after both are known.
+        if let Some(pm) = permission_manager.as_ref().filter(|pm| pm.was_resumed()) {
+            let data = serde_json::json!({
+                "operation": measurement_service::OPERATION_NAME_CLAIM_RESUMED,
+                "owner": pm.owner_address().await,
+                "kbs_node_urls": runtime.kbs_node_urls,
+                "tls_key_source": runtime.tls_key_source,
+                "scan_url": runtime.scan_url,
+                "scan_public_key": runtime.scan_public_key,
+                "timestamp": utils::current_timestamp()
+            })
+            .to_string();
+            if let Err(e) = measurement_service
+                .extend_measurement(measurement_service::OPERATION_NAME_CLAIM_RESUMED, &data)
+                .await
+            {
+                error!(error = %e, "Failed to measure the resumed claim");
+            }
+        }
         let claimed_runtime_config = Arc::new(tokio::sync::RwLock::new(runtime));
 
         info!("All TAPP service components initialized successfully");
@@ -614,10 +634,14 @@ pub async fn establish_owner_at_startup(
                     c, p
                 ));
             }
+            pm.mark_resumed();
             (Some(c), false) // measured earlier this boot
         }
         (Some(c), None) => (Some(c), true),
-        (None, Some(p)) => (Some(p), false),
+        (None, Some(p)) => {
+            pm.mark_resumed();
+            (Some(p), false)
+        }
         (None, None) => (None, false),
     };
 
