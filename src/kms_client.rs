@@ -158,9 +158,17 @@ mod onchain_visibility_tests {
     /// With attested admission on: the scan answered 404 for a signer it has not synced yet
     /// (0g-kms `KmsError::NotAttested`, src/verifier.rs).
     const VERIFIER_NOT_YET: &str = r#"{"error":"attestation required: attestation not verified: not registered on-chain per verifier"}"#;
-    /// A damped repeat from a KMS that says why (0g-kms#15 after 1dae41b)...
+    /// A damped repeat that says why, as 0g-kms#15 (after 1dae41b) sends for a refusal. That
+    /// KMS repeats the lag case above with its plain text rather than damping it; this shape
+    /// is matched all the same, since the match is on the reason.
     const VERIFIER_DAMPED_NOT_YET: &str = r#"{"error":"attestation required: attestation not verified (recently checked): not registered on-chain per verifier"}"#;
     const VERIFIER_DAMPED_REFUSAL: &str = r#"{"error":"attestation required: attestation not verified (recently checked): the TD runs with DEBUG: its host can read and write its memory"}"#;
+    /// The verifier could not answer: the KMS's first refusal, and its damped repeat
+    /// (0g-kms src/verifier.rs). Since 0g-tapp-verifier#16 this is what a failed registry
+    /// read at the scan looks like, so it is waited on; the KMS still refuses until the
+    /// scan verifies.
+    const VERIFIER_UNREACHABLE: &str = r#"{"error":"attestation required: attestation verifier unreachable and this signer has no fresh-enough verdict"}"#;
+    const VERIFIER_UNREACHABLE_DAMPED: &str = r#"{"error":"attestation required: attestation not verified (recently checked): verifier unreachable"}"#;
     /// ...and from one that does not. It turns into the real answer within the KMS's 30s
     /// damping, so it is waited on: a lasting refusal then fails fast on that answer.
     const VERIFIER_DAMPED_BARE: &str = r#"{"error":"attestation required: attestation not verified (recently checked)"}"#;
@@ -179,13 +187,16 @@ mod onchain_visibility_tests {
             assert_eq!(what(lag), Some("this node's signer at the verifier"), "{lag}");
         }
         assert_eq!(what(VERIFIER_REATTESTING), Some("this node's evidence re-attested by the verifier"));
-        // A damped repeat that names a lasting reason fails fast, like the reason itself.
-        assert!(not_onchain_yet(VERIFIER_DAMPED_REFUSAL).is_none());
+        for down in [VERIFIER_UNREACHABLE, VERIFIER_UNREACHABLE_DAMPED] {
+            assert_eq!(what(down), Some("a verdict from the verifier"), "{down}");
+        }
 
         // Everything else must keep failing fast — the KMS's own other bodies (0g-kms
-        // src/error.rs). None of these change by waiting, and waiting on them would turn a
-        // clear error into a two-minute hang.
+        // src/error.rs), and a damped repeat that names a lasting reason, like the reason
+        // itself. None of these change by waiting, and waiting on them would turn a clear
+        // error into a four-minute hang.
         for fails_fast in [
+            VERIFIER_DAMPED_REFUSAL,
             r#"{"error":"invalid signature: invalid signature hex"}"#,
             r#"{"error":"invalid timestamp: request timestamp too old"}"#,
             r#"{"error":"attestation required: attestation not verified: the TD runs with DEBUG: its host can read and write its memory"}"#,
@@ -385,7 +396,10 @@ struct NotOnChainYet {
 /// - `the TD's DEBUG attribute is not known for this result; it needs re-attesting` — the
 ///   verifier holds a result from before it recorded that attribute (0g-tapp-verifier#16);
 /// - `attestation not verified (recently checked)` with no reason after it — the damped repeat
-///   of an older KMS, which turns into the real answer within its 30s damping.
+///   of an older KMS, which turns into the real answer within its 30s damping;
+/// - `verifier unreachable`, first or damped — the scan could not answer, which since
+///   0g-tapp-verifier#16 includes a failed registry read on its side. The KMS still refuses
+///   until the scan verifies, so waiting admits nothing.
 ///
 /// Every other "attestation required" reason (a DEBUG TD, an unpublished or dev image), and a
 /// damped repeat that names one, is final and fails fast.
@@ -402,6 +416,8 @@ fn not_onchain_yet(body: &str) -> Option<NotOnChainYet> {
         "this node's signer at the verifier"
     } else if body.contains("DEBUG attribute is not known for this result") {
         "this node's evidence re-attested by the verifier"
+    } else if body.contains("verifier unreachable") {
+        "a verdict from the verifier"
     } else {
         return None;
     };
