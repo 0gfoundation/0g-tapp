@@ -266,6 +266,10 @@ enum Commands {
     /// fetch each node's evidence, verify the quote via CoCo-AS, and reconcile against the
     /// chain. Direct mode (no --contract, uses --server): verify one node's evidence + quote
     /// and show what it attests, without on-chain reconciliation (for un-registered apps).
+    /// The boot chain is compared here against the published reference values (GitHub, or
+    /// --reference-values); the AS is relied on for the quote, TCB and event-log replay.
+    /// A node whose port is closed to you is reached through its registry's scan relay —
+    /// transport only, everything is still checked here.
     VerifyApp {
         /// Application ID
         #[arg(long)]
@@ -276,22 +280,33 @@ enum Commands {
         /// TappRegistry contract address 0x… (chain mode)
         #[arg(long)]
         contract: Option<String>,
-        /// CoCo Attestation Service gRPC endpoint (host:port)
-        #[arg(long, default_value = "https://35.253.66.70:50004")]
+        /// CoCo Attestation Service gRPC endpoint (https://host:port; a bare host:port is
+        /// plaintext)
+        #[arg(long, env = "TAPP_AS_ENDPOINT", default_value = "https://35.253.66.70:50004")]
         as_endpoint: String,
 
-        /// sha256 of the AS's TLS public key (`0x…`), for a TLS endpoint.
+        /// sha256 of the AS's TLS public key (`0x…`). The current value for the default AS
+        /// is in docs/TAPPSCAN.md; it changes when that TEE restarts.
         ///
         /// The AS is a TEE serving a self-signed certificate, so this REPLACES
         /// certificate-authority validation rather than adding to it. Without it the
         /// connection is encrypted but unauthenticated — anyone on the path can return any
-        /// verdict — and the output says so rather than refusing to run.
-        #[arg(long)]
+        /// verdict — so the output warns and the result is never better than ⚠️.
+        #[arg(long, env = "TAPP_AS_PUBKEY")]
         as_pubkey: Option<String>,
         /// AS policy id to enforce (enables boot-chain check). Empty = AS default
         /// policy (no boot-chain check). E.g. --policy-ids 0g-tapp-v0.1.0-dev
         #[arg(long)]
         policy_ids: Vec<String>,
+        /// Reference values to compare the boot chain against: a directory of
+        /// `<cloud>/<boot_format>/<version>/<env>.json` files. Default: the published ones,
+        /// 0gfoundation/0g-tapp@dev:verifier/reference-values (cached per commit).
+        #[arg(long)]
+        reference_values: Option<String>,
+        /// Relay for nodes that do not answer directly. Default: the scan of the registry
+        /// (known registries only). Transport only: nothing it returns is trusted.
+        #[arg(long, hide = true, requires = "contract")]
+        relay: Option<String>,
     },
     /// List all apps currently on the server
     ListApps,
@@ -911,8 +926,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Commands::GetAppInfo { app_id } => {
             get_app_info(&cli.server, app_id).await?;
         }
-        Commands::VerifyApp { app_id, rpc_url, contract, as_endpoint, as_pubkey, policy_ids } => {
-            verify_app_cmd(&cli.server, &app_id, rpc_url, contract, &as_endpoint, as_pubkey.as_deref(), &policy_ids).await?;
+        Commands::VerifyApp { app_id, rpc_url, contract, as_endpoint, as_pubkey, policy_ids, reference_values, relay } => {
+            verify_app_cmd(&cli.server, &app_id, rpc_url, contract, &as_endpoint, as_pubkey.as_deref(), &policy_ids, relay.as_deref(), reference_values.as_deref()).await?;
         }
         Commands::ListApps => {
             list_apps(&cli.server).await?;
@@ -2386,26 +2401,65 @@ async fn verify_app_cmd(
     as_endpoint: &str,
     as_pubkey: Option<&str>,
     policy_ids: &[String],
+    relay: Option<&str>,
+    reference_values: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // boot-chain line is meaningful only when WE selected a policy (otherwise the AS
-    // default policy's executables claim is not our boot-chain check).
-    let show_boot = !policy_ids.is_empty();
+    use tapp_common::refvalues;
+    // With --policy-ids the AS also judges the boot chain, against whatever is registered
+    // on it; that verdict is shown beside the one reached here from the published values.
+    let show_policy = !policy_ids.is_empty();
+
+    // The token is read, not signature-checked: the pinned channel is the only thing that
+    // makes "the AS said so" true. Unpinned, every verdict below could come from whoever
+    // sits on the path, so it is said up front and the result is capped at ⚠️.
+    let as_pinned = as_endpoint.starts_with("https://") && as_pubkey.is_some_and(|k| !k.is_empty());
+    if !as_pinned {
+        println!(
+            "⚠️  The AS at {} is NOT authenticated (no --as-pubkey / TAPP_AS_PUBKEY): anyone on \
+             the path could forge the quote and boot-chain verdicts below. The current pin for \
+             the default AS is in docs/TAPPSCAN.md.\n",
+            as_endpoint
+        );
+    }
+
+    let loaded = match reference_values {
+        Some(dir) => refvalues::from_dir(std::path::Path::new(dir)),
+        None => {
+            refvalues::from_github(
+                refvalues::DEFAULT_REPO,
+                refvalues::DEFAULT_REF,
+                refvalues::DEFAULT_PATH,
+            )
+            .await
+        }
+    };
+    let refs = match &loaded {
+        Ok(l) => {
+            println!("Reference values: {} — {} published image(s)\n", l.source, l.sets.len());
+            Some(l.sets.as_slice())
+        }
+        Err(e) => {
+            println!("Reference values: unavailable ({}) — the boot chain is NOT checked\n", e);
+            None
+        }
+    };
+
     // Direct mode: no --contract → verify the single --server node without chain reconciliation.
     if contract.is_none() {
-        let d = tapp_common::verify::verify_node_direct(server, app_id, as_endpoint, as_pubkey, policy_ids).await?;
-        let quote_ok = d.ear_status == "affirming";
+        let d = tapp_common::verify::verify_node_direct(server, app_id, as_endpoint, as_pubkey, policy_ids, refs).await?;
         println!("Verifying app: {}  (direct mode — no on-chain reconciliation)", app_id);
         println!("  server      : {}", d.server);
         println!("  signer      : {}  (attested in report_data)", d.signer);
         print_tls_binding(&d.tls_public_key, "  ", 12);
-        println!("  AS          : ear.status={} tcb_status={} advisories={}", d.ear_status, d.tcb_status, d.advisories);
-        if show_boot {
-            if let Some(l) = boot_chain_line(d.boot_executables, show_boot) {
+        print_as_line(&d.tcb_status, d.advisories, d.replay_ok, "  ", 12);
+        print_platform(&d.platform(), "  ", 12);
+        if show_policy {
+            println!("  AS policy   : ear.status={}", d.ear_status);
+            if let Some(l) = boot_chain_line(d.boot_executables, true) {
                 println!("  {}", l);
             }
-        } else if !d.boot_measurements.is_empty() {
-            print_boot_measurements(&d.boot_measurements, "  ");
         }
+        print_boot_chain(&d.boot_chain, &d.boot_measurements, false, "  ", 12);
         if let Some(owner) = &d.claimed_owner {
             println!("  owner       : {}  (from claim_config event; no chain comparison in direct mode)", owner);
         }
@@ -2419,34 +2473,61 @@ async fn verify_app_cmd(
         if !d.note.is_empty() {
             println!("  note        : {}", d.note);
         }
-        println!("\nQuote {}", if quote_ok { "trusted ✅".to_string() } else { format!("untrusted ⚠️ ({}/{})", d.ear_status, d.tcb_status) });
+        let platform = d.platform();
+        println!(
+            "\nBoot chain {} ; platform {}{}",
+            boot_chain_summary([&d.boot_chain], false),
+            platform_word(&platform),
+            if as_pinned { "" } else { " ; AS unauthenticated ⚠️" }
+        );
         println!("(direct mode shows what the node attests; register on-chain + use --contract to reconcile)");
-        return Ok(());
+        let failed = !d.replay_ok
+            || matches!(d.boot_chain, refvalues::BootChain::Unknown { .. })
+            || matches!(platform, tapp_common::verify::Platform::Fail(_));
+        let warned = !as_pinned
+            || boot_chain_warns(&d.boot_chain)
+            || matches!(platform, tapp_common::verify::Platform::Warn(_));
+        std::process::exit(exit_status(failed, warned));
     }
 
     // Chain mode.
     let rpc_url = rpc_url.ok_or("chain mode requires --rpc-url (or omit --contract for direct mode)")?;
     let contract = contract.unwrap();
-    let verdict = tapp_common::verify::verify_app(&rpc_url, &contract, app_id, as_endpoint, as_pubkey, policy_ids).await?;
+    let verdict = tapp_common::verify::verify_app(
+        &rpc_url, &contract, app_id, as_endpoint, as_pubkey, policy_ids, relay, refs,
+    )
+    .await?;
+    // On mainnet a dev image fails, as it does in the scan's verdict and so at the KMS.
+    let mainnet = tapp_common::onchain::chain_id(&rpc_url).await?
+        == tapp_common::onchain::MAINNET_CHAIN_ID;
 
     let yn = |b: bool| if b { "✓" } else { "✗" };
     println!("Verifying app: {}  ({} node(s))", verdict.app_id, verdict.nodes.len());
     let mut all_ok = true;
     for n in &verdict.nodes {
         let reconciled = n.reconciled();
-        let quote_ok = n.ear_status == "affirming";
         all_ok &= reconciled;
         println!("\n  node {}", n.signer);
         println!("    teeUrl     : {}", n.tee_url);
+        if let Some(r) = &n.relayed_by {
+            println!("    evidence   : the node did not answer here; relayed by {}", r);
+            println!("                 (transport only — everything below is checked here, and the");
+            println!("                 quote must echo the challenge sent for it)");
+        }
         if !n.reachable {
             println!("    ✗ unreachable / {}", n.note);
             all_ok = false;
             continue;
         }
-        println!(
-            "    AS         : ear.status={} tcb_status={} advisories={}",
-            n.ear_status, n.tcb_status, n.advisories
-        );
+        print_as_line(&n.tcb_status, n.advisories, n.replay_ok, "    ", 11);
+        print_platform(&n.platform(), "    ", 11);
+        if show_policy {
+            println!("    AS policy  : ear.status={}", n.ear_status);
+            if let Some(l) = boot_chain_line(n.boot_executables, true) {
+                println!("    {}", l);
+            }
+        }
+        print_boot_chain(&n.boot_chain, &n.boot_measurements, mainnet, "    ", 11);
         let owner_str = match &n.owner_claim {
             Some(Ok(_))  => "✓",
             Some(Err(_)) => "✗",
@@ -2455,6 +2536,15 @@ async fn verify_app_cmd(
         println!(
             "    reconcile  : signer{} compose{} volumes{} image{} owner{}",
             yn(n.signer_ok), yn(n.compose_ok), yn(n.volumes_ok), yn(n.image_ok), owner_str
+        );
+        println!(
+            "    fresh      : {}",
+            match n.fresh {
+                Some(true) => "✓ the quote echoes the challenge sent for it",
+                Some(false) => "✗ the quote echoes a different challenge — not produced for this request",
+                None if n.relayed_by.is_some() => "✗ unproven (server predates challenges) — a relay could be replaying it",
+                None => "? unproven (server predates challenges)",
+            }
         );
         print_tls_binding(&n.tls_public_key, "    ", 11);
         if let Some(Err(claimed)) = &n.owner_claim {
@@ -2471,28 +2561,187 @@ async fn verify_app_cmd(
         }
         if n.app_resumed_differently {
             println!(
-                "    resumed    : ✗ a restarted tapp-server took over state for this app that no \
-                 start or stop of this boot produced — its state file was written by something else"
+                "    resumed    : ✗ a restarted tapp-server took over state for this app that is not \
+                 what this boot last measured for it — its state file was written by something else"
             );
-        }
-        if show_boot {
-            if let Some(l) = boot_chain_line(n.boot_executables, show_boot) {
-                println!("    {}", l);
-            }
-        } else if !n.boot_measurements.is_empty() {
-            print_boot_measurements(&n.boot_measurements, "    ");
         }
         if !n.note.is_empty() {
             println!("    note       : {}", n.note);
         }
         println!(
-            "    => reconcile {} ; quote {}",
+            "    => reconcile {} ; boot chain {} ; platform {}",
             if reconciled { "PASS" } else { "FAIL" },
-            if quote_ok { "trusted".to_string() } else { format!("untrusted ({}/{})", n.ear_status, n.tcb_status) }
+            boot_chain_word(&n.boot_chain, mainnet),
+            platform_word(&n.platform())
         );
     }
-    println!("\nResult: reconciliation {}", if all_ok { "ALL PASS ✅" } else { "has failures ❌" });
-    Ok(())
+    let reached: Vec<_> = verdict.nodes.iter().filter(|n| n.reachable).collect();
+    let chains: Vec<_> = reached.iter().map(|n| &n.boot_chain).collect();
+    let platforms: Vec<_> = reached.iter().map(|n| n.platform()).collect();
+    let platform_summary = if platforms.is_empty() {
+        "not checked (no node reached) ❌"
+    } else if platforms.iter().any(|p| matches!(p, tapp_common::verify::Platform::Fail(_))) {
+        "has failures ❌"
+    } else if platforms.iter().any(|p| matches!(p, tapp_common::verify::Platform::Warn(_))) {
+        "TCB advisories outstanding ⚠️"
+    } else {
+        "debug off, TCB up to date ✅"
+    };
+    println!(
+        "\nResult: reconciliation {} ; boot chain {} ; platform {}{}",
+        if all_ok { "ALL PASS ✅" } else { "has failures ❌" },
+        boot_chain_summary(chains.iter().copied(), mainnet),
+        platform_summary,
+        if as_pinned { "" } else { " ; AS unauthenticated ⚠️" }
+    );
+    let failed = !all_ok
+        || chains.iter().any(|c| matches!(c, refvalues::BootChain::Unknown { .. }))
+        || (mainnet && chains.iter().any(|c| is_dev(c)))
+        || platforms.iter().any(|p| matches!(p, tapp_common::verify::Platform::Fail(_)));
+    let warned = !as_pinned
+        || chains.iter().any(|c| boot_chain_warns(c))
+        || platforms.iter().any(|p| matches!(p, tapp_common::verify::Platform::Warn(_)));
+    std::process::exit(exit_status(failed, warned));
+}
+
+/// What the AS is relied on for: the quote's signature chain (a token at all), platform
+/// TCB, and that the event log replays against the signed RTMRs.
+fn print_as_line(tcb_status: &str, advisories: usize, replay_ok: bool, indent: &str, width: usize) {
+    if tcb_status == "-" {
+        println!("{}{:<width$}: ✗ no verdict from the AS (see note)", indent, "AS");
+        return;
+    }
+    println!(
+        "{}{:<width$}: quote ✓ ; tcb_status={} advisories={} ; event log {}",
+        indent,
+        "AS",
+        tcb_status,
+        advisories,
+        if replay_ok { "replays ✓" } else { "does NOT replay ✗" }
+    );
+}
+
+/// TD debug and TCB, from the token — what a policy used to enforce.
+fn print_platform(p: &tapp_common::verify::Platform, indent: &str, width: usize) {
+    use tapp_common::verify::Platform;
+    let label = format!("{}{:<width$}", indent, "platform");
+    match p {
+        Platform::Ok => println!("{}: ✓ debug off, TCB up to date", label),
+        Platform::Warn(w) => println!("{}: ⚠️ debug off, {} — an Intel advisory is outstanding", label, w),
+        Platform::Fail(f) => println!("{}: ✗ {}", label, f),
+    }
+}
+
+/// How a run ends, for scripts: 0 everything checked and clean, 1 a definite failure,
+/// 2 passed but with something a careful caller wants to know (unpinned AS, dev image off
+/// mainnet, a lagging TCB, a boot chain that could not be compared).
+fn exit_status(failed: bool, warned: bool) -> i32 {
+    if failed {
+        1
+    } else if warned {
+        2
+    } else {
+        0
+    }
+}
+
+/// The boot chain against the published reference values, with the measured digests
+/// whenever it does not match — so a new image's values can be published from here.
+fn print_boot_chain(
+    chain: &tapp_common::refvalues::BootChain,
+    measured: &[(String, String)],
+    mainnet: bool,
+    indent: &str,
+    width: usize,
+) {
+    use tapp_common::refvalues::BootChain;
+    let label = format!("{}{:<width$}", indent, "boot chain");
+    match chain {
+        BootChain::Matched(image) if mainnet && is_dev(chain) => println!(
+            "{}: ✗ {} — a dev image, which mainnet does not accept (can carry an SSH key into the TD)",
+            label,
+            image.trim_end_matches(".json")
+        ),
+        BootChain::Matched(image) if is_dev(chain) => println!(
+            "{}: ⚠️ {} — a dev image (can carry an SSH key into the TD)",
+            label,
+            image.trim_end_matches(".json")
+        ),
+        BootChain::Matched(image) => println!("{}: ✓ {}", label, image.trim_end_matches(".json")),
+        BootChain::Unknown { closest } => {
+            println!("{}: ✗ matches no published image", label);
+            if let Some((c, hits, of)) = closest {
+                println!(
+                    "{}{:<width$}  closest: {} ({}/{} components)",
+                    indent, "", c.trim_end_matches(".json"), hits, of
+                );
+            }
+        }
+        BootChain::NotChecked => println!("{}: ? not checked", label),
+    }
+    if !matches!(chain, BootChain::Matched(_)) && !measured.is_empty() {
+        print_boot_measurements(measured, indent);
+    }
+}
+
+fn platform_word(p: &tapp_common::verify::Platform) -> String {
+    use tapp_common::verify::Platform;
+    match p {
+        Platform::Ok => "✓".to_string(),
+        Platform::Warn(w) => format!("⚠️ {}", w),
+        Platform::Fail(f) => format!("✗ {}", f),
+    }
+}
+
+fn is_dev(chain: &tapp_common::refvalues::BootChain) -> bool {
+    matches!(chain, tapp_common::refvalues::BootChain::Matched(l) if tapp_common::refvalues::is_dev_image(l))
+}
+
+/// A boot chain that passed with a caveat: a dev image, or nothing to compare against.
+fn boot_chain_warns(chain: &tapp_common::refvalues::BootChain) -> bool {
+    use tapp_common::refvalues::BootChain;
+    match chain {
+        BootChain::NotChecked => true,
+        BootChain::Matched(l) => tapp_common::refvalues::is_dev_image(l),
+        BootChain::Unknown { .. } => false,
+    }
+}
+
+fn boot_chain_word(chain: &tapp_common::refvalues::BootChain, mainnet: bool) -> String {
+    use tapp_common::refvalues::BootChain;
+    match chain {
+        BootChain::Matched(image) if mainnet && is_dev(chain) => {
+            format!("✗ dev image {} (not accepted on mainnet)", image.trim_end_matches(".json"))
+        }
+        BootChain::Matched(image) if is_dev(chain) => {
+            format!("⚠️ dev image {}", image.trim_end_matches(".json"))
+        }
+        BootChain::Matched(image) => format!("✓ {}", image.trim_end_matches(".json")),
+        BootChain::Unknown { .. } => "✗ unpublished image".to_string(),
+        BootChain::NotChecked => "? not checked".to_string(),
+    }
+}
+
+fn boot_chain_summary<'a>(
+    chains: impl IntoIterator<Item = &'a tapp_common::refvalues::BootChain>,
+    mainnet: bool,
+) -> &'static str {
+    use tapp_common::refvalues::BootChain;
+    let chains: Vec<_> = chains.into_iter().collect();
+    // "Matches a published image's boot-chain digests", deliberately not "runs a published
+    // image": firmware (MRTD/RTMR0) is not compared, and an extra boot-services
+    // application ahead of a published UKI would still match.
+    if chains.iter().any(|c| matches!(c, BootChain::Unknown { .. })) {
+        "has nodes matching no published image ❌"
+    } else if chains.is_empty() || chains.iter().any(|c| matches!(c, BootChain::NotChecked)) {
+        "not checked ⚠️"
+    } else if mainnet && chains.iter().any(|c| is_dev(c)) {
+        "has nodes on a dev image, which mainnet does not accept ❌"
+    } else if chains.iter().any(|c| is_dev(c)) {
+        "matches published digests, but of a dev image ⚠️"
+    } else {
+        "every node matches a published image's boot-chain digests ✅"
+    }
 }
 
 async fn list_apps(server: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -4792,6 +5041,32 @@ mod replaced_node {
         // a(5) is not a node, rather than quietly getting a(1).
         assert_eq!(infer(&[a(1)], a(2)).unwrap(), Some(a(1)));
         assert!(pick_replaced_node(&[a(1)], a(2), "app", Some(a(5))).is_err());
+    }
+}
+
+#[cfg(test)]
+mod exit_status_tests {
+    use super::{boot_chain_summary, boot_chain_word, exit_status, is_dev};
+
+    #[test]
+    fn a_failure_outranks_a_warning() {
+        assert_eq!(exit_status(false, false), 0);
+        assert_eq!(exit_status(false, true), 2);
+        assert_eq!(exit_status(true, true), 1);
+        assert_eq!(exit_status(true, false), 1);
+    }
+
+    /// The scan fails a dev image on mainnet (0g-tapp-verifier#16), so verify-app does too;
+    /// elsewhere it stays a warning.
+    #[test]
+    fn a_dev_image_fails_only_on_mainnet() {
+        use tapp_common::refvalues::BootChain;
+        let dev = BootChain::Matched("uki/v0.8.0-r3/dev.json".to_string());
+        assert!(is_dev(&dev));
+        assert!(boot_chain_summary([&dev], true).contains('❌'));
+        assert!(boot_chain_summary([&dev], false).contains("⚠️"));
+        assert!(boot_chain_word(&dev, true).starts_with('✗'));
+        assert!(!is_dev(&BootChain::Matched("uki/v0.8.0-r2/prod.json".to_string())));
     }
 }
 

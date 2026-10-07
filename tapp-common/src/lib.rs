@@ -7,6 +7,7 @@ pub mod onchain;
 pub mod app_key;
 pub mod report_data;
 pub mod pinned_tls;
+pub mod refvalues;
 pub mod verify;
 pub mod compat;
 

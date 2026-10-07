@@ -203,6 +203,21 @@ pub async fn get_node(
 
 // ─── Transaction sender ───────────────────────────────────────────────────────
 
+/// 0G mainnet. The scan refuses dev images there (0g-tapp-verifier#16), and so does
+/// `verify-app`, so that the two agree on what passes.
+pub const MAINNET_CHAIN_ID: u64 = 16661;
+
+/// The chain id `rpc_url` serves.
+pub async fn chain_id(rpc_url: &str) -> Result<u64> {
+    let provider = Provider::<Http>::try_from(rpc_url)
+        .map_err(|e| anyhow!("Invalid RPC URL: {}", e))?;
+    Ok(provider
+        .get_chainid()
+        .await
+        .map_err(|e| anyhow!("Failed to get chain ID: {}", e))?
+        .as_u64())
+}
+
 async fn send_tx(
     rpc_url: &str,
     private_key_hex: &str,

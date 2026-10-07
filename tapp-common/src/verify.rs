@@ -47,6 +47,18 @@ pub struct NodeVerdict {
     /// a node believes is the operator's decision, but it is measured, so it is auditable —
     /// and a node with none configured cannot check KMS node identity at all.
     pub trust_anchors: Option<TrustAnchors>,
+    /// Whether the quote echoed the challenge sent for it: `Some(false)` means it was
+    /// produced for some other request, `None` that the server predates the field.
+    pub fresh: Option<bool>,
+    /// The relay the evidence came through, when the node did not answer directly.
+    pub relayed_by: Option<String>,
+    /// The AS replayed the event log and every entry hashes to what was extended — the
+    /// condition for believing anything read from it (start_app, claim_config).
+    pub replay_ok: bool,
+    /// The boot chain against the published reference values.
+    pub boot_chain: crate::refvalues::BootChain,
+    /// The TD's DEBUG attribute, from the AS token.
+    pub td_debug: Option<bool>,
     /// A restarted tapp-server took over state for this app (`apps_resumed`) that is neither
     /// the latest state this boot measured for it nor the one before: its state file was
     /// written by something else. See `eventlog_app_resumed_differently`.
@@ -55,11 +67,21 @@ pub struct NodeVerdict {
 }
 
 impl NodeVerdict {
+    pub fn platform(&self) -> Platform {
+        platform(&self.tcb_status, self.td_debug)
+    }
+
+    /// A quote that echoes some other challenge is never accepted. Through a relay,
+    /// freshness must also be PROVEN: replaying an old, genuine quote is the one thing
+    /// a relay can do, and the echoed challenge is the only thing that rules it out.
     pub fn reconciled(&self) -> bool {
         self.signer_ok
             && self.compose_ok
             && self.volumes_ok
             && self.image_ok
+            && self.replay_ok
+            && self.fresh != Some(false)
+            && (self.relayed_by.is_none() || self.fresh == Some(true))
             && !self.app_resumed_differently
     }
 }
@@ -259,86 +281,6 @@ fn latest_successful_start(cc_eventlog_b64: &str, app_id: &str) -> Result<Option
         }
     }
     Ok(last)
-}
-
-/// ASCII view of (possibly UTF-16LE) event data: drop NULs, lowercase.
-fn event_data_ascii(data: &[u8]) -> String {
-    data.iter()
-        .filter(|&&b| b != 0)
-        .map(|&b| (b as char).to_ascii_lowercase())
-        .collect()
-}
-
-/// Parse the cc_eventlog and return the boot-chain component digests that AS
-/// policies compare against reference values — the SAME selection rules as
-/// verifier/policy.rego:
-///   shim           EV_EFI_BOOT_SERVICES_APPLICATION, device_path ~ shimx64.efi
-///   grub           EV_EFI_BOOT_SERVICES_APPLICATION, device_path ~ grubx64.efi
-///   uki            EV_EFI_BOOT_SERVICES_APPLICATION, device_path ~ bootx64.efi (UKI boot)
-///   kernel         EV_IPL, string contains vmlinuz
-///   initrd         EV_IPL, string contains initrd
-///   kernel_cmdline EV_IPL, string starts with "kernel_cmdline:"
-/// Returns (component, sha384_hex) pairs in eventlog order.
-fn extract_boot_measurements(cc_eventlog_b64: &str) -> Result<Vec<(String, String)>> {
-    const EV_IPL: usize = 0xd;
-    const EV_EFI_BSA: usize = 0x8000_0003;
-
-    let log = B64.decode(cc_eventlog_b64).map_err(|e| anyhow!("eventlog b64: {}", e))?;
-    let u32le = |b: &[u8]| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize;
-
-    // skip SpecID event
-    let mut o = 8 + 20;
-    if o + 4 > log.len() { return Ok(vec![]); }
-    let ds = u32le(&log[o..o + 4]);
-    o += 4 + ds;
-
-    let mut results: Vec<(String, String)> = Vec::new();
-
-    while o + 12 <= log.len() {
-        let _pcr = u32le(&log[o..o + 4]); o += 4;
-        let et = u32le(&log[o..o + 4]); o += 4;
-        let cnt = u32le(&log[o..o + 4]); o += 4;
-
-        let mut sha384: Option<String> = None;
-        for _ in 0..cnt {
-            if o + 2 > log.len() { return Ok(results); }
-            let alg = u16::from_le_bytes([log[o], log[o + 1]]);
-            let sz = alg_size(alg);
-            o += 2;
-            if alg == 0xc && o + sz <= log.len() {
-                sha384 = Some(hex::encode(&log[o..o + sz]));
-            }
-            o += sz;
-        }
-        if o + 4 > log.len() { break; }
-        let dl = u32le(&log[o..o + 4]); o += 4;
-        if o + dl > log.len() { break; }
-        let data = &log[o..o + dl];
-        o += dl;
-
-        let Some(h) = sha384 else { continue };
-        let text = event_data_ascii(data);
-
-        let component = match et {
-            EV_EFI_BSA => {
-                if text.contains("shimx64.efi") { Some("shim") }
-                else if text.contains("grubx64.efi") { Some("grub") }
-                else if text.contains("bootx64.efi") { Some("uki") }
-                else { None }
-            }
-            EV_IPL => {
-                if text.starts_with("kernel_cmdline:") { Some("kernel_cmdline") }
-                else if text.contains("vmlinuz") { Some("kernel") }
-                else if text.contains("initrd") { Some("initrd") }
-                else { None }
-            }
-            _ => None,
-        };
-        if let Some(c) = component {
-            results.push((c.to_string(), h));
-        }
-    }
-    Ok(results)
 }
 
 /// Parse the cc_eventlog and extract the claimed owner from `claim_config` events.
@@ -635,8 +577,55 @@ pub struct AsVerdict {
     /// AR4SI executables trust claim (== EXECUTABLES_MATCHED when the boot chain matched
     /// the policy reference values); None if the policy set no executables / no policy applied.
     pub executables: Option<i64>,
-    /// Unused — boot measurements now come from eventlog parsing, not AS token.
-    pub boot_measurements: Vec<(String, String)>,
+    /// Boot-chain digests from the token's parsed event log — signed by the AS, unlike the
+    /// raw event log in the evidence.
+    pub measured: crate::refvalues::Measured,
+    /// Event-log entries the AS found not to hash to their extended digest.
+    pub replay_mismatches: usize,
+    /// The TD's DEBUG attribute; `None` when the token does not carry it.
+    pub td_debug: Option<bool>,
+}
+
+/// What the platform itself allows, from the AS token: a policy used to check this, and
+/// the local verdict must not lose it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Platform {
+    /// Debug off, TCB up to date.
+    Ok,
+    /// Usable, but with an Intel advisory outstanding (a TCB other than UpToDate):
+    /// common on clouds, whose firmware trails Intel's releases.
+    Warn(String),
+    /// The TD's memory is open to its host (DEBUG), the platform key is revoked, or the
+    /// debug attribute could not be read at all.
+    Fail(String),
+}
+
+/// DEBUG lets the host read and write the TD's memory: whoever launches the TD — the
+/// operator on bare metal — can, so nothing attested inside it means anything. A TCB
+/// that trails Intel's latest is a warning, not a failure: clouds lag, and failing every
+/// node over it would teach people to ignore the check. Revoked is a failure.
+pub fn platform(tcb_status: &str, td_debug: Option<bool>) -> Platform {
+    match td_debug {
+        Some(true) => return Platform::Fail("TD runs with DEBUG: its host can read and write its memory".into()),
+        None => return Platform::Fail("TD attributes not in the AS token: DEBUG cannot be ruled out".into()),
+        Some(false) => {}
+    }
+    match tcb_status {
+        "UpToDate" => Platform::Ok,
+        "Revoked" => Platform::Fail("platform TCB is revoked".into()),
+        other => Platform::Warn(format!("TCB {}", other)),
+    }
+}
+
+/// The DEBUG bit, parsed by the AS or read from the raw TDATTRIBUTES (bit 0 of the first,
+/// little-endian byte) when only that is present.
+fn td_debug_of(tdx: &serde_json::Value) -> Option<bool> {
+    if let Some(d) = tdx["td_attributes"]["debug"].as_bool() {
+        return Some(d);
+    }
+    let hex_attrs = tdx["quote"]["body"]["td_attributes"].as_str()?;
+    let first = u8::from_str_radix(hex_attrs.get(0..2)?, 16).ok()?;
+    Some(first & 1 == 1)
 }
 
 /// A bare `host:port` means plaintext, which is what the shared AS speaks today. An endpoint
@@ -731,8 +720,17 @@ async fn verify_with_as(
     let tdx = &cpu0["ear.veraison.annotated-evidence"]["tdx"];
     let tcb = tdx["tcb_status"].as_str().unwrap_or("unknown").to_string();
     let adv = tdx["advisory_ids"].as_array().map(|a| a.len()).unwrap_or(0);
+    let logs = tdx["uefi_event_logs"].as_array().cloned().unwrap_or_default();
 
-    Ok(AsVerdict { ear_status, tcb_status: tcb, advisories: adv, executables, boot_measurements: vec![] })
+    Ok(AsVerdict {
+        ear_status,
+        tcb_status: tcb,
+        advisories: adv,
+        executables,
+        measured: crate::refvalues::boot_digests(&logs),
+        replay_mismatches: crate::refvalues::replay_mismatches(&logs),
+        td_debug: td_debug_of(tdx),
+    })
 }
 
 /// A fresh challenge. Random per call, never a counter or a timestamp: the point is that
@@ -744,20 +742,53 @@ fn fresh_nonce() -> Vec<u8> {
     n
 }
 
-async fn fetch_evidence(tee_url: &str, app_id: &str, nonce: &[u8]) -> Result<Vec<u8>> {
+/// How long a node gets to accept a connection before it counts as unreachable. A port
+/// closed by a firewall usually drops rather than refuses, which would otherwise hang
+/// for minutes.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// Where a fetch failed: before the node answered (worth trying the relay) or after
+/// (the node itself said no, and a relay would only repeat it).
+enum FetchError {
+    Unreachable(anyhow::Error),
+    Failed(anyhow::Error),
+}
+
+impl From<FetchError> for anyhow::Error {
+    fn from(e: FetchError) -> Self {
+        match e {
+            FetchError::Unreachable(e) | FetchError::Failed(e) => e,
+        }
+    }
+}
+
+async fn fetch_evidence(tee_url: &str, app_id: &str, nonce: &[u8]) -> Result<Vec<u8>, FetchError> {
     // An https teeUrl (the node's :50052 TLS listener serves a per-boot
     // self-signed cert) gets encryption without authentication: evidence is
     // Intel-signed and carries our nonce, so the channel needs no identity of
     // its own — the same reasoning as the pinless AS connection above.
-    let mut client = if tee_url.starts_with("https://") {
-        let channel = crate::pinned_tls::grpc_channel(tee_url, Vec::new())
-            .await
-            .map_err(|e| anyhow!("connect {}: {}", tee_url, e))?;
-        TappServiceClient::new(channel)
-    } else {
-        TappServiceClient::connect(tee_url.to_string())
-            .await
-            .map_err(|e| anyhow!("connect {}: {}", tee_url, e))?
+    let connect = async {
+        if tee_url.starts_with("https://") {
+            crate::pinned_tls::grpc_channel(tee_url, Vec::new())
+                .await
+                .map(TappServiceClient::new)
+                .map_err(|e| anyhow!("connect {}: {}", tee_url, e))
+        } else {
+            TappServiceClient::connect(tee_url.to_string())
+                .await
+                .map_err(|e| anyhow!("connect {}: {}", tee_url, e))
+        }
+    };
+    let mut client = match tokio::time::timeout(CONNECT_TIMEOUT, connect).await {
+        Ok(Ok(c)) => c,
+        Ok(Err(e)) => return Err(FetchError::Unreachable(e)),
+        Err(_) => {
+            return Err(FetchError::Unreachable(anyhow!(
+                "connect {}: no answer within {}s",
+                tee_url,
+                CONNECT_TIMEOUT.as_secs()
+            )))
+        }
     };
     let resp = client
         .get_evidence(tonic::Request::new(GetEvidenceRequest {
@@ -765,9 +796,63 @@ async fn fetch_evidence(tee_url: &str, app_id: &str, nonce: &[u8]) -> Result<Vec
             nonce: nonce.to_vec(),
         }))
         .await
-        .map_err(|e| anyhow!("{}", e))?
+        .map_err(|e| FetchError::Failed(anyhow!("{}", e)))?
         .into_inner();
     Ok(resp.evidence)
+}
+
+/// The scan that relays evidence for nodes of a known registry. A node whose port is
+/// closed to the caller is reached through it — transport only: what comes back is
+/// checked here exactly as if fetched directly, challenge included.
+pub fn known_relay(contract: &str) -> Option<&'static str> {
+    match contract.to_ascii_lowercase().as_str() {
+        "0x2ce80374318b1d7fb3345724457a182e0ad165c9" => Some("https://tappscan.0g.ai"),
+        "0x54874f536301c993922dd95097e3902e7fbfe612" => Some("https://tappscan.0g.ai/mainnet"),
+        _ => None,
+    }
+}
+
+/// Path segments are escaped, so an app id cannot reach any other endpoint of the scan.
+fn relay_url(scan: &str, app_id: &str, signer: &str, nonce: &[u8]) -> Result<reqwest::Url> {
+    let mut url = reqwest::Url::parse(scan).map_err(|e| anyhow!("scan url {}: {}", scan, e))?;
+    url.path_segments_mut()
+        .map_err(|_| anyhow!("scan url {} cannot take a path", scan))?
+        .pop_if_empty()
+        .extend(["api", "apps", app_id, "nodes", signer, "evidence"]);
+    url.query_pairs_mut()
+        .append_pair("nonce", &format!("0x{}", hex::encode(nonce)));
+    Ok(url)
+}
+
+/// Fetch a node's evidence through a scan's relay
+/// (`GET {scan}/api/apps/{app}/nodes/{signer}/evidence?nonce=…`), for nodes whose port
+/// is open only to the scan and their operators. Nothing in the answer is trusted but
+/// the evidence bytes, and those are checked exactly as if fetched directly — the
+/// challenge included, which is what keeps the relay from passing off an old quote.
+async fn fetch_evidence_via_scan(
+    scan: &str,
+    app_id: &str,
+    signer: &str,
+    nonce: &[u8],
+) -> Result<Vec<u8>> {
+    let url = relay_url(scan, app_id, signer, nonce)?;
+    let resp = reqwest::get(url.clone())
+        .await
+        .map_err(|e| anyhow!("scan {}: {}", url, e))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(anyhow!("scan answered {}: {}", status, body.trim()));
+    }
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| anyhow!("scan response: {}", e))?;
+    let evidence = body["evidence"]
+        .as_str()
+        .ok_or_else(|| anyhow!("scan response has no evidence"))?;
+    B64.decode(evidence)
+        .map_err(|e| anyhow!("scan evidence b64: {}", e))
 }
 
 /// Direct (no-chain) verification of a single server: fetch evidence, verify the quote
@@ -790,7 +875,16 @@ pub struct DirectVerdict {
     pub claimed_owner: Option<String>,
     /// Trust anchors in force per the event log — see NodeVerdict.
     pub trust_anchors: Option<TrustAnchors>,
+    pub replay_ok: bool,
+    pub boot_chain: crate::refvalues::BootChain,
+    pub td_debug: Option<bool>,
     pub note: String,
+}
+
+impl DirectVerdict {
+    pub fn platform(&self) -> Platform {
+        platform(&self.tcb_status, self.td_debug)
+    }
 }
 
 pub async fn verify_node_direct(
@@ -799,6 +893,7 @@ pub async fn verify_node_direct(
     as_endpoint: &str,
     as_pubkey: Option<&str>,
     policy_ids: &[String],
+    refs: Option<&[crate::refvalues::RefSet]>,
 ) -> Result<DirectVerdict> {
     let mut v = DirectVerdict {
         server: server.to_string(),
@@ -813,6 +908,9 @@ pub async fn verify_node_direct(
         images: Vec::new(),
         claimed_owner: None,
         trust_anchors: None,
+        replay_ok: false,
+        boot_chain: crate::refvalues::BootChain::NotChecked,
+        td_debug: None,
         note: String::new(),
     };
 
@@ -835,7 +933,10 @@ pub async fn verify_node_direct(
             v.tcb_status = av.tcb_status;
             v.advisories = av.advisories;
             v.boot_executables = av.executables;
-            v.boot_measurements = av.boot_measurements;
+            v.boot_measurements = av.measured.as_reference_pairs();
+            v.boot_chain = crate::refvalues::identify(&av.measured, refs);
+            v.replay_ok = av.replay_mismatches == 0;
+            v.td_debug = av.td_debug;
         }
         Err(e) => v.note = format!("{}AS: {}", v.note, e),
     }
@@ -843,11 +944,6 @@ pub async fn verify_node_direct(
     if let Ok(Some(m)) = latest_successful_start(cc_b64, app_id) {
         v.compose_hash = m.compose_hash;
         v.images = m.image_hash.into_values().collect();
-    }
-
-    // boot measurements from eventlog (not from AS — no policy needed)
-    if let Ok(measurements) = extract_boot_measurements(cc_b64) {
-        v.boot_measurements = measurements;
     }
 
     // claim_config owner — direct mode: print without chain comparison
@@ -865,6 +961,10 @@ pub async fn verify_node_direct(
 
 /// Verify every node of `app_id`: read chain, fetch evidence from each node's teeUrl,
 /// verify the quote via CoCo-AS, and reconcile evidence against on-chain values.
+/// Chain-mode verification of every node of `app_id`. A node that does not answer on its
+/// teeUrl is reached through `relay` (default: the scan for this registry, see
+/// [`known_relay`]). `refs` are the published reference values; `None` leaves the boot
+/// chain unchecked rather than failed.
 pub async fn verify_app(
     rpc_url: &str,
     contract: &str,
@@ -872,7 +972,10 @@ pub async fn verify_app(
     as_endpoint: &str,
     as_pubkey: Option<&str>,
     policy_ids: &[String],
+    relay: Option<&str>,
+    refs: Option<&[crate::refvalues::RefSet]>,
 ) -> Result<AppVerdict> {
+    let relay = relay.or_else(|| known_relay(contract));
     let signers = onchain::get_node_list(rpc_url, contract, app_id).await?;
     if signers.is_empty() {
         return Err(anyhow!("app '{}' has no registered nodes on-chain", app_id));
@@ -906,6 +1009,11 @@ pub async fn verify_app(
             boot_measurements: Vec::new(),
             owner_claim: None,
             trust_anchors: None,
+            fresh: None,
+            relayed_by: None,
+            replay_ok: false,
+            boot_chain: crate::refvalues::BootChain::NotChecked,
+            td_debug: None,
             app_resumed_differently: false,
             note: String::new(),
         };
@@ -924,7 +1032,21 @@ pub async fn verify_app(
 
         // ② fetch evidence, with a challenge so a cached blob is distinguishable
         let nonce = fresh_nonce();
-        let raw = match fetch_evidence(&tee_url, app_id, &nonce).await {
+        let fetched = match fetch_evidence(&tee_url, app_id, &nonce).await {
+            Ok(b) => Ok(b),
+            Err(FetchError::Unreachable(e)) => match relay {
+                // The node never saw this challenge, so it is still fresh to use.
+                Some(r) => {
+                    v.relayed_by = Some(r.to_string());
+                    fetch_evidence_via_scan(r, app_id, &v.signer, &nonce)
+                        .await
+                        .map_err(|re| anyhow!("{}; relayed by {}: {}", e, r, re))
+                }
+                None => Err(e),
+            },
+            Err(FetchError::Failed(e)) => Err(e),
+        };
+        let raw = match fetched {
             Ok(b) => b,
             Err(e) => {
                 v.note = format!("get-evidence failed: {}", e);
@@ -948,6 +1070,7 @@ pub async fn verify_app(
         let attested = read_report_data(&j, quote_b64, &nonce);
         v.signer_ok = attested.is(signer.as_bytes());
         v.tls_public_key = attested.tls_public_key.clone();
+        v.fresh = attested.fresh;
         v.note = attested.note.clone();
 
         // ③ AS quote verification
@@ -957,6 +1080,16 @@ pub async fn verify_app(
                 v.tcb_status = av.tcb_status;
                 v.advisories = av.advisories;
                 v.boot_executables = av.executables;
+                v.boot_measurements = av.measured.as_reference_pairs();
+                v.boot_chain = crate::refvalues::identify(&av.measured, refs);
+                v.replay_ok = av.replay_mismatches == 0;
+                v.td_debug = av.td_debug;
+                if !v.replay_ok {
+                    v.note = format!(
+                        "{}{} measured tapp events do not hash to what was extended; ",
+                        v.note, av.replay_mismatches
+                    );
+                }
             }
             Err(e) => v.note = format!("{}AS: {}", v.note, e),
         }
@@ -974,11 +1107,6 @@ pub async fn verify_app(
             }
             Ok(None) => v.note = format!("{}no successful start_app in eventlog", v.note),
             Err(e) => v.note = format!("{}eventlog parse: {}", v.note, e),
-        }
-
-        // boot measurements from eventlog (shown by the CLI when no policy selected)
-        if let Ok(measurements) = extract_boot_measurements(cc_b64) {
-            v.boot_measurements = measurements;
         }
 
         // ④c reconcile claim_config owner vs on-chain app owner
@@ -1216,6 +1344,135 @@ mod tests {
         assert!(!a.is(&SIGNER));
         assert!(!a.is(&[0x22; 20]), "the swapped signer must not be believed either");
         assert!(a.note.contains("does not hash"), "got {}", a.note);
+    }
+}
+
+#[cfg(test)]
+mod relay_tests {
+    use super::*;
+
+    fn node(fresh: Option<bool>, relayed: bool) -> NodeVerdict {
+        NodeVerdict {
+            signer: "0x11".into(),
+            tee_url: String::new(),
+            reachable: true,
+            ear_status: "affirming".into(),
+            tcb_status: "UpToDate".into(),
+            advisories: 0,
+            signer_ok: true,
+            tls_public_key: String::new(),
+            compose_ok: true,
+            volumes_ok: true,
+            image_ok: true,
+            boot_executables: None,
+            boot_measurements: Vec::new(),
+            owner_claim: None,
+            trust_anchors: None,
+            fresh,
+            relayed_by: relayed.then(|| "https://tappscan.0g.ai".to_string()),
+            replay_ok: true,
+            boot_chain: crate::refvalues::BootChain::NotChecked,
+            td_debug: Some(false),
+            app_resumed_differently: false,
+            note: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_debug_td_fails_whatever_else_passes() {
+        assert!(matches!(platform("UpToDate", Some(true)), Platform::Fail(_)));
+        // Unknown is not "probably fine": the attribute must be read to be ruled out.
+        assert!(matches!(platform("UpToDate", None), Platform::Fail(_)));
+    }
+
+    #[test]
+    fn a_trailing_tcb_warns_and_a_revoked_one_fails() {
+        assert_eq!(platform("UpToDate", Some(false)), Platform::Ok);
+        for lagging in ["OutOfDate", "SWHardeningNeeded", "ConfigurationNeeded", "OutOfDateConfigurationNeeded"] {
+            assert!(matches!(platform(lagging, Some(false)), Platform::Warn(_)), "{lagging}");
+        }
+        assert!(matches!(platform("Revoked", Some(false)), Platform::Fail(_)));
+    }
+
+    #[test]
+    fn the_debug_bit_is_read_parsed_or_raw() {
+        let parsed = serde_json::json!({"td_attributes": {"debug": true}});
+        assert_eq!(td_debug_of(&parsed), Some(true));
+        // TDATTRIBUTES as seen on test-tapp (SEPT_VE_DISABLE only), then with DEBUG set.
+        let raw = |h: &str| serde_json::json!({"quote": {"body": {"td_attributes": h}}});
+        assert_eq!(td_debug_of(&raw("0000001000000000")), Some(false));
+        assert_eq!(td_debug_of(&raw("0100001000000000")), Some(true));
+        assert_eq!(td_debug_of(&serde_json::json!({})), None);
+    }
+
+    #[test]
+    fn a_quote_made_for_another_request_never_passes() {
+        assert!(!node(Some(false), false).reconciled());
+        assert!(!node(Some(false), true).reconciled());
+    }
+
+    #[test]
+    fn through_a_relay_freshness_must_be_proven() {
+        assert!(node(Some(true), true).reconciled());
+        // An old server cannot echo a challenge, so a relay could be replaying its quote.
+        assert!(!node(None, true).reconciled());
+    }
+
+    #[test]
+    fn fetched_directly_an_old_server_still_passes() {
+        assert!(node(None, false).reconciled());
+        assert!(node(Some(true), false).reconciled());
+    }
+
+    #[test]
+    fn an_event_log_that_does_not_replay_proves_nothing_read_from_it() {
+        let mut n = node(Some(true), false);
+        n.replay_ok = false;
+        assert!(!n.reconciled());
+    }
+
+    #[test]
+    fn a_resumed_app_state_the_boot_did_not_measure_fails_the_node() {
+        let mut n = node(Some(true), false);
+        assert!(n.reconciled());
+        n.app_resumed_differently = true;
+        assert!(!n.reconciled());
+    }
+
+    #[test]
+    fn each_known_registry_has_its_own_relay() {
+        assert_eq!(
+            known_relay("0x2Ce80374318B1d7Fb3345724457a182E0ad165c9"),
+            Some("https://tappscan.0g.ai")
+        );
+        assert_eq!(
+            known_relay("0x54874F536301c993922Dd95097e3902e7FBfe612"),
+            Some("https://tappscan.0g.ai/mainnet")
+        );
+        // The relay only serves nodes of the registry it scans; a different one gets none.
+        assert_eq!(known_relay("0x5f0d9c243048F5a55468472c6F090184E2E333c7"), None);
+    }
+
+    #[test]
+    fn the_relay_url_names_the_node_and_carries_the_challenge() {
+        let u = relay_url("https://tappscan.0g.ai", "0g-kms", "0xabc", &[0x01, 0xff]).unwrap();
+        assert_eq!(
+            u.as_str(),
+            "https://tappscan.0g.ai/api/apps/0g-kms/nodes/0xabc/evidence?nonce=0x01ff"
+        );
+        // A base with a path (the mainnet instance) keeps it; a trailing slash adds nothing.
+        let u = relay_url("https://tappscan.0g.ai/mainnet/", "a", "0x1", &[0x02]).unwrap();
+        assert_eq!(
+            u.as_str(),
+            "https://tappscan.0g.ai/mainnet/api/apps/a/nodes/0x1/evidence?nonce=0x02"
+        );
+    }
+
+    #[test]
+    fn an_app_id_cannot_steer_the_request_elsewhere() {
+        let u = relay_url("https://scan", "../../keys", "0x1", &[0x00]).unwrap();
+        assert!(u.path().starts_with("/api/apps/"), "{}", u);
+        assert!(!u.path().contains("/keys/") && u.path().contains("%2F"), "{}", u);
     }
 }
 

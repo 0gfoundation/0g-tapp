@@ -367,8 +367,9 @@ On every VM reboot the RTMRs are zeroed, the claim happens again, and it is meas
 
 **`tapp-cli verify-app` already performs the rules in this section automatically** (v0.3.0+): in chain mode the reconcile line prints
 `owner✓/✗/?` (✓ = claim_config owner == on-chain owner; ✗ = mismatch, Result ❌; ? = no claim_config event,
-images predating 0.3). Also, without `--policy-ids`, the boot-chain component measurements are printed verbatim in the reference-value JSON format,
-so they can be diffed directly against `verifier/reference-values/…/<env>.json`.
+images predating 0.3). Since v0.9.0 it also compares the boot chain itself, locally, against the published
+`verifier/reference-values/…/<env>.json` (read from the AS's signed token, as tappscan does) and names the image; on no match it
+prints the measured components in the reference-value JSON format, ready to publish.
 
 ---
 

@@ -684,21 +684,24 @@ tapp-cli -s http://<any-tapp>:50051 -k 0x<deployer-key> withdraw \
 
 ### Verifying an App
 
-`tapp-cli verify-app` checks that what a node actually runs matches its reference values.
-Two independent axes select which references are enforced:
+`tapp-cli verify-app` checks that what a node actually runs is what was published and
+registered — the same checks tappscan makes, made here on your machine:
 
-- **`--contract` + `--rpc-url` → dynamic references** (on-chain): reconciles the runtime
-  events against the registry — signer, compose, volumes, image, and **owner** (the
-  `claim_config` event's owner vs the on-chain app owner) → `signer✓ compose✓ volumes✓ image✓ owner✓`.
-- **`--policy-ids` → static references** (AS-registered boot-chain values): the AS enforces
-  the policy and returns the AR4SI executables claim → `boot-chain ✓ (executables=3)`.
-
-Whichever axis has NO reference supplied, verify-app prints that side's **measured values
-verbatim** so you can compare manually:
-- no `--contract` → prints owner / compose / images as attested;
-- no `--policy-ids` → prints the boot-chain component digests in reference-value JSON
-  (`{"measurement.<shim|grub|kernel|initrd|kernel_cmdline|uki>.SHA-384": [...]}`), directly
-  diffable against `verifier/reference-values/<cloud>/<boot_format>/<version>/<env>.json`.
+- **Quote, TCB, event-log replay** — the AS (`--as-endpoint`) verifies the quote's signature
+  chain to Intel, reports TCB, and replays the event log against the signed RTMRs. This is
+  what the AS is trusted for, and all it is trusted for.
+- **Boot chain → published reference values**, compared locally against the AS's signed
+  token: `boot chain : ✓ gcp/uki/v0.8.0/dev` names the image. The values are the published
+  ones, `0gfoundation/0g-tapp@dev:verifier/reference-values` (pinned to the commit the ref
+  resolves to, cached per commit; `GITHUB_TOKEN` is honoured), or a directory given with
+  `--reference-values`. No match prints the measured digests in reference-value JSON
+  (`{"measurement.<shim|grub|kernel|initrd|kernel_cmdline|uki>.SHA-384": [...]}`), ready to
+  publish, and the closest published set. A newly published image needs nothing registered
+  anywhere. `--policy-ids` additionally shows an AS policy's own verdict.
+- **`--contract` + `--rpc-url` → the registry**: reconciles the runtime events against it —
+  signer, compose, volumes, image, and **owner** (the `claim_config` event's owner vs the
+  on-chain app owner) → `signer✓ compose✓ volumes✓ image✓ owner✓`. Without `--contract`
+  (direct mode) it prints owner / compose / images as attested.
 
 Both modes also print `tls key : <sha256>  (sha256 of the public key, attested)` when the app
 has a TLS key, followed by the `openssl s_client | … | openssl dgst -sha256` one-liner for
@@ -707,18 +710,43 @@ node just verified. The line is absent when the app has never asked for a key, w
 failure.
 
 ```bash
-# full verification: dynamic (chain) + static (policy)
+# full verification: registry + published reference values
 tapp-cli verify-app \
   --app-id my-app \
   --rpc-url https://evmrpc-testnet.0g.ai \
-  --contract 0x<TappRegistry> \
-  --policy-ids 0g-tapp-<cloud>-<boot_format>-<version>-<env>
+  --contract 0x<TappRegistry>
+  # --reference-values <dir>         # pinned/offline values instead of the published ones
   # --as-endpoint https://host:port  # CoCo-AS gRPC; TLS now, so give the scheme
-  # --as-pubkey 0x<sha256>           # pin the AS's attested TLS key
+  # --as-pubkey 0x<sha256>           # pin the AS's TLS key (or TAPP_AS_PUBKEY); current value in docs/TAPPSCAN.md
 
 # direct mode (single node, not yet registered): prints attested values verbatim
 tapp-cli -s http://<tapp>:50051 verify-app --app-id my-app
 ```
+
+**Nodes whose port is closed to you** (open only to the scan and their operators) are
+reached through the scan relay of their registry, automatically — `evidence : the node did
+not answer here; relayed by …`. That is transport only: the evidence is checked exactly as
+if fetched directly, and the quote must echo the random challenge sent for it
+(`fresh : ✓`). An old quote is genuine too, so passing one off as new is the one thing a
+relay could do, and the echo is what rules it out; a quote echoing a different challenge
+fails whichever way it came. `docs/verify_app.py` does all of the above the same way.
+
+The AS is trusted for the quote, so **pin it** (`--as-pubkey`, or `TAPP_AS_PUBKEY` once;
+the current value is in [`docs/TAPPSCAN.md`](docs/TAPPSCAN.md)). Unpinned, anyone on the
+path could forge every verdict: verify-app warns and never reports better than ⚠️. A
+**dev** image's boot chain is reported ⚠️, not ✅ — dev builds can carry an SSH key into
+the TD — and on **mainnet** (chain 16661) it fails, as it does in the scan's verdict and so
+at the KMS. "✅" means the boot chain matches a published image's digests; firmware
+(MRTD/RTMR0) is not compared yet. verify-app **exits non-zero** on a reconcile FAIL or an
+unpublished image, so scripts and CI can use it: **0** everything checked and clean, **1** a
+failure, **2** passed with a warning (unpinned AS, dev image off mainnet, a TCB trailing Intel's
+latest, reference values unavailable).
+
+The **platform** line reads the TD itself out of the AS token, as the AS policy used to:
+a TD launched with **DEBUG** fails whatever else passes (its host can read and write its
+memory — on bare metal the operator launches the TD), and so does a revoked TCB. A TCB
+that merely trails Intel's latest (`OutOfDate`, `SWHardeningNeeded`, …) warns: clouds
+roll firmware out behind Intel, and the outstanding advisories are listed.
 
 List the apps a server is currently running (read-only, no key needed):
 

@@ -39,11 +39,21 @@ trust anchor:
 (The same pin in `curl --pinnedpubkey` form:
 `sha256//exPRMg5+vJOm7fgJ0Gz5tEcEZ3Rhxv6yxCBOkuVYfps=`.)
 
-It also fronts the self-hosted **CoCo-AS**, which is `verify-app`'s default:
+It also fronts the self-hosted **CoCo-AS**, which is `verify-app`'s default. The AS
+is the same TEE app, so it presents the same key — pin it, or every verdict
+`verify-app` prints could come from whoever is on the path (it warns, and never
+reports better than ⚠️, without one):
 
 ```
 --as-endpoint https://35.253.66.70:50004
+--as-pubkey   0x7b13d1320e7ebc93a6edf809d06cf9b44704677461c6feb2c4204e92e5587e9b
+# or once, for every run:
+export TAPP_AS_PUBKEY=0x7b13d1320e7ebc93a6edf809d06cf9b44704677461c6feb2c4204e92e5587e9b
+# docs/verify_app.py: AS_PUBKEY=7b13d132…
 ```
+
+This key is generated per boot inside that TEE: when the instance restarts it
+changes, and this page is where the new value is published.
 
 The AS speaks TLS; a bare `host:port` without a scheme means plaintext and
 fails as an h2 protocol error, so always give the scheme.
