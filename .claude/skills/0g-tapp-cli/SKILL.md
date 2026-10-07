@@ -1,7 +1,7 @@
 ---
 name: 0g-tapp-cli
 description: Use this skill when the user wants to deploy, manage, or troubleshoot applications on a 0G Tapp (Trusted Application Platform) server using tapp-cli. Covers start/stop apps, on-chain registration, registry login, check task status, view logs, and manage docker compose deployments across multiple remote TEE servers.
-version: 1.13.2
+version: 1.15.4
 author: 0G Labs
 tags: [0g, tapp, tee, docker, deployment, cli, onchain]
 ---
@@ -45,12 +45,20 @@ tapp-cli -s <server> -k 0x<key> docker-login -r <registry-host> -u <user> -p <pa
 tapp-cli -s <server> -k 0x<key> start-app -f docker-compose.yaml --app-id <id>   # async → task-id
 tapp-cli -s <server> -k 0x<key> start-app -f <compose> --app-id <id> \
   --register-onchain --rpc-url <rpc> --contract 0x<reg> --stake-wei 1000000000000000000
-  # ↑ idempotent register-BEFORE-start: pulls+measures first, tx confirms, THEN containers start.
-  #   not registered→registerApp; signer already a node→skip; signer absent + exactly ONE other
-  #   node→updateNode REPLACING it (a restart re-derives the signer, so the on-chain one is a
-  #   dead instance); signer absent + several others→addNode, since which one died is unknowable
-  #   — pass --old-signer 0x<addr> to say. A stated --old-signer that is not a node is an ERROR,
-  #   never a silent fallback to addNode.
+  # ↑ syncs the chain BEFORE start (pulls+measures first, txs confirm, THEN containers start);
+  #   ONE command for first deploy / restart / machine swap / upgrade. Writes nothing if in sync.
+  #   Each node's record = what THAT node runs: rewrites only this node's compose + mount
+  #   files (override where they differ from the app default); never another node's, so a
+  #   rolling upgrade stays consistent node by node. App declaration (compose/images) follows
+  #   only in a single-node app; multi-node → `update-onchain` once all nodes run the new
+  #   code. Mount files are always the node's own override. Each rewrite resets addedAt.
+  #   New images on one of several nodes → warning only (images are per-app on chain;
+  #   pin by digest in compose to cover them per node). Signer: not registered→registerApp;
+  #   already a node→fix record if needed; absent + exactly ONE other node→updateNode REPLACING
+  #   it (restart re-derives the signer); absent + several→addNode — pass --old-signer 0x<addr>
+  #   to replace one (a stated one that is not a node is an ERROR). --add-node = scale out
+  #   Signer-keyed apps (0g-sandbox vouchers): restart with --add-node, settle, then remove the old node
+  #   (a one-node app would otherwise treat the new signer as a replacement).
   #   Requires a server with measure_only support; older servers → CLI aborts ("Server did not return measurements").
 tapp-cli -s <server> -k 0x<key> get-task-status --task-id <task-id>
 tapp-cli -s <server> -k 0x<key> stop-app --app-id <id>
@@ -92,15 +100,14 @@ tapp-cli -s <server> -k 0x<key> docker-logout                    # logout from D
 # Must run before any owner-level op on a freshly booted canonical image:
 tapp-cli -s <server> -k 0x<key> claim-config                                # claim owner only
 tapp-cli -s <server> -k 0x<key> claim-config \
-  --chain-rpc-url https://evmrpc-testnet.0g.ai \
-  --chain-contract 0x<TappRegistry> \
   --kbs-urls "https://kms-1:9443,https://kms-2:9443" \
-  --tls-key-source kms                                                       # claim + set chain + KMS + TLS key source
+  --tls-key-source kms                                                       # claim + set KMS + TLS key source
 ```
 - First-come-first-served, exactly once per boot. CLI verifies result end-to-end.
-- `--chain-*`, `--kbs-urls` and `--tls-key-source` optional if already baked into config.toml.
+- `--kbs-urls` and `--tls-key-source` optional if already baked into config.toml.
+- No chain is claimed (`--chain-rpc-url`/`--chain-contract` were removed in tapp-cli 0.9.0 and are now rejected; tapp-server 0.9.0 ignores them from older CLIs). A node is not tied to one registry — on-chain commands take `--rpc-url`/`--contract`, so one node can be registered on testnet and mainnet.
 - **What to put in `--kbs-urls`**: the deployed cluster endpoints per network are in `docs/KMS.md` — mainnet and testnet both run app_id `0g-kms` but are two clusters with two masters; the doc's group pubkeys are how you check you reached the right one.
-- `--tls-key-source local|kms` (v0.4.0+, default `local`) — decides whether app TLS keys survive a restart, see App TLS certificates above. Must be decided at claim time; `kms` on a node with no KMS/chain config will fail when a cert is requested.
+- `--tls-key-source local|kms` (v0.4.0+, default `local`) — decides whether app TLS keys survive a restart, see App TLS certificates above. Must be decided at claim time; `kms` on a node with no KMS config, or whose app is not registered on chain, will fail when a cert is requested.
 - `--scan-url https://… --scan-pubkey 0x…` (v0.5.0+) — which verifier this node believes about KMS node identity, and its pinned key. Both or neither. See Trust anchors below.
 
 ### Trust anchors — which KMS cluster, and which verifier (v0.5.0+)
@@ -122,6 +129,11 @@ Owner-only, and **every call is extended into the runtime measurement** carrying
 - After VM reboot the server is UNCLAIMED again and must be claimed again.
 - `start-app` **refuses** a writable bind mount reaching `/run/tapp` (the dir, `/run`, `/`, `/var/run`, or any file in it but the socket): the claimed owner/anchors live there and are re-read on restart. Mount `/run/tapp/tapp.sock:/run/tapp/tapp.sock` only (or `:ro`).
 - A tapp-server **process** restart (same boot) keeps the claim: owner, KMS cluster, TLS key source and trust anchors all resume (tapp-server 0.8.1+; before it only the owner did, and the anchors had to be re-applied with `update-trust-anchors` — the symptom is `get-tapp-info` showing no verifier on a node you anchored).
+
+### Request signing (v0.9.0+)
+- tapp-cli >= 0.9.0 signs `Method:0x<sha256(encoded request)>:timestamp` with header `x-signature-version: 2` — the signature covers the request body, so a request altered in flight is refused. Window **±10 min**; every signature is **single-use**, and one made before tapp-server last started is refused (the previous process may have used it).
+- Against tapp-server < 0.9.0 this shows up as `Insufficient permission for this operation` (old server cannot read v2): add the global flag `--legacy-sign`. Never automatic.
+- tapp-server >= 0.9.0 accepts **only** body-bound signatures; legacy `Method:timestamp` is refused ("accepts only body-bound signatures"). Old tapp-cli cannot manage a 0.9.0 node — upgrade it.
 
 ### Server health & whitelist
 ```bash
@@ -181,13 +193,13 @@ A failed task prints the docker compose `Stderr:` (the actual root cause). A com
 
 ## On-chain Commands (TappRegistry)
 
-`--server` is also recorded on-chain as the node's `teeUrl` (the `:50051` URL). Key must be the app owner (see Keys above).
+The node's on-chain `teeUrl` is `--tee-url` when given; otherwise a node already on chain **keeps its recorded value** — only legacy `http://host:50051` auto-moves to `https://host:50052` (tapp-server ≥ 0.8.0). A **replacement** asks the replaced slot's URL for the app's signer: this node's (the restart case) → kept; another signer, or an answer that is not one → derived from `--server`, printed; no answer (e.g. a VPC-private URL seen from outside) → kept with a warning, so replacing a machine unreachable from here (dead, or a hand-over) needs `--tee-url`. A **new** record is derived from `--server` (`https://…` as given; `http://host:50051` → `https://host:50052`); a `127.0.0.1`/socket `--server` then needs `--tee-url`. `:50051` should stay closed to all but the node (#141). A node in the scan's VPC may register a private `https://10.x.x.x:50052` — only the scan reaches it, others verify through the scan relay. To move a `teeUrl`, pass `--tee-url` to `start-app --register-onchain` / `update-node-onchain` (rewritten in place, same signer). Key must be the app owner (see Keys above).
 
 ```bash
 # Preferred for new deploys: start-app --register-onchain (see Core Commands) registers
 # BEFORE containers start and is idempotent. The commands below register a RUNNING app.
 register-onchain    --app-id <id> --rpc-url <rpc> --contract 0x<reg> --stake-wei 1000000000000000000  # 1 0G
-update-onchain      --app-id <id> --rpc-url <rpc> --contract 0x<reg>                                   # re-fetch hashes after redeploy
+update-onchain      --app-id <id> --rpc-url <rpc> --contract 0x<reg>                                   # set the app default (for new nodes) to what this node runs
 add-node-onchain    --app-id <id> --rpc-url <rpc> --contract 0x<reg> --stake-wei <wei>                 # -s = new node
 update-node-onchain --app-id <id> --rpc-url <rpc> --contract 0x<reg> [--old-signer 0x..] [--new-signer 0x..] [--tee-url ..]
 update-trust-anchors --kbs-urls <urls> --scan-url https://.. --scan-pubkey 0x..   # v0.5.0+, owner-only, measured
@@ -196,8 +208,12 @@ withdraw            --rpc-url <rpc> --contract 0x<reg>                          
 withdraw-balance    --app-id <id> --rpc-url <rpc> --contract 0x<reg>                        # withdraw app balance to owner
 ```
 - `remove-node-onchain` accepts `--signer-address 0x<addr>` to provide the signer directly when the node is unreachable (can't connect to `--server`).
-- `update-node-onchain`: new signer auto-fetched from `--server` unless `--new-signer` given; `--tee-url` defaults to the `--server` URL. Pass `--old-signer` explicitly when replacing a node on a different host.
-- No app-owner transfer exists: to change owner, old owner `remove-node-onchain` (→ stake locks ~1 day, then `withdraw`) then new owner `register-onchain`.
+- `update-node-onchain`: new signer auto-fetched from `--server` unless `--new-signer` given; `--tee-url` defaults as above. When that signer is **already a node**, its own record is rewritten in place (how a `teeUrl` moves) — "Nothing to update" if it already matches. Pass `--old-signer` explicitly when replacing a node on a different host.
+- **Handing an app over** — only the registry owner transfers; machines are replaced, never transferred (TappRegistry >= 0.2.0):
+  1. `transfer-app-ownership --app-id <id> --rpc-url <rpc> --contract 0x<reg> --new-owner 0x<new>` (owner key; `--cancel` withdraws), then `accept-app-ownership --app-id <id> --rpc-url <rpc> --contract 0x<reg>` (nominee key). Two steps because a wrong address would strand the app for good.
+  2. On each machine the new owner has claimed: `start-app ... --register-onchain --tee-url https://<new-node>:50052` (+ `--old-signer` if the app has several nodes) — replaces the old node in place via updateNode (stake carried, never zero nodes, works for `encrypted` apps). **Always pass `--tee-url` here**: the old machine's port is normally closed to the new owner, so the probe gets no answer and would keep the old URL.
+  - Until a node is replaced, the old machine's owner still gets the app's KMS keys (KMS authorizes by node list). Keys derive from app_id, so they do not change across the hand-over.
+  - Live nodes' stake travels with the app; stake already locked stays with the old owner. Acks not invalidated. On a 0.1.0 registry `accept-app-ownership` fails decoding `pendingAppOwner` — the upgrade has not landed.
 - app-id is **global & unique** in the registry. `register-onchain` on an existing id → `app already exists`; use add-node/update-node instead.
 
 ### Native on-chain subcommands
@@ -219,9 +235,8 @@ docker run --rm --entrypoint cast ghcr.io/foundry-rs/foundry:latest send 0x<reg>
 
 ## Restart + re-sync on-chain
 
-Restart = `stop-app` then `start-app`. After a restart that's already registered on-chain, **re-sync** because:
-- **TEE signer may change on restart** (it's ephemeral; sometimes stable, sometimes not). Compare `get-app-key` vs `getNodeList`. If different → `update-node-onchain --old-signer <onchain> --new-signer <current>`.
-- If images/compose/env changed → `update-onchain` to refresh hashes.
+Restart / redeploy / upgrade = `stop-app` then `start-app ... --register-onchain`: it replaces a changed signer and rewrites this node's record to what it now runs, in one go (single-node app: the app declaration too). Multi-node upgrade: redeploy each node, then one `update-onchain` to move the app default.
+- Without `--register-onchain` (app already running), re-sync by hand: signer changed (compare `get-app-key` vs `getNodeList`) → `update-node-onchain --old-signer <onchain> --new-signer <current>`; code changed → `update-onchain`.
 
 Always verify after: container status `running` + (for crash-loopers) tail logs.
 
@@ -267,7 +282,11 @@ Each app gets its **own encrypted volume** (LUKS; key derived per-app by the KMS
 
 | Symptom | Cause / fix |
 |---|---|
-| `PermissionDenied` | wrong key, or server is UNCLAIMED (v0.3.0+ canonical image) — run `claim-config` first |
+| `PermissionDenied` | wrong key, or server is UNCLAIMED (v0.3.0+ canonical image) — run `claim-config` first; or tapp-cli >= 0.9.0 against tapp-server < 0.9.0 — add `--legacy-sign` |
+| `refusing to claim: this tapp-server reports version …` | tapp-cli >= 0.9.0 claiming a node older than 0.9.0: add `--legacy-sign`. (Refused on purpose — such a server would recover an unrelated address from the new signature and record IT as the owner.) |
+| `this signature was already used` | a signature is single-use (v0.9.0+); just re-run the command (it signs afresh) |
+| `this signature was made before tapp-server last started` | the server restarted after you signed; re-run. Persisting right after a restart means your clock is behind the server's — fix the clock or wait out the skew |
+| `this node accepts only body-bound signatures` | tapp-server >= 0.9.0 with an old tapp-cli, or `--legacy-sign` given — upgrade tapp-cli / drop the flag |
 | `unauthorized: authentication required` (pull) | registry token expired → `docker-login` with fresh token, retry |
 | `required variable TAPP_REGISTRY is missing` (compose interpolation) | that var absent from the uploaded `.env` |
 | container stuck `restarting` | `get-app-logs --service <svc>` → missing env var / mount file |

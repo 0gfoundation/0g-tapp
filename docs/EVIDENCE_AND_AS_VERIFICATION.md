@@ -346,12 +346,12 @@ event is honest ignorance of *which of the two*, not absence of accountability.
 
 ### claim_config (runtime claiming of owner+config; mandatory check for canonical images)
 
-Canonical images do not bake in owner/chain/kbs (one set of golden reference values network-wide, at path `<env>.json` with no owner layer),
+Canonical images do not bake in owner/kbs (one set of golden reference values network-wide, at path `<env>.json` with no owner layer),
 so **the entire runtime configuration moved from static measurements into the runtime event log**:
 
 ```
-tapp.0g.com claim_config {"owner":"0x<owner>","chain_rpc_url":"…",
-  "chain_contract_address":"0x…","kbs_node_urls":["…"],
+tapp.0g.com claim_config {"owner":"0x<owner>","kbs_node_urls":["…"],
+  "tls_key_source":"local|kms","scan_url":"…","scan_public_key":"0x…",
   "operation":"claim_config","timestamp":<ts>}
 ```
 
@@ -360,7 +360,7 @@ Reconciliation rules (add one step to §④):
 1. A **`claim_config` event must exist** in the event log (none → the node is ownerless or took an unmeasured path; reject);
 2. If there are multiple (e.g. config mode restarting across processes), **the `owner` of all `claim_config` events must be identical**;
 3. `owner` == the owner registered on-chain for this node (mismatch → the owner was squatted or the registration does not match; reject);
-4. `chain_contract_address` / `kbs_node_urls` are for audit: which contract and which KMS cluster the node claimed at the time.
+4. `kbs_node_urls` / `scan_url` are for audit: which KMS cluster and which verifier the node claimed at the time. Events from tapp-server before 0.9.0 also carry `chain_rpc_url` / `chain_contract_address`; they were a label only (nothing used them) and are no longer recorded — a node can be registered on more than one chain.
 
 The claim event is produced by the first claim after boot (dynamic mode via the ClaimConfig RPC, or automatic claiming at startup in config.toml preset mode).
 On every VM reboot the RTMRs are zeroed, the claim happens again, and it is measured again — the owner and the quote always share a lifecycle.

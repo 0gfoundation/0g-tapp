@@ -45,7 +45,7 @@ pub use proto::{
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const NAME: &str = env!("CARGO_PKG_NAME");
 
-/// Runtime configuration set via ClaimConfig (owner/chain/kbs).
+/// Runtime configuration set via ClaimConfig (owner/kbs/TLS/scan).
 /// Separate from the static TappConfig so get-tapp-info can show live values.
 ///
 /// Persisted beside the claimed owner (see [`ClaimedRuntimeConfig::save`]): the owner
@@ -55,8 +55,6 @@ pub const NAME: &str = env!("CARGO_PKG_NAME");
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct ClaimedRuntimeConfig {
-    pub chain_rpc_url: String,
-    pub chain_contract_address: String,
     pub kbs_node_urls: Vec<String>,
     /// Empty means "not claimed" — fall back to config.toml, which is the pre-baked mode.
     pub tls_key_source: String,
@@ -186,7 +184,7 @@ pub struct TappServiceImpl {
     pub app_key_service: Arc<app_key::AppKeyService>,
     /// KMS client, wrapped in RwLock so ClaimConfig can initialize it at runtime
     /// if kbs_node_urls were not baked into config.toml (dynamic mode).
-    pub kms_client: Arc<tokio::sync::RwLock<Option<kms_client::KmsClient>>>,
+    pub kms_client: Arc<tokio::sync::RwLock<Option<Arc<kms_client::KmsClient>>>>,
     pub nonce_manager: nonce_manager::NonceManager,
     pub logs_service: service_monitor::logs::LogsService,
     pub permission_manager: Option<Arc<permission::PermissionManager>>,
@@ -206,13 +204,17 @@ pub struct TappServiceImpl {
 /// volume path runs it inside the spawned start task, which holds clones of these
 /// two handles rather than `&self`.
 async fn kms_derive_with(
-    kms_client: &tokio::sync::RwLock<Option<kms_client::KmsClient>>,
+    kms_client: &tokio::sync::RwLock<Option<Arc<kms_client::KmsClient>>>,
     app_key_service: &app_key::AppKeyService,
     app_id: &str,
     material: &str,
 ) -> Result<Vec<u8>, Status> {
-    let kms_guard = kms_client.read().await;
-    let kms = kms_guard.as_ref().ok_or_else(|| {
+    // The client is taken out of the lock, not used under it: a fetch can now wait minutes
+    // for the KMS to see a registration, and a held read guard would block every claim and
+    // trust-anchor update behind it (tokio's RwLock is write-preferring), and with them every
+    // other KMS call on the node.
+    let kms = kms_client.read().await.clone();
+    let kms = kms.as_deref().ok_or_else(|| {
         Status::failed_precondition(
             "KMS not configured — set [kbs] node_urls in config.toml or call claim-config \
              with --kbs-urls",
@@ -319,7 +321,7 @@ impl TappServiceImpl {
         &self,
         app_id: &str,
     ) -> Result<(config::TlsKeySource, Vec<u8>), Status> {
-        // Claimed value wins over the pre-baked one, same as chain and KBS config.
+        // Claimed value wins over the pre-baked one, same as the KBS config.
         let source = match self
             .claimed_runtime_config
             .read()
@@ -513,13 +515,11 @@ impl TappServiceImpl {
         // when kbs_node_urls are provided dynamically instead of baked in config.
         let kms_client = Arc::new(tokio::sync::RwLock::new(config.kbs.as_ref().map(|kbs| {
             info!(nodes = kbs.node_urls.len(), "Initializing KMS client from KBS config");
-            kms_client::KmsClient::new(kbs.node_urls.clone(), &kbs.retry)
+            Arc::new(kms_client::KmsClient::new(kbs.node_urls.clone(), &kbs.retry))
         })));
 
         // Initialize runtime config from static config (pre-baked values visible immediately)
         let mut runtime = ClaimedRuntimeConfig {
-            chain_rpc_url: config.chain.as_ref().map(|c| c.rpc_url.clone()).unwrap_or_default(),
-            chain_contract_address: config.chain.as_ref().map(|c| c.contract_address.clone()).unwrap_or_default(),
             kbs_node_urls: config.kbs.as_ref().map(|k| k.node_urls.clone()).unwrap_or_default(),
             tls_key_source: config.server.tls_key_source.as_str().to_string(),
             // No static counterpart on purpose: these are claimed, never baked into the
@@ -546,12 +546,12 @@ impl TappServiceImpl {
                     "Resumed the config claimed earlier this boot"
                 );
                 if !claimed.kbs_node_urls.is_empty() {
-                    *kms_client.write().await = Some(kms_client_with_anchor(
+                    *kms_client.write().await = Some(Arc::new(kms_client_with_anchor(
                         claimed.kbs_node_urls.clone(),
                         &kbs_retry(&config),
                         &claimed.scan_url,
                         &claimed.scan_public_key,
-                    ));
+                    )));
                 }
                 runtime = claimed;
             }
@@ -622,7 +622,7 @@ impl TappServiceImpl {
 /// awaiting the ClaimConfig RPC). Sources, in order of resolution:
 ///
 /// - config `owner_address` (legacy baked-in mode) — measured as a
-///   `claim_config` event the first time it takes effect in a boot (chain/kbs
+///   `claim_config` event the first time it takes effect in a boot (kbs
 ///   values from the same config are included in the measurement data);
 /// - the owner persisted by a previous tapp-server process of the SAME boot
 ///   (restored silently: its claim_config event is already in this boot's
@@ -634,8 +634,6 @@ pub async fn establish_owner_at_startup(
     pm: &Arc<permission::PermissionManager>,
     measurement_service: &Arc<measurement_service::MeasurementService>,
     config_owner: Option<&str>,
-    chain_rpc_url: &str,
-    chain_contract_address: &str,
     kbs_node_urls: &[String],
 ) -> Result<Option<String>, String> {
     let config_owner =
@@ -668,8 +666,6 @@ pub async fn establish_owner_at_startup(
             let measurement_data = serde_json::json!({
                 "operation": measurement_service::OPERATION_NAME_CLAIM_CONFIG,
                 "owner": owner,
-                "chain_rpc_url": chain_rpc_url,
-                "chain_contract_address": chain_contract_address,
                 "kbs_node_urls": kbs_node_urls,
                 "timestamp": utils::current_timestamp()
             })
@@ -1348,30 +1344,10 @@ impl TappService for TappServiceImpl {
             None
         };
 
-        // Chain: prefer runtime (from claim), fall back to static config
-        let live_chain_rpc = if !runtime.chain_rpc_url.is_empty() {
-            runtime.chain_rpc_url.clone()
-        } else {
-            self.config.chain.as_ref().map(|c| c.rpc_url.clone()).unwrap_or_default()
-        };
-        let live_chain_contract = if !runtime.chain_contract_address.is_empty() {
-            runtime.chain_contract_address.clone()
-        } else {
-            self.config.chain.as_ref().map(|c| c.contract_address.clone()).unwrap_or_default()
-        };
         // Trust anchors have no config.toml fallback by design — see ClaimedRuntimeConfig.
         let scan_url = runtime.scan_url.clone();
         let scan_public_key = runtime.scan_public_key.clone();
         drop(runtime);
-
-        let chain_config = if !live_chain_rpc.is_empty() || !live_chain_contract.is_empty() {
-            Some(ChainConfigInfo {
-                rpc_url: live_chain_rpc,
-                contract_address: live_chain_contract,
-            })
-        } else {
-            None
-        };
 
         // Build complete config info
         let config_info = TappConfigInfo {
@@ -1380,7 +1356,6 @@ impl TappService for TappServiceImpl {
             boot: Some(boot_config),
             kbs: kbs_config,
             kbs_enabled,
-            chain: chain_config,
             scan_url: scan_url.clone(),
             scan_public_key: scan_public_key.clone(),
         };
@@ -1626,7 +1601,7 @@ impl TappService for TappServiceImpl {
         let (scan_url, scan_public_key) = scan.unwrap_or_default();
 
         // Extend runtime measurement — includes the full config so verifiers
-        // see owner + chain + kbs in one event. On failure the claim is rolled
+        // see owner + kbs + TLS + scan anchor in one event. On failure the claim is rolled
         // back so the tapp stays claimable.
         // The cluster the node will actually use, not just what this request named: the KMS
         // client is only replaced when the request supplies urls, so a claim that supplies
@@ -1647,8 +1622,6 @@ impl TappService for TappServiceImpl {
         let measurement_data = serde_json::json!({
             "operation": measurement_service::OPERATION_NAME_CLAIM_CONFIG,
             "owner": owner,
-            "chain_rpc_url": req.chain_rpc_url,
-            "chain_contract_address": req.chain_contract_address,
             "kbs_node_urls": effective_kbs,
             "tls_key_source": tls_key_source.as_str(),
             "scan_url": scan_url,
@@ -1674,8 +1647,6 @@ impl TappService for TappServiceImpl {
 
         // Store runtime config so get-tapp-info can show live values.
         *self.claimed_runtime_config.write().await = ClaimedRuntimeConfig {
-            chain_rpc_url: req.chain_rpc_url.clone(),
-            chain_contract_address: req.chain_contract_address.clone(),
             kbs_node_urls: effective_kbs.clone(),
             tls_key_source: tls_key_source.as_str().to_string(),
             scan_url: scan_url.clone(),
@@ -1693,12 +1664,12 @@ impl TappService for TappServiceImpl {
                 anchored = !scan_url.is_empty(),
                 "Initializing KMS client from ClaimConfig"
             );
-            *self.kms_client.write().await = Some(kms_client_with_anchor(
+            *self.kms_client.write().await = Some(Arc::new(kms_client_with_anchor(
                 effective_kbs.clone(),
                 &kbs_retry(&self.config),
                 &scan_url,
                 &scan_public_key,
-            ));
+            )));
         }
 
         // Persist so a process restart within this boot cannot reopen the claim.
@@ -1709,7 +1680,6 @@ impl TappService for TappServiceImpl {
 
         info!(
             owner = %owner,
-            chain_contract = %req.chain_contract_address,
             kbs_nodes = req.kbs_node_urls.len(),
             event = "CONFIG_CLAIMED",
             "Tapp config claimed and measurement extended"
@@ -1769,8 +1739,6 @@ impl TappService for TappServiceImpl {
                     .unwrap_or_default()
             };
             ClaimedRuntimeConfig {
-                chain_rpc_url: current.chain_rpc_url.clone(),
-                chain_contract_address: current.chain_contract_address.clone(),
                 tls_key_source: current.tls_key_source.clone(),
                 kbs_node_urls,
                 scan_url,
@@ -1821,12 +1789,12 @@ impl TappService for TappServiceImpl {
                 scan = %resulting.scan_url,
                 "Replacing KMS client from UpdateTrustAnchors"
             );
-            *self.kms_client.write().await = Some(kms_client_with_anchor(
+            *self.kms_client.write().await = Some(Arc::new(kms_client_with_anchor(
                 resulting.kbs_node_urls.clone(),
                 &kbs_retry(&self.config),
                 &resulting.scan_url,
                 &resulting.scan_public_key,
-            ));
+            )));
         }
 
         info!(
