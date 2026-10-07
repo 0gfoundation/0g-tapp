@@ -156,19 +156,31 @@ mod onchain_visibility_tests {
     /// restart replaced it on chain.
     const SIGNER_NOT_YET: &str = r#"{"error":"invalid signature: recovered address 0x2da59224845da5c33e114d2d428c9dc68c4ee0e3 not in on-chain signer list for app tapp-kmssync-test"}"#;
     /// With attested admission on: the scan answered 404 for a signer it has not synced yet
-    /// (0g-kms `KmsError::NotAttested`, src/verifier.rs), and the KMS's damped repeat of it.
+    /// (0g-kms `KmsError::NotAttested`, src/verifier.rs).
     const VERIFIER_NOT_YET: &str = r#"{"error":"attestation required: attestation not verified: not registered on-chain per verifier"}"#;
-    const VERIFIER_DAMPED: &str = r#"{"error":"attestation required: attestation not verified (recently checked)"}"#;
+    /// A damped repeat from a KMS that says why (0g-kms#15 after 1dae41b)...
+    const VERIFIER_DAMPED_NOT_YET: &str = r#"{"error":"attestation required: attestation not verified (recently checked): not registered on-chain per verifier"}"#;
+    const VERIFIER_DAMPED_REFUSAL: &str = r#"{"error":"attestation required: attestation not verified (recently checked): the TD runs with DEBUG: its host can read and write its memory"}"#;
+    /// ...and from one that does not. It turns into the real answer within the KMS's 30s
+    /// damping, so it is waited on: a lasting refusal then fails fast on that answer.
+    const VERIFIER_DAMPED_BARE: &str = r#"{"error":"attestation required: attestation not verified (recently checked)"}"#;
+    /// The scan has a result stored from before it recorded the DEBUG attribute and has not
+    /// re-attested the node yet (0g-tapp-verifier#16, scan/src/api.rs).
+    const VERIFIER_REATTESTING: &str = r#"{"error":"attestation required: attestation not verified: the TD's DEBUG attribute is not known for this result; it needs re-attesting"}"#;
 
     #[test]
     fn the_transient_answers_are_recognised_and_other_4xx_are_not() {
-        assert_eq!(not_onchain_yet(APP_NOT_YET).map(|n| n.what), Some("this app"));
-        assert_eq!(not_onchain_yet(SIGNER_NOT_YET).map(|n| n.what), Some("this node's signer"));
+        let what = |body| not_onchain_yet(body).map(|n| n.what);
+        assert_eq!(what(APP_NOT_YET), Some("this app on-chain"));
+        assert_eq!(what(SIGNER_NOT_YET), Some("this node's signer on-chain"));
         // Attested admission (0g-kms src/verifier.rs): the verifier has not synced the
-        // updateNode yet, and the KMS's damped repeat of that — waited on only as a follow-up.
-        let lag = not_onchain_yet(VERIFIER_NOT_YET).unwrap();
-        assert!(!lag.follow_up);
-        assert!(not_onchain_yet(VERIFIER_DAMPED).unwrap().follow_up);
+        // updateNode yet, or has not re-attested the node.
+        for lag in [VERIFIER_NOT_YET, VERIFIER_DAMPED_NOT_YET, VERIFIER_DAMPED_BARE] {
+            assert_eq!(what(lag), Some("this node's signer at the verifier"), "{lag}");
+        }
+        assert_eq!(what(VERIFIER_REATTESTING), Some("this node's evidence re-attested by the verifier"));
+        // A damped repeat that names a lasting reason fails fast, like the reason itself.
+        assert!(not_onchain_yet(VERIFIER_DAMPED_REFUSAL).is_none());
 
         // Everything else must keep failing fast — the KMS's own other bodies (0g-kms
         // src/error.rs). None of these change by waiting, and waiting on them would turn a
@@ -350,16 +362,12 @@ pub struct KmsClient {
 /// in the KMS's own cache or, with attested admission on, in the verifier's.
 /// Distinguished from every other 4xx because it resolves on its own, given time.
 #[derive(Debug, thiserror::Error)]
-#[error("the KMS has not seen {what} on-chain yet")]
+#[error("the KMS has not seen {what} yet")]
 struct NotOnChainYet {
     what: &'static str,
-    /// Only meaningful once a real not-yet was seen in this wait: the KMS's 30s damping of
-    /// a negative verdict, which repeats the earlier "not registered per verifier" without
-    /// saying so. Alone, it is just as likely a lasting refusal.
-    follow_up: bool,
 }
 
-/// Recognise the two conditions in the KMS's answer that only waiting resolves:
+/// Recognise the answers from the KMS that only waiting resolves. Without attested admission:
 ///
 /// - 404 `{"error":"app not found on-chain: <id>"}` — no nodes for the app at all;
 /// - 401 `{"error":"invalid signature: recovered address 0x… not in on-chain signer list for
@@ -370,25 +378,34 @@ struct NotOnChainYet {
 /// this; the deadline message says both. Matching the KMS's prose is the only signal on the
 /// wire, and it is pinned in tests so a wording change on either side shows up as a failure.
 ///
-/// With attested admission on (0g-kms#15) a third: 403 `{"error":"attestation required:
-/// attestation not verified: not registered on-chain per verifier"}` — the KMS found the
-/// signer in its own list, but the verifier has not synced the `updateNode` yet. Every other
-/// "attestation required" reason (a DEBUG TD, an unpublished or dev image) is final and fails
-/// fast, except the KMS's damped repeat of this one, `attestation not verified (recently
-/// checked)`, which is waited on only after this one was seen.
+/// With attested admission on (0g-kms#15), 403 `{"error":"attestation required: …"}` with:
+///
+/// - `not registered on-chain per verifier` — the KMS found the signer in its own list, but
+///   the verifier has not synced the `updateNode` yet;
+/// - `the TD's DEBUG attribute is not known for this result; it needs re-attesting` — the
+///   verifier holds a result from before it recorded that attribute (0g-tapp-verifier#16);
+/// - `attestation not verified (recently checked)` with no reason after it — the damped repeat
+///   of an older KMS, which turns into the real answer within its 30s damping.
+///
+/// Every other "attestation required" reason (a DEBUG TD, an unpublished or dev image), and a
+/// damped repeat that names one, is final and fails fast.
 fn not_onchain_yet(body: &str) -> Option<NotOnChainYet> {
-    let not_yet = |what| Some(NotOnChainYet { what, follow_up: false });
-    if body.contains("app not found on-chain") {
-        not_yet("this app")
+    const DAMPED: &str = "attestation not verified (recently checked)";
+    let damped_bare = body
+        .find(DAMPED)
+        .is_some_and(|i| !body[i + DAMPED.len()..].starts_with(':'));
+    let what = if body.contains("app not found on-chain") {
+        "this app on-chain"
     } else if body.contains("not in on-chain signer list") {
-        not_yet("this node's signer")
-    } else if body.contains("not registered on-chain per verifier") {
-        not_yet("this node's signer (at the verifier)")
-    } else if body.contains("attestation not verified (recently checked)") {
-        Some(NotOnChainYet { what: "this node's signer (at the verifier)", follow_up: true })
+        "this node's signer on-chain"
+    } else if body.contains("not registered on-chain per verifier") || damped_bare {
+        "this node's signer at the verifier"
+    } else if body.contains("DEBUG attribute is not known for this result") {
+        "this node's evidence re-attested by the verifier"
     } else {
-        None
-    }
+        return None;
+    };
+    Some(NotOnChainYet { what })
 }
 
 impl KmsClient {
@@ -514,27 +531,21 @@ impl KmsClient {
         let deadline =
             std::time::Instant::now() + std::time::Duration::from_millis(self.onchain_wait_ms);
         let mut delay = std::time::Duration::from_secs(5);
-        let mut waiting = false;
         loop {
             match self
                 .get_encrypted_secret_once(app_id, timestamp, pubkey_hex, signature_hex, material)
                 .await
             {
                 Ok(v) => return Ok(v),
-                // A damped repeat with nothing before it to repeat is a refusal like any other.
-                Err(e) if e.downcast_ref::<NotOnChainYet>().is_some_and(|n| n.follow_up && !waiting) => {
-                    return Err(e)
-                }
                 Err(e) if e.downcast_ref::<NotOnChainYet>().is_some() => {
-                    waiting = true;
-                    let what = e.downcast_ref::<NotOnChainYet>().map(|n| n.what).unwrap_or("this app");
+                    let what = e.downcast_ref::<NotOnChainYet>().map(|n| n.what).unwrap_or("this app on-chain");
                     let left = deadline.saturating_duration_since(std::time::Instant::now());
                     if left.is_zero() {
                         // Say what is actually known: the KMS did not see it for the whole
                         // window. Whether it is registered at all is the caller's next
                         // question, and the old message answered it for them, wrongly.
                         return Err(anyhow!(
-                            "the KMS did not see {} of '{}' on-chain within {}s. If it was \
+                            "the KMS did not see {} for '{}' within {}s. If it was \
                              registered or replaced just now, the change may still be \
                              propagating — retry. If it never was, register it first \
                              (start-app --register-onchain).",
@@ -549,7 +560,7 @@ impl KmsClient {
                         wait_s = nap.as_secs(),
                         remaining_s = left.as_secs(),
                         what,
-                        "not visible to the KMS yet (its on-chain view is cached); waiting"
+                        "not visible to the KMS yet (its view of the chain lags); waiting"
                     );
                     tokio::time::sleep(nap).await;
                     delay = (delay * 2).min(std::time::Duration::from_secs(30));
