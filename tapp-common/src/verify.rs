@@ -47,12 +47,20 @@ pub struct NodeVerdict {
     /// a node believes is the operator's decision, but it is measured, so it is auditable —
     /// and a node with none configured cannot check KMS node identity at all.
     pub trust_anchors: Option<TrustAnchors>,
+    /// A restarted tapp-server took over state for this app (`apps_resumed`) that is neither
+    /// the latest state this boot measured for it nor the one before: its state file was
+    /// written by something else. See `eventlog_app_resumed_differently`.
+    pub app_resumed_differently: bool,
     pub note: String,
 }
 
 impl NodeVerdict {
     pub fn reconciled(&self) -> bool {
-        self.signer_ok && self.compose_ok && self.volumes_ok && self.image_ok
+        self.signer_ok
+            && self.compose_ok
+            && self.volumes_ok
+            && self.image_ok
+            && !self.app_resumed_differently
     }
 }
 
@@ -491,6 +499,50 @@ pub struct TrustAnchors {
     pub config_unreadable: bool,
 }
 
+/// Whether a restarted tapp-server took over state for `app_id` that differs from what
+/// this boot's events left for it.
+///
+/// tapp-server keeps its apps on tmpfs so that a process restart within a boot still knows
+/// them, and measures what it read back (`apps_resumed`) because that file sits outside the
+/// measurement. Replaying start_app / start_service / stop_app gives what the file may hold:
+/// the state after the latest of them, or the one before it — tapp-server records a change
+/// only after measuring it, so a process stopped in between leaves the previous state. An
+/// `apps_resumed` entry that is anything else — another owner, a compose or image never
+/// started, an app this boot never started, or an older state rolled back to — means the
+/// file was written by something other than tapp-server.
+fn eventlog_app_resumed_differently(cc_eventlog_b64: &str, app_id: &str) -> Result<bool> {
+    let fields = |v: &serde_json::Value| {
+        ["deployer", "compose_hash", "volumes_hash", "image_hash"].map(|k| v[k].clone())
+    };
+    let mut states = Vec::new();
+    let mut differs = false;
+    let events = eventlog_tapp_events_of(
+        cc_eventlog_b64,
+        &["start_app", "start_service", "stop_app", "apps_resumed"],
+    )?;
+    for (op, v) in &events {
+        if op == "apps_resumed" {
+            let resumed = v["apps"].as_array().into_iter().flatten();
+            let possible = &states[states.len().saturating_sub(2)..];
+            for a in resumed.filter(|a| a["app_id"].as_str() == Some(app_id)) {
+                differs |= !possible.contains(&fields(a));
+            }
+        } else if v["app_id"].as_str() == Some(app_id) && v["result"].as_str() == Some("success") {
+            states.push(match op.as_str() {
+                // A stop keeps the owner and clears the rest (BootService::stop_app).
+                "stop_app" => [
+                    v["deployer"].clone(),
+                    serde_json::json!(""),
+                    serde_json::json!({}),
+                    serde_json::json!({}),
+                ],
+                _ => fields(v),
+            });
+        }
+    }
+    Ok(differs)
+}
+
 /// The anchors in force, read from the newest event that sets them.
 ///
 /// `update_trust_anchors` events carry the resulting state in full, so the newest one is
@@ -854,6 +906,7 @@ pub async fn verify_app(
             boot_measurements: Vec::new(),
             owner_claim: None,
             trust_anchors: None,
+            app_resumed_differently: false,
             note: String::new(),
         };
 
@@ -943,6 +996,11 @@ pub async fn verify_app(
 
         if let Ok(anchors) = eventlog_trust_anchors(cc_b64) {
             v.trust_anchors = anchors;
+        }
+
+        match eventlog_app_resumed_differently(cc_b64, app_id) {
+            Ok(differs) => v.app_resumed_differently = differs,
+            Err(e) => v.note = format!("{}apps_resumed: {}", v.note, e),
         }
 
         nodes.push(v);
@@ -1162,11 +1220,95 @@ mod tests {
 }
 
 #[cfg(test)]
+mod resumed_apps_tests {
+    use super::resumed_claim_tests::log_of;
+    use super::*;
+
+    fn op(op: &str, app: &str, deployer: &str, compose: &str, image: &str) -> String {
+        format!(
+            r#"tapp.0g.com {op} {{"app_id":"{app}","operation":"{op}","result":"success","compose_hash":"{compose}","volumes_hash":{{"a.conf":"01"}},"image_hash":{{"web":"{image}"}},"deployer":"{deployer}"}}"#
+        )
+    }
+
+    fn resumed(apps: &[(&str, &str, &str, &str)]) -> String {
+        let list: Vec<_> = apps
+            .iter()
+            .map(|(app, deployer, compose, image)| {
+                let (volumes, images) = if compose.is_empty() {
+                    (serde_json::json!({}), serde_json::json!({}))
+                } else {
+                    (serde_json::json!({"a.conf": "01"}), serde_json::json!({"web": image}))
+                };
+                serde_json::json!({"app_id": app, "deployer": deployer, "compose_hash": compose,
+                                   "volumes_hash": volumes, "image_hash": images})
+            })
+            .collect();
+        format!(
+            "tapp.0g.com apps_resumed {}",
+            serde_json::json!({"operation": "apps_resumed", "apps": list, "timestamp": 1})
+        )
+    }
+
+    fn differs(events: &[String]) -> bool {
+        eventlog_app_resumed_differently(&log_of(events), "app").unwrap()
+    }
+
+    #[test]
+    fn a_resume_of_what_was_started_is_not_a_finding() {
+        assert!(!differs(&[op("start_app", "app", "0xa", "c1", "sha256:1"), resumed(&[("app", "0xa", "c1", "sha256:1")])]));
+        // A pulled image, then a stop: the resume follows both.
+        assert!(!differs(&[
+            op("start_app", "app", "0xa", "c1", "sha256:1"),
+            op("start_service", "app", "0xa", "c1", "sha256:2"),
+            resumed(&[("app", "0xa", "c1", "sha256:2")]),
+        ]));
+        assert!(!differs(&[
+            op("start_app", "app", "0xa", "c1", "sha256:1"),
+            op("stop_app", "app", "0xa", "c1", "sha256:1"),
+            resumed(&[("app", "0xa", "", "")]),
+        ]));
+        // A process that stopped between measuring a stop and recording it: an earlier,
+        // genuine state.
+        assert!(!differs(&[
+            op("start_app", "app", "0xa", "c1", "sha256:1"),
+            op("stop_app", "app", "0xa", "c1", "sha256:1"),
+            resumed(&[("app", "0xa", "c1", "sha256:1")]),
+        ]));
+        // Other apps in the list are theirs to answer for.
+        assert!(!differs(&[op("start_app", "app", "0xa", "c1", "sha256:1"), resumed(&[("app", "0xa", "c1", "sha256:1"), ("other", "0xb", "c9", "sha256:9")])]));
+        // No resume at all: nothing to judge.
+        assert!(!differs(&[op("start_app", "app", "0xa", "c1", "sha256:1")]));
+    }
+
+    #[test]
+    fn a_changed_state_file_shows() {
+        // Another owner, another compose, an image never pulled, an app never started.
+        assert!(differs(&[op("start_app", "app", "0xa", "c1", "sha256:1"), resumed(&[("app", "0xb", "c1", "sha256:1")])]));
+        assert!(differs(&[op("start_app", "app", "0xa", "c1", "sha256:1"), resumed(&[("app", "0xa", "c2", "sha256:1")])]));
+        assert!(differs(&[op("start_app", "app", "0xa", "c1", "sha256:1"), resumed(&[("app", "0xa", "c1", "sha256:2")])]));
+        assert!(differs(&[resumed(&[("app", "0xa", "c1", "sha256:1")])]));
+        // Rolled back two changes: a genuine state, but not one a crash can leave.
+        assert!(differs(&[
+            op("start_app", "app", "0xa", "c1", "sha256:1"),
+            op("start_service", "app", "0xa", "c1", "sha256:2"),
+            op("stop_app", "app", "0xa", "c1", "sha256:2"),
+            resumed(&[("app", "0xa", "c1", "sha256:1")]),
+        ]));
+        // And it stays a finding: a later start does not erase what the file held.
+        assert!(differs(&[
+            op("start_app", "app", "0xa", "c1", "sha256:1"),
+            resumed(&[("app", "0xb", "c1", "sha256:1")]),
+            op("start_app", "app", "0xa", "c1", "sha256:1"),
+        ]));
+    }
+}
+
+#[cfg(test)]
 mod resumed_claim_tests {
     use super::*;
 
     /// A minimal CCEL: the header the walkers skip, then one tapp event per entry.
-    fn log_of(events: &[String]) -> String {
+    pub(super) fn log_of(events: &[String]) -> String {
         let mut b = vec![0u8; 28];
         b.extend_from_slice(&0u32.to_le_bytes());
         for text in events {

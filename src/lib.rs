@@ -79,18 +79,9 @@ impl ClaimedRuntimeConfig {
         Some(permission.owner_state_path.with_file_name("claimed_config.json"))
     }
 
-    /// Written whole and renamed into place, so a crash mid-write leaves the previous
-    /// version rather than half of a new one. The temporary name is unique per write:
-    /// two overlapping writes sharing one could rename each other's half-written file.
+    /// Written whole and renamed into place (see `utils::write_state_file`).
     pub fn save(&self, path: &std::path::Path) -> std::io::Result<()> {
-        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let tmp = path.with_extension(format!("json.{}.{}.tmp", std::process::id(), seq));
-        std::fs::write(&tmp, serde_json::to_vec(self).map_err(std::io::Error::other)?)?;
-        std::fs::rename(&tmp, path)
+        utils::write_state_file(path, &serde_json::to_vec(self).map_err(std::io::Error::other)?)
     }
 
     /// `Ok(None)` when nothing was claimed this boot (or by a tapp-server that did not
@@ -498,8 +489,14 @@ impl TappServiceImpl {
         let task_manager = Arc::new(task_manager::TaskManager::new());
 
         // Initialize BootService with measurement_service and task_manager
-        let boot_service =
-            Arc::new(BootService::new(measurement_service.clone(), task_manager).await?);
+        let boot_service = Arc::new(
+            BootService::new(
+                measurement_service.clone(),
+                task_manager,
+                BootService::state_path(&config),
+            )
+            .await?,
+        );
 
         // Initialize AppKeyService (always in-memory, independent of KBS).
         // Arc because volume-key derivation runs inside the spawned start task,

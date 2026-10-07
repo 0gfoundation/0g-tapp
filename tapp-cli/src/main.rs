@@ -2469,6 +2469,12 @@ async fn verify_app_cmd(
         if n.trust_anchors.as_ref().is_some_and(|a| a.resumed_differently) {
             all_ok = false;
         }
+        if n.app_resumed_differently {
+            println!(
+                "    resumed    : ✗ a restarted tapp-server took over state for this app that no \
+                 start or stop of this boot produced — its state file was written by something else"
+            );
+        }
         if show_boot {
             if let Some(l) = boot_chain_line(n.boot_executables, show_boot) {
                 println!("    {}", l);

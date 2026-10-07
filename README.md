@@ -121,8 +121,8 @@ protect it, `docker.sock` mounts, `privileged`) and the CLI prints them; the
 app still starts. One kind of mount is **refused** outright: a writable bind
 mount reaching tapp-server's own state in `/run/tapp` — the directory itself,
 anything above it (`/run`, `/`, `/var/run`), or a file in it other than the
-socket. That is where the claimed owner, the trust anchors and the scratch key
-live, read back on a process restart without being re-measured. Mount
+socket. That is where the claimed owner, the trust anchors, the apps started this
+boot and the scratch key live, read back on a process restart. Mount
 `/run/tapp/tapp.sock` alone, or the directory read-only. On a KMS-configured node the start **fails** when the volume
 key cannot be fetched — an app never silently runs on a plaintext directory.
 The usual cause is ordering: the node must be registered on-chain for the app
@@ -225,6 +225,8 @@ Attestation evidence returned by `GetEvidence` commits the application's TEE-der
 | `nonce` | Caller-supplied challenge, echoed back. A quote is self-authenticating but undated, so without a challenge a cached quote is indistinguishable from a fresh one. Pass `get-evidence --nonce <hex>` (≤64 bytes, must be random). |
 | `signer` | The Ethereum address derived inside the enclave — the identity `TappRegistry` records. Verifiers match it against the registered `signerAddress` to prove a signed message and the on-chain identity come from the same app on this TEE. |
 | `tls_public_key` | sha256 of the app's TLS SubjectPublicKeyInfo, when it has one. This is what lets a client tie the certificate it was handed during a TLS handshake to a TEE running this app. |
+
+`GetEvidence` with an `app_id` answers for an app that was started this boot (running, or stopped since) and for one that is **being started**. The last is for the KMS's attested admission: before it releases an encrypted app's volume key, the KMS has the verifier check this node's evidence for the app, and the start is waiting for that key. Such evidence proves the app's signer is held in this TEE, not that the app runs — there is no `start_app` event for it yet, and reconciliation (verify-app, the scan) reads that event. A second `start-app` of an app that is being started is refused.
 
 Empty fields are omitted rather than serialised as `""`, so evidence produced before a field existed and after it are byte-identical whenever the field is unused. Two consequences for verifiers:
 
@@ -490,8 +492,14 @@ cannot invent one.
   the node as claimed. What it reads back is measured again as a `claim_resumed`
   event, so a state file changed between two processes shows in the evidence:
   verify-app reports a different owner as inconsistent, different trust anchors
-  as ✗, and a claimed config the restart found but could not read as ⚠️; a VM reboot clears both the state and the RTMRs, so a rebooted
-  node is claimable (and re-measured) again.
+  as ✗, and a claimed config the restart found but could not read as ⚠️; a VM reboot
+  clears both the state and the RTMRs, so a rebooted node is claimable (and
+  re-measured) again. The apps started this boot are kept the same way
+  (`/run/tapp/apps.json`), so a restarted process still serves their evidence, stops
+  them and checks their owner. They are measured on resume as `apps_resumed`, and
+  verify-app fails a node whose resumed state for the app is not the last one this
+  boot measured for it, or the one before (which a process stopped between measuring
+  a change and recording it leaves).
 - **Hijack window**: practically closed — don't expose :50051 before claiming
   (cloud firewall), and claim right after boot. Even if raced, the intruder's
   address is indelibly measured, your own claim fails immediately (instant
