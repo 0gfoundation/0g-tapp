@@ -1,7 +1,7 @@
 ---
 name: 0g-tapp-cli
 description: Use this skill when the user wants to deploy, manage, or troubleshoot applications on a 0G Tapp (Trusted Application Platform) server using tapp-cli. Covers start/stop apps, on-chain registration, registry login, check task status, view logs, and manage docker compose deployments across multiple remote TEE servers.
-version: 1.13.1
+version: 1.13.2
 author: 0G Labs
 tags: [0g, tapp, tee, docker, deployment, cli, onchain]
 ---
@@ -242,7 +242,7 @@ Scans `volumes:` and uploads sources starting with `./` (files or dirs, recursiv
 1. **`../` mount paths unsupported** → copy the file into the compose dir, use `./`.
 2. **`.env` not uploaded** (not in `volumes:`) → mount `./.env:/...:ro` in a service so it uploads; compose then finds it for `${VAR}` substitution. Missing a `${VAR:?}` var → compose fails at interpolation (`required variable X is missing`).
 3. **Private-registry images need login** on EACH server. The aliyun `cr_temp_user` tokens are **very short-lived** — `unauthorized: authentication required` on pull means re-`docker-login` with a fresh token. Token is account-wide (works on any server until it expires).
-4. **App already running** → `stop-app` before re-deploy.
+4. **App already running** → `stop-app` before re-deploy. **"already being started"** → a start of that app is still in flight (e.g. waiting for its KMS volume key); `get-task-status` it rather than starting again.
 
 ### Data volumes & encryption (FDE servers, 0g-tapp#107+)
 

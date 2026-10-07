@@ -144,6 +144,10 @@ for signer in nodes:
     log = base64.b64decode(j["cc_eventlog"]); o = 8 + 20
     ds, = struct.unpack_from('<I', log, o); o += 4 + ds
     last = None
+    # Every state this boot measured for the app, and whether a restarted tapp-server took
+    # over one it never measured (apps_resumed): its state file was written by something else.
+    fields = lambda d: [d.get(k) for k in ("deployer", "compose_hash", "volumes_hash", "image_hash")]
+    states, forged = [], False
     while o + 12 <= len(log):
         pcr, et = struct.unpack_from('<II', log, o); o += 8
         cnt, = struct.unpack_from('<I', log, o); o += 4
@@ -153,10 +157,17 @@ for signer in nodes:
         data = log[o:o+dl]; o += dl
         if et == 0x6 and dl >= 8:
             t = data[8:8 + struct.unpack_from('<I', data, 4)[0]].decode('utf-8', 'replace')
-            if t.startswith("tapp.0g.com start_app"):
+            op = t.split(" ", 2)[1] if t.startswith("tapp.0g.com ") else ""
+            if op == "apps_resumed":
                 d = json.loads(t.split(" ", 2)[2])
-                if d.get("app_id") == APP and d.get("compose_hash") == compose_hex and d["result"] == "success":
-                    last = d
+                forged |= any(fields(a) not in states for a in d.get("apps", []) if a.get("app_id") == APP)
+            elif op in ("start_app", "start_service", "stop_app"):
+                d = json.loads(t.split(" ", 2)[2])
+                if d.get("app_id") == APP and d.get("result") == "success":
+                    # A stop keeps the owner and clears the rest.
+                    states.append([d.get("deployer"), "", {}, {}] if op == "stop_app" else fields(d))
+                    if op == "start_app" and d.get("compose_hash") == compose_hex:
+                        last = d
     if not last:
         print("  4. FAIL: no successful start_app whose compose matches the chain")
         all_ok = False; continue
@@ -169,6 +180,9 @@ for signer in nodes:
     print(f"  4. signer={ok(sig_ok)}  compose={ok(cmp_ok)}  "
           f"volumes={ok(vol_ok)}  image={ok(img_ok)}"
           + ("" if fresh is None else f"  challenge={'echoed' if fresh else 'NOT echoed'}"))
+    if forged:
+        print("     FAIL: a restarted tapp-server took over state for this app that no start or "
+              "stop of this boot produced — its state file was written by something else")
     if tls_pubkey:
         # This is the thread tying "the TEE I verified" to "the endpoint I am talking to":
         # compare it against the sha256 of the public key offered during the handshake.
@@ -181,7 +195,7 @@ for signer in nodes:
 
     # A challenge that was not echoed means this quote was not produced for this request,
     # which is as hard a failure as a measurement that does not reconcile.
-    node_ok = all([sig_ok, cmp_ok, vol_ok, img_ok]) and fresh is not False
+    node_ok = all([sig_ok, cmp_ok, vol_ok, img_ok, not forged]) and fresh is not False
     quote_ok = (as_status == "affirming")
     all_ok &= node_ok
     print(f"  => reconcile {'PASS' if node_ok else 'FAIL'} ; "

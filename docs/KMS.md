@@ -94,6 +94,12 @@ That makes the on-chain node list the entire authorization model:
 - A node that reboots re-derives its signer, no longer matches its
   registration, and is locked out until `update-node-onchain` syncs the chain —
   KMS refusals after a reboot are this, not a network problem.
+- With attested admission on (0g-kms#15), the KMS also has the verifier check the
+  node's evidence for the app before it answers. tapp-server serves that evidence
+  while the app is still being started (≥ 0.8.2), which an encrypted app needs: its
+  start waits for the volume key. Older servers refuse evidence for an app that is
+  not running yet, so the start deadlocks; every node fetching keys from a gated KMS
+  must run ≥ 0.8.2 before the gate is turned on (#145).
 - Nobody — including the cluster operators — can mint an app's key for an
   unregistered address without `t` colluding TEEs deviating from their measured
   code.
