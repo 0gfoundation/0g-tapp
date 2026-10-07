@@ -532,10 +532,12 @@ impl TappServiceImpl {
         };
 
         // A process restart within this boot resumes the claimed config, and the KMS
-        // client built from it, exactly as the claim left them. Not measured again: the
-        // claim_config / update_trust_anchors events are already in this boot's event log.
+        // client built from it, exactly as the claim left them — and measures what it took
+        // over (claim_resumed, below).
+        let mut config_resumed = false;
         match ClaimedRuntimeConfig::state_path(&config).map(|p| ClaimedRuntimeConfig::load(&p)) {
             Some(Ok(Some(claimed))) => {
+                config_resumed = true;
                 info!(
                     kbs_nodes = claimed.kbs_node_urls.len(),
                     tls_key_source = %claimed.tls_key_source,
@@ -573,14 +575,25 @@ impl TappServiceImpl {
                 "tls_key_source": runtime.tls_key_source,
                 "scan_url": runtime.scan_url,
                 "scan_public_key": runtime.scan_public_key,
+                // False: there was no claimed config to take over (a tapp-server that
+                // persisted only the owner ran before this one), so these are
+                // config.toml's values — not carried over, which is not "changed".
+                "config_resumed": config_resumed,
                 "timestamp": utils::current_timestamp()
             })
             .to_string();
+            // Fail closed: running on state read back from tmpfs without measuring it is
+            // the gap this event exists to close. Exiting lets the supervisor retry.
             if let Err(e) = measurement_service
                 .extend_measurement(measurement_service::OPERATION_NAME_CLAIM_RESUMED, &data)
                 .await
             {
-                error!(error = %e, "Failed to measure the resumed claim");
+                error!(error = %e, "Failed to measure the resumed claim; refusing to run on it unmeasured");
+                return Err(std::io::Error::other(format!(
+                    "could not measure the resumed claim: {}",
+                    e
+                ))
+                .into());
             }
         }
         let claimed_runtime_config = Arc::new(tokio::sync::RwLock::new(runtime));

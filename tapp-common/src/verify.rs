@@ -474,8 +474,16 @@ pub struct TrustAnchors {
     /// to see, and the reason these events carry the resulting state rather than a delta.
     pub revisions: usize,
     /// A restarted process took over anchors that differ from what the claim or the last
-    /// update before it set: the state file was changed between the two processes.
+    /// update before it set: the state file was changed between the two processes. Cleared
+    /// by a later update, which measures the anchors in force again.
     pub resumed_differently: bool,
+    /// The above happened at some point this boot, even if an update has re-set the
+    /// anchors since — history a reader should still see.
+    pub ever_resumed_differently: bool,
+    /// A restart had no claimed config to take over (the tapp-server before it persisted
+    /// only the owner), so it ran on config.toml's values: not carried over, not changed.
+    /// Cleared by a later update, as above.
+    pub not_carried_over: bool,
 }
 
 /// The anchors in force, read from the newest event that sets them.
@@ -497,13 +505,23 @@ fn eventlog_trust_anchors(cc_eventlog_b64: &str) -> Result<Option<TrustAnchors>>
     };
     let mut revisions = 0;
     let mut resumed_differently = false;
+    let mut ever_resumed_differently = false;
+    let mut not_carried_over = false;
     let mut source: Option<&serde_json::Value> = None;
     for (op, v) in &events {
         match op.as_str() {
-            "update_trust_anchors" => revisions += 1,
+            "update_trust_anchors" => {
+                revisions += 1;
+                resumed_differently = false;
+                not_carried_over = false;
+            }
             "claim_resumed" => {
-                if source.is_some_and(|prev| anchors_of(prev) != anchors_of(v)) {
+                // Absent in events from before the field existed: those always carried it.
+                if v["config_resumed"].as_bool() == Some(false) {
+                    not_carried_over = true;
+                } else if source.is_some_and(|prev| anchors_of(prev) != anchors_of(v)) {
                     resumed_differently = true;
+                    ever_resumed_differently = true;
                 }
             }
             _ => {}
@@ -513,6 +531,8 @@ fn eventlog_trust_anchors(cc_eventlog_b64: &str) -> Result<Option<TrustAnchors>>
     let Some(source) = source else { return Ok(None) };
     Ok(Some(TrustAnchors {
         resumed_differently,
+        ever_resumed_differently,
+        not_carried_over,
         kbs_node_urls: source["kbs_node_urls"]
             .as_array()
             .map(|a| {
@@ -1185,6 +1205,29 @@ mod resumed_claim_tests {
         let a = eventlog_trust_anchors(&log).unwrap().unwrap();
         assert!(a.resumed_differently);
         assert_eq!(a.scan_url, "https://evil");
+    }
+
+    #[test]
+    fn a_config_that_was_not_carried_over_is_not_called_changed() {
+        let mut resumed = ev("claim_resumed", "0xa", "");
+        resumed = resumed.replace(r#""scan_public_key""#, r#""config_resumed":false,"scan_public_key""#);
+        let log = log_of(&[ev("claim_config", "0xa", "https://s1"), resumed]);
+        let a = eventlog_trust_anchors(&log).unwrap().unwrap();
+        assert!(a.not_carried_over);
+        assert!(!a.resumed_differently);
+    }
+
+    #[test]
+    fn a_later_update_clears_the_finding_but_not_its_history() {
+        let log = log_of(&[
+            ev("claim_config", "0xa", "https://s1"),
+            ev("claim_resumed", "0xa", "https://evil"),
+            ev("update_trust_anchors", "0xa", "https://s1"),
+        ]);
+        let a = eventlog_trust_anchors(&log).unwrap().unwrap();
+        assert!(!a.resumed_differently);
+        assert!(a.ever_resumed_differently);
+        assert_eq!(a.scan_url, "https://s1");
     }
 
     #[test]

@@ -1676,6 +1676,19 @@ fn print_trust_anchors(
              update set — its state file was changed in between",
             indent, pad
         );
+    } else if a.ever_resumed_differently {
+        println!(
+            "{}{}⚠️  earlier this boot a restart took over different anchors than were set; \
+             update-trust-anchors has re-set them since",
+            indent, pad
+        );
+    }
+    if a.not_carried_over {
+        println!(
+            "{}{}⚠️  a restart found no claimed config to take over (e.g. the tapp-server before \
+             it kept only the owner): these are config.toml's values",
+            indent, pad
+        );
     }
     if a.revisions > 0 {
         println!(
