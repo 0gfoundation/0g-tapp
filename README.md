@@ -492,8 +492,8 @@ cannot invent one.
   `/run` (tmpfs) — a tapp-server process restart cannot reopen the claim and resumes
   the node as claimed. What it reads back is measured again as a `claim_resumed`
   event, so a state file changed between two processes shows in the evidence:
-  verify-app reports a different owner as inconsistent and different trust anchors
-  as ✗; a VM reboot clears both the state and the RTMRs, so a rebooted
+  verify-app reports a different owner as inconsistent, different trust anchors
+  as ✗, and a claimed config the restart found but could not read as ⚠️; a VM reboot clears both the state and the RTMRs, so a rebooted
   node is claimable (and re-measured) again.
 - **Hijack window**: practically closed — don't expose :50051 before claiming
   (cloud firewall), and claim right after boot. Even if raced, the intruder's

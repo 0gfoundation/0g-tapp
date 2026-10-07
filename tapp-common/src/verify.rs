@@ -484,6 +484,11 @@ pub struct TrustAnchors {
     /// only the owner), so it ran on config.toml's values: not carried over, not changed.
     /// Cleared by a later update, as above.
     pub not_carried_over: bool,
+    /// A restart found the claimed config but could not read it — damaged, or written by
+    /// something other than tapp-server — and ran on config.toml's values. Those are what
+    /// this reports, so nothing is hidden, but the file was not what tapp-server left.
+    /// Cleared by a later update, as above.
+    pub config_unreadable: bool,
 }
 
 /// The anchors in force, read from the newest event that sets them.
@@ -507,6 +512,7 @@ fn eventlog_trust_anchors(cc_eventlog_b64: &str) -> Result<Option<TrustAnchors>>
     let mut resumed_differently = false;
     let mut ever_resumed_differently = false;
     let mut not_carried_over = false;
+    let mut config_unreadable = false;
     let mut source: Option<&serde_json::Value> = None;
     for (op, v) in &events {
         match op.as_str() {
@@ -514,10 +520,15 @@ fn eventlog_trust_anchors(cc_eventlog_b64: &str) -> Result<Option<TrustAnchors>>
                 revisions += 1;
                 resumed_differently = false;
                 not_carried_over = false;
+                config_unreadable = false;
             }
             "claim_resumed" => {
                 // Absent in events from before the field existed: those always carried it.
-                if v["config_resumed"].as_bool() == Some(false) {
+                // `false` is what the first version of the field wrote for "absent".
+                let resumed = &v["config_resumed"];
+                if resumed == "unreadable" {
+                    config_unreadable = true;
+                } else if resumed == "absent" || resumed.as_bool() == Some(false) {
                     not_carried_over = true;
                 } else if source.is_some_and(|prev| anchors_of(prev) != anchors_of(v)) {
                     resumed_differently = true;
@@ -533,6 +544,7 @@ fn eventlog_trust_anchors(cc_eventlog_b64: &str) -> Result<Option<TrustAnchors>>
         resumed_differently,
         ever_resumed_differently,
         not_carried_over,
+        config_unreadable,
         kbs_node_urls: source["kbs_node_urls"]
             .as_array()
             .map(|a| {
@@ -1215,6 +1227,33 @@ mod resumed_claim_tests {
         let a = eventlog_trust_anchors(&log).unwrap().unwrap();
         assert!(a.not_carried_over);
         assert!(!a.resumed_differently);
+    }
+
+    #[test]
+    fn an_unreadable_config_is_told_apart_from_an_absent_one() {
+        let with = |state: &str| {
+            ev("claim_resumed", "0xa", "").replace(
+                r#""scan_public_key""#,
+                &format!(r#""config_resumed":{state},"scan_public_key""#),
+            )
+        };
+        let a = eventlog_trust_anchors(&log_of(&[ev("claim_config", "0xa", "https://s1"), with(r#""absent""#)]))
+            .unwrap()
+            .unwrap();
+        assert!(a.not_carried_over && !a.config_unreadable && !a.resumed_differently);
+        let a = eventlog_trust_anchors(&log_of(&[ev("claim_config", "0xa", "https://s1"), with(r#""unreadable""#)]))
+            .unwrap()
+            .unwrap();
+        assert!(a.config_unreadable && !a.not_carried_over && !a.resumed_differently);
+        // A later update measures the anchors in force again.
+        let a = eventlog_trust_anchors(&log_of(&[
+            ev("claim_config", "0xa", "https://s1"),
+            with(r#""unreadable""#),
+            ev("update_trust_anchors", "0xa", "https://s1"),
+        ]))
+        .unwrap()
+        .unwrap();
+        assert!(!a.config_unreadable);
     }
 
     #[test]

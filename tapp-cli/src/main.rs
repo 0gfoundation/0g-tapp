@@ -1683,6 +1683,13 @@ fn print_trust_anchors(
             indent, pad
         );
     }
+    if a.config_unreadable {
+        println!(
+            "{}{}⚠️  a restart found the claimed config but could not read it (damaged, or not \
+             written by tapp-server): these are config.toml's values",
+            indent, pad
+        );
+    }
     if a.not_carried_over {
         println!(
             "{}{}⚠️  a restart found no claimed config to take over (e.g. the tapp-server before \

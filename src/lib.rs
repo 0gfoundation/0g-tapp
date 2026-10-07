@@ -534,10 +534,14 @@ impl TappServiceImpl {
         // A process restart within this boot resumes the claimed config, and the KMS
         // client built from it, exactly as the claim left them — and measures what it took
         // over (claim_resumed, below).
-        let mut config_resumed = false;
+        // What `claim_resumed` records about the config: true when it was taken over,
+        // "absent" when there was none to take over (a tapp-server that persisted only the
+        // owner ran before this one), "unreadable" when the file is there but damaged — the
+        // case a verifier should not mistake for the benign one.
+        let mut config_resumed = serde_json::json!("absent");
         match ClaimedRuntimeConfig::state_path(&config).map(|p| ClaimedRuntimeConfig::load(&p)) {
             Some(Ok(Some(claimed))) => {
-                config_resumed = true;
+                config_resumed = serde_json::json!(true);
                 info!(
                     kbs_nodes = claimed.kbs_node_urls.len(),
                     tls_key_source = %claimed.tls_key_source,
@@ -559,11 +563,14 @@ impl TappServiceImpl {
             // claimed anchor the KMS client refuses unverified nodes, and get-tapp-info
             // shows what is in force. Refusing to start would leave the node unmanageable
             // until a reboot.
-            Some(Err(e)) => error!(
-                error = %e,
-                "Could not read the config claimed earlier this boot; running with config.toml \
-                 values. Re-apply the trust anchors with update-trust-anchors."
-            ),
+            Some(Err(e)) => {
+                config_resumed = serde_json::json!("unreadable");
+                error!(
+                    error = %e,
+                    "Could not read the config claimed earlier this boot; running with config.toml \
+                     values. Re-apply the trust anchors with update-trust-anchors."
+                )
+            }
         }
         // Measure what was taken over: the owner and config read back from tmpfs are
         // otherwise only as trustworthy as that directory. One event, after both are known.
@@ -575,9 +582,8 @@ impl TappServiceImpl {
                 "tls_key_source": runtime.tls_key_source,
                 "scan_url": runtime.scan_url,
                 "scan_public_key": runtime.scan_public_key,
-                // False: there was no claimed config to take over (a tapp-server that
-                // persisted only the owner ran before this one), so these are
-                // config.toml's values — not carried over, which is not "changed".
+                // Not true: these are config.toml's values, not carried over — which is
+                // not "changed". See config_resumed above for the two ways that happens.
                 "config_resumed": config_resumed,
                 "timestamp": utils::current_timestamp()
             })
