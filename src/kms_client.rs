@@ -576,7 +576,7 @@ impl KmsClient {
                         wait_s = nap.as_secs(),
                         remaining_s = left.as_secs(),
                         what,
-                        "not visible to the KMS yet (its view of the chain lags); waiting"
+                        "the KMS cannot vouch for this node yet (its view of the chain, or the verifier, lags); waiting"
                     );
                     tokio::time::sleep(nap).await;
                     delay = (delay * 2).min(std::time::Duration::from_secs(30));
