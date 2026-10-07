@@ -144,7 +144,7 @@ pub struct TappServiceImpl {
     pub app_key_service: Arc<app_key::AppKeyService>,
     /// KMS client, wrapped in RwLock so ClaimConfig can initialize it at runtime
     /// if kbs_node_urls were not baked into config.toml (dynamic mode).
-    pub kms_client: Arc<tokio::sync::RwLock<Option<kms_client::KmsClient>>>,
+    pub kms_client: Arc<tokio::sync::RwLock<Option<Arc<kms_client::KmsClient>>>>,
     pub nonce_manager: nonce_manager::NonceManager,
     pub logs_service: service_monitor::logs::LogsService,
     pub permission_manager: Option<Arc<permission::PermissionManager>>,
@@ -164,13 +164,17 @@ pub struct TappServiceImpl {
 /// volume path runs it inside the spawned start task, which holds clones of these
 /// two handles rather than `&self`.
 async fn kms_derive_with(
-    kms_client: &tokio::sync::RwLock<Option<kms_client::KmsClient>>,
+    kms_client: &tokio::sync::RwLock<Option<Arc<kms_client::KmsClient>>>,
     app_key_service: &app_key::AppKeyService,
     app_id: &str,
     material: &str,
 ) -> Result<Vec<u8>, Status> {
-    let kms_guard = kms_client.read().await;
-    let kms = kms_guard.as_ref().ok_or_else(|| {
+    // The client is taken out of the lock, not used under it: a fetch can now wait minutes
+    // for the KMS to see a registration, and a held read guard would block every claim and
+    // trust-anchor update behind it (tokio's RwLock is write-preferring), and with them every
+    // other KMS call on the node.
+    let kms = kms_client.read().await.clone();
+    let kms = kms.as_deref().ok_or_else(|| {
         Status::failed_precondition(
             "KMS not configured — set [kbs] node_urls in config.toml or call claim-config \
              with --kbs-urls",
@@ -454,7 +458,7 @@ impl TappServiceImpl {
         // when kbs_node_urls are provided dynamically instead of baked in config.
         let kms_client = Arc::new(tokio::sync::RwLock::new(config.kbs.as_ref().map(|kbs| {
             info!(nodes = kbs.node_urls.len(), "Initializing KMS client from KBS config");
-            kms_client::KmsClient::new(kbs.node_urls.clone(), &kbs.retry)
+            Arc::new(kms_client::KmsClient::new(kbs.node_urls.clone(), &kbs.retry))
         })));
 
         // Initialize runtime config from static config (pre-baked values visible immediately)
@@ -1514,12 +1518,12 @@ impl TappService for TappServiceImpl {
                 anchored = !scan_url.is_empty(),
                 "Initializing KMS client from ClaimConfig"
             );
-            *self.kms_client.write().await = Some(kms_client_with_anchor(
+            *self.kms_client.write().await = Some(Arc::new(kms_client_with_anchor(
                 effective_kbs.clone(),
                 &Default::default(),
                 &scan_url,
                 &scan_public_key,
-            ));
+            )));
         }
 
         // Persist so a process restart within this boot cannot reopen the claim.
@@ -1637,12 +1641,12 @@ impl TappService for TappServiceImpl {
                 scan = %resulting.scan_url,
                 "Replacing KMS client from UpdateTrustAnchors"
             );
-            *self.kms_client.write().await = Some(kms_client_with_anchor(
+            *self.kms_client.write().await = Some(Arc::new(kms_client_with_anchor(
                 resulting.kbs_node_urls.clone(),
                 &Default::default(),
                 &resulting.scan_url,
                 &resulting.scan_public_key,
-            ));
+            )));
         }
 
         info!(

@@ -1,7 +1,8 @@
 use crate::config::PermissionConfig;
 use crate::permission::{Permission, PermissionManager};
 use crate::signature_auth::{
-    build_sign_message_v2, recover_evm_address, verify_timestamp, ReplayGuard, MAX_TIMESTAMP_DIFF,
+    build_sign_message_v2, recover_evm_address, verify_timestamp, Admission, ReplayGuard,
+    MAX_TIMESTAMP_DIFF,
 };
 use sha2::Digest;
 use std::sync::Arc;
@@ -272,19 +273,35 @@ where
             // guard — a claim succeeds once, and every later copy is refused by the
             // handler as already claimed.
             let signed_message = build_sign_message_v2(&method_name, &body_hash, signed_ts);
-            if method_permission != MethodPermission::Authenticated
-                && !replay.admit(&signer_address, &signed_message, signed_ts)
-            {
-                warn!(
-                    method = %method_name,
-                    signer = %signer_address,
-                    event = "AUTH_SIGNATURE_REPLAYED",
-                    "Refused a signature that was already used"
-                );
-                return Ok(Status::unauthenticated(
-                    "this signature was already used; sign the request again",
-                )
-                .into_http());
+            if method_permission != MethodPermission::Authenticated {
+                match replay.admit(&signer_address, &signed_message, signed_ts) {
+                    Admission::Admitted => {}
+                    Admission::Replayed => {
+                        warn!(
+                            method = %method_name,
+                            signer = %signer_address,
+                            event = "AUTH_SIGNATURE_REPLAYED",
+                            "Refused a signature that was already used"
+                        );
+                        return Ok(Status::unauthenticated(
+                            "this signature was already used; sign the request again",
+                        )
+                        .into_http());
+                    }
+                    Admission::PredatesProcess => {
+                        warn!(
+                            method = %method_name,
+                            signer = %signer_address,
+                            event = "AUTH_SIGNATURE_PREDATES_PROCESS",
+                            "Refused a signature made before this process started"
+                        );
+                        return Ok(Status::unauthenticated(
+                            "this signature was made before tapp-server last started and may \
+                             already have been used; sign the request again",
+                        )
+                        .into_http());
+                    }
+                }
             }
 
             info!(
@@ -808,6 +825,8 @@ mod signed_body_tests {
         let msg = start_app("services: {}");
         let body = frame(&msg.encode_to_vec());
         let now = chrono::Utc::now().timestamp();
+        // A process that has been up longer than the window, so only the window decides.
+        svc.replay = Arc::new(ReplayGuard::started_at(now - 900));
 
         let ts = now - 480;
         let sig = signed_v2(&KEY, "StartApp", &msg, ts);

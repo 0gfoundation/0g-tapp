@@ -120,17 +120,51 @@ pub fn build_sign_message_v2(method_name: &str, body_hash: &[u8; 32], timestamp:
 /// bounded by authorised operations per window — operator actions, not
 /// traffic. A legitimate retry is unaffected: the CLI signs afresh on every
 /// call (a new timestamp, so a new message).
-#[derive(Default)]
 pub struct ReplayGuard {
     /// keccak256(signer ‖ 0x00 ‖ message) → the signed timestamp.
     seen: std::sync::Mutex<std::collections::HashMap<[u8; 32], i64>>,
+    /// When this process started. The memory above starts empty, so a signature made
+    /// before then may already have run in the previous process — a restart, which a
+    /// persisted claim now makes seamless, would otherwise reopen the whole window.
+    started_at: i64,
+}
+
+impl Default for ReplayGuard {
+    fn default() -> Self {
+        Self {
+            seen: Default::default(),
+            started_at: chrono::Utc::now().timestamp(),
+        }
+    }
+}
+
+/// What the guard decided about a signed request.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Admission {
+    Admitted,
+    /// This exact signed request was already admitted.
+    Replayed,
+    /// Signed before this process started: it may have run in the previous one, which
+    /// this process cannot know. Re-signing fixes it — unless the caller's clock is
+    /// behind, in which case only time does, for at most that skew after a restart.
+    PredatesProcess,
 }
 
 impl ReplayGuard {
+    /// A guard whose process started at `ts` — for tests about the timestamp window,
+    /// which a guard started "now" would cut short.
+    #[cfg(test)]
+    pub fn started_at(ts: i64) -> Self {
+        Self { seen: Default::default(), started_at: ts }
+    }
+
     /// Admit a signed request exactly once. `signer` is the recovered address,
     /// `message` the exact string that was signed, `signed_ts` the timestamp
-    /// inside it. Returns false when that request was already admitted.
-    pub fn admit(&self, signer: &str, message: &str, signed_ts: i64) -> bool {
+    /// inside it.
+    pub fn admit(&self, signer: &str, message: &str, signed_ts: i64) -> Admission {
+        if signed_ts < self.started_at {
+            return Admission::PredatesProcess;
+        }
         let mut h = Keccak256::new();
         h.update(signer.to_lowercase().as_bytes());
         h.update([0u8]);
@@ -140,7 +174,11 @@ impl ReplayGuard {
         let mut seen = self.seen.lock().unwrap_or_else(|p| p.into_inner());
         // Prune whatever can no longer validate anyway (small slack for clock skew).
         seen.retain(|_, ts| (now - *ts).abs() <= MAX_TIMESTAMP_DIFF + 60);
-        seen.insert(digest, signed_ts).is_none()
+        if seen.insert(digest, signed_ts).is_none() {
+            Admission::Admitted
+        } else {
+            Admission::Replayed
+        }
     }
 
     /// How many requests are currently remembered.
@@ -301,5 +339,28 @@ mod tests {
             let recovered = recover_evm_address(message, signature).unwrap();
             assert_eq!(recovered.to_lowercase(), expected_address.to_lowercase());
         }
+    }
+}
+
+#[cfg(test)]
+mod replay_guard_tests {
+    use super::*;
+
+    #[test]
+    fn a_signature_is_admitted_once() {
+        let g = ReplayGuard::default();
+        let now = chrono::Utc::now().timestamp();
+        assert_eq!(g.admit("0xa", "StartApp:0x01:1", now), Admission::Admitted);
+        assert_eq!(g.admit("0xA", "StartApp:0x01:1", now), Admission::Replayed);
+    }
+
+    #[test]
+    fn a_signature_from_before_the_process_started_is_refused() {
+        // Inside the timestamp window, but the previous process may have run it, and this
+        // one's memory starts empty.
+        let g = ReplayGuard::default();
+        let before = chrono::Utc::now().timestamp() - 30;
+        assert_eq!(g.admit("0xa", "StartApp:0x01:1", before), Admission::PredatesProcess);
+        assert_eq!(g.len(), 0);
     }
 }
