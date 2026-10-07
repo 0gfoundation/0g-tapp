@@ -74,14 +74,36 @@ All four contracts (impl, beacon, proxy, timelock) source-verified on https://ch
 
 - Beacon owner = TimelockController, minDelay **86400 s (1 day)**: every upgrade is
   scheduled on-chain and executable only a day later.
-- Timelock proposer / executor / admin = `0x73443d8C05c74F8C2F5D499Da2597a1EE49E431b`.
+- Timelock proposer / executor / canceller / admin =
+  `0x87605ec8e10eb373c1d070e15e5d78fac4d7621d` (the timelock also administers
+  itself).
 - Registry `admin` (setMinStakeAmount / setLockPeriod / transferAdmin) =
-  `0x73443d8C05c74F8C2F5D499Da2597a1EE49E431b`.
+  `0x87605ec8e10eb373c1d070e15e5d78fac4d7621d`.
+
+Both moved from `0x73443d8C05c74F8C2F5D499Da2597a1EE49E431b` on 2026-10-04, all
+signed by the old address: the registry admin first (`AdminTransferred`, block
+46146695, 13:28:45 UTC), then the four timelock roles — granted to the new address
+and revoked from the old one (blocks 46146918–46146998, 13:32:00–13:33:10 UTC). App
+ownership is separate and did not move — e.g. `0g-kms` is still owned by
+`0x73443d…` (see [`docs/KMS.md`](../docs/KMS.md)).
+
+One address holds every timelock role, so the delay is the only check: whoever holds
+that key can schedule, execute and cancel. Moving the roles to a multisig would
+restore a second one.
+
+To re-check what is in force:
+
+```bash
+TL=0xD070792b1dB64F858ACE3E5443f2d21c0edE0BAc
+cast call $TL "hasRole(bytes32,address)(bool)" $(cast keccak PROPOSER_ROLE) 0x87605ec8e10eb373c1d070e15e5d78fac4d7621d --rpc-url https://evmrpc.0g.ai
+cast call 0x54874F536301c993922Dd95097e3902e7FBfe612 "admin()(address)" --rpc-url https://evmrpc.0g.ai
+```
 
 **Upgrading:** deploy the new implementation, then use `0g-agentic-id`'s
 `ScheduleUpgrade.s.sol` / `ExecuteUpgrade.s.sol` (its OZ scripts match this beacon's
 `upgradeTo(address)`) with `TIMELOCK=0xD070…0BAc BEACON=0x32fF…975f`, run as the
-proposer key. Direct `beacon.upgradeTo` no longer works — only the timelock can call it.
+proposer key (`0x87605ec8…`). Direct `beacon.upgradeTo` no longer works — only the
+timelock can call it.
 
 ---
 
