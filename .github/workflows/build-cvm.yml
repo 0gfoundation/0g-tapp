@@ -13,7 +13,13 @@
 #                        Per-owner image + per-owner reference set (legacy mode).
 #                        Identifiers: image og-tdx-dev-grub-<ver>-<owner>, refval .../<owner>.json
 #
-# Dimensions: cloud × boot_format × env × image version (× owner only in custom mode).
+# Dimensions: boot_format × enable_gpu × env × image version (× owner only in custom mode).
+# enable_gpu changes the image (an NVIDIA driver in the verity-sealed rootfs and the initrd
+# measures differently), so it rides in the image version as a `-gpu` marker and therefore keys
+# the image name, the reference-value path and the AS policy id like every other image change.
+# `cloud` is NOT a dimension any more — it only chooses where Stage C publishes to. The image is
+# identical on every platform (one HWE generic kernel; dev access via dev_ssh_pubkey rather than a
+# per-cloud agent), so its measurements, reference values and AS policy id carry no cloud.
 # KBS/KMS is fixed (vars.TAPP_KBS_URLS), not per-build.
 #
 # TWO versions, do not conflate them (docs/VERSIONING.md → CVM image):
@@ -61,22 +67,41 @@ on:
         type: boolean
         default: true
       cloud:
-        description: "target cloud (kernel/guest/publish)"
+        description: "Stage C publish target(s) ONLY — does not change the image. `both` publishes the SAME build to GCP and Alibaba Cloud in one run; the identity work (reference values, AS policy, refvalues PR) is per-image and happens once regardless. The image boots on GCP, Alibaba Cloud and bare metal alike, so its reference values and AS policy id carry no cloud."
         type: choice
-        options: [gcp, ali]
+        options: [gcp, ali, both]
         default: gcp
       boot_format:
         description: "boot format (grub default; uki = one signed EFI, kernel+initrd+cmdline fused)"
         type: choice
         options: [grub, uki]
         default: grub
+      enable_gpu:
+        description: "build a CONFIDENTIAL GPU image: NVIDIA open driver + container toolkit + CC mode (cvm/GPU.md). The driver lands in the verity-sealed rootfs and the initrd, so this image measures differently from a CPU-only one and gets its own identity — `-gpu` is appended to the image version, hence to the image name, the reference-value path and the AS policy id. It is NOT a drop-in replacement for the CPU image. Note uki does not currently fit the ESP on a GPU image; use grub."
+        type: boolean
+        default: false
       overwrite:
         description: "replace an existing image of the same name (delete + recreate). Off = fail if it exists."
         type: boolean
         default: false
+      allow_refval_overwrite:
+        description: "Let this build replace reference values that already exist for its identity. OFF (default) fails instead, because overwriting them re-registers new measurements behind the SAME AS policy id and every node still running the previous image stops verifying — with no deploy and no warning. The fix is almost always to bump image_rev, not to tick this."
+        type: boolean
+        default: false
+      dev_ssh_pubkey:
+        description: "DEV IMAGES ONLY. An SSH public key line ('ssh-ed25519 AAAA... comment') to bake into the image, so a hardened image can be logged into with no cloud component — works on GCP, Alibaba Cloud and bare metal alike (the cloud's own `gcloud compute ssh` / browser SSH stay dead either way, since the agent they inject through is purged). Blank = no key, image byte-identical. IGNORED on a prod image, with a warning, so env=both is fine: you get a keyed dev image and a clean prod one. A keyed image has a DIFFERENT measurement.uki, so no verifier can mistake it for a production image — but never publish it as one, and give it its OWN image_rev: the key changes the measurement while appearing in no identifier, so reusing an identity would replace the reference values its nodes verify against."
+        type: string
+        default: ""
 
+# Keyed on the IMAGE identity, and `cloud` is deliberately NOT in the key. It used to be, because
+# reaching two clouds meant two dispatches and they must not serialise each other -- at the cost of
+# both doing the identity work, pushing the same refvalues/<...> branch, the second failing and
+# marking a good dual-publish red. `cloud=both` removes the reason: one build reaches every target
+# and the identity work happens once. With the input out of the key, two dispatches of the same
+# identity now queue behind each other, which is what you want -- they would be writing the same
+# reference values and the same policy id.
 concurrency:
-  group: build-cvm-${{ inputs.cloud || 'gcp' }}-${{ inputs.boot_format }}-${{ inputs.build_mode || 'canonical' }}-${{ inputs.version }}-r${{ inputs.image_rev || '1' }}-${{ inputs.owner }}
+  group: build-cvm-${{ inputs.boot_format }}-${{ inputs.enable_gpu && 'gpu' || 'cpu' }}-${{ inputs.build_mode || 'canonical' }}-${{ inputs.version }}-r${{ inputs.image_rev || '1' }}-${{ inputs.owner }}
   cancel-in-progress: false
 
 # The reference-values step pushes a refvalues/* branch and opens a PR into dev with GITHUB_TOKEN;
@@ -103,10 +128,35 @@ jobs:
       # OWNER is only meaningful in custom mode; empty otherwise so no step can
       # accidentally use it (canonical images must not know any owner).
       OWNER: ${{ inputs.build_mode == 'custom' && inputs.owner || '' }}
-      # cloud/boot-format dimensions (independent; a CVM = one CLOUD × one BOOT_FORMAT = one measurement
-      # chain). cloud defaults to gcp; boot_format defaults to grub (uki is opt-in, any cloud).
+      # boot_format is the only dimension that changes the image (one BOOT_FORMAT = one measurement
+      # chain); it defaults to grub, uki is opt-in. CLOUD reaches Stage C only — it selects which
+      # publish scripts run, and nothing else.
       CLOUD: ${{ inputs.cloud || 'gcp' }}
+      # One build, one or both publish targets. Derived here rather than compared in every step so
+      # adding a third target is one line, and so `both` cannot half-apply by a step being missed.
+      PUB_GCP: ${{ (inputs.cloud == 'gcp' || inputs.cloud == 'both' || inputs.cloud == '') && 'true' || 'false' }}
+      PUB_ALI: ${{ (inputs.cloud == 'ali' || inputs.cloud == 'both') && 'true' || 'false' }}
       BOOT_FORMAT: ${{ inputs.boot_format }}
+      # Second dimension that changes the image. Unlike DEV_SSH_PUBKEY (which changes the
+      # measurement while appearing in no identifier, and so needs a manual image_rev), this one
+      # is folded into the image version below, so a GPU image can never collide with the
+      # CPU image's reference values.
+      ENABLE_GPU: ${{ inputs.enable_gpu && '1' || '0' }}
+      # DEV ONLY, orthogonal to both dimensions: bakes an SSH key into the image. Empty = no key
+      # and a byte-identical image, so this is inert on every normal build. It changes
+      # measurement.uki, so a keyed image has its own reference values and a verifier can always
+      # tell it from a production one.
+      # Forced empty for the prod matrix job rather than rejected up front, so `env=both` works:
+      # one dispatch gives a keyed dev image AND a clean prod image. The prod job says out loud
+      # that it dropped the key (see "Notice: dev_ssh_pubkey ignored" below) so a silently
+      # key-less image is never a surprise.
+      DEV_SSH_PUBKEY: ${{ matrix.env == 'dev' && inputs.dev_ssh_pubkey || '' }}
+      # The same value UNGATED, for the form check below, which must see it on every matrix job
+      # (env=both: a malformed key would otherwise slip through on the prod half). Both arrive
+      # via env rather than ${{ }} inside a run: script -- a raw expansion there is the standard
+      # Actions script-injection shape, and this is the only input a human pastes arbitrary text
+      # into. Every other input in that step already comes through env.
+      DEV_SSH_PUBKEY_INPUT: ${{ inputs.dev_ssh_pubkey }}
       KBS_URLS: ${{ vars.TAPP_KBS_URLS }}                       # required (no safe default)
       GCP_PROJECT: ${{ vars.GCP_PROJECT || 'g-devops' }}
       GCS_BUCKET: ${{ vars.GCS_BUCKET || 'gs://tapp-image' }}
@@ -149,9 +199,32 @@ jobs:
             echo "error: image_rev must be a positive integer; got '${IMAGE_REV:-<empty>}'." >&2
             FAIL=1
           fi
+          # A GPU UKI does not fit the 105 MB ESP, and the partition is sandwiched between others so
+          # it cannot grow in place -- convert fails on "No space left on device". Rejecting the
+          # pair here rather than there saves an hour of DKMS building an artifact that is known
+          # to be undeliverable. Remove this check when the ESP is enlarged in stage 0.
+          if [ "$ENABLE_GPU" = 1 ] && [ "$BOOT_FORMAT" = uki ]; then
+            echo "error: enable_gpu with boot_format=uki cannot produce an image -- the NVIDIA driver's initrd does not fit the 105MB ESP and convert fails late. Use boot_format=grub (see cvm/GPU.md)." >&2
+            FAIL=1
+          fi
           # env=both runs two matrix jobs; a fixed image_name would make them clobber each other.
           if [ -n "${{ inputs.image_name }}" ] && [ "${{ inputs.env }}" = "both" ]; then
             echo "error: image_name requires a single env (dev or prod), not both." >&2
+            FAIL=1
+          fi
+          # dev_ssh_pubkey is checked for FORM here, not for which env it may apply to: prod simply
+          # ignores it (see the job env + the skip notice below), so env=both stays usable — one
+          # dispatch yields a keyed dev image and a clean prod one. A malformed key, on the other
+          # hand, is always a typo: it would build a dev image whose authorized_keys grants
+          # nothing, discovered only when the login fails, so stop now even if this build ignores it.
+          # Whole-string match, not per-line: grep -E '^...$' succeeds if ANY line matches, so a
+          # valid key followed by arbitrary lines would pass the check and then be baked in.
+          # bash's =~ anchors across the entire value and `.` does not cross newlines.
+          # [^[:cntrl:]] for the comment, not `.`: bash's `.` DOES cross newlines, so `( .*)?$`
+          # would accept "<valid key>\n<anything>". This keeps spaces and quotes in a comment legal.
+          KEYRE='^(ssh-(rsa|ed25519|dss)|ecdsa-sha2-nistp(256|384|521)|sk-(ssh-ed25519|ecdsa-sha2-nistp256)@openssh\.com) [A-Za-z0-9+/]+=*( [^[:cntrl:]]*)?$'
+          if [ -n "$DEV_SSH_PUBKEY_INPUT" ] && ! [[ $DEV_SSH_PUBKEY_INPUT =~ $KEYRE ]]; then
+            echo "error: dev_ssh_pubkey is not a single well-formed SSH public key line (expected e.g. 'ssh-ed25519 AAAA... comment'; a private key, a truncated paste or extra lines look like this)." >&2
             FAIL=1
           fi
           # The tapp-server release asset must exist (otherwise the build dies mid-way).
@@ -179,9 +252,45 @@ jobs:
           # for a changed image would overwrite the reference values already registered for the old
           # one under the same policy id, and every node still running it would stop verifying.
           # rev 1 == no suffix, so identifiers built before image_rev existed keep working.
-          if [ "$IMAGE_REV" = 1 ]; then IMGVER="$VERSION"; else IMGVER="${VERSION}-r${IMAGE_REV}"; fi
+          # A GPU image is a different artifact from the CPU one at the same binary version, so
+          # the marker goes in ahead of the revision: variant first, then the revision within it
+          # (v0.8.0-gpu, v0.8.0-gpu-r2). A CPU build is untouched by this and keeps producing the
+          # exact identifiers it produced before.
+          IMGVER="$VERSION"
+          [ "$ENABLE_GPU" = 1 ] && IMGVER="${IMGVER}-gpu"
+          [ "$IMAGE_REV" = 1 ] || IMGVER="${IMGVER}-r${IMAGE_REV}"
           echo "imgver=$IMGVER" >> "$GITHUB_OUTPUT"
-          echo "image version: $IMGVER (tapp-server binary: $VERSION)"
+          echo "image version: $IMGVER (tapp-server binary: $VERSION, gpu: $ENABLE_GPU)"
+
+      - name: Refuse to overwrite an identity's reference values
+        # The whole protection for image identity used to be prose. gen-reference-values.sh writes
+        # its JSON unconditionally and register-shared-as.sh registers the policy id
+        # unconditionally, so rebuilding under an identity that already has reference values
+        # silently replaces what every node of that identity verifies against -- the no-deploy,
+        # no-warning mass failure docs/VERSIONING.md describes. Two ways to reach it: forgetting
+        # image_rev after an image change, and building a DEV_SSH_PUBKEY image under a plain dev
+        # identity (the key changes the measurement but appears in no identifier). Same guard.
+        if: ${{ inputs.publish && !inputs.allow_refval_overwrite }}
+        env:
+          IMGVER: ${{ steps.v.outputs.imgver }}
+          MENV: ${{ matrix.env }}
+        run: |
+          git fetch --depth=1 origin dev
+          # These paths must match gen-reference-values.sh / register-shared-as.sh exactly, or the
+          # guard checks somewhere nothing is ever written and reports "free" every single time.
+          # That is precisely what happened when the cloud dimension was dropped and a stale
+          # $CLOUD segment was left here: the protection was inert from that commit until this one.
+          if [ -n "$OWNER" ]; then
+            O="$(printf '%s' "$OWNER" | sed 's/^0[xX]//' | tr 'A-Z' 'a-z')"
+            REF="verifier/reference-values/$BOOT_FORMAT/$IMGVER/$MENV/$O.json"
+          else
+            REF="verifier/reference-values/$BOOT_FORMAT/$IMGVER/$MENV.json"
+          fi
+          if git cat-file -e "origin/dev:$REF" 2>/dev/null; then
+            echo "::error title=identity already has reference values::$REF exists on dev. Publishing would re-register new measurements behind the same AS policy id and break every node still running that image. Bump image_rev (currently $IMAGE_REV), or set allow_refval_overwrite if you really mean to replace it."
+            exit 1
+          fi
+          echo "identity is free: $REF does not exist on dev"
 
       - name: Fetch build inputs (base image + 0.8.0 guest deb)
         run: cvm/ci/fetch-inputs.sh "$VERSION"   # → cvm/base-noble.qcow2 + cryptpilot-fde-guest_0.8.0_amd64.deb
@@ -191,6 +300,16 @@ jobs:
         # fde-host(#128) built from the pinned fork; idempotent (fast no-op on an already-provisioned
         # runner). Needed by the build (convert #130) and the reference-value step (fde-host #128).
         run: cvm/ci/setup-toolchain.sh
+
+      - name: Notice — dev_ssh_pubkey ignored on a prod image
+        # Only fires on the prod half of the build. Says it in the log AND in the run summary,
+        # because a key that silently did not make it into the image is discovered otherwise
+        # only when the login fails.
+        if: ${{ inputs.dev_ssh_pubkey != '' && matrix.env != 'dev' }}
+        run: |
+          MSG="dev_ssh_pubkey was supplied but this is the **${{ matrix.env }}** image — the key was NOT baked in. A production image must carry no login credential; use the dev image for SSH access."
+          echo "::warning title=dev_ssh_pubkey ignored::$MSG"
+          echo "⚠️ $MSG" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Stage A+B — build the image
         run: |
@@ -202,7 +321,7 @@ jobs:
           # an assignment BEFORE expansion, so a variable there (even empty) turns every
           # later VAR=val into the command name ("KBS_URLS=...: command not found").
           [ "$BUILD_MODE" = "custom" ] && export OWNER_ADDRESS="$OWNER"
-          HARDEN=${{ steps.v.outputs.harden }} ENABLE_SYSBOX=1 \
+          HARDEN=${{ steps.v.outputs.harden }} ENABLE_SYSBOX=1 ENABLE_GPU="$ENABLE_GPU" \
             TAPP_SERVER_URL="https://github.com/0gfoundation/0g-tapp/releases/download/${VERSION}/tapp-server" \
             ./build-tapp.sh base-noble.qcow2 "out-${{ matrix.env }}.qcow2"
 
@@ -219,7 +338,7 @@ jobs:
       # KVM runner is available. Real boot + attestation validation is done on actual TDX hardware.
 
       - name: Authenticate to GCP
-        if: ${{ env.PUBLISH == 'true' && env.CLOUD == 'gcp' }}
+        if: ${{ env.PUBLISH == 'true' && env.PUB_GCP == 'true' }}
         run: |
           # Keep the SA credential OFF the persistent self-hosted runner: point gcloud/gsutil at a
           # job-scoped temp config dir (RUNNER_TEMP is wiped per job), so nothing lands in ~/.config/gcloud.
@@ -235,7 +354,7 @@ jobs:
           GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
 
       - name: Authenticate to Ali
-        if: ${{ env.PUBLISH == 'true' && env.CLOUD == 'ali' }}
+        if: ${{ env.PUBLISH == 'true' && env.PUB_ALI == 'true' }}
         run: |
           # The al8 runner is an Ali ECS instance; aliyun/ossutil authenticate via its instance RAM role
           # (no AK/SK secret). ossutil is already configured on the runner; point aliyun at the role too.
@@ -257,7 +376,7 @@ jobs:
           fi
 
       - name: Stage C — publish versioned image (gcp)
-        if: ${{ env.PUBLISH == 'true' && env.CLOUD == 'gcp' }}
+        if: ${{ env.PUBLISH == 'true' && env.PUB_GCP == 'true' }}
         run: |
           cd cvm
           IMG="${{ inputs.image_name }}"
@@ -268,7 +387,7 @@ jobs:
             ./publish-gcp-image.sh "out-${{ matrix.env }}.qcow2" "$IMG"
 
       - name: Stage C — publish versioned image (ali)
-        if: ${{ env.PUBLISH == 'true' && env.CLOUD == 'ali' }}
+        if: ${{ env.PUBLISH == 'true' && env.PUB_ALI == 'true' }}
         run: |
           cd cvm
           IMG="${{ inputs.image_name }}"
@@ -286,9 +405,9 @@ jobs:
           # custom: $OWNER is the full 0x address (scripts strip/lowercase themselves).
           cd cvm
           IMGVER="${{ steps.v.outputs.imgver }}"
-          ci/gen-reference-values.sh "out-${{ matrix.env }}.qcow2" "$CLOUD" "$BOOT_FORMAT" "$IMGVER" "${{ matrix.env }}" $OWNER
+          ci/gen-reference-values.sh "out-${{ matrix.env }}.qcow2" "$BOOT_FORMAT" "$IMGVER" "${{ matrix.env }}" $OWNER
           cd ..
-          verifier/register-shared-as.sh "$CLOUD" "$BOOT_FORMAT" "$IMGVER" "${{ matrix.env }}" $OWNER "$AS_ENDPOINT"
+          verifier/register-shared-as.sh "$BOOT_FORMAT" "$IMGVER" "${{ matrix.env }}" $OWNER "$AS_ENDPOINT"
         env:
           # Bearer key for the gated AS (issue #82): the hosted deployment allows
           # AttestationEvaluate/GetAttestationChallenge but requires a key for the policy write.
@@ -297,7 +416,7 @@ jobs:
 
       - name: Open PR with the new reference values → dev
         if: ${{ env.PUBLISH == 'true' }}
-        run: cvm/ci/open-refvalues-pr.sh "$CLOUD" "$BOOT_FORMAT" "${{ steps.v.outputs.imgver }}" "${{ matrix.env }}" $OWNER
+        run: cvm/ci/open-refvalues-pr.sh "$BOOT_FORMAT" "${{ steps.v.outputs.imgver }}" "${{ matrix.env }}" $OWNER
         env:
           # PAT so `gh pr create` works even if the org disables "Actions create/approve PRs".
           # git push still uses GITHUB_TOKEN via the permissions block above. Falls back if unset.

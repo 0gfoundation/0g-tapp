@@ -1,7 +1,7 @@
 ---
 name: 0g-tapp-cli
 description: Use this skill when the user wants to deploy, manage, or troubleshoot applications on a 0G Tapp (Trusted Application Platform) server using tapp-cli. Covers start/stop apps, on-chain registration, registry login, check task status, view logs, and manage docker compose deployments across multiple remote TEE servers.
-version: 1.16.0
+version: 1.20.0
 author: 0G Labs
 tags: [0g, tapp, tee, docker, deployment, cli, onchain]
 ---
@@ -94,9 +94,10 @@ tapp-cli -s <server> -k 0x<key> docker-logout                    # logout from D
 - **`platform :`** — from the AS token: TD **DEBUG on → ✗** (host can read TD memory), TCB **Revoked → ✗**, TCB `OutOfDate`/`SWHardeningNeeded`/… → ⚠️ (clouds lag Intel; advisories listed), `UpToDate` + debug off → ✓.
 - **Exit status**: 0 clean, 1 failure (reconcile FAIL, unpublished image, dev image on mainnet, platform ✗), 2 passed with warnings (unpinned AS, dev image off mainnet, lagging TCB, values unavailable). Point it at a self-hosted local AS (e.g. `127.0.0.1:50004`, see the `verifier/0g-tapp-verifier` submodule) to use RVPS-backed reference values.
 - **Policy ids** — two formats depending on build mode:
-  - **canonical** (v0.3.0+): `0g-tapp-<cloud>-<boot_format>-<version>-<env>` (e.g. `0g-tapp-gcp-grub-v0.3.0-dev`). Reference values at `verifier/reference-values/<cloud>/<boot_format>/<version>/<env>.json`.
-  - **custom** (per-owner): `0g-tapp-<cloud>-<boot_format>-<version>-<env>-<owner>`. Reference values at `.../env/<owner>.json`.
-  - Must be registered on the AS first (stored as `<id>_cpu`); use `verifier/register-shared-as.sh <cloud> <boot_format> <version> <env> [owner] [as-endpoint]`.
+  - **canonical** (v0.3.0+): `0g-tapp-<boot_format>-<version>-<env>` (e.g. `0g-tapp-grub-v0.3.0-dev`). Reference values at `verifier/reference-values/<boot_format>/<version>/<env>.json`.
+  - **custom** (per-owner): `0g-tapp-<boot_format>-<version>-<env>-<owner>`. Reference values at `.../env/<owner>.json`.
+  - Must be registered on the AS first (stored as `<id>_cpu`); use `verifier/register-shared-as.sh <boot_format> <version> <env> [owner] [as-endpoint]`.
+  - **Images built before the cloud dimension was dropped** keep the older `0g-tapp-<cloud>-<boot_format>-…` ids and `<cloud>/<boot_format>/…` paths; those stay registered, so a node on such an image still verifies with its original policy id. New builds are cloud-free — one image now boots on GCP, Alibaba Cloud and bare metal with identical measurements.
 - Note: `ear.status=affirming` also needs platform TCB `UpToDate`; `executables=3` alone (boot chain matched) is the boot-chain conclusion independent of TCB.
 
 ### Claim ownership (v0.3.0+, canonical images)
@@ -138,6 +139,23 @@ Owner-only, and **every call is extended into the runtime measurement** carrying
 - tapp-cli >= 0.9.0 signs `Method:0x<sha256(encoded request)>:timestamp` with header `x-signature-version: 2` — the signature covers the request body, so a request altered in flight is refused. Window **±10 min**; every signature is **single-use**, and one made before tapp-server last started is refused (the previous process may have used it).
 - Against tapp-server < 0.9.0 this shows up as `Insufficient permission for this operation` (old server cannot read v2): add the global flag `--legacy-sign`. Never automatic.
 - tapp-server >= 0.9.0 accepts **only** body-bound signatures; legacy `Method:timestamp` is refused ("accepts only body-bound signatures"). Old tapp-cli cannot manage a 0.9.0 node — upgrade it.
+
+### The node has no data disk (apps will not start)
+
+`/data` holds the app volumes, container stores and logs, and `tapp-server` does not start
+without it — the rootfs is a RAM overlay, so anything written there is lost at reboot. A node
+that could not pick a data disk by itself says so **on the console** (serial log on a cloud),
+naming the disks it saw. Cloud scratch disks are excluded, so a GPU machine type with one
+attached data disk provisions itself; a host with several genuine spare disks does not, and the
+intended disk must be labelled beforehand on any machine with a shell:
+
+```bash
+mkfs.ext4 -L tapp-data <device>
+```
+
+The label is the contract — a disk carrying it is used on every boot with no guessing, and one
+already holding ext4 is adopted by relabelling, never reformatted. Combine several disks (LVM or
+RAID) and label the result if they should act as one.
 
 ### Server health & whitelist
 ```bash
@@ -351,8 +369,10 @@ tapp-cli -s <teeUrl> get-evidence --app-id <APP_ID> --nonce $(openssl rand -hex 
 - `composeHash/volumesHash/imageHashes` == the last `result:"success"` `start_app` event in RTMR3 eventlog. Hash encoding (rebuild before compare): compose=raw 48B SHA-384; volumes=sorted `key + ':' + raw(digest) + '\n'` per entry; image=`sha256:<hex>` ascii per service.
 - Boot chain MRTD/shim/grub/kernel/initrd == AS reference values (initrd may differ per host). `kernel_cmdline` matches by **OR** of two refs (new-grub `/vmlinuz...` vs old-grub `(hd0,gptN)/boot/vmlinuz...`) — both pass.
 - RTMR3 `EV_EVENT_TAG` events are `<domain> <op> <value>`: `tapp.0g.com` = start_app/stop_app/... ; `cryptpilot.alibabacloud.com` = FDE (only on old aliyun images, absent on GCP).
+- **`gpu_evidence`** is `null` on a CPU-only node. On a confidential-GPU node it holds one entry per GPU (`name`, `uuid`, `cc_enabled`, `driver_version`, `vbios_version`, `attestation_report`, `certificate`). Two checks, both required: `cc_enabled == true` (a GPU that is present but not in CC mode protects nothing), and the report is bound to **this** quote — the nonce at **offset 4** of the decoded `attestation_report` equals the first 32 bytes of `report_data`, i.e. `sha512(runtime_data)[:32]`. Skipping the binding lets a genuine report from another machine or another moment pass. Building/running such a node: `cvm/GPU.md`.
 
 ## Reference
 - RA / evidence + AS verification (full flow, encoding rules, tested walkthrough): `docs/EVIDENCE_AND_AS_VERIFICATION.md`; runnable verifier `docs/verify_app.py` (+ `docs/attestation.proto`).
+- Confidential GPUs — building a GPU image (`ENABLE_GPU=1`), the driver/Fabric Manager pinning, the data-disk labelling a GPU host needs, and the four post-boot checks: `cvm/GPU.md`.
 - Full end-to-end app deploy flow + pitfalls (provider/broker: start → register → authorizeInvalidator → provider register): `docs/DEPLOY_RUNBOOK.md`.
 - Contract addresses & on-chain query examples: `contract/CONTRACTS.md`.

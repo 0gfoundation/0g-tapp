@@ -16,7 +16,7 @@ export DEBIAN_FRONTEND=noninteractive
 
 # ===== Tunables =====
 TAPP_SERVER_BIN="${TAPP_SERVER_BIN:-}"                              # path to a local tapp-server binary; empty -> download from URL
-TAPP_SERVER_URL="${TAPP_SERVER_URL:-https://github.com/0gfoundation/0g-tapp/releases/download/v0.1.0/tapp-server}"
+TAPP_SERVER_URL="${TAPP_SERVER_URL:-https://github.com/0gfoundation/0g-tapp/releases/download/v0.8.0/tapp-server}"
 BUILD_MODE="${BUILD_MODE:-canonical}"  # canonical (default): owner-agnostic image, one refval set for all owners.
                                        # custom: OWNER_ADDRESS baked in, per-owner initrd measurement + refval set.
 OWNER_ADDRESS="${OWNER_ADDRESS:-}"     # Required when BUILD_MODE=custom; ignored in canonical mode.
@@ -42,13 +42,24 @@ ENABLE_SYSBOX="${ENABLE_SYSBOX:-0}"
 SYSBOX_VERSION="${SYSBOX_VERSION:-0.7.0}"
 SYSBOX_DEB_URL="${SYSBOX_DEB_URL:-https://downloads.nestybox.com/sysbox/releases/v${SYSBOX_VERSION}/sysbox-ce_${SYSBOX_VERSION}-0.linux_amd64.deb}"
 # Two independent build dimensions (each image = one of each):
-#   CLOUD       gcp | ali  — kernel/guest/publish. gcp: linux-image-gcp + fix A + google-guest-agent +
-#               publish-gcp-image.sh; ali: generic kernel + cloud-init(AliYun) + publish-ali-image.sh.
+#   CLOUD       gcp | ali  — **publish target only** (Stage C: publish-gcp-image.sh vs
+#               publish-ali-image.sh). It no longer changes a single byte of the image: one HWE
+#               generic kernel serves every platform, and the dev variant's key injection is now
+#               DEV_SSH_PUBKEY instead of a per-cloud agent. So one build can be published to
+#               either cloud, or to neither and booted on bare metal.
 #   BOOT_FORMAT grub | uki — boot format (stage B convert). Defaults to grub for any cloud;
 #               set uki explicitly. Determines --uki + UKI prereqs + the reference-value shape (grub 5 / uki 1).
 # Both exported so prepare-*.sh (stage B) inherits them.
+# Orthogonal to both, and DEV ONLY: DEV_SSH_PUBKEY bakes an SSH public key so a HARDENED
+# image can be logged into with no cloud component at all (see the dev-access block below).
 export CLOUD="${CLOUD:-gcp}"
 export BOOT_FORMAT="${BOOT_FORMAT:-grub}"
+# GPU confidential computing (opt-in). Same base image and same pipeline as a CPU-only build --
+# stage B just installs the NVIDIA open driver + container toolkit on top and turns CC mode on.
+# It must happen there rather than in stage A, because the driver compiles against the kernel
+# this image boots and stage A still has the base one. Exported so prepare-tapp.sh sees it.
+export ENABLE_GPU="${ENABLE_GPU:-0}"
+export NVIDIA_DRIVER_BRANCH="${NVIDIA_DRIVER_BRANCH:-580}"   # open module; 575 does not build against 6.17 (see prepare-tapp.sh [1a/4])
 # passed through to prepare-tapp.sh (used by convert)
 export CONFIG_DIR="${CONFIG_DIR:-$HERE/config_dir}"
 export FDE_PACKAGE="${FDE_PACKAGE:-$HERE/cryptpilot-fde-guest_0.8.0_amd64.deb}"   # 0.8.0 in-image runtime (cryptpilot-fde split into -host/-guest at 0.8.0)
@@ -152,7 +163,7 @@ level = "info"
 format = "pretty"
 # On the persistent /data disk, NOT the RAM rootfs (rw_overlay="ram") — file
 # logs on "/" consume RAM and are lost on reboot (issue #23). tapp-server keeps
-# at most `max_log_files` daily files (default 7).
+# at most \`max_log_files\` daily files (default 7).
 file_path = "/data/log/tapp/"
 
 [server]
@@ -167,7 +178,7 @@ unix_socket_path = "/run/tapp/tapp.sock"
 
 [server.permission]
 enabled = true
-# owner: unset ⇒ boots UNCLAIMED; first valid `tapp-cli claim-owner` signer
+# owner: unset ⇒ boots UNCLAIMED; first valid \`tapp-cli claim-owner\` signer
 # becomes the owner (measured claim_owner runtime event). A baked owner
 # (legacy) re-introduces per-owner reference values.
 $OWNER_LINE
@@ -303,13 +314,22 @@ grep -q 'LABEL=tapp-data' /etc/fstab || printf '%s\n' 'LABEL=tapp-data /data ext
 # Auto-provision /data on first boot with NO SSH. Find the single non-boot whole disk and:
 #   - blank (no filesystem signature)      -> mkfs.ext4 -L tapp-data     (fresh node)
 #   - already ext4 (e.g. a migrated disk)  -> e2label tapp-data          (adopt, NEVER reformat)
-# SAFE: only real disks (sd*/nvme*/vd*), never the boot disk, never a partitioned disk; with zero or
-# more-than-one candidates it refuses to guess; an existing fs is adopted (labelled), never wiped.
+# SAFE: only real disks (sd*/nvme*/vd*), never the boot disk, never a partitioned disk, never an
+# ephemeral cloud scratch disk; with zero or more-than-one candidates it refuses to guess; an
+# existing fs is adopted (labelled), never wiped.
 # So attaching ANY single data disk -- brand-new or an old one carrying data -- just works, no SSH,
 # no manual mkfs/label. A disk already labelled tapp-data short-circuits at the top. Idempotent.
 cat > /usr/local/sbin/tapp-data-provision.sh <<'PROVSH'
 #!/bin/bash
 set -u
+# A node that ends up without /data does not start tapp-server, and on a hardened image there is
+# no shell to read the journal with -- the failure is invisible, and looks like the node is simply
+# broken. So anything that leaves /data unprovisioned is said on the console too, where the cloud's
+# serial log (or a bare-metal screen) shows it, together with the one command that fixes it.
+say() {
+  echo "tapp-data-provision: $*" >&2
+  { echo "tapp-data-provision: $*" > /dev/console; } 2>/dev/null || true
+}
 udevadm settle 2>/dev/null || true
 # already have a tapp-data fs (labelled on an earlier boot, or operator-provided)? done.
 blkid -L tapp-data >/dev/null 2>&1 && exit 0
@@ -317,6 +337,32 @@ blkid -L tapp-data >/dev/null 2>&1 && exit 0
 esp="$(blkid -L UEFI 2>/dev/null)" || true
 bootdisk=""
 [ -n "${esp:-}" ] && bootdisk="$(lsblk -no pkname "$esp" 2>/dev/null | head -1)"
+# Cloud scratch ("local SSD") is ephemeral -- wiped on stop/start -- so it must never become /data.
+# This is not a corner case: GCP attaches local SSDs unconditionally to every GPU machine type
+# (a3-highgpu-1g gets two, and they cannot be declined), which leaves the "exactly one candidate"
+# rule permanently unsatisfiable on a GPU host -- measured on a3-highgpu-1g, where the candidate
+# set was (local-ssd, local-ssd, data-pd) and provisioning refused, so /data never mounted and
+# tapp-server never started.
+#
+# GCP's own /dev/disk/by-id/google-local-nvme-ssd-N aliases are NOT available to us: those udev
+# rules ship in google-guest-configs, which this image deliberately does not install. The alias
+# check below is kept for images that do have them; what actually discriminates here is the NVMe
+# model string, which GCP sets to "nvme_card-pd" for a persistent disk and "nvme_card<N>"
+# (nvme_card0, nvme_card1, ...) for each local SSD -- so match the prefix, not a fixed string.
+is_scratch() {
+  local n="$1" l model
+  for l in /dev/disk/by-id/*; do
+    [ -e "$l" ] || continue
+    case "${l##*/}" in *local-nvme-ssd*|*local-ssd*|*ephemeral*) ;; *) continue ;; esac
+    [ "$(readlink -f "$l" 2>/dev/null)" = "/dev/$n" ] && return 0
+  done
+  model="$(tr -d ' ' < "/sys/block/$n/device/model" 2>/dev/null)"
+  case "$model" in
+    nvme_card-pd) return 1 ;;      # persistent disk -- a legitimate /data candidate
+    nvme_card*)   return 0 ;;      # nvme_card0, nvme_card1, ... -- local SSD
+  esac
+  return 1
+}
 # collect candidate non-boot whole disks (no partitions)
 cands=()
 while read -r name type; do
@@ -324,12 +370,18 @@ while read -r name type; do
   case "$name" in sd*|nvme*|vd*) ;; *) continue ;; esac                            # real disks only (skip zram/loop/dm/sr)
   [ "$name" = "$bootdisk" ] && continue                                            # never the boot disk
   [ -n "$(lsblk -rno NAME "/dev/$name" 2>/dev/null | tail -n +2)" ] && continue    # skip partitioned disks
+  is_scratch "$name" && continue                                                   # never ephemeral scratch
   cands+=("/dev/$name")
 done < <(lsblk -dno NAME,TYPE 2>/dev/null)
 if [ "${#cands[@]}" -eq 0 ]; then
-  echo "tapp-data-provision: no candidate data disk; /data stays unmounted (docker fails loud)" >&2; exit 0
+  say "no candidate data disk found; /data stays unmounted, so tapp-server will NOT start."
+  say "remedy: attach a data disk, or pre-label one with: mkfs.ext4 -L tapp-data <device>"
+  exit 0
 elif [ "${#cands[@]}" -gt 1 ]; then
-  echo "tapp-data-provision: multiple candidate disks (${cands[*]}); refusing to guess" >&2; exit 0
+  say "multiple candidate disks (${cands[*]}); refusing to guess which one is /data."
+  say "/data stays unmounted, so tapp-server will NOT start."
+  say "remedy: pre-label the intended disk and reboot: mkfs.ext4 -L tapp-data <device>"
+  exit 0
 fi
 dev="${cands[0]}"
 fstype="$(blkid -p -s TYPE -o value "$dev" 2>/dev/null || true)"
@@ -340,7 +392,9 @@ elif [ "$fstype" = ext4 ]; then
   e2label "$dev" tapp-data                                                         # adopt existing data, no reformat
   echo "tapp-data-provision: adopted existing ext4 $dev -> LABEL=tapp-data (data preserved)"
 else
-  echo "tapp-data-provision: $dev has unexpected fs '$fstype'; not touching it" >&2; exit 0
+  say "$dev has unexpected fs '$fstype'; not touching it. /data stays unmounted, so tapp-server"
+  say "will NOT start. remedy: pre-label an ext4 disk with: mkfs.ext4 -L tapp-data <device>"
+  exit 0
 fi
 PROVSH
 chmod 0755 /usr/local/sbin/tapp-data-provision.sh
@@ -434,30 +488,69 @@ network:
 NETEOF
 chmod 600 /etc/netplan/01-dhcp.yaml
 EOF
-elif [ "$CLOUD" = gcp ]; then
-  echo "==> [harden] HARDEN=0 gcp: reinstall google-guest-agent to restore GCP SSH key injection"
-  cat >> "$TMPD/provision-base.sh" <<'EOF'
-# dev variant only: google-guest-agent (from Ubuntu universe) injects the instance
-# SSH public key from metadata into ~ubuntu/.ssh/authorized_keys. It talks to the
-# metadata server by the hostname metadata.google.internal by default; since we pin
-# resolv.conf to public DNS (see fix C) that name will not resolve, so we also add a
-# direct IP mapping (169.254.169.254) to /etc/hosts. Both are GCP back-door-class
-# components and are intentionally NOT installed on the hardened variant.
-apt-get install -y google-guest-agent
-systemctl enable google-guest-agent.service || true
-grep -q 'metadata.google.internal' /etc/hosts || \
-  printf '169.254.169.254 metadata.google.internal metadata\n' >> /etc/hosts
-EOF
 else
-  # ali (or other) dev variant: the dev build does NOT purge cloud-init (only HARDEN=1 does), and on
-  # Alibaba Cloud cloud-init injects the instance SSH key + configures networking from the Ali metadata
-  # service (100.100.100.200). So no google-guest-agent (that is GCP-only) — rely on cloud-init, and
-  # PIN its datasource to AliYun: Alibaba recommends pinning rather than relying on ds-identify picking
-  # AliYun out of ~30 candidate datasources, so key/network injection is reliable.
-  echo "==> [harden] HARDEN=0 $CLOUD: pin cloud-init datasource to AliYun for SSH/network injection (no google-guest-agent)"
+  # HARDEN=0 dev variant. It used to restore whichever key-injection agent the target cloud
+  # uses -- google-guest-agent reading metadata.google.internal on GCP, cloud-init pinned to
+  # `datasource_list: [ AliYun ]` reading 100.100.100.200 on Alibaba Cloud -- which is what
+  # forced a dev image to pick a cloud, and left bare metal with no usable dev image at all
+  # (a self-launched TD is handed no metadata service to ask).
+  #
+  # DEV_SSH_PUBKEY replaces both: the key is baked at build time, so one dev image serves GCP,
+  # Alibaba Cloud and bare metal, and the image no longer varies by cloud. See the dev-access
+  # block below. Nothing cloud-specific is installed here any more.
+  #
+  # That is NOT the same as having no way in. Only HARDEN=1 purges cloud-init; the dev variant
+  # keeps it, and dropping the AliYun datasource pin left it unpinned rather than absent -- so on
+  # a cloud, ds-identify still detects the platform (GCE detection is DMI-based and needs no
+  # google-guest-agent) and can inject the project's SSH key from instance metadata on first boot.
+  # A keyless dev image is therefore still reachable on GCP or Alibaba Cloud by whatever keys the
+  # project hands out. What it has no way into is BARE METAL, where no metadata service exists --
+  # which is the gap DEV_SSH_PUBKEY closes, and the serial console is the only other route there.
+  echo "==> [harden] HARDEN=0: no cloud key-injection agent installed; cloud-init is still present (see comment)"
+fi
+
+# ===== Dev SSH access, cloud-independent (opt-in via DEV_SSH_PUBKEY) =====
+# Additive and opt-in: with DEV_SSH_PUBKEY unset this block does nothing and the image is
+# byte-identical to before. When set, it gives a HARDENED image a way in WITHOUT any cloud
+# component: the key is baked at build time instead of fetched from a metadata service at
+# boot, so ONE image works on GCP, Alibaba Cloud and bare metal alike (the first two each
+# have their own metadata service, the third has none at all -- which is why the HARDEN=0
+# dev variants, which rely on that injection, cannot be used on bare metal).
+#
+# Consequence worth knowing: the cloud's own convenience paths stay dead, because they are
+# the injection this removes -- `gcloud compute ssh` and GCP's browser SSH both push an
+# ephemeral key to metadata for google-guest-agent to install, and that agent is purged
+# (verified: "Permission denied (publickey)"). The baked key is then the only way in, and
+# reading the serial console the only fallback.
+#
+# In exchange, WHO CAN GET IN becomes part of the measurement rather than something the
+# cloud decides at boot: the key lands in the verity-sealed rootfs, whose root hash is in
+# the initrd, which is in the UKI -- so an image built with a key has a different
+# measurement.uki than the same image without one, and a verifier can tell them apart.
+#
+# DEV ONLY. This is a deliberate back door; an image built with it must never be published
+# as a production image (the differing reference values make that mistake detectable, not
+# impossible). Runs after the harden block, so it reinstalls the sshd HARDEN=1 purged.
+DEV_SSH_UPLOAD=()   # extra virt-customize args for stage A; empty unless a key was supplied
+if [ -n "${DEV_SSH_PUBKEY:-}" ]; then
+  echo "==> [dev-access] DEV_SSH_PUBKEY set: reinstall sshd + bake authorized_keys (no cloud-init, no guest agent)"
+  # The key is the only arbitrary user-supplied string in this build, so it is written host-side
+  # and UPLOADED as a file -- never interpolated into provision-base.sh, which runs as root inside
+  # the guest. An unquoted heredoc here would let an apostrophe in a legitimate key comment
+  # (ssh-keygen -C "o'brien@laptop") break the generated script, and a crafted value run commands
+  # as root at build time. The heredoc below is therefore quoted, and carries no user bytes.
+  printf '%s\n' "$DEV_SSH_PUBKEY" > "$TMPD/dev_authorized_keys"
+  DEV_SSH_UPLOAD=(
+    --mkdir /root/.ssh
+    --chmod 0700:/root/.ssh
+    --upload "$TMPD/dev_authorized_keys":/root/.ssh/authorized_keys
+    --chmod 0600:/root/.ssh/authorized_keys
+  )
   cat >> "$TMPD/provision-base.sh" <<'EOF'
-mkdir -p /etc/cloud/cloud.cfg.d
-printf 'datasource_list: [ AliYun ]\n' > /etc/cloud/cloud.cfg.d/99-aliyun-ds.cfg
+export DEBIAN_FRONTEND=noninteractive
+apt-get install -y openssh-server
+systemctl enable ssh
+systemctl unmask serial-getty@ttyS0.service getty@tty1.service || true
 EOF
 fi
 
@@ -506,6 +599,7 @@ virt-customize -a "$IN" \
   --upload "$TMPD/config.toml":/etc/tapp/config.toml \
   --mkdir /etc/systemd/resolved.conf.d \
   --upload "$TMPD/99-fallback-dns.conf":/etc/systemd/resolved.conf.d/99-fallback-dns.conf \
+  ${DEV_SSH_UPLOAD[@]+"${DEV_SSH_UPLOAD[@]}"} \
   --run "$TMPD/provision-base.sh"
 
 # ---- stage B: kernel + convert + ESP (IN_PLACE operates on the input, reusing the validated script) ----

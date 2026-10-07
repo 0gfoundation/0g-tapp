@@ -8,12 +8,16 @@
 #
 # Two modes (matching build modes):
 #   canonical (owner omitted): one policy for all owners; reads <env>.json
-#     → policy id: 0g-tapp-<cloud>-<boot_format>-<version>-<env>
+#     → policy id: 0g-tapp-<boot_format>-<version>-<env>
 #   custom    (owner given):   per-owner policy; reads <env>/<owner>.json
-#     → policy id: 0g-tapp-<cloud>-<boot_format>-<version>-<env>-<owner>
+#     → policy id: 0g-tapp-<boot_format>-<version>-<env>-<owner>
+#
+# No cloud in either: the image is identical on every platform, so one policy covers a build
+# wherever it was published. Ids registered under the older 0g-tapp-<cloud>-... form stay
+# registered for the nodes still running those images — this script just never mints one again.
 #
 # Usage:
-#   ./register-shared-as.sh <cloud> <boot_format> <version> <env> [owner] [as-endpoint]
+#   ./register-shared-as.sh <boot_format> <version> <env> [owner] [as-endpoint]
 #     owner       optional: OWNER_ADDRESS (0x...); omit for canonical mode
 #     as-endpoint default https://35.253.66.70:50004 (https:// selects TLS; host:port stays plaintext)
 #
@@ -30,27 +34,26 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."   # repo root
 
-U="usage: register-shared-as.sh <cloud> <boot_format> <version> <env> [owner] [as-endpoint]"
-CLOUD="${1:?$U}"
-BOOT_FORMAT="${2:?$U}"
-VERSION="${3:?$U}"
-ENV="${4:?$U}"
-# Detect whether arg 5 looks like an owner address or an AS endpoint
-_ARG5="${5:-}"
-if printf '%s' "$_ARG5" | grep -qE '^(0[xX])?[0-9a-fA-F]{40}$'; then
-  OWNER="$(printf '%s' "$_ARG5" | sed 's/^0[xX]//' | tr 'A-Z' 'a-z')"
-  AS="${6:-https://35.253.66.70:50004}"
+U="usage: register-shared-as.sh <boot_format> <version> <env> [owner] [as-endpoint]"
+BOOT_FORMAT="${1:?$U}"
+VERSION="${2:?$U}"
+ENV="${3:?$U}"
+# Detect whether arg 4 looks like an owner address or an AS endpoint
+_ARG4="${4:-}"
+if printf '%s' "$_ARG4" | grep -qE '^(0[xX])?[0-9a-fA-F]{40}$'; then
+  OWNER="$(printf '%s' "$_ARG4" | sed 's/^0[xX]//' | tr 'A-Z' 'a-z')"
+  AS="${5:-https://35.253.66.70:50004}"
 else
   OWNER=""
-  AS="${_ARG5:-https://35.253.66.70:50004}"
+  AS="${_ARG4:-https://35.253.66.70:50004}"
 fi
 
 if [ -n "$OWNER" ]; then
-  REF="verifier/reference-values/${CLOUD}/${BOOT_FORMAT}/${VERSION}/${ENV}/${OWNER}.json"
-  POLICY_ID="0g-tapp-${CLOUD}-${BOOT_FORMAT}-${VERSION}-${ENV}-${OWNER}"
+  REF="verifier/reference-values/${BOOT_FORMAT}/${VERSION}/${ENV}/${OWNER}.json"
+  POLICY_ID="0g-tapp-${BOOT_FORMAT}-${VERSION}-${ENV}-${OWNER}"
 else
-  REF="verifier/reference-values/${CLOUD}/${BOOT_FORMAT}/${VERSION}/${ENV}.json"
-  POLICY_ID="0g-tapp-${CLOUD}-${BOOT_FORMAT}-${VERSION}-${ENV}"
+  REF="verifier/reference-values/${BOOT_FORMAT}/${VERSION}/${ENV}.json"
+  POLICY_ID="0g-tapp-${BOOT_FORMAT}-${VERSION}-${ENV}"
 fi
 POLICY="verifier/policy.rego"
 PROTO_DIR="tapp-common/proto"

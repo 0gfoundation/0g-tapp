@@ -7,10 +7,12 @@ One CVM = one point in this grid; each combination has its own image, its own re
 
 | Dimension | Values | Set by | Effect |
 |---|---|---|---|
-| **cloud** | `gcp` \| `ali` | `CLOUD` | kernel + guest agent + publish target (see platform table) |
-| **boot_format** | `grub` \| `uki` | `BOOT_FORMAT` (default `grub` for any cloud; `uki` is opt-in) | boot chain ⇒ **shape of the measurement** (see below) |
-| **env** | `dev` (HARDEN=0) \| `prod` (HARDEN=1) | `HARDEN` | dev keeps cloud-init/SSH for debugging; prod purges it |
+| **boot_format** | `grub` \| `uki` | `BOOT_FORMAT` (default `grub`; `uki` is opt-in) | boot chain ⇒ **shape of the measurement** (see below) |
+| **env** | `dev` (HARDEN=0) \| `prod` (HARDEN=1) | `HARDEN` | prod purges everything that can change the instance from outside; dev leaves the rest in place |
 | **version** | tapp-server release tag | `TAPP_SERVER_URL` | which tapp-server binary + image-name suffix |
+
+Not a dimension but it does change the measurement: **`DEV_SSH_PUBKEY`** (dev only) bakes an SSH
+public key into a hardened image — see [Dev SSH access](#dev-ssh-access-cloud-independent).
 
 > **Two build modes** (`BUILD_MODE`, default `canonical`):
 > - **canonical** — owner-agnostic image: owner/kbs are claimed at runtime
@@ -19,32 +21,54 @@ One CVM = one point in this grid; each combination has its own image, its own re
 > - **custom** — `OWNER_ADDRESS` baked into `config.toml` → folded into the **initrd
 >   measurement** → per-owner image + per-owner reference set (legacy behaviour).
 
-`cloud` and `boot_format` are **independent axes** — a CVM boots one way (one measurement chain), regardless of cloud. The measurement *shape* is decided by `boot_format`, not cloud:
+A CVM boots one way (one measurement chain). The measurement *shape* is decided by `boot_format`:
 - **grub** → 5 components: `measurement.{shim,grub,kernel,initrd,kernel_cmdline}.SHA-384`
 - **uki**  → 1 component:  `measurement.uki.SHA-384` (kernel+initrd+cmdline fused into one signed EFI)
 
-Because they yield different images/measurements, **`boot_format` (like `cloud`, `env`, `version`) is part of the identifiers**, so a grub and a uki build never clobber each other:
+> **`cloud` is not a dimension** — it only selects the Stage C publish target
+> (`publish-gcp-image.sh` vs `publish-ali-image.sh`) and changes nothing in the image. One HWE
+> generic kernel (≥6.16, for the TDX RTMR measurement interface) serves every platform, and the
+> dev variant's SSH access is baked in at build time (`DEV_SSH_PUBKEY`) rather than injected at
+> boot by a per-cloud agent — so the same build boots on GCP, Alibaba Cloud **and bare metal**
+> with identical measurements. Verified on real GCP TDX hardware with `6.17.0-42-generic`.
+
+Because they yield different images/measurements, **`boot_format` (like `env`, `version`) is part of the identifiers**, so a grub and a uki build never clobber each other:
 - image name: `<imgbase>-<boot_format>-<version>` (e.g. `og-tdx-dev-grub-v0-3-0`); custom mode appends `-<owner>`
-- reference value: canonical `…/<version>/<env>.json`; custom `…/<version>/<env>/<owner>.json`
-- AS policy id: canonical `0g-tapp-<cloud>-<boot_format>-<version>-<env>`; custom appends `-<owner>`
+- reference value: canonical `<boot_format>/<version>/<env>.json`; custom `<boot_format>/<version>/<env>/<owner>.json`
+- AS policy id: canonical `0g-tapp-<boot_format>-<version>-<env>`; custom appends `-<owner>`
+
+Paths and policy ids from before this carried a leading `<cloud>`; they are kept, and never
+written again, so nodes on those images keep verifying — see
+[`verifier/reference-values/README.md`](../verifier/reference-values/README.md).
 
 Here `<version>` is the **image** version `<tapp-server tag>[-r<image_rev>]` (`build-cvm` inputs `version` + `image_rev`; rev 1 = no suffix), **not** the binary version — the two diverge whenever the image changes and the binary does not, which is most `cvm/` changes. Rebuilding a changed image under an already-published identity re-registers new measurements behind the **same AS policy id**, and every node still running the old image stops verifying on the spot. See [docs/VERSIONING.md → CVM image](../docs/VERSIONING.md#cvm-image).
 
-### Platform differences (everything else is shared)
-| | GCP (`gcp`) | Alibaba Cloud (`ali`) |
-|---|---|---|
-| default boot format | grub | grub (`uki` opt-in via `BOOT_FORMAT=uki`) |
-| kernel | `linux-image-gcp` (+ fix A: point `/boot/vmlinuz`) | base **generic** kernel (ECS uses virtio; no swap) |
-| guest / dev SSH inject | `google-guest-agent` | cloud-init pinned to `datasource_list: [ AliYun ]` |
-| convert boot handling | grub → ESP grub.cfg sync (`cryptpilot-convert`, #130) | grub → ESP sync; `uki` → `cryptpilot-convert --uki` (dracut + systemd-boot-efi) |
-| publish | `publish-gcp-image.sh` → GCS + `gcloud compute images create` | `publish-ali-image.sh` → OSS + `aliyun ecs ImportImage` |
+### Platform differences — only the publish step
+The image is the same everywhere; `cloud` reaches nothing but Stage C.
+
+| | GCP (`gcp`) | Alibaba Cloud (`ali`) | bare metal |
+|---|---|---|---|
+| kernel | HWE generic (≥6.16) | ← same | ← same |
+| dev SSH access | `DEV_SSH_PUBKEY` | ← same | ← same (the only option) |
+| publish | `publish-gcp-image.sh` → GCS + `gcloud compute images create` | `publish-ali-image.sh` → OSS + `aliyun ecs ImportImage` | none — boot the qcow2 with your own QEMU |
+
+It used to differ in two more rows, and those were the whole reason `cloud` was a build
+dimension: GCP got `linux-image-gcp` (the base 6.8 generic kernel lacks the TDX RTMR
+measurement interface, which the HWE generic kernel supplies just as well), and each cloud got
+its own key-injection agent for the dev variant (`google-guest-agent` / cloud-init pinned to
+`datasource_list: [ AliYun ]`) — which is also why bare metal had no usable dev image, since it
+has no metadata service to ask. `DEV_SSH_PUBKEY` replaced both.
+
+Convert-side handling follows `BOOT_FORMAT`, not the cloud: grub syncs the ESP `grub.cfg`
+(`cryptpilot-convert`, #130), `uki` runs `cryptpilot-convert --uki` (dracut + systemd-boot-efi).
 
 ## Directory contents
 | File | Description |
 |---|---|
 | `cryptpilot-gcp-boot-fix.md` | **Main doc**: root-cause analysis + fixes + full SOP (§9) + security-hardening audit (§11) + convert issues for Alibaba Cloud (§7) |
 | `build-tapp.sh` | **One-shot full chain** (cloud-generic, `CLOUD=`): base image → final tapp image (Stage A app/docker/SGX/DNS + hardening + /data + Sysbox / Stage B kernel + convert / opt-in Stage C publish via `PUBLISH_AS=`) |
-| `prepare-tapp.sh` | Stage B only (when a base already exists): fix A (gcp) / generic kernel (ali) + DNS (guestfish) + nbd reset + `cryptpilot-convert` (grub or `--uki`) |
+| `prepare-tapp.sh` | Stage B only (when a base already exists): HWE generic kernel + fix A + DNS (guestfish) + nbd reset + `cryptpilot-convert` (grub or `--uki`) |
+| `run-tapp-td.sh` | **Launch the image as a TD on a bare-metal TDX host** (own QEMU, no cloud). TDX flags taken from `canonical/tdx`'s own launchers; see [`BARE_METAL.md`](BARE_METAL.md) |
 | `publish-gcp-image.sh` | **Stage C (gcp)**: `qemu-img` raw → oldgnu sparse `tar.gz` → `gsutil` → `gcloud compute images create` (confidential guest-os-features). Needs gcloud/gsutil auth |
 | `publish-ali-image.sh` | **Stage C (ali)**: `ossutil cp` → `aliyun ecs ImportImage` (x86_64/UEFI/QCOW2) → enable NVMe → wait Available. Needs ossutil/aliyun auth |
 | `fix-esp-grub.sh` | Sync the ESP grub only (gcp/grub fix B, standalone against an already-converted image) |
@@ -55,10 +79,15 @@ Here `<version>` is the **image** version `<tapp-server tag>[-r<image_rev>]` (`b
 > The output qcow2 (~4–4.5G, converted / verity-sealed / hardened) is the **output** of `build-tapp.sh` and is not committed (gitignored).
 > The same applies to `cryptpilot-fde_*.deb` and the tapp-server binary: the deb must be placed locally in this directory; tapp-server is pulled by default from a GitHub release (see below).
 
+> **Running on bare metal?** The image is the same; what changes is that you launch the TD
+> yourself and own the quote-generation setup. [`BARE_METAL.md`](BARE_METAL.md) is the runbook —
+> verified end to end on an `ecs.ebmg8i.48xlarge`, including the one step that is genuinely easy
+> to get wrong (which PCCS can serve *your* platform).
+
 ## Pipeline (stages)
 - **Stage 0 — base prep** *(one-time, reused across builds & both clouds)*: official Ubuntu 24.04 cloud image → resize to 20 GiB → base qcow2. See `cryptpilot-gcp-boot-fix.md` §0. The base is **cloud-neutral** (generic kernel only). Input to Stage A, not part of `build-tapp.sh`.
 - **Stage A** (`build-tapp.sh`): provision app / docker / SGX / DNS, security hardening, Sysbox, and the `/data` + `br_netfilter` bakes. Remote-management encryption needs nothing baked: tapp-server ≥0.8.0 itself serves a TLS listener on **:50052** (per-boot in-memory self-signed cert; `[server] tls_bind_address`), so `tapp-cli --server https://<host>:50052 --insecure` is encrypted from first boot, claim included. Encryption only — defeats passive observers; against an active on-path attacker use `--tls-pin` or a CA-issued front. Node identity is established by attestation, not by that certificate.
-- **Stage B** (`prepare-tapp.sh`, invoked by A): `CLOUD=gcp` → install the gcp kernel + fix A; `CLOUD=ali` → keep the generic kernel. Then `cryptpilot-convert` (grub, syncing the ESP) or `cryptpilot-convert --uki` per `BOOT_FORMAT`.
+- **Stage B** (`prepare-tapp.sh`, invoked by A): install the newest complete HWE **generic** kernel (≥6.16 — the TDX RTMR measurement interface) + fix A (point `/boot/vmlinuz` at it, so convert builds the cryptpilot initrd for the kernel grub will actually boot). Then `cryptpilot-convert` (grub, syncing the ESP) or `cryptpilot-convert --uki` per `BOOT_FORMAT`. Not cloud-dependent.
 - *(optional)* local boot smoke test (`test/boot-smoke-test.sh`).
 - **Stage C** (`publish-gcp-image.sh` / `publish-ali-image.sh` by `CLOUD`): publish the built qcow2 to the cloud. Run standalone, or from `build-tapp.sh` via `PUBLISH_AS=<name>`.
 
@@ -83,9 +112,10 @@ See `cryptpilot-gcp-boot-fix.md` §0.1 for details.
 ## One-shot build
 ```bash
 export LIBGUESTFS_BACKEND=direct
-CLOUD=gcp \                       # or CLOUD=ali (default gcp; picks kernel/guest/boot-format/publish)
 KBS_URLS='"http://<kbs-host-1>:9091", "http://<kbs-host-2>:9091"' \
 ./build-tapp.sh <bare-ubuntu-24.04.qcow2> tapp.qcow2
+# One image for every platform. CLOUD (gcp|ali) is only needed for an opt-in Stage C publish
+# (PUBLISH_AS=…); leave it alone to build a qcow2 you can publish later, or boot yourself.
 ```
 - **Required**:
   - `KBS_URLS` — KBS node URLs for `[kbs] node_urls`, comma-separated and quoted as shown.
@@ -176,6 +206,14 @@ ALIYUN_REGION=cn-beijing ./publish-ali-image.sh /path/og-tdx-ali-dev.qcow2 og-td
 ```
 Defaults `OSS_BUCKET=0g-confidential-disk` (`ALIYUN_REGION` required, no default). It refuses to clobber an existing image name. In CI the al8 build runner is itself an Ali ECS instance, so it authenticates via its **instance RAM role** (no AK/SK secret). Create a confidential (TDX) instance from the image; assign a public IPv4 (for Trustee attestation) and use **key-pair** auth (passwords are unsupported on confidential instances).
 
+**In CI, reach both clouds from one build: `cloud=both`.** The image is identical on every platform,
+so building twice to publish twice was waste — and the second dispatch also redid the identity work,
+pushing the same `refvalues/*` branch and failing there, which marked a good dual-publish red. With
+`cloud=both` one build is published to GCP and Alibaba Cloud while the reference values, the AS
+policy and the refvalues PR are produced once, as they should be for one image. `gcp` and `ali`
+remain if you want a single target. For a GPU build, which spends most of its 90 minutes in DKMS,
+this is the difference between one build and two.
+
 ## Three core fixes (all required)
 - **Fix A**: before convert, point the `/boot/vmlinuz` symlink at the gcp kernel → the cryptpilot stack goes into the correct initrd (fixes read-only / RTMR / verity).
 - **Fix B**: after convert, sync the boot-partition grub.cfg + modules to the ESP (fixes the boot crash bli.mod / vmlinuz not found).
@@ -194,6 +232,103 @@ Stage A always:
 Why it is a build-time hard gate (`cvm/ci/check-no-auto-update.sh`, run on the final image in `build-cvm.yml`): an auto-upgrade restarts tapp-server — observed on testnet as a glibc upgrade restarting `tapp-server` + `containerd` + `sysbox` in one go — and tapp derives the app signer in memory, so **within that same boot** every on-chain node/service of every app on the node silently goes stale. (On an image variant whose `/boot`/ESP is writable at runtime, an auto kernel upgrade would additionally change RTMR + `kernel_cmdline` and invalidate the reference values; here the rootfs overlay is RAM-backed, so that one is the secondary concern.) Package updates go through a rebuild, which regenerates reference values, never through the running node.
 
 Scope: this covers **apt**. `HARDEN=1` additionally purges the other self-changing components (`snapd` auto-refresh, `ubuntu-pro-client`'s `ua-timer`/`apt-news`/`esm-cache`, `motd-news`); on a `HARDEN=0` dev image those are still present.
+
+<a name="dev-ssh-access-cloud-independent"></a>
+### Dev SSH access without a cloud — `DEV_SSH_PUBKEY` (dev only)
+The `HARDEN=0` dev variants get you in by letting the **cloud inject your key at boot**: on GCP
+`google-guest-agent` reads it from `metadata.google.internal`, on Alibaba Cloud cloud-init reads it
+from `100.100.100.200`. That is why the dev image has to pick a cloud — and why **neither dev
+variant can be used on bare metal**, where no metadata service exists at all and a self-launched TD
+is handed nothing.
+
+`DEV_SSH_PUBKEY` removes the dependency by baking the key at **build** time, so nothing has to be
+asked for at boot:
+
+```bash
+DEV_SSH_PUBKEY="$(cat ~/.ssh/id_ed25519.pub)" CLOUD=ali BOOT_FORMAT=uki HARDEN=1 \
+  ./build-tapp.sh base-noble.qcow2 out-dev.qcow2      # then: ssh root@<ip>
+```
+
+or the `dev_ssh_pubkey` input on `build-cvm`. Unset ⇒ the block is skipped and the image is
+byte-identical, so this is inert on every normal build. It reinstalls the `openssh-server` that
+`HARDEN=1` purges, writes `/root/.ssh/authorized_keys`, and unmasks the getty.
+
+On `build-cvm` the key is **ignored for the prod image, with a warning** (log annotation + run
+summary) rather than rejected up front, so `env=both` stays usable — one dispatch gives a keyed dev
+image and a clean prod one. A **malformed** key is still a hard failure in `Validate inputs`
+whatever the env: it is always a typo, and it would otherwise build a dev image whose
+`authorized_keys` grants nothing, discovered only when the login fails.
+
+One image then works on GCP, Alibaba Cloud **and** bare metal — bare metal being the one where it is
+the *only* option, see below. Prefer baking a *team's* keys over one person's: the key is measured,
+so rotating it means rebuilding.
+
+**On a hardened image the cloud's own entry points stay dead.** `gcloud compute ssh` and GCP's
+browser SSH both work by pushing an ephemeral key to instance metadata for `google-guest-agent` to
+install, and `HARDEN=1` purges that agent — verified on a hardened image as
+`Permission denied (publickey)`. Alibaba Cloud's console "remote connect" fails for the same
+reason. There, your baked key is the only way in, and
+`gcloud compute instances get-serial-port-output` (hypervisor-level, so it needs nothing in the
+guest) the only fallback.
+
+One difference between the variants is worth stating plainly, because "no way in" is easy to
+read as "nothing listening". **A dev image runs sshd; a prod image does not** — unless it was
+built with `DEV_SSH_PUBKEY`, which reinstalls `openssh-server` (CI forces the key empty for
+prod). `HARDEN=1` purges `openssh-server` outright (it heads the purge list), while `HARDEN=0`
+leaves the base image's copy in place. Measured on v0.8.0-r2 instances: port 22 answers on the
+dev image, refuses on the prod one. Whether a keyless dev image's sshd has any key to accept is
+the next question, and the answer depends on the platform:
+
+**A dev image keeps cloud-init, and whether that is a way in depends on the platform.** Only
+`HARDEN=1` purges cloud-init; `HARDEN=0` keeps it and does not pin its datasource, so
+ds-identify still detects the platform and could in principle inject the project's SSH key from
+instance metadata. Whether it actually can turns on one detail — how that platform's metadata
+endpoint is addressed — and the answer measured so far is not uniform:
+
+| platform | metadata endpoint | keyless dev image |
+|---|---|---|
+| GCP | `metadata.google.internal` (a **name**) | **closed, measured** |
+| Alibaba Cloud | `100.100.100.200` (an **IP**) | **unmeasured, assume open** |
+| bare metal | none | closed |
+
+On GCP it is closed, and not by design: the image writes a static `/etc/resolv.conf` (fix C in
+`prepare-tapp.sh`), which cannot resolve an internal name, so cloud-init falls through to
+`DataSourceNone` and injects nothing. Measured on a TDX instance —
+
+```
+DataSourceGCE.py[WARNING]: address "http://metadata.google.internal/computeMetadata/v1/" is not resolvable
+Datasource DataSourceNone.  Used fallback datasource
+ci-info: no authorized SSH keys fingerprints found for user ubuntu
+```
+
+`sshd` runs and port 22 answers; there is simply no key. The same reasoning does **not** carry to
+Alibaba Cloud, whose endpoint is a literal IP and needs no resolution, so the static
+`resolv.conf` does nothing to it and key injection is plausible. That has not been measured —
+treat an Aliyun keyless dev image as reachable by the project's keys until someone checks, and
+pin the datasource to `None` if you need it closed.
+
+On **bare metal** there is no metadata service to ask on any platform, which is the gap
+`DEV_SSH_PUBKEY` closes unconditionally.
+
+That is the trade, and it is the point: the cloud's convenience *is* its ability to inject
+credentials into your instance, which is exactly what hardening removes. In exchange, **who can get
+in becomes part of the measurement** — the key lands in the verity-sealed rootfs, whose root hash is
+in the initrd, which is in the UKI. Measured on real TDX hardware, the same image with and without a
+baked key:
+
+| image | `measurement.uki.SHA-384` |
+|---|---|
+| hardened, no key | `335c28e6971fc1ef…` |
+| hardened + baked key | `b0a640cae384ddde…` |
+
+So a keyed dev image has its own reference values and **cannot be mistaken for a production one** by
+any verifier. It is still a deliberate back door: never publish one as a production image.
+
+**A keyed image needs its own `image_rev`.** The key changes the measurement but appears in no
+identifier — not the image name, the reference-value path, the AS policy id, nor the concurrency
+group. So building one under an identity that already has reference values would replace what
+every node of that identity verifies against. `build-cvm` now refuses that (see
+`allow_refval_overwrite`), but the fix is to bump `image_rev`, not to override the guard.
 
 ## Verification (passed)
 - Image static checks: all the above packages gone, getty masked, netplan = 01-dhcp, resolv.conf 3 lines, gcp initrd cryptpilot = 16.
