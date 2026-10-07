@@ -1,7 +1,7 @@
 ---
 name: 0g-tapp-cli
 description: Use this skill when the user wants to deploy, manage, or troubleshoot applications on a 0G Tapp (Trusted Application Platform) server using tapp-cli. Covers start/stop apps, on-chain registration, registry login, check task status, view logs, and manage docker compose deployments across multiple remote TEE servers.
-version: 1.15.1
+version: 1.15.2
 author: 0G Labs
 tags: [0g, tapp, tee, docker, deployment, cli, onchain]
 ---
@@ -191,7 +191,7 @@ A failed task prints the docker compose `Stderr:` (the actual root cause). A com
 
 ## On-chain Commands (TappRegistry)
 
-The node's on-chain `teeUrl` is `--tee-url` when given; otherwise a node already on chain **keeps its recorded value** — only legacy `http://host:50051` auto-moves to `https://host:50052` (tapp-server ≥ 0.8.0). A **replacement** asks the replaced slot's URL for the app's signer: this node's (the restart case) → kept; another machine's → derived from `--server`, printed; no answer (e.g. a VPC-private URL seen from outside) → kept with a warning, so replacing a dead machine needs `--tee-url`. A **new** record is derived from `--server` (`https://…` as given; `http://host:50051` → `https://host:50052`); a `127.0.0.1`/socket `--server` then needs `--tee-url`. `:50051` should stay closed to all but the node (#141). A node in the scan's VPC may register a private `https://10.x.x.x:50052` — only the scan reaches it, others verify through the scan relay. To move a `teeUrl`, pass `--tee-url` to `start-app --register-onchain` / `update-node-onchain` (rewritten in place, same signer). Key must be the app owner (see Keys above).
+The node's on-chain `teeUrl` is `--tee-url` when given; otherwise a node already on chain **keeps its recorded value** — only legacy `http://host:50051` auto-moves to `https://host:50052` (tapp-server ≥ 0.8.0). A **replacement** asks the replaced slot's URL for the app's signer: this node's (the restart case) → kept; another signer, or an answer that is not one → derived from `--server`, printed; no answer (e.g. a VPC-private URL seen from outside) → kept with a warning, so replacing a machine unreachable from here (dead, or a hand-over) needs `--tee-url`. A **new** record is derived from `--server` (`https://…` as given; `http://host:50051` → `https://host:50052`); a `127.0.0.1`/socket `--server` then needs `--tee-url`. `:50051` should stay closed to all but the node (#141). A node in the scan's VPC may register a private `https://10.x.x.x:50052` — only the scan reaches it, others verify through the scan relay. To move a `teeUrl`, pass `--tee-url` to `start-app --register-onchain` / `update-node-onchain` (rewritten in place, same signer). Key must be the app owner (see Keys above).
 
 ```bash
 # Preferred for new deploys: start-app --register-onchain (see Core Commands) registers
@@ -209,7 +209,7 @@ withdraw-balance    --app-id <id> --rpc-url <rpc> --contract 0x<reg>            
 - `update-node-onchain`: new signer auto-fetched from `--server` unless `--new-signer` given; `--tee-url` defaults as above. When that signer is **already a node**, its own record is rewritten in place (how a `teeUrl` moves) — "Nothing to update" if it already matches. Pass `--old-signer` explicitly when replacing a node on a different host.
 - **Handing an app over** — only the registry owner transfers; machines are replaced, never transferred (TappRegistry >= 0.2.0):
   1. `transfer-app-ownership --app-id <id> --rpc-url <rpc> --contract 0x<reg> --new-owner 0x<new>` (owner key; `--cancel` withdraws), then `accept-app-ownership --app-id <id> --rpc-url <rpc> --contract 0x<reg>` (nominee key). Two steps because a wrong address would strand the app for good.
-  2. On each machine the new owner has claimed: `start-app ... --register-onchain` (+ `--old-signer` if the app has several nodes) — replaces the old node in place via updateNode (stake carried, never zero nodes, works for `encrypted` apps).
+  2. On each machine the new owner has claimed: `start-app ... --register-onchain --tee-url https://<new-node>:50052` (+ `--old-signer` if the app has several nodes) — replaces the old node in place via updateNode (stake carried, never zero nodes, works for `encrypted` apps). **Always pass `--tee-url` here**: the old machine's port is normally closed to the new owner, so the probe gets no answer and would keep the old URL.
   - Until a node is replaced, the old machine's owner still gets the app's KMS keys (KMS authorizes by node list). Keys derive from app_id, so they do not change across the hand-over.
   - Live nodes' stake travels with the app; stake already locked stays with the old owner. Acks not invalidated. On a 0.1.0 registry `accept-app-ownership` fails decoding `pendingAppOwner` — the upgrade has not landed.
 - app-id is **global & unique** in the registry. `register-onchain` on an existing id → `app already exists`; use add-node/update-node instead.

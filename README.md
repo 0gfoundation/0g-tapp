@@ -516,8 +516,13 @@ are not transferred — the new owner replaces them with its own.
    ```bash
    tapp-cli -s <new-node> -k 0x<new-key> start-app -f docker-compose.yml -a <app_id> \
      --register-onchain --rpc-url <rpc> --contract <registry> --stake-wei <wei> \
+     --tee-url https://<new-node>:50052 \
      [--old-signer 0x<node being replaced>]   # needed only when the app has several nodes
    ```
+
+   Pass `--tee-url` here. Without it the replaced node's teeUrl is kept unless something
+   else answers there, and the old machine's port is normally closed to the new owner
+   (#141), so it would be kept — now pointing verifiers and the KMS at the old machine.
 
    The new signer replaces the old one in place (`updateNode`): one transaction, the
    stake carried over, no moment where the app has no node. It also orders things so
@@ -558,7 +563,7 @@ the body-bound form too (`sign_message.py` takes the request JSON).
 
 Register your app and TEE nodes on the TappRegistry contract using `tapp-cli`. These commands require `--private-key` (the deployer's Ethereum private key) and `--server` (the tapp gRPC endpoint).
 
-The node's on-chain `teeUrl` — where the scan and `verify-app` fetch its evidence — is `--tee-url` when given. Otherwise a node already on chain **keeps its recorded `teeUrl`**: a DNS name, front or private address was someone's choice, and a run from wherever the operator happens to be must not move it. A **replacement** asks the replaced slot's `teeUrl` for the app's signer. If *this* node answers (the restart case), the URL is kept. If another machine answers (a new owner taking over), the replacement gets a URL derived from `--server` instead, and says so. If nothing answers — a VPC-private URL seen from outside, or a dead machine — the URL is kept with a warning, so replacing a dead machine is the one case that needs `--tee-url`. The one automatic move is the legacy `http://<host>:50051` → `https://<host>:50052` when the node serves the TLS listener (tapp-server ≥ 0.8.0). A **new** record is derived from `--server`: `https://` as given, `http://` → `https://<host>:50052`; a `--server` reached locally (`127.0.0.1`, a socket) cannot be derived from, so a new record then needs `--tee-url`. Every change is printed. `:50051` is meant to stay closed to everyone but the node (#141). `--tee-url` takes a DNS name, a TLS front, or a **private address** — a node in the scan's VPC can register `https://10.x.x.x:50052`, which only the scan reaches; everyone else verifies it through the scan relay. To move a node's `teeUrl`, pass `--tee-url` to `start-app --register-onchain` or `update-node-onchain` (signer unchanged, nothing else touched).
+The node's on-chain `teeUrl` — where the scan and `verify-app` fetch its evidence — is `--tee-url` when given. Otherwise a node already on chain **keeps its recorded `teeUrl`**: a DNS name, front or private address was someone's choice, and a run from wherever the operator happens to be must not move it. A **replacement** asks the replaced slot's `teeUrl` for the app's signer. If *this* node answers (the restart case), the URL is kept. If another signer answers, or something answers that is not a tapp-server naming this node, the replacement gets a URL derived from `--server` instead, and says so. If nothing answers — a VPC-private URL seen from outside, a dead machine, or the old machine on a hand-over — the URL is kept with a warning, so those replacements need `--tee-url`. The one automatic move is the legacy `http://<host>:50051` → `https://<host>:50052` when the node serves the TLS listener (tapp-server ≥ 0.8.0). A **new** record is derived from `--server`: `https://` as given, `http://` → `https://<host>:50052`; a `--server` reached locally (`127.0.0.1`, a socket) cannot be derived from, so a new record then needs `--tee-url`. Every change is printed. `:50051` is meant to stay closed to everyone but the node (#141). `--tee-url` takes a DNS name, a TLS front, or a **private address** — a node in the scan's VPC can register `https://10.x.x.x:50052`, which only the scan reaches; everyone else verifies it through the scan relay. To move a node's `teeUrl`, pass `--tee-url` to `start-app --register-onchain` or `update-node-onchain` (signer unchanged, nothing else touched).
 
 ### Register during start (recommended)
 

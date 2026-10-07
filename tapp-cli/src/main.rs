@@ -1528,18 +1528,33 @@ async fn node_evidence_url(
     Ok((url, serves_tls_listener(&version)))
 }
 
-/// The signer a teeUrl answers with for `app_id`, or `None` when it does not answer in
-/// time. Any certificate is accepted: this only asks "is that this node?", and what it
-/// learns is compared against a signer already in hand. GetAppKey creates a key for an app
-/// it has not seen, so any tapp-server that answers names a signer.
-async fn signer_reached_at(url: &str, app_id: &str) -> Option<ethers::types::Address> {
+/// What answers at a teeUrl when asked for an app's signer.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum AtUrl {
+    /// A tapp-server naming a signer. GetAppKey creates a key for an app it has not seen
+    /// (in memory, unused unless the app starts there), so any tapp-server names one.
+    Signer(ethers::types::Address),
+    /// Something answered, but not with a signer: an error, `success=false`, something that
+    /// is not a tapp-server. Whatever it is, it is not this node.
+    NotThisNode,
+    /// Nothing within the timeout: closed to us, private, or down. Not evidence either way.
+    NoAnswer,
+}
+
+/// Ask a teeUrl for `app_id`'s signer. Any certificate is accepted: this only asks "is that
+/// this node?", and what it learns is compared against a signer already in hand.
+async fn signer_reached_at(url: &str, app_id: &str) -> AtUrl {
     let ask = async {
-        let mut client = if url.starts_with("https://") {
-            TappServiceClient::new(tapp_common::pinned_tls::grpc_channel(url, Vec::new()).await.ok()?)
+        let channel = if url.starts_with("https://") {
+            tapp_common::pinned_tls::grpc_channel(url, Vec::new()).await.map_err(|_| AtUrl::NoAnswer)?
         } else {
-            TappServiceClient::connect(url.to_string()).await.ok()?
+            tonic::transport::Endpoint::from_shared(url.to_string())
+                .map_err(|_| AtUrl::NotThisNode)?
+                .connect()
+                .await
+                .map_err(|_| AtUrl::NoAnswer)?
         };
-        let resp = client
+        let resp = TappServiceClient::new(channel)
             .get_app_key(Request::new(GetAppKeyRequest {
                 app_id: app_id.to_owned(),
                 key_type: "ethereum".to_string(),
@@ -1548,24 +1563,26 @@ async fn signer_reached_at(url: &str, app_id: &str) -> Option<ethers::types::Add
                 x25519: false,
             }))
             .await
-            .ok()?
+            .map_err(|s| match s.code() {
+                // The connection broke rather than anything answering.
+                tonic::Code::Unavailable | tonic::Code::DeadlineExceeded => AtUrl::NoAnswer,
+                _ => AtUrl::NotThisNode,
+            })?
             .into_inner();
-        (resp.success && resp.eth_address.len() == 20)
-            .then(|| ethers::types::Address::from_slice(&resp.eth_address))
+        if resp.success && resp.eth_address.len() == 20 {
+            Ok(AtUrl::Signer(ethers::types::Address::from_slice(&resp.eth_address)))
+        } else {
+            Err(AtUrl::NotThisNode)
+        }
     };
-    tokio::time::timeout(std::time::Duration::from_secs(8), ask).await.ok().flatten()
+    match tokio::time::timeout(std::time::Duration::from_secs(8), ask).await {
+        Ok(Ok(at)) | Ok(Err(at)) => at,
+        Err(_) => AtUrl::NoAnswer,
+    }
 }
 
-/// The teeUrl for a node that REPLACES another, decided by who answers at the slot's record:
-///
-/// - this node's signer: a restart (same machine, new signer). Kept.
-/// - another signer: a replacement on another machine — a new owner taking over, a dead
-///   machine replaced. Keeping it would point verifiers, and the KMS's admission, at the
-///   machine replaced, so the URL derived from `--server` is recorded instead, and printed.
-/// - no answer: unknown. The record may be private to the scan's network (a VPC address)
-///   and this command run from outside it, which is the common restart case, so it is kept
-///   and the operator told how to move it. Replacing a dead machine is the one case that
-///   then needs `--tee-url`.
+/// The teeUrl for a node that REPLACES another, decided by who answers at the slot's record
+/// (see `replacement_tee_url`).
 async fn tee_url_for_replacement(
     kept: String,
     derived: &Result<String, String>,
@@ -1576,35 +1593,63 @@ async fn tee_url_for_replacement(
     if explicit || derived.as_ref() == Ok(&kept) {
         return Ok(kept);
     }
-    let other = match signer_reached_at(&kept, app_id).await {
-        Some(s) if s == signer => return Ok(kept),
-        Some(other) => other,
-        None => {
+    let at = signer_reached_at(&kept, app_id).await;
+    let (url, note) = replacement_tee_url(kept, derived, at, signer);
+    if let Some(note) = note {
+        println!("  {}", note);
+    }
+    url
+}
+
+/// The decision behind `tee_url_for_replacement`, and what to tell the operator:
+///
+/// - this node's signer: a restart (same machine, new signer). Kept.
+/// - another signer, or an answer that is not a signer at all: not this node. Keeping it
+///   would point verifiers, and the KMS's admission, at the machine replaced, so the URL
+///   derived from `--server` is recorded instead, and printed.
+/// - no answer: unknown. The record may be private to the scan's network (a VPC address)
+///   and this command run from outside it, which is the common restart case, so it is kept
+///   and the operator told how to move it. Replacing a machine that cannot be reached from
+///   here — a dead one, or one behind #141's allowlist on a hand-over — needs `--tee-url`.
+fn replacement_tee_url(
+    kept: String,
+    derived: &Result<String, String>,
+    at: AtUrl,
+    signer: ethers::types::Address,
+) -> (Result<String, String>, Option<String>) {
+    let answered = match at {
+        AtUrl::Signer(s) if s == signer => return (Ok(kept), None),
+        AtUrl::Signer(other) => format!("answers as 0x{:x}", other),
+        AtUrl::NotThisNode => "answers, but not as a tapp-server naming this node".to_string(),
+        AtUrl::NoAnswer => {
             let to = match derived {
                 Ok(d) => format!("--tee-url {}", d),
                 Err(_) => "--tee-url".to_string(),
             };
-            println!(
-                "  ⚠ teeUrl {} (the replaced node's) did not answer from here; keeping it. If \
+            let note = format!(
+                "⚠ teeUrl {} (the replaced node's) did not answer from here; keeping it. If \
                  this node is on another machine, rerun with {}",
                 kept, to
             );
-            return Ok(kept);
+            return (Ok(kept), Some(note));
         }
     };
     match derived {
-        Ok(d) => {
-            println!(
-                "  teeUrl {} (the replaced node's) answers as 0x{:x}, another machine; \
-                 recording {} — --tee-url to choose another",
-                kept, other, d
-            );
-            Ok(d.clone())
-        }
-        Err(e) => Err(format!(
-            "the replaced node's teeUrl {} answers as 0x{:x}, another machine, and {}",
-            kept, other, e
-        )),
+        Ok(d) => (
+            Ok(d.clone()),
+            Some(format!(
+                "teeUrl {} (the replaced node's) {}, another machine; recording {} — \
+                 --tee-url to choose another",
+                kept, answered, d
+            )),
+        ),
+        Err(e) => (
+            Err(format!(
+                "the replaced node's teeUrl {} {}, another machine, and {}",
+                kept, answered, e
+            )),
+            None,
+        ),
     }
 }
 
@@ -4762,6 +4807,33 @@ mod evidence_url_tests {
             assert!(evidence_url_for(local, None, Some("0.9.0")).is_err(), "{local}");
             assert!(evidence_url_for(local, Some("https://node.example:50052"), None).is_ok(), "{local}");
         }
+    }
+
+    /// Every outcome of the replacement decision, without a network.
+    #[test]
+    fn a_replacement_keeps_the_url_only_when_this_node_answers_or_nothing_does() {
+        let me = ethers::types::Address::repeat_byte(0x11);
+        let other = ethers::types::Address::repeat_byte(0x22);
+        let kept = "https://10.0.0.5:50052".to_string();
+        let derived: Result<String, String> = Ok("https://203.0.113.7:50052".to_string());
+        let local: Result<String, String> = Err("--server is reached locally".to_string());
+
+        // This node answers: a restart. Kept, nothing to say.
+        assert_eq!(replacement_tee_url(kept.clone(), &derived, AtUrl::Signer(me), me), (Ok(kept.clone()), None));
+
+        // Another signer, or an answer that is no signer: another machine. Derived, and said.
+        for at in [AtUrl::Signer(other), AtUrl::NotThisNode] {
+            let (url, note) = replacement_tee_url(kept.clone(), &derived, at, me);
+            assert_eq!(url, derived);
+            assert!(note.unwrap().contains("another machine"), "{at:?}");
+            // ...and with nothing to derive from, it refuses rather than keep the wrong URL.
+            assert!(replacement_tee_url(kept.clone(), &local, at, me).0.is_err(), "{at:?}");
+        }
+
+        // Nothing answers: kept, with the flag to pass if this is another machine.
+        let (url, note) = replacement_tee_url(kept.clone(), &derived, AtUrl::NoAnswer, me);
+        assert_eq!(url, Ok(kept.clone()));
+        assert!(note.unwrap().contains("--tee-url https://203.0.113.7:50052"));
     }
 
     /// A replaced slot's URL that does not answer from here is kept: it may be private to the
