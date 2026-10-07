@@ -271,6 +271,14 @@ reason. There, your baked key is the only way in, and
 `gcloud compute instances get-serial-port-output` (hypervisor-level, so it needs nothing in the
 guest) the only fallback.
 
+One difference between the variants is worth stating plainly, because "no way in" is easy to
+read as "nothing listening". **A dev image runs sshd; a prod image does not** — unless it was
+built with `DEV_SSH_PUBKEY`, which reinstalls `openssh-server` (CI forces the key empty for
+prod). `HARDEN=1` purges `openssh-server` outright (it heads the purge list), while `HARDEN=0`
+leaves the base image's copy in place. Measured on v0.8.0-r2 instances: port 22 answers on the
+dev image, refuses on the prod one. Whether a keyless dev image's sshd has any key to accept is
+the next question, and the answer depends on the platform:
+
 **A dev image keeps cloud-init, and whether that is a way in depends on the platform.** Only
 `HARDEN=1` purges cloud-init; `HARDEN=0` keeps it and does not pin its datasource, so
 ds-identify still detects the platform and could in principle inject the project's SSH key from
