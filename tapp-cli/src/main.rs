@@ -1530,7 +1530,8 @@ async fn node_evidence_url(
 
 /// The signer a teeUrl answers with for `app_id`, or `None` when it does not answer in
 /// time. Any certificate is accepted: this only asks "is that this node?", and what it
-/// learns is compared against a signer already in hand.
+/// learns is compared against a signer already in hand. GetAppKey creates a key for an app
+/// it has not seen, so any tapp-server that answers names a signer.
 async fn signer_reached_at(url: &str, app_id: &str) -> Option<ethers::types::Address> {
     let ask = async {
         let mut client = if url.starts_with("https://") {
@@ -1555,10 +1556,16 @@ async fn signer_reached_at(url: &str, app_id: &str) -> Option<ethers::types::Add
     tokio::time::timeout(std::time::Duration::from_secs(8), ask).await.ok().flatten()
 }
 
-/// The teeUrl for a node that REPLACES another. The slot's record is kept only if it
-/// reaches this node: after a restart it does (same machine, new signer), but a
-/// replacement on another machine — a new owner taking over, a dead machine replaced —
-/// would otherwise point verifiers, and the KMS's admission, at the machine it replaced.
+/// The teeUrl for a node that REPLACES another, decided by who answers at the slot's record:
+///
+/// - this node's signer: a restart (same machine, new signer). Kept.
+/// - another signer: a replacement on another machine — a new owner taking over, a dead
+///   machine replaced. Keeping it would point verifiers, and the KMS's admission, at the
+///   machine replaced, so the URL derived from `--server` is recorded instead, and printed.
+/// - no answer: unknown. The record may be private to the scan's network (a VPC address)
+///   and this command run from outside it, which is the common restart case, so it is kept
+///   and the operator told how to move it. Replacing a dead machine is the one case that
+///   then needs `--tee-url`.
 async fn tee_url_for_replacement(
     kept: String,
     derived: &Result<String, String>,
@@ -1569,21 +1576,34 @@ async fn tee_url_for_replacement(
     if explicit || derived.as_ref() == Ok(&kept) {
         return Ok(kept);
     }
-    if signer_reached_at(&kept, app_id).await == Some(signer) {
-        return Ok(kept);
-    }
+    let other = match signer_reached_at(&kept, app_id).await {
+        Some(s) if s == signer => return Ok(kept),
+        Some(other) => other,
+        None => {
+            let to = match derived {
+                Ok(d) => format!("--tee-url {}", d),
+                Err(_) => "--tee-url".to_string(),
+            };
+            println!(
+                "  ⚠ teeUrl {} (the replaced node's) did not answer from here; keeping it. If \
+                 this node is on another machine, rerun with {}",
+                kept, to
+            );
+            return Ok(kept);
+        }
+    };
     match derived {
         Ok(d) => {
             println!(
-                "  teeUrl {} (the replaced node's) does not reach this node; recording {} — \
-                 --tee-url to choose another",
-                kept, d
+                "  teeUrl {} (the replaced node's) answers as 0x{:x}, another machine; \
+                 recording {} — --tee-url to choose another",
+                kept, other, d
             );
             Ok(d.clone())
         }
         Err(e) => Err(format!(
-            "the replaced node's teeUrl {} does not reach this node, and {}",
-            kept, e
+            "the replaced node's teeUrl {} answers as 0x{:x}, another machine, and {}",
+            kept, other, e
         )),
     }
 }
@@ -3823,7 +3843,7 @@ async fn update_node_onchain(
     let (cur_url, cur_compose, cur_volumes) =
         tapp_common::onchain::get_node(&rpc_url, &contract, &app_id, old_signer_addr).await?;
     // Explicit: as given (validated already). In place: the record, legacy form migrated.
-    // A replacement: the replaced slot's record only if it reaches this node.
+    // A replacement: the replaced slot's record unless another machine answers there.
     let tee_url = if explicit_tee_url {
         derived_tee_url?
     } else if in_place {
@@ -4741,6 +4761,24 @@ mod evidence_url_tests {
         for local in ["http://127.0.0.1:50051", "https://localhost:50052", "/run/tapp/tapp.sock", "unix:///run/tapp/tapp.sock", "http://[::1]:50051"] {
             assert!(evidence_url_for(local, None, Some("0.9.0")).is_err(), "{local}");
             assert!(evidence_url_for(local, Some("https://node.example:50052"), None).is_ok(), "{local}");
+        }
+    }
+
+    /// A replaced slot's URL that does not answer from here is kept: it may be private to the
+    /// scan's network and this run from outside it, which is the common restart case.
+    #[tokio::test]
+    async fn a_replaced_url_that_does_not_answer_is_kept() {
+        let kept = "https://127.0.0.1:1".to_string();
+        for derived in [Ok("https://203.0.113.7:50052".to_string()), Err("local --server".to_string())] {
+            let got = tee_url_for_replacement(
+                kept.clone(),
+                &derived,
+                false,
+                "app",
+                ethers::types::Address::repeat_byte(0x11),
+            )
+            .await;
+            assert_eq!(got, Ok(kept.clone()));
         }
     }
 }
