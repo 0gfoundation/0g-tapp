@@ -188,7 +188,7 @@ if AS.startswith("https://") and AS_PUBKEY:
         print(f"FAIL: the AS at {AS} presents key {seen or '(none)'}, not the pinned {AS_PUBKEY}")
         sys.exit(1)
     AS_AUTH = True
-    AS_TLS_ARGS = f"-cacert {shlex.quote(AS_CERT)}" + (f" -servername {as_name}" if as_name else "")
+    AS_TLS_ARGS = f"-cacert {shlex.quote(AS_CERT)}" + (f" -servername {shlex.quote(as_name)}" if as_name else "")
 else:
     print(f"WARNING: the AS at {AS} is NOT authenticated (set AS_PUBKEY; current value in "
           "docs/TAPPSCAN.md) — anyone on the path could forge the verdicts below\n")
@@ -203,8 +203,12 @@ except Exception as e:
 # ───────── 1. read the registration off the chain ─────────
 print("## 1. chain")
 # On mainnet a dev image fails, as it does in the scan's verdict and so at the KMS.
-MAINNET = subprocess.run([CAST, "chain-id", "--rpc-url", R],
-                         capture_output=True, text=True).stdout.strip() == "16661"
+# Fails closed: without the chain id a dev image on mainnet would only warn.
+_cid = subprocess.run([CAST, "chain-id", "--rpc-url", R], capture_output=True, text=True)
+if _cid.returncode != 0 or not _cid.stdout.strip().isdigit():
+    print(f"FAIL: cannot read the chain id from {R}: {(_cid.stderr or _cid.stdout).strip()[:160]}")
+    sys.exit(1)
+MAINNET = _cid.stdout.strip() == "16661"
 ai = cast_call("getAppInfo(string)((bytes,bytes,bytes[],address,uint256))", APP)
 f = split_top(ai.strip()[1:-1])
 app_compose_hex   = f[0][2:]                      # app-level shared defaults
