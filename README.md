@@ -617,11 +617,12 @@ The AS is trusted for the quote, so **pin it** (`--as-pubkey`, or `TAPP_AS_PUBKE
 the current value is in [`docs/TAPPSCAN.md`](docs/TAPPSCAN.md)). Unpinned, anyone on the
 path could forge every verdict: verify-app warns and never reports better than ⚠️. A
 **dev** image's boot chain is reported ⚠️, not ✅ — dev builds can carry an SSH key into
-the TD. "✅" means the boot chain matches a published image's digests; firmware
+the TD — and on **mainnet** (chain 16661) it fails, as it does in the scan's verdict and so
+at the KMS. "✅" means the boot chain matches a published image's digests; firmware
 (MRTD/RTMR0) is not compared yet. verify-app **exits non-zero** on a reconcile FAIL or an
 unpublished image, so scripts and CI can use it: **0** everything checked and clean, **1** a
-failure, **2** passed with a warning (unpinned AS, dev image, a TCB trailing Intel's latest,
-reference values unavailable).
+failure, **2** passed with a warning (unpinned AS, dev image off mainnet, a TCB trailing Intel's
+latest, reference values unavailable).
 
 The **platform** line reads the TD itself out of the AS token, as the AS policy used to:
 a TD launched with **DEBUG** fails whatever else passes (its host can read and write its

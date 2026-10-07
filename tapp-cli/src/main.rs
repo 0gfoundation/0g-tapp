@@ -1825,7 +1825,7 @@ async fn verify_app_cmd(
                 println!("  {}", l);
             }
         }
-        print_boot_chain(&d.boot_chain, &d.boot_measurements, "  ", 12);
+        print_boot_chain(&d.boot_chain, &d.boot_measurements, false, "  ", 12);
         if let Some(owner) = &d.claimed_owner {
             println!("  owner       : {}  (from claim_config event; no chain comparison in direct mode)", owner);
         }
@@ -1842,7 +1842,7 @@ async fn verify_app_cmd(
         let platform = d.platform();
         println!(
             "\nBoot chain {} ; platform {}{}",
-            boot_chain_summary([&d.boot_chain]),
+            boot_chain_summary([&d.boot_chain], false),
             platform_word(&platform),
             if as_pinned { "" } else { " ; AS unauthenticated ⚠️" }
         );
@@ -1863,6 +1863,9 @@ async fn verify_app_cmd(
         &rpc_url, &contract, app_id, as_endpoint, as_pubkey, policy_ids, relay, refs,
     )
     .await?;
+    // On mainnet a dev image fails, as it does in the scan's verdict and so at the KMS.
+    let mainnet = tapp_common::onchain::chain_id(&rpc_url).await?
+        == tapp_common::onchain::MAINNET_CHAIN_ID;
 
     let yn = |b: bool| if b { "✓" } else { "✗" };
     println!("Verifying app: {}  ({} node(s))", verdict.app_id, verdict.nodes.len());
@@ -1890,7 +1893,7 @@ async fn verify_app_cmd(
                 println!("    {}", l);
             }
         }
-        print_boot_chain(&n.boot_chain, &n.boot_measurements, "    ", 11);
+        print_boot_chain(&n.boot_chain, &n.boot_measurements, mainnet, "    ", 11);
         let owner_str = match &n.owner_claim {
             Some(Ok(_))  => "✓",
             Some(Err(_)) => "✗",
@@ -1925,14 +1928,16 @@ async fn verify_app_cmd(
         println!(
             "    => reconcile {} ; boot chain {} ; platform {}",
             if reconciled { "PASS" } else { "FAIL" },
-            boot_chain_word(&n.boot_chain),
+            boot_chain_word(&n.boot_chain, mainnet),
             platform_word(&n.platform())
         );
     }
     let reached: Vec<_> = verdict.nodes.iter().filter(|n| n.reachable).collect();
     let chains: Vec<_> = reached.iter().map(|n| &n.boot_chain).collect();
     let platforms: Vec<_> = reached.iter().map(|n| n.platform()).collect();
-    let platform_summary = if platforms.iter().any(|p| matches!(p, tapp_common::verify::Platform::Fail(_))) {
+    let platform_summary = if platforms.is_empty() {
+        "not checked (no node reached) ❌"
+    } else if platforms.iter().any(|p| matches!(p, tapp_common::verify::Platform::Fail(_))) {
         "has failures ❌"
     } else if platforms.iter().any(|p| matches!(p, tapp_common::verify::Platform::Warn(_))) {
         "TCB advisories outstanding ⚠️"
@@ -1942,12 +1947,13 @@ async fn verify_app_cmd(
     println!(
         "\nResult: reconciliation {} ; boot chain {} ; platform {}{}",
         if all_ok { "ALL PASS ✅" } else { "has failures ❌" },
-        boot_chain_summary(chains.iter().copied()),
+        boot_chain_summary(chains.iter().copied(), mainnet),
         platform_summary,
         if as_pinned { "" } else { " ; AS unauthenticated ⚠️" }
     );
     let failed = !all_ok
         || chains.iter().any(|c| matches!(c, refvalues::BootChain::Unknown { .. }))
+        || (mainnet && chains.iter().any(|c| is_dev(c)))
         || platforms.iter().any(|p| matches!(p, tapp_common::verify::Platform::Fail(_)));
     let warned = !as_pinned
         || chains.iter().any(|c| boot_chain_warns(c))
@@ -1984,8 +1990,8 @@ fn print_platform(p: &tapp_common::verify::Platform, indent: &str, width: usize)
 }
 
 /// How a run ends, for scripts: 0 everything checked and clean, 1 a definite failure,
-/// 2 passed but with something a careful caller wants to know (unpinned AS, dev image,
-/// a lagging TCB, a boot chain that could not be compared).
+/// 2 passed but with something a careful caller wants to know (unpinned AS, dev image off
+/// mainnet, a lagging TCB, a boot chain that could not be compared).
 fn exit_status(failed: bool, warned: bool) -> i32 {
     if failed {
         1
@@ -2001,13 +2007,19 @@ fn exit_status(failed: bool, warned: bool) -> i32 {
 fn print_boot_chain(
     chain: &tapp_common::refvalues::BootChain,
     measured: &[(String, String)],
+    mainnet: bool,
     indent: &str,
     width: usize,
 ) {
     use tapp_common::refvalues::BootChain;
     let label = format!("{}{:<width$}", indent, "boot chain");
     match chain {
-        BootChain::Matched(image) if tapp_common::refvalues::is_dev_image(image) => println!(
+        BootChain::Matched(image) if mainnet && is_dev(chain) => println!(
+            "{}: ✗ {} — a dev image, which mainnet does not accept (can carry an SSH key into the TD)",
+            label,
+            image.trim_end_matches(".json")
+        ),
+        BootChain::Matched(image) if is_dev(chain) => println!(
             "{}: ⚠️ {} — a dev image (can carry an SSH key into the TD)",
             label,
             image.trim_end_matches(".json")
@@ -2038,6 +2050,10 @@ fn platform_word(p: &tapp_common::verify::Platform) -> String {
     }
 }
 
+fn is_dev(chain: &tapp_common::refvalues::BootChain) -> bool {
+    matches!(chain, tapp_common::refvalues::BootChain::Matched(l) if tapp_common::refvalues::is_dev_image(l))
+}
+
 /// A boot chain that passed with a caveat: a dev image, or nothing to compare against.
 fn boot_chain_warns(chain: &tapp_common::refvalues::BootChain) -> bool {
     use tapp_common::refvalues::BootChain;
@@ -2048,10 +2064,13 @@ fn boot_chain_warns(chain: &tapp_common::refvalues::BootChain) -> bool {
     }
 }
 
-fn boot_chain_word(chain: &tapp_common::refvalues::BootChain) -> String {
+fn boot_chain_word(chain: &tapp_common::refvalues::BootChain, mainnet: bool) -> String {
     use tapp_common::refvalues::BootChain;
     match chain {
-        BootChain::Matched(image) if tapp_common::refvalues::is_dev_image(image) => {
+        BootChain::Matched(image) if mainnet && is_dev(chain) => {
+            format!("✗ dev image {} (not accepted on mainnet)", image.trim_end_matches(".json"))
+        }
+        BootChain::Matched(image) if is_dev(chain) => {
             format!("⚠️ dev image {}", image.trim_end_matches(".json"))
         }
         BootChain::Matched(image) => format!("✓ {}", image.trim_end_matches(".json")),
@@ -2062,6 +2081,7 @@ fn boot_chain_word(chain: &tapp_common::refvalues::BootChain) -> String {
 
 fn boot_chain_summary<'a>(
     chains: impl IntoIterator<Item = &'a tapp_common::refvalues::BootChain>,
+    mainnet: bool,
 ) -> &'static str {
     use tapp_common::refvalues::BootChain;
     let chains: Vec<_> = chains.into_iter().collect();
@@ -2072,10 +2092,9 @@ fn boot_chain_summary<'a>(
         "has nodes matching no published image ❌"
     } else if chains.is_empty() || chains.iter().any(|c| matches!(c, BootChain::NotChecked)) {
         "not checked ⚠️"
-    } else if chains
-        .iter()
-        .any(|c| matches!(c, BootChain::Matched(l) if tapp_common::refvalues::is_dev_image(l)))
-    {
+    } else if mainnet && chains.iter().any(|c| is_dev(c)) {
+        "has nodes on a dev image, which mainnet does not accept ❌"
+    } else if chains.iter().any(|c| is_dev(c)) {
         "matches published digests, but of a dev image ⚠️"
     } else {
         "every node matches a published image's boot-chain digests ✅"
@@ -3821,7 +3840,7 @@ mod replaced_node {
 
 #[cfg(test)]
 mod exit_status_tests {
-    use super::exit_status;
+    use super::{boot_chain_summary, boot_chain_word, exit_status, is_dev};
 
     #[test]
     fn a_failure_outranks_a_warning() {
@@ -3829,5 +3848,18 @@ mod exit_status_tests {
         assert_eq!(exit_status(false, true), 2);
         assert_eq!(exit_status(true, true), 1);
         assert_eq!(exit_status(true, false), 1);
+    }
+
+    /// The scan fails a dev image on mainnet (0g-tapp-verifier#16), so verify-app does too;
+    /// elsewhere it stays a warning.
+    #[test]
+    fn a_dev_image_fails_only_on_mainnet() {
+        use tapp_common::refvalues::BootChain;
+        let dev = BootChain::Matched("uki/v0.8.0-r3/dev.json".to_string());
+        assert!(is_dev(&dev));
+        assert!(boot_chain_summary([&dev], true).contains('❌'));
+        assert!(boot_chain_summary([&dev], false).contains("⚠️"));
+        assert!(boot_chain_word(&dev, true).starts_with('✗'));
+        assert!(!is_dev(&BootChain::Matched("uki/v0.8.0-r2/prod.json".to_string())));
     }
 }

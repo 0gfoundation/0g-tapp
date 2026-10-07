@@ -11,8 +11,10 @@ Usage: python3 verify_app.py <app_id>
 Environment overrides: CAST, TAPP_CLI, REGISTRY, RPC_URL, AS_ENDPOINT, AS_PUBKEY,
 REFERENCE_VALUES, RELAY. AS_PUBKEY pins the AS's TLS key (current value in TAPPSCAN.md);
 without it the AS is unauthenticated and the verdict says so. Exit status: 0 clean, 1 a
-failure, 2 passed with a warning (unpinned AS, dev image, lagging TCB, values unavailable). Two TappRegistry deployments exist and an app lives on exactly one of them, so
-REGISTRY has to name the right one. See contract/CONTRACTS.md.
+failure (including a dev image on mainnet, as the scan judges it), 2 passed with a warning
+(unpinned AS, dev image off mainnet, lagging TCB, values unavailable). Two TappRegistry
+deployments exist and an app lives on exactly one of them, so REGISTRY has to name the
+right one. See contract/CONTRACTS.md.
 
 The AS is relied on for the quote's signature chain, TCB and the event-log replay. The
 boot chain is compared HERE against the published reference values
@@ -22,6 +24,7 @@ A node whose port is closed to you is reached through its registry's scan relay 
 overrides it). Transport only: the evidence is checked exactly the same way, and the
 quote must echo the random challenge sent for it."""
 import sys, os, json, base64, struct, subprocess, re, binascii, hashlib, secrets
+import atexit, shlex, shutil, tempfile
 import urllib.parse, urllib.request, urllib.error
 
 APP   = sys.argv[1] if len(sys.argv) > 1 else "0g-agentic-id-attestor"
@@ -39,6 +42,10 @@ RELAYS = {"0x2ce80374318b1d7fb3345724457a182e0ad165c9": "https://tappscan.0g.ai"
 RELAY = os.environ.get("RELAY", RELAYS.get(C.lower(), "")).rstrip("/")
 REFS  = os.environ.get("REFERENCE_VALUES", "")
 PROTO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "attestation.proto")
+# Scratch files in a directory only this user can open: at a fixed /tmp path another local
+# user could pre-create a symlink, or swap the AS certificate the call below trusts.
+TMP   = tempfile.mkdtemp(prefix="verify_app.")
+atexit.register(shutil.rmtree, TMP, ignore_errors=True)
 ALG   = {4: 20, 0xb: 32, 0xc: 48, 0xd: 64}
 print(f"### verifying app_id = {APP}\n")
 
@@ -151,7 +158,7 @@ def identify(m, sets):
             best = (label, hits, len(vals))
     return None, best
 
-AS_CERT = "/tmp/_as_cert.pem"
+AS_CERT = os.path.join(TMP, "as_cert.pem")
 
 def as_key_sha256():
     """sha256 of the AS's TLS public key (SPKI DER), as tapp-cli --as-pubkey compares it.
@@ -163,7 +170,7 @@ def as_key_sha256():
     if "BEGIN CERTIFICATE" not in pem:
         return "", ""
     open(AS_CERT, "w").write(pem)
-    digest = subprocess.run(f"openssl x509 -in {AS_CERT} -pubkey -noout | openssl pkey -pubin -outform der"
+    digest = subprocess.run(f"openssl x509 -in {shlex.quote(AS_CERT)} -pubkey -noout | openssl pkey -pubin -outform der"
                             " | openssl dgst -sha256", shell=True, capture_output=True, text=True).stdout
     name = subprocess.run(["openssl", "x509", "-in", AS_CERT, "-noout", "-subject", "-nameopt", "multiline"],
                           capture_output=True, text=True).stdout
@@ -181,7 +188,7 @@ if AS.startswith("https://") and AS_PUBKEY:
         print(f"FAIL: the AS at {AS} presents key {seen or '(none)'}, not the pinned {AS_PUBKEY}")
         sys.exit(1)
     AS_AUTH = True
-    AS_TLS_ARGS = f"-cacert {AS_CERT}" + (f" -servername {as_name}" if as_name else "")
+    AS_TLS_ARGS = f"-cacert {shlex.quote(AS_CERT)}" + (f" -servername {as_name}" if as_name else "")
 else:
     print(f"WARNING: the AS at {AS} is NOT authenticated (set AS_PUBKEY; current value in "
           "docs/TAPPSCAN.md) — anyone on the path could forge the verdicts below\n")
@@ -195,6 +202,9 @@ except Exception as e:
 
 # ───────── 1. read the registration off the chain ─────────
 print("## 1. chain")
+# On mainnet a dev image fails, as it does in the scan's verdict and so at the KMS.
+MAINNET = subprocess.run([CAST, "chain-id", "--rpc-url", R],
+                         capture_output=True, text=True).stdout.strip() == "16661"
 ai = cast_call("getAppInfo(string)((bytes,bytes,bytes[],address,uint256))", APP)
 f = split_top(ai.strip()[1:-1])
 app_compose_hex   = f[0][2:]                      # app-level shared defaults
@@ -263,11 +273,12 @@ for signer in nodes:
     # ───────── 3. verify quote signature + TCB (CoCo-AS gRPC 50004) ─────────
     req = {"verification_requests": [
             {"tee": "tdx", "evidence": base64.urlsafe_b64encode(raw).rstrip(b'=').decode()}]}
-    open("/tmp/_as_req.json", "w").write(json.dumps(req))
+    as_req = os.path.join(TMP, "as_req.json")
+    open(as_req, "w").write(json.dumps(req))
     out = subprocess.run(
         f"grpcurl {AS_TLS_ARGS if AS.startswith('https://') else '-plaintext'} "
         f"-import-path {os.path.dirname(PROTO)} -proto {PROTO} "
-        f"-d @ {AS.split('://', 1)[-1]} attestation.AttestationService/AttestationEvaluate < /tmp/_as_req.json",
+        f"-d @ {AS.split('://', 1)[-1]} attestation.AttestationService/AttestationEvaluate < {shlex.quote(as_req)}",
         shell=True, capture_output=True, text=True, timeout=90)
     tm = re.search(r'"attestationToken":\s*"([^"]+)"', out.stdout)
     as_status = tcb = as_report_data = None
@@ -307,7 +318,9 @@ for signer in nodes:
             boot_ok = label is not None
             dev = boot_ok and ("dev" in os.path.dirname(label).split("/")
                                or os.path.splitext(os.path.basename(label))[0] == "dev")
-            boot = (f"WARN {label.removesuffix('.json')} is a dev image (can carry an SSH key)" if dev else
+            boot = (f"FAIL {label.removesuffix('.json')} is a dev image, which mainnet does not accept"
+                    if dev and MAINNET else
+                    f"WARN {label.removesuffix('.json')} is a dev image (can carry an SSH key)" if dev else
                     f"ok {label.removesuffix('.json')}" if boot_ok else
                     "FAIL matches no published image"
                     + (f" (closest {near[0].removesuffix('.json')}, {near[1]}/{near[2]})" if near else ""))
@@ -396,7 +409,8 @@ for signer in nodes:
         and (fresh is True or not relayed)
     all_ok &= node_ok and platform_ok
     warned = warned or platform_warn or dev or boot_ok is None
-    boot_all = boot_ok if boot_all is None else (boot_all and boot_ok if boot_ok is not None else boot_all)
+    boot_node = False if dev and MAINNET else boot_ok
+    boot_all = boot_node if boot_all is None else (boot_all and boot_node if boot_node is not None else boot_all)
     print(f"  => reconcile {'PASS' if node_ok else 'FAIL'} ; boot chain {boot} ; platform {platform}")
 
 print(f"\n### verdict: reconcile {'PASS on every node' if all_ok else 'FAILED on at least one node'}"

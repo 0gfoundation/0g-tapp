@@ -1,7 +1,7 @@
 ---
 name: 0g-tapp-cli
 description: Use this skill when the user wants to deploy, manage, or troubleshoot applications on a 0G Tapp (Trusted Application Platform) server using tapp-cli. Covers start/stop apps, on-chain registration, registry login, check task status, view logs, and manage docker compose deployments across multiple remote TEE servers.
-version: 1.14.0
+version: 1.14.1
 author: 0G Labs
 tags: [0g, tapp, tee, docker, deployment, cli, onchain]
 ---
@@ -82,9 +82,9 @@ tapp-cli -s <server> -k 0x<key> docker-logout                    # logout from D
 - **`--as-endpoint`** picks the Attestation Service (default `https://35.253.66.70:50004`). **It speaks TLS now**, and a bare `host:port` still means plaintext — so an endpoint that moved to TLS must be given with its scheme or the connection fails as an h2 protocol error.
 - Deployed verifier instances (explorer URLs per network incl. mainnet, the attested instance's trust-anchor URL+pin, the AS endpoint) are registered in `docs/TAPPSCAN.md` — the public explorer is `https://tappscan.0g.ai` (`?net=mainnet` for mainnet).
 - **`--as-pubkey 0x<sha256>`** (or env **`TAPP_AS_PUBKEY`**; `TAPP_AS_ENDPOINT` for the endpoint) pins the AS's TLS key. The AS is a TEE with a self-signed certificate, so this **replaces** CA validation rather than adding to it. Without it anyone on the path can hand back any verdict: verify-app prints a warning and the result is capped at ⚠️ (`AS unauthenticated`). Current value: `0x7b13d132…` (full value in `docs/TAPPSCAN.md`), the same key scan serves, since both are the same tapp app — it changes when that TEE restarts.
-- **dev images** match as `⚠️ dev image …` (they can carry an SSH key), never ✅.
+- **dev images** match as `⚠️ dev image …` (they can carry an SSH key), never ✅; on mainnet (chain 16661) they fail ✗, as in the scan's verdict.
 - **`platform :`** — from the AS token: TD **DEBUG on → ✗** (host can read TD memory), TCB **Revoked → ✗**, TCB `OutOfDate`/`SWHardeningNeeded`/… → ⚠️ (clouds lag Intel; advisories listed), `UpToDate` + debug off → ✓.
-- **Exit status**: 0 clean, 1 failure (reconcile FAIL, unpublished image, platform ✗), 2 passed with warnings (unpinned AS, dev image, lagging TCB, values unavailable). Point it at a self-hosted local AS (e.g. `127.0.0.1:50004`, see the `verifier/0g-tapp-verifier` submodule) to use RVPS-backed reference values.
+- **Exit status**: 0 clean, 1 failure (reconcile FAIL, unpublished image, dev image on mainnet, platform ✗), 2 passed with warnings (unpinned AS, dev image off mainnet, lagging TCB, values unavailable). Point it at a self-hosted local AS (e.g. `127.0.0.1:50004`, see the `verifier/0g-tapp-verifier` submodule) to use RVPS-backed reference values.
 - **Policy ids** — two formats depending on build mode:
   - **canonical** (v0.3.0+): `0g-tapp-<cloud>-<boot_format>-<version>-<env>` (e.g. `0g-tapp-gcp-grub-v0.3.0-dev`). Reference values at `verifier/reference-values/<cloud>/<boot_format>/<version>/<env>.json`.
   - **custom** (per-owner): `0g-tapp-<cloud>-<boot_format>-<version>-<env>-<owner>`. Reference values at `.../env/<owner>.json`.
