@@ -144,8 +144,9 @@ for signer in nodes:
     log = base64.b64decode(j["cc_eventlog"]); o = 8 + 20
     ds, = struct.unpack_from('<I', log, o); o += 4 + ds
     last = None
-    # Every state this boot measured for the app, and whether a restarted tapp-server took
-    # over one it never measured (apps_resumed): its state file was written by something else.
+    # The states this boot measured for the app, and whether a restarted tapp-server took
+    # over one that is neither the latest nor the one before it (a process stopped between
+    # measuring a change and recording it leaves the one before): written by something else.
     fields = lambda d: [d.get(k) for k in ("deployer", "compose_hash", "volumes_hash", "image_hash")]
     states, forged = [], False
     while o + 12 <= len(log):
@@ -160,7 +161,7 @@ for signer in nodes:
             op = t.split(" ", 2)[1] if t.startswith("tapp.0g.com ") else ""
             if op == "apps_resumed":
                 d = json.loads(t.split(" ", 2)[2])
-                forged |= any(fields(a) not in states for a in d.get("apps", []) if a.get("app_id") == APP)
+                forged |= any(fields(a) not in states[-2:] for a in d.get("apps", []) if a.get("app_id") == APP)
             elif op in ("start_app", "start_service", "stop_app"):
                 d = json.loads(t.split(" ", 2)[2])
                 if d.get("app_id") == APP and d.get("result") == "success":

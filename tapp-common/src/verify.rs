@@ -47,9 +47,9 @@ pub struct NodeVerdict {
     /// a node believes is the operator's decision, but it is measured, so it is auditable —
     /// and a node with none configured cannot check KMS node identity at all.
     pub trust_anchors: Option<TrustAnchors>,
-    /// A restarted tapp-server took over state for this app (`apps_resumed`) that no start
-    /// or stop of this boot produced: its state file was written by something else. See
-    /// `eventlog_app_resumed_differently`.
+    /// A restarted tapp-server took over state for this app (`apps_resumed`) that is neither
+    /// the latest state this boot measured for it nor the one before: its state file was
+    /// written by something else. See `eventlog_app_resumed_differently`.
     pub app_resumed_differently: bool,
     pub note: String,
 }
@@ -504,11 +504,12 @@ pub struct TrustAnchors {
 ///
 /// tapp-server keeps its apps on tmpfs so that a process restart within a boot still knows
 /// them, and measures what it read back (`apps_resumed`) because that file sits outside the
-/// measurement. Replaying start_app / start_service / stop_app gives every state the file
-/// may have held; an `apps_resumed` entry that is none of them — another owner, a compose
-/// or image never started, an app this boot never started — means it was written by
-/// something other than tapp-server. An earlier genuine state is accepted: a process that
-/// stopped between measuring a change and recording it leaves exactly that.
+/// measurement. Replaying start_app / start_service / stop_app gives what the file may hold:
+/// the state after the latest of them, or the one before it — tapp-server records a change
+/// only after measuring it, so a process stopped in between leaves the previous state. An
+/// `apps_resumed` entry that is anything else — another owner, a compose or image never
+/// started, an app this boot never started, or an older state rolled back to — means the
+/// file was written by something other than tapp-server.
 fn eventlog_app_resumed_differently(cc_eventlog_b64: &str, app_id: &str) -> Result<bool> {
     let fields = |v: &serde_json::Value| {
         ["deployer", "compose_hash", "volumes_hash", "image_hash"].map(|k| v[k].clone())
@@ -522,8 +523,9 @@ fn eventlog_app_resumed_differently(cc_eventlog_b64: &str, app_id: &str) -> Resu
     for (op, v) in &events {
         if op == "apps_resumed" {
             let resumed = v["apps"].as_array().into_iter().flatten();
+            let possible = &states[states.len().saturating_sub(2)..];
             for a in resumed.filter(|a| a["app_id"].as_str() == Some(app_id)) {
-                differs |= !states.contains(&fields(a));
+                differs |= !possible.contains(&fields(a));
             }
         } else if v["app_id"].as_str() == Some(app_id) && v["result"].as_str() == Some("success") {
             states.push(match op.as_str() {
@@ -1285,6 +1287,13 @@ mod resumed_apps_tests {
         assert!(differs(&[op("start_app", "app", "0xa", "c1", "sha256:1"), resumed(&[("app", "0xa", "c2", "sha256:1")])]));
         assert!(differs(&[op("start_app", "app", "0xa", "c1", "sha256:1"), resumed(&[("app", "0xa", "c1", "sha256:2")])]));
         assert!(differs(&[resumed(&[("app", "0xa", "c1", "sha256:1")])]));
+        // Rolled back two changes: a genuine state, but not one a crash can leave.
+        assert!(differs(&[
+            op("start_app", "app", "0xa", "c1", "sha256:1"),
+            op("start_service", "app", "0xa", "c1", "sha256:2"),
+            op("stop_app", "app", "0xa", "c1", "sha256:2"),
+            resumed(&[("app", "0xa", "c1", "sha256:1")]),
+        ]));
         // And it stays a finding: a later start does not erase what the file held.
         assert!(differs(&[
             op("start_app", "app", "0xa", "c1", "sha256:1"),

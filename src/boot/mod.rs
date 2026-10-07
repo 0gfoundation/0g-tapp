@@ -582,6 +582,7 @@ enable_eventlog = true
                     },
                 };
 
+                // Measured above, recorded here: never the other way round (see stop_app).
                 let mut apps = self.app_info.lock().await;
                 apps.insert(app_id.clone(), app_info);
                 self.persist(&apps);
@@ -972,7 +973,6 @@ enable_eventlog = true
                     info.mount_files.hash.clear();
                     info.mount_files.content.clear();
                 }
-                self.persist(&app_info_lock);
                 info!(app_id = %app_id, "Application stopped successfully, hash info cleared");
                 base_measurement.with_success()
             }
@@ -994,6 +994,11 @@ enable_eventlog = true
             .await
         {
             tracing::error!("Failed to extend measurement for stop operation: {}", e);
+        }
+        // Recorded only now, after measuring: a process stopped in between then leaves the
+        // state before the stop, which a verifier accepts, not one it never measured.
+        if result.is_ok() {
+            self.persist(&*self.app_info.lock().await);
         }
 
         result
@@ -1351,7 +1356,6 @@ enable_eventlog = true
                                     "Updated image hash for service"
                                 );
                             }
-                            self.persist(&app_info_lock);
                             // Update measurement with new image hash
                             base_measurement
                                 .image_hash
@@ -1424,6 +1428,8 @@ enable_eventlog = true
                 e
             );
         }
+        // After measuring, as in stop_app.
+        self.persist(&*self.app_info.lock().await);
     }
 }
 
@@ -1472,8 +1478,10 @@ mod tests {
         let back = load_apps(&path).unwrap().unwrap();
         assert_eq!(back.iter().map(|a| a.app_id.as_str()).collect::<Vec<_>>(), ["a", "b"]);
         assert_eq!(back[0].compose_content.image_hash, apps["a"].compose_content.image_hash);
-        // Nothing left behind from the write.
+        // Nothing left behind from the write, and only root can read the apps' compose.
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
     }
 
     /// A verifier compares an apps_resumed entry with the start_app event's fields, so the
