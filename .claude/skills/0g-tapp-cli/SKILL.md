@@ -1,7 +1,7 @@
 ---
 name: 0g-tapp-cli
 description: Use this skill when the user wants to deploy, manage, or troubleshoot applications on a 0G Tapp (Trusted Application Platform) server using tapp-cli. Covers start/stop apps, on-chain registration, registry login, check task status, view logs, and manage docker compose deployments across multiple remote TEE servers.
-version: 1.13.0
+version: 1.14.0
 author: 0G Labs
 tags: [0g, tapp, tee, docker, deployment, cli, onchain]
 ---
@@ -121,6 +121,11 @@ Owner-only, and **every call is extended into the runtime measurement** carrying
 **What the node then does** (v0.5.0+): before fetching key material it pins the verifier against `--scan-pubkey`, asks it for the KMS app's attested keys, and pins the KMS node against that set. No path degrades to unverified — if the verifier is unreachable and nothing is cached, it refuses. A pin mismatch triggers one refresh (a rebooted node has legitimately re-derived its key) then rejects.
 - After VM reboot the server is UNCLAIMED again and must be claimed again.
 
+### Request signing (v0.9.0+)
+- tapp-cli >= 0.9.0 signs `Method:0x<sha256(encoded request)>:timestamp` with header `x-signature-version: 2` — the signature covers the request body, so a request altered in flight is refused. Window **±10 min**; every signature is **single-use**, and one made before tapp-server last started is refused (the previous process may have used it).
+- Against tapp-server < 0.9.0 this shows up as `Insufficient permission for this operation` (old server cannot read v2): add the global flag `--legacy-sign`. Never automatic.
+- tapp-server >= 0.9.0 accepts **only** body-bound signatures; legacy `Method:timestamp` is refused ("accepts only body-bound signatures"). Old tapp-cli cannot manage a 0.9.0 node — upgrade it.
+
 ### Server health & whitelist
 ```bash
 tapp-cli -s <server> get-service-status                           # server health + systemd journalctl (no key needed)
@@ -195,7 +200,11 @@ withdraw-balance    --app-id <id> --rpc-url <rpc> --contract 0x<reg>            
 ```
 - `remove-node-onchain` accepts `--signer-address 0x<addr>` to provide the signer directly when the node is unreachable (can't connect to `--server`).
 - `update-node-onchain`: new signer auto-fetched from `--server` unless `--new-signer` given; `--tee-url` defaults to the `--server` URL. Pass `--old-signer` explicitly when replacing a node on a different host.
-- No app-owner transfer exists: to change owner, old owner `remove-node-onchain` (→ stake locks ~1 day, then `withdraw`) then new owner `register-onchain`.
+- **Handing an app over** — only the registry owner transfers; machines are replaced, never transferred (TappRegistry >= 0.2.0):
+  1. `transfer-app-ownership --app-id <id> --rpc-url <rpc> --contract 0x<reg> --new-owner 0x<new>` (owner key; `--cancel` withdraws), then `accept-app-ownership --app-id <id> --rpc-url <rpc> --contract 0x<reg>` (nominee key). Two steps because a wrong address would strand the app for good.
+  2. On each machine the new owner has claimed: `start-app ... --register-onchain` (+ `--old-signer` if the app has several nodes) — replaces the old node in place via updateNode (stake carried, never zero nodes, works for `encrypted` apps).
+  - Until a node is replaced, the old machine's owner still gets the app's KMS keys (KMS authorizes by node list). Keys derive from app_id, so they do not change across the hand-over.
+  - Live nodes' stake travels with the app; stake already locked stays with the old owner. Acks not invalidated. On a 0.1.0 registry `accept-app-ownership` fails decoding `pendingAppOwner` — the upgrade has not landed.
 - app-id is **global & unique** in the registry. `register-onchain` on an existing id → `app already exists`; use add-node/update-node instead.
 
 ### Native on-chain subcommands
@@ -265,7 +274,11 @@ Each app gets its **own encrypted volume** (LUKS; key derived per-app by the KMS
 
 | Symptom | Cause / fix |
 |---|---|
-| `PermissionDenied` | wrong key, or server is UNCLAIMED (v0.3.0+ canonical image) — run `claim-config` first |
+| `PermissionDenied` | wrong key, or server is UNCLAIMED (v0.3.0+ canonical image) — run `claim-config` first; or tapp-cli >= 0.9.0 against tapp-server < 0.9.0 — add `--legacy-sign` |
+| `refusing to claim: this tapp-server reports version …` | tapp-cli >= 0.9.0 claiming a node older than 0.9.0: add `--legacy-sign`. (Refused on purpose — such a server would recover an unrelated address from the new signature and record IT as the owner.) |
+| `this signature was already used` | a signature is single-use (v0.9.0+); just re-run the command (it signs afresh) |
+| `this signature was made before tapp-server last started` | the server restarted after you signed; re-run. Persisting right after a restart means your clock is behind the server's — fix the clock or wait out the skew |
+| `this node accepts only body-bound signatures` | tapp-server >= 0.9.0 with an old tapp-cli, or `--legacy-sign` given — upgrade tapp-cli / drop the flag |
 | `unauthorized: authentication required` (pull) | registry token expired → `docker-login` with fresh token, retry |
 | `required variable TAPP_REGISTRY is missing` (compose interpolation) | that var absent from the uploaded `.env` |
 | container stuck `restarting` | `get-app-logs --service <svc>` → missing env var / mount file |

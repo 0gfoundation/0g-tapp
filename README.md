@@ -421,7 +421,7 @@ The values to put in `--kbs-urls` — the deployed KMS cluster endpoints for
 mainnet and testnet, and the group public key that verifies you reached the
 right one (**both networks use the app_id `0g-kms`, but they are two different
 clusters with two different masters**) — are listed in
-[`docs/KMS.md`](KMS.md), which also explains why `--scan-url`/`--scan-pubkey`
+[`docs/KMS.md`](docs/KMS.md), which also explains why `--scan-url`/`--scan-pubkey`
 must accompany a `kms` setup.
 
 ### Trust anchors
@@ -492,6 +492,70 @@ cannot invent one.
 
 Legacy mode: setting `owner_address` in `config.toml` still works (the owner is
 claimed automatically at startup and also measured).
+
+### Handing an app over to a new owner
+
+Only the app's **registry** owner is transferable (TappRegistry >= 0.2.0). Machines
+are not transferred — the new owner replaces them with its own.
+
+1. **Transfer on chain**, in two steps so a mistyped address cannot strand the app
+   (with no admin override, an app owned by an address nobody controls could never
+   be updated, its nodes never removed, its stake never refunded):
+
+   ```bash
+   tapp-cli -k 0x<owner-key> transfer-app-ownership -a <app_id> -r <rpc> -c <registry> --new-owner 0x<new>
+   tapp-cli -k 0x<new-key>   accept-app-ownership   -a <app_id> -r <rpc> -c <registry>
+   ```
+
+   Nothing changes until the nominee accepts; nominating again replaces the nominee,
+   `--cancel` withdraws. Live nodes' stake travels with the app (`removeNode` refunds
+   whoever owns the app at that moment); stake already locked by earlier `removeNode`
+   calls stays with the address it was locked to. Acknowledgements are not
+   invalidated — no code changed, and every change the new owner can make bumps the
+   ack version.
+
+2. **Replace every node** with a machine the new owner has claimed — on each one:
+
+   ```bash
+   tapp-cli -s <new-node> -k 0x<new-key> start-app -f docker-compose.yml -a <app_id> \
+     --register-onchain --rpc-url <rpc> --contract <registry> --stake-wei <wei> \
+     [--old-signer 0x<node being replaced>]   # needed only when the app has several nodes
+   ```
+
+   The new signer replaces the old one in place (`updateNode`): one transaction, the
+   stake carried over, no moment where the app has no node. It also orders things so
+   an `encrypted` app works: the new signer is on chain before the node asks the KMS
+   for its volume key.
+
+**Until a node is replaced, its machine's owner can still obtain the app's KMS keys**
+— the KMS authorizes by the on-chain node list — so replace promptly. The keys
+themselves do not change: they derive from the app id, so the new nodes get the same
+ones and an encrypted volume can be copied across. By the same token, anything
+encrypted before the hand-over was readable by the previous owner.
+
+### Request signing
+
+Every signed RPC carries `x-signature` (EIP-191 `personal_sign`, 65-byte r‖s‖v),
+`x-timestamp` and `x-signature-version: 2`, and signs
+
+```
+<Method>:0x<sha256 of the encoded protobuf request>:<unix timestamp>
+```
+
+— the hash is over the exact message bytes in the gRPC frame, which the server
+hashes as received, so a request altered in flight no longer recovers to the
+owner. Each signature is accepted **once** (replays are refused) within **±10
+minutes** of its timestamp.
+
+tapp-server >= 0.9.0 accepts **only** this form. The older `<Method>:<timestamp>`
+message authorised the method with *any* body, so an observed signature could
+carry a different request; it is refused (`AUTH_LEGACY_SIGNATURE_REFUSED`).
+
+tapp-cli >= 0.9.0 signs this form. To manage a tapp-server < 0.9.0 (which reports
+a body-bound signature as "Insufficient permission"), pass `--legacy-sign`. It is
+never chosen automatically, since falling back on failure would hand anyone able
+to make a request fail the weaker signature. The scripts under `examples/` sign
+the body-bound form too (`sign_message.py` takes the request JSON).
 
 ## On-chain Registration
 

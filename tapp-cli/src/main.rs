@@ -21,6 +21,12 @@ static INSECURE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 /// --tls-pin, normalized to lowercase hex: the server's SPKI sha256 to require.
 static TLS_PIN: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
 
+/// --legacy-sign: sign `Method:timestamp` instead of binding the request body.
+/// Only for tapp-server < 0.9.0. Never chosen automatically — falling back on
+/// failure would let anyone who can make a request fail obtain the weaker
+/// signature, which is the one that can be reused with a different body.
+static LEGACY_SIGN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
 /// Accept the pin as `sha256//<base64>` (what scan's /cert and curl use) or as
 /// hex (with or without 0x), normalize to the lowercase hex pinned_tls expects.
 fn parse_pin(raw: &str) -> Result<String, String> {
@@ -147,6 +153,13 @@ struct Cli {
     /// defeats active man-in-the-middle, no CA involved.
     #[arg(long, global = true)]
     tls_pin: Option<String>,
+
+    /// Sign the legacy `Method:timestamp` message instead of binding the request
+    /// body. Only needed for tapp-server < 0.9.0, which rejects body-bound
+    /// signatures as "Insufficient permission". The legacy signature authorises
+    /// the method with any body, so prefer upgrading the server.
+    #[arg(long, global = true)]
+    legacy_sign: bool,
 
     /// Private key for authentication (can also use TAPP_PRIVATE_KEY env var)
     #[arg(short = 'k', long, global = true)]
@@ -748,12 +761,78 @@ enum Commands {
         #[arg(short, long)]
         invalidator: String,
     },
+
+    /// Nominate a new on-chain owner for an app (app owner only; registry >= 0.2.0).
+    /// Nothing changes until the nominee runs accept-app-ownership. Live nodes'
+    /// stake travels with the app; stake already locked by earlier removeNode
+    /// calls stays with you. Machines are not transferred: the new owner then
+    /// replaces each node with one of its own (start-app --register-onchain on
+    /// its machine updates the node in place), which is what cuts the previous
+    /// owner off from the app's KMS keys.
+    TransferAppOwnership {
+        /// Application ID
+        #[arg(short, long)]
+        app_id: String,
+
+        /// Ethereum RPC URL
+        #[arg(short, long)]
+        rpc_url: String,
+
+        /// TappRegistry contract address (0x...)
+        #[arg(short, long)]
+        contract: String,
+
+        /// Address to nominate (0x...)
+        #[arg(long, required_unless_present = "cancel")]
+        new_owner: Option<String>,
+
+        /// Withdraw a pending nomination
+        #[arg(long, conflicts_with = "new_owner")]
+        cancel: bool,
+    },
+
+    /// Accept an on-chain ownership nomination. Sign with the NOMINATED key.
+    AcceptAppOwnership {
+        /// Application ID
+        #[arg(short, long)]
+        app_id: String,
+
+        /// Ethereum RPC URL
+        #[arg(short, long)]
+        rpc_url: String,
+
+        /// TappRegistry contract address (0x...)
+        #[arg(short, long)]
+        contract: String,
+    },
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let result = run().await;
+    // A pre-0.9.0 server verifies the legacy message, recovers an unrelated
+    // address from a body-bound signature, and reports that as a permission
+    // problem — which says nothing about the actual cause.
+    if let Err(e) = &result {
+        if let Some(status) = e.downcast_ref::<tonic::Status>() {
+            if status.code() == tonic::Code::PermissionDenied
+                && status.message() == "Insufficient permission for this operation"
+                && !*LEGACY_SIGN.get().unwrap_or(&false)
+            {
+                eprintln!(
+                    "hint: if this tapp-server is older than 0.9.0 it cannot read body-bound \
+                     signatures — retry with --legacy-sign (or upgrade the server)."
+                );
+            }
+        }
+    }
+    result
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut cli = Cli::parse();
     let _ = INSECURE.set(cli.insecure);
+    let _ = LEGACY_SIGN.set(cli.legacy_sign);
     let pin = match cli.tls_pin.as_deref().map(parse_pin).transpose() {
         Ok(p) => p,
         Err(e) => {
@@ -1053,6 +1132,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             let private_key = require_private_key(&cli.private_key)?;
             revoke_invalidator_onchain(app_id, rpc_url, contract, invalidator, private_key).await?;
+        }
+        Commands::TransferAppOwnership {
+            app_id,
+            rpc_url,
+            contract,
+            new_owner,
+            cancel,
+        } => {
+            let private_key = require_private_key(&cli.private_key)?;
+            let new_owner = if cancel { None } else { new_owner };
+            transfer_app_ownership_onchain(app_id, rpc_url, contract, new_owner, private_key)
+                .await?;
+        }
+        Commands::AcceptAppOwnership {
+            app_id,
+            rpc_url,
+            contract,
+        } => {
+            let private_key = require_private_key(&cli.private_key)?;
+            accept_app_ownership_onchain(app_id, rpc_url, contract, private_key).await?;
         }
     }
 
@@ -2427,6 +2526,30 @@ async fn claim_config(
 
     let mut client = create_client(server).await?;
 
+    // A claim is the one command a signature-format mismatch turns into damage.
+    // A pre-0.9.0 server recovers the signer from the legacy message, so a
+    // body-bound signature recovers to some unrelated address — and ClaimConfig
+    // accepts ANY signer, so the node would be claimed by an address nobody holds
+    // and stay unmanageable until the VM is reset. Every other command merely
+    // fails. So the server's version is checked first, and the claim refused
+    // rather than sent in a form that server cannot read.
+    if !*LEGACY_SIGN.get().unwrap_or(&false) {
+        let version = client
+            .get_tapp_info(Request::new(GetTappInfoRequest {}))
+            .await
+            .map(|r| r.into_inner().version)
+            .unwrap_or_default();
+        if !reads_body_bound_signatures(&version) {
+            eprintln!(
+                "✗ refusing to claim: this tapp-server reports version {:?}. Servers older \
+                 than 0.9.0 cannot read the signature this CLI sends, and would record an \
+                 unrelated address as the owner. Re-run with --legacy-sign.",
+                version
+            );
+            std::process::exit(1);
+        }
+    }
+
     let mut request = Request::new(ClaimConfigRequest {
         chain_rpc_url: chain_rpc_url.clone(),
         chain_contract_address: chain_contract_address.clone(),
@@ -3338,7 +3461,130 @@ async fn revoke_invalidator_onchain(
     Ok(())
 }
 
-fn add_signature_metadata<T>(
+fn wallet_address(private_key: &str) -> Result<ethers::types::Address, Box<dyn std::error::Error>> {
+    use ethers::signers::Signer;
+    let key_bytes = hex::decode(private_key.trim_start_matches("0x"))
+        .map_err(|e| format!("Invalid private key: {}", e))?;
+    let wallet = ethers::signers::LocalWallet::from_bytes(&key_bytes)
+        .map_err(|e| format!("Invalid private key: {}", e))?;
+    Ok(wallet.address())
+}
+
+async fn transfer_app_ownership_onchain(
+    app_id: String,
+    rpc_url: String,
+    contract: String,
+    new_owner: Option<String>,
+    private_key: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use ethers::types::Address;
+    use tapp_common::onchain::{self, OnchainParams};
+
+    let nominee = match &new_owner {
+        Some(a) => a
+            .parse::<Address>()
+            .map_err(|_| format!("Invalid address: {}", a))?,
+        None => Address::zero(),
+    };
+    // Checked here so a wrong key fails with a sentence instead of a bare revert.
+    let me = wallet_address(&private_key)?;
+    let owner = onchain::get_app_owner(&rpc_url, &contract, &app_id).await?;
+    if owner == Address::zero() {
+        return Err(format!("App {} is not registered on this registry", app_id).into());
+    }
+    if owner != me {
+        return Err(format!(
+            "App {} is owned by 0x{:x}; the provided key is 0x{:x}",
+            app_id, owner, me
+        )
+        .into());
+    }
+
+    let params = OnchainParams { rpc_url, contract, private_key };
+    let tx = onchain::transfer_app_ownership(&params, &app_id, nominee).await?;
+    if nominee == Address::zero() {
+        println!("✓ Nomination cancelled — 0x{:x} remains the owner of {}", me, app_id);
+    } else {
+        println!("✓ Nominated 0x{:x} as owner of {}", nominee, app_id);
+        println!("  Owner (unchanged until accepted): 0x{:x}", me);
+        println!("  Next: the nominee runs accept-app-ownership with its own key");
+    }
+    println!("  Tx Hash: 0x{:x}", tx);
+    Ok(())
+}
+
+async fn accept_app_ownership_onchain(
+    app_id: String,
+    rpc_url: String,
+    contract: String,
+    private_key: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use ethers::types::Address;
+    use tapp_common::onchain::{self, OnchainParams};
+
+    let me = wallet_address(&private_key)?;
+    let pending = onchain::get_pending_app_owner(&rpc_url, &contract, &app_id).await?;
+    if pending == Address::zero() {
+        return Err(format!("No ownership transfer is pending for {}", app_id).into());
+    }
+    if pending != me {
+        return Err(format!(
+            "The nominee for {} is 0x{:x}; the provided key is 0x{:x}",
+            app_id, pending, me
+        )
+        .into());
+    }
+    let previous = onchain::get_app_owner(&rpc_url, &contract, &app_id).await?;
+
+    let params = OnchainParams { rpc_url, contract, private_key };
+    let tx = onchain::accept_app_ownership(&params, &app_id).await?;
+    println!("✓ Ownership of {} transferred", app_id);
+    println!("  Previous owner: 0x{:x}", previous);
+    println!("  Owner:          0x{:x}", me);
+    println!("  Tx Hash: 0x{:x}", tx);
+    Ok(())
+}
+
+/// Whether a tapp-server of this version verifies body-bound signatures
+/// (>= 0.9.0). An unreadable version is treated as "no": the caller refuses
+/// rather than guesses.
+fn reads_body_bound_signatures(version: &str) -> bool {
+    let mut parts = version.trim().trim_start_matches('v').split('.');
+    let major: u64 = match parts.next().and_then(|p| p.parse().ok()) {
+        Some(m) => m,
+        None => return false,
+    };
+    let minor: u64 = parts
+        .next()
+        .and_then(|p| p.split(|c: char| !c.is_ascii_digit()).next())
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(0);
+    major > 0 || minor >= 9
+}
+
+/// The message a request is signed over.
+///
+/// Body-bound (default, tapp-server >= 0.9.0): `Method:0x<sha256(body)>:timestamp`,
+/// where body is the encoded protobuf request — exactly the bytes tonic puts on
+/// the wire, so the server hashes what it received and any change in flight
+/// breaks the signature. Legacy (`--legacy-sign`, for older servers):
+/// `Method:timestamp`, which authorises the method with ANY body.
+fn sign_message_for<T: prost::Message>(
+    request: &Request<T>,
+    method_name: &str,
+    timestamp: i64,
+    legacy: bool,
+) -> String {
+    if legacy {
+        format!("{}:{}", method_name, timestamp)
+    } else {
+        use sha2::Digest;
+        let body_hash = sha2::Sha256::digest(request.get_ref().encode_to_vec());
+        format!("{}:0x{}:{}", method_name, hex::encode(body_hash), timestamp)
+    }
+}
+
+fn add_signature_metadata<T: prost::Message>(
     request: &mut Request<T>,
     private_key_hex: &str,
     method_name: &str,
@@ -3361,8 +3607,8 @@ fn add_signature_metadata<T>(
     let private_key = hex::decode(private_key_hex)?;
     let timestamp = chrono::Utc::now().timestamp();
 
-    // Build message: "MethodName:timestamp" (same as Python script)
-    let message = format!("{}:{}", method_name, timestamp);
+    let legacy = *LEGACY_SIGN.get().unwrap_or(&false);
+    let message = sign_message_for(request, method_name, timestamp, legacy);
 
     // Build Ethereum signed message hash (EIP-191) - same as Python's encode_defunct
     // Format: keccak256("\x19Ethereum Signed Message:\n" + len(message) + message)
@@ -3400,6 +3646,11 @@ fn add_signature_metadata<T>(
         "x-timestamp",
         MetadataValue::try_from(timestamp.to_string())?,
     );
+    if !legacy {
+        request
+            .metadata_mut()
+            .insert("x-signature-version", MetadataValue::from_static("2"));
+    }
 
     Ok(())
 }
@@ -3409,6 +3660,48 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    #[test]
+    fn only_0_9_and_later_read_body_bound_signatures() {
+        for v in ["0.9.0", "0.9.3", "0.10.0", "1.0.0", "v0.9.0", "0.9.0-rc1"] {
+            assert!(reads_body_bound_signatures(v), "{v}");
+        }
+        // Unknown or unreadable is "no" — the claim is refused, not guessed.
+        for v in ["0.8.0", "0.8.9", "0.6.0", "", "unknown", "x.y"] {
+            assert!(!reads_body_bound_signatures(v), "{v}");
+        }
+    }
+
+    /// The server rebuilds exactly this string from the body it received
+    /// (`build_sign_message_v2` in tapp-server's signature_auth.rs). Any drift
+    /// here — hash of something other than the encoded message, a missing 0x,
+    /// another separator — and every signed command fails as "Insufficient
+    /// permission", so the shape is pinned.
+    #[test]
+    fn the_body_bound_message_is_method_hash_timestamp() {
+        use prost::Message;
+        use sha2::Digest;
+        let req = Request::new(StartAppRequest {
+            compose_content: "services: {}".into(),
+            app_id: "demo".into(),
+            ..Default::default()
+        });
+        let expected_hash = hex::encode(sha2::Sha256::digest(req.get_ref().encode_to_vec()));
+        // Fixed vector shared with examples/sign_message.py, whose own protobuf
+        // encoder must produce the same bytes for the same request.
+        assert_eq!(
+            expected_hash,
+            "39fef2e2e8466a84cb5f0cec06023957f2b8b354defa0bdd3a2a9e065d08260d"
+        );
+        assert_eq!(
+            sign_message_for(&req, "StartApp", 1700000000, false),
+            format!("StartApp:0x{expected_hash}:1700000000")
+        );
+        assert_eq!(
+            sign_message_for(&req, "StartApp", 1700000000, true),
+            "StartApp:1700000000"
+        );
+    }
 
     #[test]
     fn boot_chain_line_hidden_when_no_policy() {
