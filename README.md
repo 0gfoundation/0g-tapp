@@ -118,7 +118,12 @@ your own override file disables the redirect (loudly).
 
 `start-app` returns any lint findings (data placed where the volume cannot
 protect it, `docker.sock` mounts, `privileged`) and the CLI prints them; the
-app still starts. On a KMS-configured node the start **fails** when the volume
+app still starts. One kind of mount is **refused** outright: a writable bind
+mount reaching tapp-server's own state in `/run/tapp` — the directory itself,
+anything above it (`/run`, `/`, `/var/run`), or a file in it other than the
+socket. That is where the claimed owner, the trust anchors and the scratch key
+live, read back on a process restart without being re-measured. Mount
+`/run/tapp/tapp.sock` alone, or the directory read-only. On a KMS-configured node the start **fails** when the volume
 key cannot be fetched — an app never silently runs on a plaintext directory.
 The usual cause is ordering: the node must be registered on-chain for the app
 first, which `start-app --register-onchain` handles.
@@ -479,9 +484,14 @@ cannot invent one.
   `claim_config` event (same mechanism as `start_app`), so verifiers see WHO owns
   the node in the attestation evidence and can reconcile it with the on-chain
   registration — the owner moved from the golden values into the runtime event log.
-- **Restart-safe**: the claimed owner is persisted under `/run` (tmpfs) — a
-  tapp-server process restart cannot reopen the claim; a VM reboot clears both
-  the state and the RTMRs, so a rebooted node is claimable (and re-measured) again.
+- **Restart-safe**: the claimed owner and the claimed config (KMS cluster, TLS key
+  source, trust anchors, including later `update-trust-anchors`) are persisted under
+  `/run` (tmpfs) — a tapp-server process restart cannot reopen the claim and resumes
+  the node as claimed. What it reads back is measured again as a `claim_resumed`
+  event, so a state file changed between two processes shows in the evidence:
+  verify-app reports a different owner as inconsistent, different trust anchors
+  as ✗, and a claimed config the restart found but could not read as ⚠️; a VM reboot clears both the state and the RTMRs, so a rebooted
+  node is claimable (and re-measured) again.
 - **Hijack window**: practically closed — don't expose :50051 before claiming
   (cloud firewall), and claim right after boot. Even if raced, the intruder's
   address is indelibly measured, your own claim fails immediately (instant

@@ -366,7 +366,12 @@ fn eventlog_claim_config_owner(cc_eventlog_b64: &str) -> Result<Option<String>> 
             let tsz = u32le(&data[4..8]);
             if 8 + tsz <= data.len() {
                 if let Ok(text) = std::str::from_utf8(&data[8..8 + tsz]) {
-                    if let Some(payload) = text.strip_prefix("tapp.0g.com claim_config ") {
+                    // A resumed claim states the owner a restarted process took over: it
+                    // must be the one claimed, or the state file was changed in between.
+                    let payload = text
+                        .strip_prefix("tapp.0g.com claim_config ")
+                        .or_else(|| text.strip_prefix("tapp.0g.com claim_resumed "));
+                    if let Some(payload) = payload {
                         if let Ok(v) = serde_json::from_str::<serde_json::Value>(payload) {
                             if let Some(owner) = v["owner"].as_str() {
                                 owners.push(owner.to_lowercase());
@@ -392,9 +397,19 @@ fn eventlog_claim_config_owner(cc_eventlog_b64: &str) -> Result<Option<String>> 
 /// (The TCG walk here is a fourth copy of the same loop. Left duplicated rather than
 /// refactoring three working parsers as a side effect of adding a feature.)
 fn eventlog_tapp_events(cc_eventlog_b64: &str, operation: &str) -> Result<Vec<serde_json::Value>> {
+    Ok(eventlog_tapp_events_of(cc_eventlog_b64, &[operation])?
+        .into_iter()
+        .map(|(_, v)| v)
+        .collect())
+}
+
+/// Events of any of `operations`, in log order, with the operation each one is.
+fn eventlog_tapp_events_of(
+    cc_eventlog_b64: &str,
+    operations: &[&str],
+) -> Result<Vec<(String, serde_json::Value)>> {
     let log = B64.decode(cc_eventlog_b64).map_err(|e| anyhow!("eventlog b64: {}", e))?;
     let u32le = |b: &[u8]| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize;
-    let prefix = format!("tapp.0g.com {} ", operation);
 
     let mut out = Vec::new();
     let mut o = 8 + 20;
@@ -432,9 +447,12 @@ fn eventlog_tapp_events(cc_eventlog_b64: &str, operation: &str) -> Result<Vec<se
             let tsz = u32le(&data[4..8]);
             if 8 + tsz <= data.len() {
                 if let Ok(text) = std::str::from_utf8(&data[8..8 + tsz]) {
-                    if let Some(payload) = text.strip_prefix(prefix.as_str()) {
-                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(payload) {
-                            out.push(v);
+                    for op in operations {
+                        let prefix = format!("tapp.0g.com {} ", op);
+                        if let Some(payload) = text.strip_prefix(prefix.as_str()) {
+                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(payload) {
+                                out.push((op.to_string(), v));
+                            }
                         }
                     }
                 }
@@ -455,6 +473,22 @@ pub struct TrustAnchors {
     /// a verifier restart legitimately forces one — but it is history a reader is entitled
     /// to see, and the reason these events carry the resulting state rather than a delta.
     pub revisions: usize,
+    /// A restarted process took over anchors that differ from what the claim or the last
+    /// update before it set: the state file was changed between the two processes. Cleared
+    /// by a later update, which measures the anchors in force again.
+    pub resumed_differently: bool,
+    /// The above happened at some point this boot, even if an update has re-set the
+    /// anchors since — history a reader should still see.
+    pub ever_resumed_differently: bool,
+    /// A restart had no claimed config to take over (the tapp-server before it persisted
+    /// only the owner), so it ran on config.toml's values: not carried over, not changed.
+    /// Cleared by a later update, as above.
+    pub not_carried_over: bool,
+    /// A restart found the claimed config but could not read it — damaged, or written by
+    /// something other than tapp-server — and ran on config.toml's values. Those are what
+    /// this reports, so nothing is hidden, but the file was not what tapp-server left.
+    /// Cleared by a later update, as above.
+    pub config_unreadable: bool,
 }
 
 /// The anchors in force, read from the newest event that sets them.
@@ -465,16 +499,52 @@ pub struct TrustAnchors {
 /// mutable: earlier events are history, not conflicts — unlike the owner, which cannot
 /// change and where disagreement is a finding.
 fn eventlog_trust_anchors(cc_eventlog_b64: &str) -> Result<Option<TrustAnchors>> {
-    let updates = eventlog_tapp_events(cc_eventlog_b64, "update_trust_anchors")?;
-    let revisions = updates.len();
-    let source = match updates.last() {
-        Some(v) => v.clone(),
-        None => match eventlog_tapp_events(cc_eventlog_b64, "claim_config")?.last() {
-            Some(v) => v.clone(),
-            None => return Ok(None),
-        },
+    // All three state the anchors in full. In log order, the newest is in force; a resumed
+    // claim that does not repeat the state before it is a finding, not a revision.
+    let events = eventlog_tapp_events_of(
+        cc_eventlog_b64,
+        &["claim_config", "update_trust_anchors", "claim_resumed"],
+    )?;
+    let anchors_of = |v: &serde_json::Value| {
+        (v["kbs_node_urls"].clone(), v["scan_url"].clone(), v["scan_public_key"].clone())
     };
+    let mut revisions = 0;
+    let mut resumed_differently = false;
+    let mut ever_resumed_differently = false;
+    let mut not_carried_over = false;
+    let mut config_unreadable = false;
+    let mut source: Option<&serde_json::Value> = None;
+    for (op, v) in &events {
+        match op.as_str() {
+            "update_trust_anchors" => {
+                revisions += 1;
+                resumed_differently = false;
+                not_carried_over = false;
+                config_unreadable = false;
+            }
+            "claim_resumed" => {
+                // Absent in events from before the field existed: those always carried it.
+                // `false` is what the first version of the field wrote for "absent".
+                let resumed = &v["config_resumed"];
+                if resumed == "unreadable" {
+                    config_unreadable = true;
+                } else if resumed == "absent" || resumed.as_bool() == Some(false) {
+                    not_carried_over = true;
+                } else if source.is_some_and(|prev| anchors_of(prev) != anchors_of(v)) {
+                    resumed_differently = true;
+                    ever_resumed_differently = true;
+                }
+            }
+            _ => {}
+        }
+        source = Some(v);
+    }
+    let Some(source) = source else { return Ok(None) };
     Ok(Some(TrustAnchors {
+        resumed_differently,
+        ever_resumed_differently,
+        not_carried_over,
+        config_unreadable,
         kbs_node_urls: source["kbs_node_urls"]
             .as_array()
             .map(|a| {
@@ -1088,5 +1158,120 @@ mod tests {
         assert!(!a.is(&SIGNER));
         assert!(!a.is(&[0x22; 20]), "the swapped signer must not be believed either");
         assert!(a.note.contains("does not hash"), "got {}", a.note);
+    }
+}
+
+#[cfg(test)]
+mod resumed_claim_tests {
+    use super::*;
+
+    /// A minimal CCEL: the header the walkers skip, then one tapp event per entry.
+    fn log_of(events: &[String]) -> String {
+        let mut b = vec![0u8; 28];
+        b.extend_from_slice(&0u32.to_le_bytes());
+        for text in events {
+            b.extend_from_slice(&3u32.to_le_bytes()); // pcr
+            b.extend_from_slice(&6u32.to_le_bytes()); // EV_EVENT_TAG
+            b.extend_from_slice(&1u32.to_le_bytes()); // one digest
+            b.extend_from_slice(&0x0cu16.to_le_bytes());
+            b.extend_from_slice(&[0u8; 48]);
+            let mut data = vec![0u8; 4];
+            data.extend_from_slice(&(text.len() as u32).to_le_bytes());
+            data.extend_from_slice(text.as_bytes());
+            b.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            b.extend_from_slice(&data);
+        }
+        B64.encode(b)
+    }
+
+    fn ev(op: &str, owner: &str, scan: &str) -> String {
+        format!(
+            r#"tapp.0g.com {op} {{"owner":"{owner}","kbs_node_urls":["https://kms:9443"],"scan_url":"{scan}","scan_public_key":"0x01"}}"#
+        )
+    }
+
+    #[test]
+    fn a_resume_that_repeats_the_state_is_not_a_finding() {
+        let log = log_of(&[ev("claim_config", "0xa", "https://s1"), ev("claim_resumed", "0xa", "https://s1")]);
+        let a = eventlog_trust_anchors(&log).unwrap().unwrap();
+        assert!(!a.resumed_differently);
+        assert_eq!(a.scan_url, "https://s1");
+        assert_eq!(eventlog_claim_config_owner(&log).unwrap().as_deref(), Some("0xa"));
+    }
+
+    #[test]
+    fn a_resume_after_an_update_compares_with_the_update() {
+        let log = log_of(&[
+            ev("claim_config", "0xa", "https://s1"),
+            ev("update_trust_anchors", "0xa", "https://s2"),
+            ev("claim_resumed", "0xa", "https://s2"),
+        ]);
+        let a = eventlog_trust_anchors(&log).unwrap().unwrap();
+        assert!(!a.resumed_differently);
+        assert_eq!((a.scan_url.as_str(), a.revisions), ("https://s2", 1));
+    }
+
+    #[test]
+    fn anchors_changed_between_processes_are_reported() {
+        let log = log_of(&[ev("claim_config", "0xa", "https://s1"), ev("claim_resumed", "0xa", "https://evil")]);
+        let a = eventlog_trust_anchors(&log).unwrap().unwrap();
+        assert!(a.resumed_differently);
+        assert_eq!(a.scan_url, "https://evil");
+    }
+
+    #[test]
+    fn a_config_that_was_not_carried_over_is_not_called_changed() {
+        let mut resumed = ev("claim_resumed", "0xa", "");
+        resumed = resumed.replace(r#""scan_public_key""#, r#""config_resumed":false,"scan_public_key""#);
+        let log = log_of(&[ev("claim_config", "0xa", "https://s1"), resumed]);
+        let a = eventlog_trust_anchors(&log).unwrap().unwrap();
+        assert!(a.not_carried_over);
+        assert!(!a.resumed_differently);
+    }
+
+    #[test]
+    fn an_unreadable_config_is_told_apart_from_an_absent_one() {
+        let with = |state: &str| {
+            ev("claim_resumed", "0xa", "").replace(
+                r#""scan_public_key""#,
+                &format!(r#""config_resumed":{state},"scan_public_key""#),
+            )
+        };
+        let a = eventlog_trust_anchors(&log_of(&[ev("claim_config", "0xa", "https://s1"), with(r#""absent""#)]))
+            .unwrap()
+            .unwrap();
+        assert!(a.not_carried_over && !a.config_unreadable && !a.resumed_differently);
+        let a = eventlog_trust_anchors(&log_of(&[ev("claim_config", "0xa", "https://s1"), with(r#""unreadable""#)]))
+            .unwrap()
+            .unwrap();
+        assert!(a.config_unreadable && !a.not_carried_over && !a.resumed_differently);
+        // A later update measures the anchors in force again.
+        let a = eventlog_trust_anchors(&log_of(&[
+            ev("claim_config", "0xa", "https://s1"),
+            with(r#""unreadable""#),
+            ev("update_trust_anchors", "0xa", "https://s1"),
+        ]))
+        .unwrap()
+        .unwrap();
+        assert!(!a.config_unreadable);
+    }
+
+    #[test]
+    fn a_later_update_clears_the_finding_but_not_its_history() {
+        let log = log_of(&[
+            ev("claim_config", "0xa", "https://s1"),
+            ev("claim_resumed", "0xa", "https://evil"),
+            ev("update_trust_anchors", "0xa", "https://s1"),
+        ]);
+        let a = eventlog_trust_anchors(&log).unwrap().unwrap();
+        assert!(!a.resumed_differently);
+        assert!(a.ever_resumed_differently);
+        assert_eq!(a.scan_url, "https://s1");
+    }
+
+    #[test]
+    fn an_owner_changed_between_processes_is_inconsistent() {
+        let log = log_of(&[ev("claim_config", "0xa", "https://s1"), ev("claim_resumed", "0xb", "https://s1")]);
+        assert!(eventlog_claim_config_owner(&log).is_err());
     }
 }

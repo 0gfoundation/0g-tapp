@@ -47,6 +47,10 @@ pub struct PermissionManager {
 
     /// App ownership tracking: app_id -> ownership
     app_ownership: Arc<RwLock<HashMap<String, AppOwnership>>>,
+
+    /// This process took over a claim an earlier process of the same boot made, from
+    /// `owner_state_path` — which is measured again on startup (see `claim_resumed`).
+    resumed: std::sync::atomic::AtomicBool,
 }
 
 impl PermissionManager {
@@ -58,7 +62,17 @@ impl PermissionManager {
             owner_state_path: None,
             whitelist: Arc::new(RwLock::new(HashSet::new())),
             app_ownership: Arc::new(RwLock::new(HashMap::new())),
+            resumed: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    pub fn mark_resumed(&self) {
+        self.resumed.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// See `resumed`.
+    pub fn was_resumed(&self) -> bool {
+        self.resumed.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Enable owner-claim persistence at `path` (see `owner_state_path`).
