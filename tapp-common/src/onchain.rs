@@ -129,6 +129,21 @@ pub async fn get_app_owner(rpc_url: &str, contract: &str, app_id: &str) -> Resul
     Err(anyhow!("unexpected getAppInfo return shape"))
 }
 
+/// The nominee of a pending ownership transfer (pendingAppOwner, registry >= 0.2.0).
+/// Address::zero() means none. Errors on an older registry, which has no such call.
+pub async fn get_pending_app_owner(rpc_url: &str, contract: &str, app_id: &str) -> Result<Address> {
+    let data = calldata("pendingAppOwner(string)", vec![Token::String(app_id.to_owned())]);
+    let out = call_raw(rpc_url, contract, data).await?;
+    match decode(&[ParamType::Address], &out)
+        .map_err(|e| anyhow!("decode pendingAppOwner (registry older than 0.2.0?): {}", e))?
+        .into_iter()
+        .next()
+    {
+        Some(Token::Address(a)) => Ok(a),
+        _ => Err(anyhow!("unexpected pendingAppOwner return shape")),
+    }
+}
+
 /// Registered node signer addresses for an app (getNodeList).
 pub async fn get_node_list(rpc_url: &str, contract: &str, app_id: &str) -> Result<Vec<Address>> {
     let data = calldata("getNodeList(string)", vec![Token::String(app_id.to_owned())]);
@@ -484,6 +499,25 @@ pub async fn authorize_invalidator(
             Token::Address(invalidator),
         ],
     );
+    send_tx(&params.rpc_url, &params.private_key, params.contract_address()?, data, U256::zero()).await
+}
+
+/// transferAppOwnership(string,address) — nominate; Address::zero() cancels.
+pub async fn transfer_app_ownership(
+    params: &OnchainParams,
+    app_id: &str,
+    new_owner: Address,
+) -> Result<TxHash> {
+    let data = calldata(
+        "transferAppOwnership(string,address)",
+        vec![Token::String(app_id.to_owned()), Token::Address(new_owner)],
+    );
+    send_tx(&params.rpc_url, &params.private_key, params.contract_address()?, data, U256::zero()).await
+}
+
+/// acceptAppOwnership(string) — sent by the nominee.
+pub async fn accept_app_ownership(params: &OnchainParams, app_id: &str) -> Result<TxHash> {
+    let data = calldata("acceptAppOwnership(string)", vec![Token::String(app_id.to_owned())]);
     send_tx(&params.rpc_url, &params.private_key, params.contract_address()?, data, U256::zero()).await
 }
 

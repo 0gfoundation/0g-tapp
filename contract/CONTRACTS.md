@@ -24,7 +24,8 @@ upgrades apply immediately, which is intended for a dev chain).
 |----------|---------|
 | TappRegistry Implementation (initial) | `0xaeddc6b6A6b9d4a9513Cc2322bbb78DFF97DA459` |
 | TappRegistry Implementation (getNode resolves inherit) | `0x6987fD9afe6e2430bF5AD85cfBC8c63487d4e4BD` |
-| **TappRegistry Implementation (current, v0.1.0 — adds `version()`)** | `0x9Ea52Ef383e8eA3fe7F0890309D3C62b2FC1Ac2B` |
+| TappRegistry Implementation (v0.1.0 — adds `version()`) | `0x9Ea52Ef383e8eA3fe7F0890309D3C62b2FC1Ac2B` |
+| **TappRegistry Implementation (current, v0.2.0 — app-owner transfer)** | `0xa10a561C3Bf2c2dE3013845Cc2ed3eb5a218D3b8` |
 | UpgradeableBeacon | `0x1Cd7544068AdC525b9Cb21cC13aF25D95a53645E` |
 | **BeaconProxy (stable)** | `0x2Ce80374318B1d7Fb3345724457a182E0ad165c9` |
 
@@ -33,10 +34,11 @@ upgrades apply immediately, which is intended for a dev chain).
 | Date | New Implementation | Upgrade Tx | Notes |
 |------|--------------------|-----------|-------|
 | 2026-07-07 | `0x9Ea52Ef383e8eA3fe7F0890309D3C62b2FC1Ac2B` | `0x8a003a1a05c381f59bf213c19e2340b63094ad3230d84e0f42ac9c71d7f84505` | Add `version()` view (baseline `0.1.0`); storage layout unchanged, source-verified |
+| 2026-10-05 | `0xa10a561C3Bf2c2dE3013845Cc2ed3eb5a218D3b8` | `0x9541c3bb9c413bc8844f23066405a0671623833627a43c34304981576e5a2445` | `0.2.0`: two-step app-owner transfer. One new slot from `__gap`; `cmd/upgrade --check` confirmed 15 values unchanged (admin, stake parameters, and 0g-kms / 0g-agentic-id / 0g-agentic-id-sandbox-provider / 0g-tappscan records). Source-verified |
 
 **`getNode` returns 5 fields** — `(teeUrl, addedAt, stakeAmount, composeHash, volumesHash)`.
 Sanity check you are talking to this registry: `cast call <proxy> "version()(string)"`
-returns `"0.1.0"`.
+returns `"0.2.0"`.
 
 e2e exercised on app `0g-kms`: register-onchain (app-level default + first node
 inherit), add-node-onchain (per-node override), update-node-onchain — all verified
@@ -83,6 +85,44 @@ proposer key. Direct `beacon.upgradeTo` no longer works — only the timelock ca
 
 ---
 
+## Implementation 0.2.0 (app ownership transfer)
+
+**Testnet: deployed 2026-10-05** (see its upgrades table). **Mainnet: pending** —
+the proxy still answers `version()` = `"0.1.0"`. Adds a two-step app-owner transfer:
+
+| Function | Who | Effect |
+|---|---|---|
+| `transferAppOwnership(appId, newOwner)` | app owner | nominate (`address(0)` cancels; again = replace) |
+| `acceptAppOwnership(appId)` | the nominee | becomes owner; nomination cleared |
+| `pendingAppOwner(appId)` → address | anyone | current nominee, or `address(0)` |
+
+Events `AppOwnershipTransferStarted(appId, owner, pendingOwner)` and
+`AppOwnershipTransferred(appId, previousOwner, newOwner)`.
+
+- **Stake**: live nodes' stake travels with the app (`removeNode` refunds whoever
+  owns the app then); stake already locked to the old owner stays theirs.
+- **Acks** are not bumped: no code changes, and every change the new owner can
+  make bumps the ack version anyway.
+- A nomination is deleted when the app unregisters (last `removeNode`), so a stale
+  nominee can never accept a later registration of the same id.
+- **Storage**: one new mapping at slot 12, taken from `__gap` (48 → 47); slots
+  0–11 unchanged. `test_Upgrade_From010_PreservesStateAndStartsWithNothingPending`
+  upgrades a populated 0.1.0 proxy and checks every field.
+
+Rollout with `go run ./cmd/upgrade/` (Go Tools below), which keeps the beacon
+owner's key off the machine doing the work. Testnet: the owner (`0x73443d…`) signs
+the printed `upgradeTo`. Mainnet: the owner is the timelock — its proposer
+(`0x87605ec8…`) schedules, and after the 1-day delay an executor executes. Then
+`go run ./cmd/verify/ --network <net>`. Record each in its network's upgrades table
+and flip this section to "deployed". Both paths have been rehearsed end to end on
+local forks of the live networks: state unchanged, the new functions live.
+
+The 0.1.0 implementations live on both networks (testnet `0x9Ea52Ef3…`, mainnet
+`0xf399583d…`) are byte-identical, metadata aside, to the 0.1.0 fixture the
+upgrade test runs against.
+
+---
+
 ## Contract Architecture
 
 ```
@@ -108,61 +148,93 @@ optional per-node override (empty = inherit).
 
 ## Go Tools
 
-All contract operations are handled by Go tools under `contract/cmd/`. Docker is required only for compilation (forge runs inside a container to work around host GLIBC constraints).
-
-### Compile
-
-Compiles Solidity via Docker and extracts ABIs to `internal/chain/abi/`.
+Deploy, upgrade and verify are Go tools under `contract/cmd/`. They read forge's build
+output directly, so the one prerequisite is:
 
 ```bash
-cd contract
-go run ./cmd/compile/
+cd contract && forge build
 ```
 
-After an ABI change, regenerate Go bindings:
+All three take `--network testnet|mainnet`, which supplies the RPC, chain id, explorer
+and the registry's proxy address; `--rpc` / `--chain-id` override it for a local
+anvil fork. A command refuses an RPC that is not on the network's chain.
 
-```bash
-$(go env GOPATH)/bin/abigen \
-  --abi internal/chain/abi/TappRegistry.json \
-  --pkg chain --type TappRegistry \
-  --out internal/chain/tapp_registry.go
-```
+Keys: `--keystore <file>` (a foundry/geth keystore — `~/.foundry/keystores/<name>`;
+password prompted, or `--password-file`), or `PRIVATE_KEY` in the environment.
+`--key 0x…` still works for throwaway keys, with a warning: it is visible in the
+process list and the shell history. Exactly one source: giving two is refused, so
+an owner key left in the environment can never be used in place of the throwaway
+named on the command line.
 
 ### Deploy (first time)
 
 ```bash
-cd contract
-go run ./cmd/deploy/ \
-  --rpc   https://evmrpc-testnet.0g.ai \
-  --key   0x<DEPLOYER_PRIVATE_KEY>     \
-  --stake 1000000000000000000          \
-  --lock  86400
+PRIVATE_KEY=0x<throwaway> go run ./cmd/deploy/ --network testnet \
+  --stake 1000000000000000000 --lock 86400 \
+  --beacon-owner 0x<timelock or wallet> --admin 0x<wallet>
 ```
 
-Output lists Implementation, Beacon, and Proxy addresses. Set the Proxy as `TAPP_REGISTRY_CONTRACT`.
+The deploy key needs gas and nothing else. The beacon is created with
+`--beacon-owner` (who may upgrade) as its owner, so that power never passes through
+the deploy key; `--admin` (stake parameters) is handed over straight after, since
+`initialize()` records its caller. Both are read back and must match. On mainnet
+both are required and `--beacon-owner` must be a contract (the timelock) — checked
+before anything is deployed, so a typo costs nothing. Output lists the proxy (`TAPP_REGISTRY_CONTRACT`), beacon,
+implementation and the authority in force.
 
 ### Upgrade
 
-Edit `src/TappRegistry.sol`, recompile, then:
-
 ```bash
-cd contract
-go run ./cmd/upgrade/ \
-  --rpc    https://evmrpc-testnet.0g.ai     \
-  --key    0x<DEPLOYER_PRIVATE_KEY>         \
-  --beacon 0x<UPGRADEABLE_BEACON_ADDRESS>
+PRIVATE_KEY=0x<throwaway> go run ./cmd/upgrade/ --network testnet     # or mainnet
+go run ./cmd/upgrade/ --network testnet --check 0x<new implementation>
 ```
 
-Deploys a new implementation and calls `beacon.upgradeTo`. The proxy address is unchanged.
+The key only pays for putting the new implementation on chain. The switch
+(`beacon.upgradeTo`) belongs to the beacon owner, and the tool reads what that is:
+
+| beacon owner | what happens |
+|---|---|
+| this key | the switch is sent (dev chains) |
+| a wallet (testnet: `0x73443d…`) | the exact transaction is printed for the owner to sign elsewhere — wallet, hardware key — after simulating it **as** the owner |
+| a TimelockController (mainnet) | the schedule and execute transactions are printed, with the delay read from it; `--proposer <addr>` simulates the schedule as that proposer |
+
+`--check <impl>` confirms the beacon moved and that the switch itself changed
+nothing: the registry's admin, stake parameters, and for `--apps` (default
+`0g-kms`) app info, node list and ack version, read at the block before the
+switch and the block of it — so a day of ordinary activity behind a timelock is not
+mistaken for a change. An RPC that prunes history (the 0G testnet's) cannot answer
+for old blocks; then the snapshot taken when the upgrade was prepared
+(`upgrade-state.<proxy>.txt`) is compared with now. Before the switch, for a
+timelock, it reports whether the operation is unscheduled, pending (until when) or
+ready. `--impl <addr>` re-prints the switch for an
+implementation already deployed.
+
+Rehearse on a fork first — it costs nothing and runs the real state:
+
+```bash
+anvil --fork-url https://evmrpc.0g.ai --port 8545 &
+PRIVATE_KEY=<an anvil account> go run ./cmd/upgrade/ --network mainnet --rpc http://127.0.0.1:8545 \
+  --proposer 0x87605ec8e10eb373c1d070e15e5d78fac4d7621d --apps 0g-kms,0g-agentic-id
+# impersonate the proposer (anvil_impersonateAccount), send the schedule tx,
+# evm_increaseTime 86401, send the execute tx, then --check
+```
 
 ### Verify
 
 ```bash
-cd contract
-go run ./cmd/verify/ --proxy 0x<BEACON_PROXY_ADDRESS>
+go run ./cmd/verify/ --network testnet      # or mainnet
 ```
 
-Auto-discovers impl, beacon, and proxy from the given BeaconProxy address. Checks which are unverified, extracts constructor args from on-chain data, submits source, and polls for results. All three contracts are verified in one command.
+Auto-discovers impl, beacon and proxy behind the network's registry (or `--proxy`),
+skips what is already verified, extracts constructor args from on-chain data, submits
+source and polls. Run it again after an upgrade and it verifies the new
+implementation.
+
+### Compile (only to regenerate the Go bindings in `internal/chain/`)
+
+`go run ./cmd/compile/` builds via Docker and extracts ABIs to `internal/chain/abi/`;
+then `abigen` regenerates `internal/chain/tapp_registry.go`. The tools above do not
+need them.
 
 ---
 
@@ -195,6 +267,11 @@ tapp-cli \
 ```
 
 ### Update app hashes (after redeployment)
+
+`start-app --register-onchain` keeps each node's record equal to what that node
+runs (its own override where it differs from the app default) and, in a
+single-node app, the app declaration too. In a multi-node app the app-level
+default moves with `update-onchain`, below.
 
 `update-onchain` updates the app-level shared defaults (compose/volumes/images). If a
 specific node diverges from the defaults, set its per-node override with

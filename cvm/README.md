@@ -13,7 +13,7 @@ One CVM = one point in this grid; each combination has its own image, its own re
 | **version** | tapp-server release tag | `TAPP_SERVER_URL` | which tapp-server binary + image-name suffix |
 
 > **Two build modes** (`BUILD_MODE`, default `canonical`):
-> - **canonical** — owner-agnostic image: owner/chain/kbs are claimed at runtime
+> - **canonical** — owner-agnostic image: owner/kbs are claimed at runtime
 >   (`tapp-cli claim-config`) as a measured `claim_config` event. One image and ONE
 >   reference set serve every owner. Requires tapp-server ≥ v0.3.0.
 > - **custom** — `OWNER_ADDRESS` baked into `config.toml` → folded into the **initrd
