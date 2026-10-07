@@ -49,8 +49,6 @@ pub struct TappConfig {
     pub server: ServerConfig,
     #[serde(default)]
     pub kbs: Option<KbsConfig>,
-    #[serde(default)]
-    pub chain: Option<ChainConfig>,
 }
 
 impl TappConfig {
@@ -218,15 +216,6 @@ pub struct PermissionConfig {
     /// reboot, matching the RTMR lifetime (reboot = re-claim, re-measured).
     #[serde(default = "default_owner_state_path")]
     pub owner_state_path: PathBuf,
-}
-
-/// On-chain configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChainConfig {
-    /// Ethereum-compatible RPC URL
-    pub rpc_url: String,
-    /// TappRegistry contract address
-    pub contract_address: String,
 }
 
 /// KBS configuration — points to the KMS cluster for app secret retrieval.
@@ -462,5 +451,29 @@ mod socket_mode {
         for bad in ["rw-rw----", "0o", "", "0899", "abc"] {
             assert!(parse(bad).is_err(), "accepted {:?}", bad);
         }
+    }
+}
+
+#[cfg(test)]
+mod retired_sections {
+    use super::*;
+
+    #[test]
+    fn a_config_with_the_retired_chain_table_still_loads() {
+        // Hand-written and older configs carry [chain]. A node must not refuse to boot
+        // over a section that no longer means anything — it would turn an upgrade into
+        // an outage for no gain.
+        let config: TappConfig = toml::from_str(
+            r#"
+[chain]
+rpc_url = "https://evmrpc-testnet.0g.ai"
+contract_address = "0x2Ce80374318B1d7Fb3345724457a182E0ad165c9"
+
+[kbs]
+node_urls = ["http://kms-1:9091"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.kbs.unwrap().node_urls, vec!["http://kms-1:9091"]);
     }
 }

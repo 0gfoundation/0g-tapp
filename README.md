@@ -351,7 +351,7 @@ unix_socket_mode = "0660"
 
 # Where app TLS private keys come from: "local" (default, bound to this instance,
 # changes every boot) or "kms" (stable across restarts and shared by every node of
-# the app, needs [kbs] and [chain]). See "App TLS certificates" above.
+# the app, needs [kbs] and the app registered on chain). See "App TLS certificates" above.
 tls_key_source = "local"
 
 # Optional CA for app TLS certificates. Unset, GetAppTlsCert self-signs — which is
@@ -389,12 +389,11 @@ node_urls = [
     "https://kms-node-1:9443",
     "https://kms-node-2:9443",
 ]
-
-# Optional: on-chain TappRegistry integration
-[chain]
-rpc_url = "https://evmrpc-testnet.0g.ai"
-contract_address = "0x..."
 ```
+
+There is no `[chain]` section (an old one is ignored). A node is not tied to one
+registry: every on-chain command takes `--rpc-url`/`--contract`, so the same node can
+be registered on testnet and mainnet at once.
 
 ## Claiming Ownership (runtime owner claim)
 
@@ -406,11 +405,9 @@ claims it:
 ```bash
 tapp-cli -s http://<tapp>:50051 -k 0x<your-key> claim-config
 
-# Or claim and configure in one call — chain, KMS cluster and TLS key source are
-# all optional here if already present in config.toml:
+# Or claim and configure in one call — KMS cluster and TLS key source are
+# optional here if already present in config.toml:
 tapp-cli -s http://<tapp>:50051 -k 0x<your-key> claim-config \
-  --chain-rpc-url https://evmrpc-testnet.0g.ai \
-  --chain-contract 0x<TappRegistry> \
   --kbs-urls "https://kms-1:9443,https://kms-2:9443" \
   --tls-key-source kms \
   --scan-url https://scan.example \
@@ -519,8 +516,13 @@ are not transferred — the new owner replaces them with its own.
    ```bash
    tapp-cli -s <new-node> -k 0x<new-key> start-app -f docker-compose.yml -a <app_id> \
      --register-onchain --rpc-url <rpc> --contract <registry> --stake-wei <wei> \
+     --tee-url https://<new-node>:50052 \
      [--old-signer 0x<node being replaced>]   # needed only when the app has several nodes
    ```
+
+   Pass `--tee-url` here. Without it the replaced node's teeUrl is kept unless something
+   else answers there, and the old machine's port is normally closed to the new owner
+   (#141), so it would be kept — now pointing verifiers and the KMS at the old machine.
 
    The new signer replaces the old one in place (`updateNode`): one transaction, the
    stake carried over, no moment where the app has no node. It also orders things so
@@ -559,18 +561,51 @@ the body-bound form too (`sign_message.py` takes the request JSON).
 
 ## On-chain Registration
 
-Register your app and TEE nodes on the TappRegistry contract using `tapp-cli`. These commands require `--private-key` (the deployer's Ethereum private key) and `--server` (the tapp gRPC endpoint, used both as the gRPC target and as the on-chain `teeUrl`).
+Register your app and TEE nodes on the TappRegistry contract using `tapp-cli`. These commands require `--private-key` (the deployer's Ethereum private key) and `--server` (the tapp gRPC endpoint).
+
+The node's on-chain `teeUrl` — where the scan and `verify-app` fetch its evidence — is `--tee-url` when given. Otherwise a node already on chain **keeps its recorded `teeUrl`**: a DNS name, front or private address was someone's choice, and a run from wherever the operator happens to be must not move it. A **replacement** asks the replaced slot's `teeUrl` for the app's signer. If *this* node answers (the restart case), the URL is kept. If another signer answers, or something answers that is not a tapp-server naming this node, the replacement gets a URL derived from `--server` instead, and says so. If nothing answers — a VPC-private URL seen from outside, a dead machine, or the old machine on a hand-over — the URL is kept with a warning, so those replacements need `--tee-url`. The one automatic move is the legacy `http://<host>:50051` → `https://<host>:50052` when the node serves the TLS listener (tapp-server ≥ 0.8.0). A **new** record is derived from `--server`: `https://` as given, `http://` → `https://<host>:50052`; a `--server` reached locally (`127.0.0.1`, a socket) cannot be derived from, so a new record then needs `--tee-url`. Every change is printed. `:50051` is meant to stay closed to everyone but the node (#141). `--tee-url` takes a DNS name, a TLS front, or a **private address** — a node in the scan's VPC can register `https://10.x.x.x:50052`, which only the scan reaches; everyone else verifies it through the scan relay. To move a node's `teeUrl`, pass `--tee-url` to `start-app --register-onchain` or `update-node-onchain` (signer unchanged, nothing else touched).
 
 ### Register during start (recommended)
 
-`start-app --register-onchain` idempotently registers the app BEFORE its
-containers start: the server pulls the images and computes all hashes first
-(measure-only), the CLI submits the transaction, and only after it confirms are
-the containers started. Safe to re-run:
+`start-app --register-onchain` brings the chain in line with this deployment
+BEFORE its containers start — one command for a first deploy, a restart, a
+machine replacement and an upgrade. The server pulls the images and computes all
+hashes first (measure-only), the CLI submits what the chain needs, and only after
+it confirms are the containers started (so a node whose volume key comes from the
+KMS is on the node list when it asks). Safe to re-run; it writes nothing when the
+chain already matches.
 
-- app not registered on-chain → `registerApp` (this node becomes the first node)
-- registered, but this node's signer not in the node list → `addNode`
-- signer already a node → skip registration, just start
+**Each node's record says what that node runs.** A deployment rewrites only this
+node's compose and mount files — stored as the node's own override where they
+differ from the app's default — and never another node's. So every node can be
+checked against its own record at any moment, including half-way through a
+rolling upgrade, and nodes that legitimately differ (each KMS node has its own
+`kms.toml`) need nothing special.
+
+The app-level declaration is the default for new nodes. Its code (compose and
+images) follows the deployment only in a **single-node** app, where the two are the
+same thing; in a multi-node app it moves with an explicit `update-onchain` once every
+node runs the new code. Mount files never move the app default — a node whose files
+differ always records them as its own override.
+Images are the one exception to "per node": the registry keeps them per app only,
+so new images on one node of several are reported, not written — pin images by
+digest in the compose file and the compose hash covers them per node.
+
+The signer:
+  - app not registered → `registerApp` (this node becomes the first node)
+  - signer already a node → its record is corrected if needed, otherwise nothing
+  - signer absent, exactly one other node → `updateNode`, **replacing** it (a
+    restart re-derives the signer, so the address on chain is a dead instance)
+  - signer absent, several other nodes → `addNode`; pass `--old-signer` to replace
+    a specific one instead
+  - `--add-node` → `addNode` regardless: how a one-node app scales out to two
+  - **Apps whose external contracts key on the signer** (0g-sandbox's vouchers, for
+    one) should restart with `--add-node`, let the old signer's obligations settle,
+    then `remove-node-onchain` it. A one-step replacement skips that settling.
+
+Rewriting a node's record goes through `updateNode`, which also resets the node's
+on-chain `addedAt` to that block. Nothing in tapp reads it, but it means "when this
+record was last written", not "when this machine joined".
 
 ```bash
 tapp-cli -s http://<tapp>:50051 -k 0x<deployer-key> start-app \
@@ -593,7 +628,8 @@ tapp-cli -s http://<tapp>:50051 -k 0x<deployer-key> register-onchain \
   --contract 0x<TappRegistry> \
   --stake-wei 1000000000000000000
 
-# Update app hashes after redeployment
+# Set the app-level declaration (the default for new nodes) to what this node
+# runs — e.g. after every node of a multi-node app has been upgraded
 tapp-cli -s http://<tapp>:50051 -k 0x<deployer-key> update-onchain \
   --app-id my-app \
   --rpc-url https://evmrpc-testnet.0g.ai \

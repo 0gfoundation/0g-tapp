@@ -111,7 +111,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Step 6.5: Establish the tapp owner (config / persisted claim / unclaimed).
-    // Also passes chain/kbs from config so the startup claim_config measurement
+    // Also passes kbs from config so the startup claim_config measurement
     // includes the full runtime configuration baked into the image.
     if let Some(ref pm) = permission_manager {
         let config_owner = config
@@ -119,16 +119,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .permission
             .as_ref()
             .and_then(|p| p.owner_address.as_deref());
-        let chain_rpc_url = config
-            .chain
-            .as_ref()
-            .map(|c| c.rpc_url.as_str())
-            .unwrap_or("");
-        let chain_contract = config
-            .chain
-            .as_ref()
-            .map(|c| c.contract_address.as_str())
-            .unwrap_or("");
         let kbs_urls: Vec<String> = config
             .kbs
             .as_ref()
@@ -139,8 +129,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             pm,
             &measurement_service,
             config_owner,
-            chain_rpc_url,
-            chain_contract,
             &kbs_urls,
         )
         .await
