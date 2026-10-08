@@ -28,13 +28,15 @@ HARDEN="${HARDEN:-1}"                                   # 1=hardened (purge Tier
 # `sysbox-runc features` (unsupported) on startup. Nestybox officially supports Docker 20.10-27.x.
 # Pin to the last 27.x; set DOCKER_VERSION="" to install the (unpinned) repo default instead.
 DOCKER_VERSION="${DOCKER_VERSION:-5:27.5.1-1~ubuntu.24.04~noble}"
-# Container storage is ALWAYS pinned off the RAM rootfs (rw_overlay="ram") onto the persistent /data
-# disk -- this is independent of Sysbox. Two stores must be moved: docker's data-root (metadata)
-# and containerd's root (image layers/snapshots; docker-ce defaults to the containerd image store).
-# The /data disk is provisioned per-instance at deploy time (attach a disk, mkfs.ext4 -L tapp-data);
-# docker + containerd wait for it and fail loud if it is absent (never write to the RAM root).
-DATA_ROOT="${DATA_ROOT:-/data/docker}"                 # docker data-root (metadata/volumes/buildkit)
-CONTAINERD_ROOT="${CONTAINERD_ROOT:-/data/containerd}" # containerd root (image layers + snapshots)
+# Container storage lives on the RUNTIME VOLUME (tapp-runtime-volume, below): a volume on the /data
+# disk that is encrypted with a key generated at random on every boot and re-created on every boot.
+# It is too big for the RAM rootfs (rw_overlay="ram"), and it must not be on /data in the clear:
+# images, containers, their env and logs would be readable there, image layers could be altered
+# before the next start, and a previous boot's containers would come back by themselves. On the
+# runtime volume they are secret, cannot be altered from outside, and do not outlive the boot.
+# Independent of Sysbox. Only what must persist is on /data itself: each app's ./data.
+DATA_ROOT="${DATA_ROOT:-/var/lib/tapp-runtime/docker}"                 # docker data-root (metadata/volumes/buildkit)
+CONTAINERD_ROOT="${CONTAINERD_ROOT:-/var/lib/tapp-runtime/containerd}" # containerd root (image layers + snapshots)
 # Sysbox (issue #21): hostile-multi-tenant container isolation (sysbox-runc). Opt-in; default OFF.
 # When ON: installs sysbox-ce and registers sysbox-runc as a dockerd runtime (storage pinning above
 # happens regardless). Requires Docker <=27.x (see DOCKER_VERSION).
@@ -288,20 +290,22 @@ grep -q 'Unattended-Upgrade "0"' /etc/apt/apt.conf.d/20auto-upgrades \
   || { echo "ERROR: effective needrestart restart mode is not 'l' -- services would auto-restart"; exit 1; }
 echo "auto-update: apt-daily* masked, unattended-upgrades purged, needrestart=list-only"
 
-# ---- pin container storage OFF the ephemeral RAM rootfs (rw_overlay="ram") -- UNCONDITIONAL ----
-# The cryptpilot writable rootfs overlay is RAM-backed and RAM-capped, so container state MUST NOT
-# accumulate on "/". Independent of Sysbox. Two distinct stores must both move to the /data disk:
+# ---- container storage on the runtime volume -- UNCONDITIONAL ----
+# Two distinct stores, both on the runtime volume (see DATA_ROOT above):
 #   - docker's data-root : metadata, volumes, buildkit                              -> $DATA_ROOT
 #   - containerd's root  : image layers + snapshots (docker-ce defaults to the      -> $CONTAINERD_ROOT
 #                          containerd image store, so layers live here, NOT data-root)
-# docker + containerd must wait for /data and FAIL LOUD if absent (never write to the RAM root).
+# docker + containerd require the runtime volume and FAIL LOUD without it -- never falling back to
+# the RAM root or to /data in the clear.
 mkdir -p /data /etc/docker /etc/containerd
 printf '%s\n' '{' "  \"data-root\": \"$DATA_ROOT\"" '}' > /etc/docker/daemon.json
 containerd config default > /etc/containerd/config.toml
 sed -i "s|^root = .*|root = \"$CONTAINERD_ROOT\"|" /etc/containerd/config.toml
 mkdir -p /etc/systemd/system/docker.service.d /etc/systemd/system/containerd.service.d
-printf '%s\n' '[Unit]' 'RequiresMountsFor=/data' > /etc/systemd/system/docker.service.d/10-data-mount.conf
-printf '%s\n' '[Unit]' 'RequiresMountsFor=/data' > /etc/systemd/system/containerd.service.d/10-data-mount.conf
+for unit in docker containerd; do
+  printf '%s\n' '[Unit]' 'Requires=tapp-runtime-volume.service' 'After=tapp-runtime-volume.service' \
+    > "/etc/systemd/system/$unit.service.d/10-runtime-volume.conf"
+done
 # fstab: nofail so a missing/blank /data disk NEVER blocks boot (a non-nofail mount failure drops the
 # whole system into emergency mode -> no network/SSH). With nofail only docker/containerd fail loud
 # (RequiresMountsFor). x-systemd.requires pulls the provisioner first. device-timeout must comfortably
@@ -454,6 +458,72 @@ ExecStart=/usr/local/sbin/tapp-data-grow.sh
 WantedBy=multi-user.target
 GROWUNIT
 systemctl enable tapp-data-grow.service || true
+
+# The RUNTIME VOLUME: where docker, containerd (and sysbox) keep their state. A sparse file on the
+# tapp-data disk, encrypted with a key read from the kernel RNG at boot and held only in the kernel
+# (TEE memory), re-created on every boot. It touches nothing on /data but its own file, and only
+# when /data is the tapp-data disk; otherwise docker stays down. Restarting the unit within a boot
+# keeps the volume (docker is using it). Discards reach /data, so deleted images free disk space.
+cat > /usr/local/sbin/tapp-runtime-volume.sh <<'RTVSH'
+#!/bin/bash
+# Create this boot's runtime volume and mount it at /var/lib/tapp-runtime (see build-tapp.sh).
+set -euo pipefail
+IMG=/data/tapp/runtime.img
+NAME=tapp-runtime
+MNT=/var/lib/tapp-runtime
+say() {
+  echo "tapp-runtime-volume: $*" >&2
+  { echo "tapp-runtime-volume: $*" > /dev/console; } 2>/dev/null || true
+}
+# Already created in this boot (the unit was restarted): docker is using it, keep it.
+if [ -e "/dev/mapper/$NAME" ]; then
+  mountpoint -q "$MNT" || mount -o discard "/dev/mapper/$NAME" "$MNT"
+  exit 0
+fi
+# Only ever on the tapp data disk. Anything else mounted at /data is left alone, and docker
+# stays down rather than putting its state somewhere unintended.
+data_dev="$(findmnt -no SOURCE /data 2>/dev/null || true)"
+want_dev="$(blkid -L tapp-data 2>/dev/null || true)"
+if [ -z "$data_dev" ] || [ -z "$want_dev" ] || [ "$(readlink -f "$data_dev")" != "$(readlink -f "$want_dev")" ]; then
+  say "/data is not the tapp-data disk; no runtime volume, so docker will NOT start."
+  exit 1
+fi
+mkdir -p /data/tapp "$MNT"
+# The previous boot's volume cannot be read any more -- its key died with that boot -- so it is
+# dropped, with any loop device a failed attempt earlier in this boot left attached to it.
+for d in $(losetup -n -O NAME -j "$IMG" 2>/dev/null); do losetup -d "$d" || true; done
+rm -f "$IMG"
+# Sparse and nominally the whole /data filesystem, the same rule as the app volumes: the only real
+# limit is the disk. With discards passed down, what docker deletes is given back to /data.
+truncate -s "$(( $(stat -f -c %b /data) * $(stat -f -c %S /data) ))" "$IMG"
+loop="$(losetup --find --show "$IMG")"
+# Plain dm-crypt (AES-256-XTS) keyed with 64 bytes from the kernel RNG, which exist only in the
+# kernel, in TEE memory: no header and nothing stored, so nothing outlives this boot.
+cryptsetup open --type plain --cipher aes-xts-plain64 --key-size 512 \
+  --key-file /dev/urandom --allow-discards "$loop" "$NAME"
+# No journal: after a crash the node reboots, and a reboot re-creates the volume anyway.
+mkfs.ext4 -q -O ^has_journal -E nodiscard "/dev/mapper/$NAME"
+mount -o discard "/dev/mapper/$NAME" "$MNT"
+mkdir -p "$MNT/docker" "$MNT/containerd" "$MNT/sysbox"
+echo "tapp-runtime-volume: $MNT ready on $loop (per-boot key)"
+RTVSH
+chmod 0755 /usr/local/sbin/tapp-runtime-volume.sh
+cat > /etc/systemd/system/tapp-runtime-volume.service <<'RTVUNIT'
+[Unit]
+Description=Per-boot encrypted runtime volume for container storage
+RequiresMountsFor=/data
+After=tapp-data-grow.service
+Before=containerd.service docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/tapp-runtime-volume.sh
+
+[Install]
+WantedBy=multi-user.target
+RTVUNIT
+systemctl enable tapp-runtime-volume.service || true
 EOF
 
 # ===== Hardening (appended when HARDEN=1): remove software that can bypass tapp and mutate the environment (Tier1+Tier2, audit in doc §11) =====
@@ -571,14 +641,16 @@ wget -qO /tmp/sysbox-ce.deb "$SYSBOX_DEB_URL"
 dpkg -i /tmp/sysbox-ce.deb || apt-get -f install -y
 rm -f /tmp/sysbox-ce.deb
 systemctl enable sysbox.service || true
-# Keep sysbox's data store off the RAM rootfs: it holds per-container state AND inner-container
-# images (docker-in-sysbox), which would otherwise pile onto "/". Relocate sysbox-mgr --data-root
-# to /data via a drop-in that preserves the vendor ExecStart args, and make it wait for /data too.
+# Keep sysbox's data store on the runtime volume, next to docker's: it holds per-container state AND
+# inner-container images (docker-in-sysbox), which would otherwise pile onto the RAM "/". Relocate
+# sysbox-mgr --data-root via a drop-in that preserves the vendor ExecStart args, and make it
+# require the runtime volume too.
 sbx_unit="\$(ls /lib/systemd/system/sysbox-mgr.service /usr/lib/systemd/system/sysbox-mgr.service 2>/dev/null | head -1)"
 if [ -n "\$sbx_unit" ]; then
-  mkdir -p /data/sysbox /etc/systemd/system/sysbox-mgr.service.d
+  mkdir -p /etc/systemd/system/sysbox-mgr.service.d
   sbx_exec="\$(sed -n 's/^ExecStart=//p' "\$sbx_unit" | head -1)"
-  printf '%s\n' '[Unit]' 'RequiresMountsFor=/data' '[Service]' 'ExecStart=' "ExecStart=\$sbx_exec --data-root /data/sysbox" \
+  printf '%s\n' '[Unit]' 'Requires=tapp-runtime-volume.service' 'After=tapp-runtime-volume.service' \
+    '[Service]' 'ExecStart=' "ExecStart=\$sbx_exec --data-root /var/lib/tapp-runtime/sysbox" \
     > /etc/systemd/system/sysbox-mgr.service.d/10-data-root.conf
 fi
 # Merge the sysbox-runc runtime into the existing daemon.json (which already pins data-root),

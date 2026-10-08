@@ -124,7 +124,7 @@ KBS_URLS='"http://<kbs-host-1>:9091", "http://<kbs-host-2>:9091"' \
   (measured event). `BUILD_MODE=custom` requires `OWNER_ADDRESS=0x…` and bakes it into
   `config.toml` `[server.permission]` (per-owner reference values, legacy).
 - tapp-server is downloaded by default from GitHub v0.1.0 (includes the guest-components `8d71a3b4` fix, RTMR OK); if you have it locally, set `TAPP_SERVER_BIN=<path>`.
-- Storage / Sysbox knobs: `DATA_ROOT` (docker data-root, default `/data/docker`), `CONTAINERD_ROOT` (default `/data/containerd`), `DOCKER_VERSION` (default `5:27.5.1-…noble`; empty = repo default), `ENABLE_SYSBOX` / `SYSBOX_VERSION` (default `0.7.0`).
+- Storage / Sysbox knobs: `DATA_ROOT` (docker data-root, default `/var/lib/tapp-runtime/docker`, on the runtime volume), `CONTAINERD_ROOT` (default `/var/lib/tapp-runtime/containerd`), `DOCKER_VERSION` (default `5:27.5.1-…noble`; empty = repo default), `ENABLE_SYSBOX` / `SYSBOX_VERSION` (default `0.7.0`).
 - Publish (Stage C, opt-in): `PUBLISH_AS=<gcp-image-name>` publishes the built image to GCP after the build (see [Publish to GCP](#publish-to-gcp-stage-c)); `GCS_BUCKET` / `GCP_PROJECT` / `GUEST_OS_FEATURES` pass through.
 - Other environment variables: `DNS_FALLBACK` `PURGE_KERNEL` `CONFIG_DIR` `FDE_PACKAGE` `ROOTFS_MODE` `IN_PLACE` `INSTALL_KERNEL` `NBD_RESET` (see the top of the script).
 
@@ -147,10 +147,11 @@ Apparent `/` size (`df`) = **read-only base + overlay size**. Under our `rw_over
 **To make `/` bigger:** add instance **memory** (simplest — `/` grows automatically, no config change); or switch `rw_overlay` to **`disk`** so `/` is backed by the boot-disk leftover (boot-disk size then matters), still wiped each boot (stateless preserved), overlay key can be ephemeral. Use **`disk-persist`** only if `/` must survive reboots — that needs a real KBS key for the delta volume (not the placeholder currently in `fde.toml`). Persistent app data does not depend on any of this — it goes to the separate `/data` disk (below).
 
 ## Persistent data disk (`/data`) — always configured
-The cryptpilot rootfs writable overlay is **RAM-backed (zram) and ephemeral** — anything written to `/` lives in RAM and is lost on reboot. So all persistent container state is pinned off the root onto a separate **`/data`** disk. This is **unconditional** (independent of Sysbox); every image does it:
+The cryptpilot rootfs writable overlay is **RAM-backed (zram) and ephemeral** — anything written to `/` lives in RAM and is lost on reboot. Two kinds of data therefore go to the separate **`/data`** disk, and they are kept apart:
 
-- **docker `data-root` → `/data/docker`** *and* **containerd `root` → `/data/containerd`** — both, because current docker-ce keeps image layers under containerd's root, which moving `data-root` alone does **not** cover. Configurable via `DATA_ROOT` / `CONTAINERD_ROOT`.
-- `docker.service` + `containerd.service` get `RequiresMountsFor=/data` → they **fail loud** (won't start) if `/data` is missing, never silently writing to the RAM root.
+- **What must persist: each app's `./data`** (encrypted with a KMS-derived key, or plain, per `x-tapp.data`; named volumes are redirected into it). Nothing else on `/data` survives a reboot in a usable form.
+- **Container storage: the runtime volume.** docker's `data-root` and containerd's `root` (which holds the image layers in current docker-ce) are at `/var/lib/tapp-runtime/{docker,containerd}`, a volume that `tapp-runtime-volume.service` creates at every boot from a sparse file, `/data/tapp/runtime.img`, encrypted (plain dm-crypt, AES-256-XTS) with a key read from the kernel RNG and held only in the kernel. Images, containers, their env and logs are therefore secret, cannot be altered from outside the TEE before the next start, and **do not survive a reboot** — a previous boot's containers cannot come back, and images are pulled again by the next `start-app`. Discards are passed down, so deleting images frees `/data` space. Configurable via `DATA_ROOT` / `CONTAINERD_ROOT`; pointing them at `/data` directly would put all of that back on the plain disk.
+- The runtime volume is created only when `/data` is the `tapp-data` disk, touches nothing there but its own file, and is kept if the unit restarts within a boot. `docker.service` + `containerd.service` **require** it → they **fail loud** (won't start) without it, never writing to the RAM root or to `/data` in the clear.
 - fstab mounts `LABEL=tapp-data` at `/data` with **`nofail`** (+ `x-systemd.device-timeout=60s`). A missing/blank data disk therefore does **not** brick boot — without `nofail` a failed `/data` mount drops the whole system into **emergency mode → no SSH**; with it, only docker/containerd stay down.
 
 **Two-disk deploy model:**
@@ -160,14 +161,14 @@ The cryptpilot rootfs writable overlay is **RAM-backed (zram) and ephemeral** �
   - **disk that already has an ext4 filesystem** (e.g. a migrated chain-data disk) → **adopted as-is** (`e2label tapp-data`, **never reformatted** — data preserved), then mounted.
 
   Safe: only real disks (`sd*`/`nvme*`/`vd*`), never the boot disk, never a partitioned disk; with zero or more-than-one candidate it refuses to guess (`/data` stays unmounted → docker fails loud). So *attach any single data disk — brand-new or carrying data — and it becomes `/data`, no SSH, no reboot, no `mkfs`/`e2label`.* A disk already labelled `tapp-data` short-circuits.
-- **`/data` confidentiality is Phase 2.** Today `/data` is plaintext ext4 relying on GCP's default at-rest encryption (Google-managed keys), which does **not** protect against the cloud operator. Phase 2 binds it to a KBS/attestation key (mount-layer dm-crypt, no image change). Do not treat Phase 1 `/data` as confidential vs the host.
+- **`/data` itself is plain ext4.** What is protected on it from the cloud operator is what is encrypted inside it: the apps' encrypted volumes and the runtime volume. A `plain` app's data, tapp-server's logs (`/data/log/tapp`) and anything an app bind-mounts from an absolute `/data/...` path are not.
 
 ## Multi-tenant container isolation — Sysbox (issue #21, opt-in)
 For hostile-multi-tenant workloads (e.g. 0g-sandbox), build with `ENABLE_SYSBOX=1` to install [Sysbox](https://github.com/nestybox/sysbox) and register `sysbox-runc` as a dockerd runtime, so in-container `root` is user-namespace-remapped (a kernel CVE in a sandbox is no longer host-equivalent):
 ```bash
 ENABLE_SYSBOX=1 KBS_URLS='...' ./build-tapp.sh base.qcow2 gcp-tapp.qcow2
 ```
-- Only the runtime registration is gated behind `ENABLE_SYSBOX`; the `/data` storage pinning above happens regardless. Sysbox's own data store is also moved off the RAM root: `sysbox-mgr --data-root` → **`/data/sysbox`** (it holds inner-container images).
+- Only the runtime registration is gated behind `ENABLE_SYSBOX`; the runtime volume above is there regardless. Sysbox's own data store is on it too: `sysbox-mgr --data-root` → **`/var/lib/tapp-runtime/sysbox`** (it holds inner-container images).
 - **Docker is pinned to 27.5.1** (`DOCKER_VERSION`). Docker 28+/29+ emit the Linux *time namespace* in the OCI spec, which `sysbox-runc` rejects (`namespace ... does not exist`); Nestybox supports Docker 20.10–27.x only.
 - The image ships **`fuse3`** (`fusermount3`), which `sysbox-fs` 0.7.0 needs to mount its per-container FUSE fs (without it container launch fails with `FuseServer InitWait`).
 - **`br_netfilter`** is auto-loaded (`/etc/modules-load.d/`, baked for **all** images). Docker 28's `icc=false` bridges — created by the 0g-sandbox runner — hard-require `/proc/sys/net/bridge/bridge-nf-call-iptables`, which only exists once `br_netfilter` is loaded; a fresh CVM without it crash-loops the runner.

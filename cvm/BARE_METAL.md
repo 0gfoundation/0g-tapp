@@ -196,8 +196,8 @@ qemu-system-x86_64 \
 Four things to get right:
 
 - **Exactly one non-boot disk.** `tapp-data-provision.service` formats and labels "the single
-  non-boot disk" and *refuses to guess* with zero or more than one — and docker/containerd are
-  `RequiresMountsFor=/data`, so they fail loud rather than writing to the RAM root. Never attach a
+  non-boot disk" and *refuses to guess* with zero or more than one — and docker/containerd
+  require the runtime volume on it, so they fail loud rather than writing to the RAM root. Never attach a
   cloud-init seed as a *disk*; as a `-cdrom` it appears as `sr0` and is correctly skipped.
 - **Memory is your writable `/`.** The rootfs overlay is RAM-backed zram, so `/` ≈ 4 GB of baked
   base plus whatever you pass to `-m`. More `/` means more `-m`, not a bigger boot disk — and
