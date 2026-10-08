@@ -66,6 +66,6 @@ tonic-build = "0.12"
 tempfile = "3.23.0"
 
 [features]
-# Drive a Ledger for --external-signer (tapp-cli --ledger). Needs the platform's HID
-# library: built into macOS, libudev on Linux.
+# Drive a Ledger for --external-signer (tapp-cli --ledger). macOS uses its own IOKit; Linux
+# builds libusb in (non-root access needs Ledger's udev rules).
 ledger = ["ethers/ledger"]

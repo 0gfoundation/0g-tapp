@@ -48,7 +48,7 @@ tempfile = "3.23.0"
 
 [features]
 # Ledger support for --external-signer (--ledger). On by default on macOS, below; elsewhere
-# opt in with --features ledger (Linux needs libudev at build and run time).
+# opt in with --features ledger (Linux: libusb; Ledger's udev rules for non-root access).
 ledger = ["tapp-common/ledger"]
 
 [target.'cfg(target_os = "macos")'.dependencies]

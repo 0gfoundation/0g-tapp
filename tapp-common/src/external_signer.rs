@@ -53,8 +53,7 @@ pub fn use_backend(backend: Backend) -> Result<()> {
     if backend == Backend::Ledger && !LEDGER_SUPPORTED {
         return Err(anyhow!(
             "this tapp-cli was built without Ledger support. It is built in on macOS; \
-             elsewhere build with `cargo build --release -p tapp-cli --features ledger` (Linux \
-             needs libudev)"
+             elsewhere build with `cargo build --release -p tapp-cli --features ledger`"
         ));
     }
     BACKEND
@@ -501,7 +500,7 @@ fn prompt(label: &str) -> Result<String> {
 }
 
 /// The Ledger itself. The account is found by the address the operator gave, not by a
-/// derivation index they have to know: Ledger Live paths first, then the legacy ones.
+/// derivation index they have to know, across the three path styles wallets use.
 #[cfg(feature = "ledger")]
 mod ledger {
     use super::*;
@@ -512,10 +511,40 @@ mod ledger {
     static PATH: OnceLock<HDPath> = OnceLock::new();
 
     fn device_error(e: impl std::fmt::Display) -> anyhow::Error {
-        anyhow!(
-            "Ledger: {e}. Is it connected and unlocked, with the Ethereum app open? (A \
-             contract call also needs Blind signing enabled in that app's settings.)"
-        )
+        let e = e.to_string();
+        anyhow!("Ledger: {}", explain(&e).unwrap_or(&e))
+    }
+
+    /// What a device answer means for the operator. The codes are the Ethereum app's; the
+    /// raw text is kept when none applies.
+    pub(super) fn explain(e: &str) -> Option<&'static str> {
+        Some(if e.contains("CONDITIONS_NOT_SATISFIED") {
+            "rejected on the device"
+        } else if e.contains("APDU_CODE_INVALID_DATA") || e.contains("DATA_INVALID") {
+            "the device refused the contract call — enable Blind signing in the Ethereum app's \
+             settings and run the command again"
+        } else if e.contains("UNLOCK_DEVICE") {
+            "the device is locked — unlock it and run the command again"
+        } else if e.contains("CLA_NOT_SUPPORTED") || e.contains("INS_NOT_SUPPORTED") {
+            "the Ethereum app is not open on the device"
+        } else if e.contains("device not found") {
+            "no Ledger found — connect and unlock it, and close Ledger Live (only one program \
+             can use the device at a time)"
+        } else {
+            return None;
+        })
+    }
+
+    /// The path styles, per account index: Ledger Live, BIP44 standard (MetaMask's "BIP44
+    /// Standard", most software wallets) and legacy (MEW/MyCrypto). Index 0 of the first
+    /// two is the same path, so it is tried once.
+    fn paths(i: usize) -> Vec<HDPath> {
+        let mut out = vec![HDPath::LedgerLive(i)];
+        if i > 0 {
+            out.push(HDPath::Other(format!("m/44'/60'/0'/0/{i}")));
+        }
+        out.push(HDPath::Legacy(i));
+        out
     }
 
     async fn open(address: &Address, chain_id: u64) -> Result<Ledger> {
@@ -527,7 +556,7 @@ mod ledger {
             .map_err(device_error)?;
         let mut seen = Vec::new();
         for i in 0..SEARCH {
-            for path in [HDPath::LedgerLive(i), HDPath::Legacy(i)] {
+            for path in paths(i) {
                 let found = probe.get_address_with_path(&path).await.map_err(device_error)?;
                 if found == *address {
                     drop(probe);
@@ -539,8 +568,8 @@ mod ledger {
             }
         }
         Err(anyhow!(
-            "0x{:x} is not among the first {SEARCH} accounts of this Ledger (Ledger Live and \
-             legacy paths): {}",
+            "0x{:x} is not among the first {SEARCH} accounts of this Ledger (Ledger Live, BIP44 \
+             and legacy paths): {}",
             address,
             seen.join(", ")
         ))
@@ -647,6 +676,19 @@ mod tests {
         assert!(check_signed_transaction(&raw, 16661, &from, &to, &[9], value).is_err(), "other data");
         assert!(check_signed_transaction(&raw, 16661, &from, &to, &data, U256::zero()).is_err(), "other value");
         assert!(check_signed_transaction(&[0xde, 0xad], 16661, &from, &to, &data, value).is_err(), "garbage");
+    }
+
+    /// A device answer is told to the operator as what to do, not as a connection problem.
+    #[cfg(feature = "ledger")]
+    #[test]
+    fn device_answers_say_what_to_do() {
+        let says = |raw: &str| super::ledger::explain(raw).unwrap_or("");
+        assert!(says("[APDU_CODE_CONDITIONS_NOT_SATISFIED] Conditions of use not satisfied").contains("rejected"));
+        assert!(says("[APDU_CODE_INVALID_DATA] The parameters in the data field are incorrect").contains("Blind signing"));
+        assert!(says("[APDU_CODE_UNLOCK_DEVICE_ERROR] Device is locked").contains("locked"));
+        assert!(says("[APDU_CODE_CLA_NOT_SUPPORTED] Class not supported").contains("Ethereum app"));
+        assert!(says("Ledger device not found").contains("Ledger Live"));
+        assert_eq!(super::ledger::explain("something else"), None);
     }
 
     #[test]

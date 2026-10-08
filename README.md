@@ -646,18 +646,21 @@ Add `--ledger` and tapp-cli drives a Ledger on this machine's USB instead of pro
 tapp-cli --external-signer 0x<the Ledger address> --ledger start-app -f docker-compose.yml -a my-app ...
 ```
 
-- The account is found **by the address**: the first ten Ledger Live and legacy accounts are
-  searched, so there is no derivation index to get wrong.
+- The account is found **by the address**: the first ten accounts of each path style (Ledger
+  Live, BIP44 standard as MetaMask offers it, and legacy MEW/MyCrypto) are searched, so there
+  is no derivation index to get wrong.
 - A message shows on the device as text; approve it if it matches what the CLI printed.
 - A transaction is **signed only**. tapp-cli checks the signed transaction (signer, chain,
   contract, data, value) and broadcasts it itself, so a wrong one never reaches the chain.
   A registry call is contract data, which the Ethereum app signs only with **Blind
   signing** enabled in its settings.
-- Keep the device unlocked with the Ethereum app open.
+- Keep the device unlocked with the Ethereum app open, and **close Ledger Live** (only one
+  program can use the device at a time).
 
-Ledger support is built in on **macOS**: install Rust and protobuf (`brew install
-protobuf`), then `cargo build --release -p tapp-cli`. The release binaries are built for
-Linux without it. On Linux, build with `--features ledger`, which needs libudev.
+Ledger support is built in on **macOS**, through the system's own USB (IOKit) with nothing
+else to install: install Rust and protobuf (`brew install protobuf`), then `cargo build
+--release -p tapp-cli`. The release binaries are built for Linux without it. On Linux, build
+with `--features ledger` (libusb; non-root access needs Ledger's udev rules).
 
 ## On-chain Registration
 
