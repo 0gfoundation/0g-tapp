@@ -4437,11 +4437,20 @@ fn add_signature_metadata<T: prost::Message>(
 
     let legacy = *LEGACY_SIGN.get().unwrap_or(&false);
     if let KeySigner::External(address) = KeySigner::parse(private_key_hex)? {
-        let timestamp = chrono::Utc::now().timestamp();
-        let message = sign_message_for(request, method_name, timestamp, legacy);
-        // The server accepts a signature up to 600s either side of its timestamp.
-        let sig = external_signer::request_signature(&address, &message, method_name, Some(timestamp + 600))?;
-        return attach_signature(request, &hex::encode(sig), timestamp, legacy);
+        // The server accepts a signature up to 600s either side of its timestamp. One that
+        // comes back later is asked for again over a fresh timestamp — same request, nothing
+        // sent yet — rather than ending a multi-step command half-way.
+        loop {
+            let timestamp = chrono::Utc::now().timestamp();
+            let message = sign_message_for(request, method_name, timestamp, legacy);
+            match external_signer::request_signature(&address, &message, method_name, Some(timestamp + 600)) {
+                Ok(sig) => return attach_signature(request, &hex::encode(sig), timestamp, legacy),
+                Err(e) if e.downcast_ref::<external_signer::Expired>().is_some() => {
+                    eprintln!("  ✗ that signature came after its deadline; here is a new message for the same request");
+                }
+                Err(e) => return Err(e.to_string().into()),
+            }
+        }
     }
 
     let private_key_hex = private_key_hex
@@ -4517,6 +4526,21 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    /// With --external-signer the CLI never holds a key: the owner address it acts as is the
+    /// one given, which is what claim-config and the on-chain commands compare against.
+    #[test]
+    fn an_external_signer_acts_as_the_address_given() {
+        let a: ethers::types::Address = "0x1E524e3a3Ef3Af6F62b2732015b216A8c6ce05cd".parse().unwrap();
+        let value = tapp_common::external_signer::as_key_value(&a);
+        assert_eq!(wallet_address(&value).unwrap(), a);
+        // A key still derives its own address.
+        let key = "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+        assert_eq!(
+            format!("{:#x}", wallet_address(key).unwrap()),
+            "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266"
+        );
+    }
 
     #[test]
     fn only_0_9_and_later_read_body_bound_signatures() {

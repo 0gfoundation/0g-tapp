@@ -30,6 +30,12 @@ pub const PREFIX: &str = "external:";
 /// How long to wait for a pasted transaction hash to be mined.
 const MINING_WAIT: Duration = Duration::from_secs(600);
 
+/// A signature came back after the server would accept it. The caller makes a new message
+/// for the same request and asks again; nothing has been sent.
+#[derive(Debug, thiserror::Error)]
+#[error("the signature came after its deadline")]
+pub struct Expired;
+
 /// The signer behind the CLI's `-k` value.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Signer {
@@ -108,9 +114,7 @@ pub fn request_signature(
         let pasted = prompt("signature (0x…, 65 bytes)")?;
         if let Some(t) = valid_until {
             if chrono::Utc::now().timestamp() > t {
-                return Err(anyhow!(
-                    "the signature came after its deadline; run the command again for a new one"
-                ));
+                return Err(Expired.into());
             }
         }
         match parse_signature(&pasted).and_then(|s| Ok((s, recover_personal(message, &s)?))) {
@@ -125,15 +129,30 @@ pub fn request_signature(
 }
 
 /// The transaction that landed is the one that was asked for: same sender, contract, data
-/// and value, and it succeeded. Kept separate from the waiting so it can be tested.
+/// and value, it succeeded, and it was mined no earlier than `asked_at` — an identical call
+/// made before (an earlier run, say) is not this one. Kept separate from the waiting so it
+/// can be tested.
+#[allow(clippy::too_many_arguments)]
 pub fn check_transaction(
     tx: &Transaction,
     status: Option<u64>,
+    mined_in: Option<u64>,
+    asked_at: u64,
     from: &Address,
     to: &Address,
     data: &[u8],
     value: U256,
 ) -> Result<()> {
+    match mined_in {
+        Some(b) if b >= asked_at => {}
+        Some(b) => {
+            return Err(anyhow!(
+                "it was mined in block {b}, before it was asked for (block {asked_at}) — an \
+                 earlier, identical call"
+            ))
+        }
+        None => return Err(anyhow!("its receipt has no block number")),
+    }
     if tx.from != *from {
         return Err(anyhow!("it was sent by 0x{:x}, not by 0x{:x}", tx.from, from));
     }
@@ -171,6 +190,12 @@ pub async fn request_transaction(
     eprintln!("  value    {} wei", value);
     eprintln!("  data     0x{}", hex::encode(data));
     eprintln!();
+    // Anything mined before this point is not the transaction being asked for.
+    let asked_at = provider
+        .get_block_number()
+        .await
+        .map_err(|e| anyhow!("reading the chain head: {}", e))?
+        .as_u64();
     loop {
         let pasted = prompt("hash of the sent transaction (0x…, 32 bytes)")?;
         let hash = match TxHash::from_str(pasted.trim()) {
@@ -181,27 +206,47 @@ pub async fn request_transaction(
             }
         };
         eprintln!("  waiting for 0x{:x} to be mined…", hash);
+        // The transaction is out of our hands once sent, so an RPC hiccup must not end the
+        // command half-way: keep asking until it is mined (or the wait runs out).
         let started = Instant::now();
-        let receipt = loop {
-            match provider.get_transaction_receipt(hash).await {
-                Ok(Some(r)) => break Some(r),
-                Ok(None) if started.elapsed() < MINING_WAIT => {
+        let mined = loop {
+            let found = match provider.get_transaction_receipt(hash).await {
+                Ok(Some(r)) => match provider.get_transaction(hash).await {
+                    Ok(Some(tx)) => Some((r, tx)),
+                    Ok(None) => None,
+                    Err(e) => {
+                        eprintln!("  (reading the transaction: {e}; retrying)");
+                        None
+                    }
+                },
+                Ok(None) => None,
+                Err(e) => {
+                    eprintln!("  (reading the receipt: {e}; retrying)");
+                    None
+                }
+            };
+            match found {
+                Some(m) => break Some(m),
+                None if started.elapsed() < MINING_WAIT => {
                     tokio::time::sleep(Duration::from_secs(3)).await
                 }
-                Ok(None) => break None,
-                Err(e) => return Err(anyhow!("reading the receipt: {}", e)),
+                None => break None,
             }
         };
-        let Some(receipt) = receipt else {
+        let Some((receipt, tx)) = mined else {
             eprintln!("  ✗ not mined within {}s. Paste the hash again once it is.", MINING_WAIT.as_secs());
             continue;
         };
-        let tx = provider
-            .get_transaction(hash)
-            .await
-            .map_err(|e| anyhow!("reading the transaction: {}", e))?
-            .ok_or_else(|| anyhow!("the node returned a receipt but no transaction for 0x{:x}", hash))?;
-        match check_transaction(&tx, receipt.status.map(|s| s.as_u64()), from, to, data, value) {
+        match check_transaction(
+            &tx,
+            receipt.status.map(|s| s.as_u64()),
+            receipt.block_number.map(|b| b.as_u64()),
+            asked_at,
+            from,
+            to,
+            data,
+            value,
+        ) {
             Ok(()) => {
                 eprintln!("  ✓ mined in block {}", receipt.block_number.unwrap_or_default());
                 return Ok(hash);
@@ -280,12 +325,19 @@ mod tests {
             value,
             ..Default::default()
         };
-        assert!(check_transaction(&tx, Some(1), &from, &to, &data, value).is_ok());
-        assert!(check_transaction(&tx, Some(0), &from, &to, &data, value).is_err());
+        let ok = |status, block, from: &Address, to: &Address, data: &[u8], value| {
+            check_transaction(&tx, status, block, 100, from, to, data, value).is_ok()
+        };
+        assert!(ok(Some(1), Some(100), &from, &to, &data, value));
+        assert!(ok(Some(1), Some(105), &from, &to, &data, value));
+        assert!(!ok(Some(0), Some(105), &from, &to, &data, value), "reverted");
         let other: Address = "0x3333333333333333333333333333333333333333".parse().unwrap();
-        assert!(check_transaction(&tx, Some(1), &other, &to, &data, value).is_err());
-        assert!(check_transaction(&tx, Some(1), &from, &other, &data, value).is_err());
-        assert!(check_transaction(&tx, Some(1), &from, &to, &[9], value).is_err());
-        assert!(check_transaction(&tx, Some(1), &from, &to, &data, U256::zero()).is_err());
+        assert!(!ok(Some(1), Some(105), &other, &to, &data, value), "another sender");
+        assert!(!ok(Some(1), Some(105), &from, &other, &data, value), "another contract");
+        assert!(!ok(Some(1), Some(105), &from, &to, &[9], value), "other data");
+        assert!(!ok(Some(1), Some(105), &from, &to, &data, U256::zero()), "other value");
+        // The same call, made before it was asked for: an earlier run's transaction.
+        assert!(!ok(Some(1), Some(99), &from, &to, &data, value), "mined before it was asked for");
+        assert!(!ok(Some(1), None, &from, &to, &data, value), "no block number");
     }
 }
