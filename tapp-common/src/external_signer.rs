@@ -107,8 +107,10 @@ pub fn as_key_value(address: &Address) -> String {
     format!("{}0x{:x}", PREFIX, address)
 }
 
-/// A pasted signature as 65 bytes r‖s‖v with v in {27, 28}. Wallets differ in how they
-/// return v (0/1 or 27/28) and whether they prefix 0x; all of those are accepted.
+/// A pasted signature as 65 bytes r‖s‖v with v in {27, 28} and s in the lower half. Wallets
+/// differ in how they return v (0/1 or 27/28) and whether they prefix 0x, and a signer that
+/// does not normalise s (some MPC ones) can return the high-s twin, which the server's
+/// recovery refuses; all of those are accepted and brought to the one spelling.
 pub fn parse_signature(pasted: &str) -> Result<[u8; 65]> {
     let hex_str = pasted.trim().trim_start_matches("0x").trim_start_matches("0X");
     let bytes = hex::decode(hex_str).map_err(|_| anyhow!("not hex"))?;
@@ -120,6 +122,12 @@ pub fn parse_signature(pasted: &str) -> Result<[u8; 65]> {
     }
     if sig[64] != 27 && sig[64] != 28 {
         return Err(anyhow!("recovery byte v = {} is neither 0/1 nor 27/28", sig[64]));
+    }
+    let rs = k256::ecdsa::Signature::from_slice(&sig[..64]).map_err(|e| anyhow!("{}", e))?;
+    if let Some(low) = rs.normalize_s() {
+        // (r, n - s) is the same signature with the other recovery parity.
+        sig[..64].copy_from_slice(&low.to_bytes());
+        sig[64] = if sig[64] == 27 { 28 } else { 27 };
     }
     Ok(sig)
 }
@@ -224,9 +232,9 @@ fn paste_signature(
 }
 
 /// The transaction that landed is the one that was asked for: same sender, contract, data
-/// and value, it succeeded, and it was mined no earlier than `asked_at` — an identical call
-/// made before (an earlier run, say) is not this one. Kept separate from the waiting so it
-/// can be tested.
+/// and value, it succeeded, and it was mined after block `asked_at`, the chain head when it
+/// was asked for — an identical call made before (an earlier run, say) is not this one.
+/// Kept separate from the waiting so it can be tested.
 #[allow(clippy::too_many_arguments)]
 pub fn check_transaction(
     tx: &Transaction,
@@ -239,11 +247,11 @@ pub fn check_transaction(
     value: U256,
 ) -> Result<()> {
     match mined_in {
-        Some(b) if b >= asked_at => {}
+        Some(b) if b > asked_at => {}
         Some(b) => {
             return Err(anyhow!(
-                "it was mined in block {b}, before it was asked for (block {asked_at}) — an \
-                 earlier, identical call"
+                "it was mined in block {b}, before it was asked for (head was block {asked_at}) \
+                 — an earlier, identical call"
             ))
         }
         None => return Err(anyhow!("its receipt has no block number")),
@@ -403,10 +411,13 @@ async fn ledger_transaction(
         .await
         .map_err(|e| anyhow!("reading the chain head: {}", e))?
         .as_u64();
-    provider
-        .send_raw_transaction(raw)
-        .await
-        .map_err(|e| anyhow!("broadcasting 0x{:x}: {}", hash, e))?;
+    if let Err(e) = provider.send_raw_transaction(raw).await {
+        // The answer can be lost after the node took it (a timeout, say); it is out if the
+        // node knows it, and stopping here would leave a sent transaction unaccounted for.
+        if !matches!(provider.get_transaction(hash).await, Ok(Some(_))) {
+            return Err(anyhow!("broadcasting 0x{:x}: {}", hash, e));
+        }
+    }
     eprintln!("  sent 0x{:x}; waiting for it to be mined…", hash);
     let Some((receipt, mined)) = wait_mined(provider, hash).await else {
         return Err(anyhow!(
@@ -438,6 +449,12 @@ async fn paste_transaction(
     value: U256,
     what: &str,
 ) -> Result<TxHash> {
+    // Anything mined up to this block is not the transaction about to be asked for.
+    let asked_at = provider
+        .get_block_number()
+        .await
+        .map_err(|e| anyhow!("reading the chain head: {}", e))?
+        .as_u64();
     eprintln!();
     eprintln!("──── transaction needed: {what} ────");
     eprintln!("  from     0x{:x}  (chain {chain_id})", from);
@@ -445,12 +462,6 @@ async fn paste_transaction(
     eprintln!("  value    {} wei", value);
     eprintln!("  data     0x{}", hex::encode(data));
     eprintln!();
-    // Anything mined before this point is not the transaction being asked for.
-    let asked_at = provider
-        .get_block_number()
-        .await
-        .map_err(|e| anyhow!("reading the chain head: {}", e))?
-        .as_u64();
     loop {
         let pasted = prompt("hash of the sent transaction (0x…, 32 bytes)")?;
         let hash = match TxHash::from_str(pasted.trim()) {
@@ -528,8 +539,10 @@ mod ledger {
         } else if e.contains("CLA_NOT_SUPPORTED") || e.contains("INS_NOT_SUPPORTED") {
             "the Ethereum app is not open on the device"
         } else if e.contains("device not found") {
-            "no Ledger found — connect and unlock it, and close Ledger Live (only one program \
-             can use the device at a time)"
+            "no Ledger found — connect and unlock it, and open the Ethereum app"
+        } else if e.contains("Error opening device") {
+            "the Ledger is in use by another program — close Ledger Live (only one program can \
+             use the device at a time) and run the command again"
         } else {
             return None;
         })
@@ -547,13 +560,28 @@ mod ledger {
         out
     }
 
+    /// Open the device at `path`. A handle that was just dropped releases the device from its
+    /// own thread a moment later, and macOS opens it exclusively, so an open straight after one
+    /// (the search, then the account found) can find it still taken; that is waited out.
+    async fn connect(path: &HDPath, chain_id: u64) -> Result<Ledger> {
+        let mut tries = 0;
+        loop {
+            match Ledger::new(path.clone(), chain_id).await {
+                Ok(device) => return Ok(device),
+                Err(e) if tries < 10 && e.to_string().contains("Error opening device") => {
+                    tries += 1;
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+                Err(e) => return Err(device_error(e)),
+            }
+        }
+    }
+
     async fn open(address: &Address, chain_id: u64) -> Result<Ledger> {
         if let Some(path) = PATH.get() {
-            return Ledger::new(path.clone(), chain_id).await.map_err(device_error);
+            return connect(path, chain_id).await;
         }
-        let probe = Ledger::new(HDPath::LedgerLive(0), chain_id)
-            .await
-            .map_err(device_error)?;
+        let probe = connect(&HDPath::LedgerLive(0), chain_id).await?;
         let mut seen = Vec::new();
         for i in 0..SEARCH {
             for path in paths(i) {
@@ -562,7 +590,7 @@ mod ledger {
                     drop(probe);
                     let _ = PATH.set(path.clone());
                     eprintln!("  (Ledger account {path})");
-                    return Ledger::new(path, chain_id).await.map_err(device_error);
+                    return connect(&path, chain_id).await;
                 }
                 seen.push(format!("{path} → 0x{found:x}"));
             }
@@ -630,6 +658,32 @@ mod tests {
         assert_ne!(recover_personal("StartApp:0x00fe:1791400000", &parsed).unwrap(), wallet.address());
     }
 
+    /// A signer that does not normalise s returns (r, n - s) with the other parity. The server
+    /// refuses that spelling, so it is turned into the low-s one, which names the same signer.
+    #[tokio::test]
+    async fn a_high_s_signature_is_brought_to_low_s() {
+        let wallet: LocalWallet = KEY.parse().unwrap();
+        let message = "StopApp:0x00ff:1791400000";
+        let low = wallet.sign_message(message).await.unwrap().to_vec();
+        let rs = k256::ecdsa::Signature::from_slice(&low[..64]).unwrap();
+        let n_minus_s = -*rs.s();
+        let high_rs = k256::ecdsa::Signature::from_scalars(*rs.r(), n_minus_s).unwrap();
+        let mut high = high_rs.to_bytes().to_vec();
+        high.push(if low[64] == 27 { 28 } else { 27 });
+        // What the server does (src/signature_auth.rs): k256 recovery, which refuses high s.
+        let server_recovers = |sig: &[u8]| {
+            let rs = k256::ecdsa::Signature::from_slice(&sig[..64]).unwrap();
+            let id = k256::ecdsa::RecoveryId::try_from(sig[64] - 27).unwrap();
+            k256::ecdsa::VerifyingKey::recover_from_prehash(ethers::utils::hash_message(message).as_bytes(), &rs, id).is_ok()
+        };
+        assert!(server_recovers(&low));
+        assert!(!server_recovers(&high), "the server would refuse the high-s spelling");
+
+        let parsed = parse_signature(&hex::encode(&high)).unwrap();
+        assert_eq!(parsed.to_vec(), low);
+        assert_eq!(recover_personal(message, &parsed).unwrap(), wallet.address());
+    }
+
     #[test]
     fn wallets_that_return_v_as_0_or_1_are_accepted() {
         let mut sig = [1u8; 65];
@@ -687,8 +741,28 @@ mod tests {
         assert!(says("[APDU_CODE_INVALID_DATA] The parameters in the data field are incorrect").contains("Blind signing"));
         assert!(says("[APDU_CODE_UNLOCK_DEVICE_ERROR] Device is locked").contains("locked"));
         assert!(says("[APDU_CODE_CLA_NOT_SUPPORTED] Class not supported").contains("Ethereum app"));
-        assert!(says("Ledger device not found").contains("Ledger Live"));
+        assert!(says("Ledger device not found").contains("connect"));
+        assert!(says("Error opening device. hidapi error. Hint: This usually means that the device is already in use by another transport instance.").contains("Ledger Live"));
         assert_eq!(super::ledger::explain("something else"), None);
+    }
+
+    /// The device is driven from synchronous code (a request's signature) inside the CLI's
+    /// runtime, whose main future runs on the thread that called `Runtime::block_on`, not on
+    /// a worker. Bridging back into async there must not panic.
+    #[test]
+    fn async_device_calls_can_be_made_from_the_clis_main_future() {
+        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+        let got = rt.block_on(async {
+            // As add_signature_metadata does: plain sync code, then the bridge.
+            fn sync_caller() -> u32 {
+                block_on(async {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    7
+                })
+            }
+            sync_caller()
+        });
+        assert_eq!(got, 7);
     }
 
     #[test]
@@ -714,7 +788,7 @@ mod tests {
         let ok = |status, block, from: &Address, to: &Address, data: &[u8], value| {
             check_transaction(&tx, status, block, 100, from, to, data, value).is_ok()
         };
-        assert!(ok(Some(1), Some(100), &from, &to, &data, value));
+        assert!(ok(Some(1), Some(101), &from, &to, &data, value));
         assert!(ok(Some(1), Some(105), &from, &to, &data, value));
         assert!(!ok(Some(0), Some(105), &from, &to, &data, value), "reverted");
         let other: Address = "0x3333333333333333333333333333333333333333".parse().unwrap();
@@ -724,6 +798,7 @@ mod tests {
         assert!(!ok(Some(1), Some(105), &from, &to, &data, U256::zero()), "other value");
         // The same call, made before it was asked for: an earlier run's transaction.
         assert!(!ok(Some(1), Some(99), &from, &to, &data, value), "mined before it was asked for");
+        assert!(!ok(Some(1), Some(100), &from, &to, &data, value), "mined in the head block when asked");
         assert!(!ok(Some(1), None, &from, &to, &data, value), "no block number");
     }
 }
