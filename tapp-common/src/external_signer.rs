@@ -398,7 +398,7 @@ async fn ledger_transaction(
     eprintln!("──── confirm on the Ledger: {what} ────");
     eprintln!("  from     0x{:x}  (chain {chain_id})", from);
     eprintln!("  to       0x{:x}", to);
-    eprintln!("  value    {} wei", value);
+    eprintln!("  value    {} wei ({} OG)", value, ethers::utils::format_ether(value));
     eprintln!("  data     0x{}", hex::encode(data));
     eprintln!("  (a contract call needs Blind signing enabled in the device's Ethereum app)");
     let signature = ledger::sign_tx(from, chain_id, &tx).await?;
@@ -459,7 +459,7 @@ async fn paste_transaction(
     eprintln!("──── transaction needed: {what} ────");
     eprintln!("  from     0x{:x}  (chain {chain_id})", from);
     eprintln!("  to       0x{:x}", to);
-    eprintln!("  value    {} wei", value);
+    eprintln!("  value    {} wei ({} OG)", value, ethers::utils::format_ether(value));
     eprintln!("  data     0x{}", hex::encode(data));
     eprintln!();
     loop {
@@ -541,8 +541,8 @@ mod ledger {
         } else if e.contains("device not found") {
             "no Ledger found — connect and unlock it, and open the Ethereum app"
         } else if e.contains("Error opening device") {
-            "the Ledger is in use by another program — close Ledger Live (only one program can \
-             use the device at a time) and run the command again"
+            "the Ledger cannot be opened — close Ledger Live (only one program can use the \
+             device at a time); on Linux, also check Ledger's udev rules"
         } else {
             return None;
         })
