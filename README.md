@@ -610,9 +610,37 @@ never chosen automatically, since falling back on failure would hand anyone able
 to make a request fail the weaker signature. The scripts under `examples/` sign
 the body-bound form too (`sign_message.py` takes the request JSON).
 
+### Signing with a key held elsewhere (`--external-signer`)
+
+The owner key does not have to be on the machine running tapp-cli. A hardware wallet or an
+MPC/multisig custodian (Fordefi, for one) looks like an ordinary address from outside and
+returns ordinary signatures, so the server and the registry need nothing different. Pass the
+signer's address instead of `-k`:
+
+```bash
+tapp-cli -s https://<node>:50052 --tls-pin 0x<pin> \
+  --external-signer 0x<owner address> start-app -f docker-compose.yml -a my-app
+```
+
+(or set `TAPP_EXTERNAL_SIGNER`). Every command that would sign then stops and asks:
+
+- **a request signature**: the CLI prints the one line of text above (`<Method>:0x<hash>:<ts>`).
+  Sign it as a *message* (`personal_sign`), for example in Fordefi's message signing, and
+  paste the 65-byte signature back. The CLI checks that it recovers to the given address
+  before sending, and asks again if it does not. It has to come back within the server's
+  ±10-minute window; the prompt shows the deadline.
+- **an on-chain call**: the CLI prints the transaction — chain, from, contract, value, data,
+  and which registry function it is. Send it from the owner address, for example as a
+  contract call in Fordefi, and paste its hash back. The CLI waits for it to be mined and
+  checks that it is that transaction from that address and that it succeeded, then goes on.
+
+So multi-step commands such as `start-app --register-onchain` run to the end, with one
+prompt per signature and per transaction. The signer sees a hash, not the compose: what it
+approves is "this exact request", and the request is what this CLI run built.
+
 ## On-chain Registration
 
-Register your app and TEE nodes on the TappRegistry contract using `tapp-cli`. These commands require `--private-key` (the deployer's Ethereum private key) and `--server` (the tapp gRPC endpoint).
+Register your app and TEE nodes on the TappRegistry contract using `tapp-cli`. These commands require `--private-key` (the deployer's Ethereum private key), or `--external-signer` for a key held elsewhere (see above), and `--server` (the tapp gRPC endpoint).
 
 The node's on-chain `teeUrl` — where the scan and `verify-app` fetch its evidence — is `--tee-url` when given. Otherwise a node already on chain **keeps its recorded `teeUrl`**: a DNS name, front or private address was someone's choice, and a run from wherever the operator happens to be must not move it. A **replacement** asks the replaced slot's `teeUrl` for the app's signer. If *this* node answers (the restart case), the URL is kept. If another signer answers, or something answers that is not a tapp-server naming this node, the replacement gets a URL derived from `--server` instead, and says so. If nothing answers — a VPC-private URL seen from outside, a dead machine, or the old machine on a hand-over — the URL is kept with a warning, so those replacements need `--tee-url`. The one automatic move is the legacy `http://<host>:50051` → `https://<host>:50052` when the node serves the TLS listener (tapp-server ≥ 0.8.0). A **new** record is derived from `--server`: `https://` as given, `http://` → `https://<host>:50052`; a `--server` reached locally (`127.0.0.1`, a socket) cannot be derived from, so a new record then needs `--tee-url`. Every change is printed. `:50051` is meant to stay closed to everyone but the node (#141). `--tee-url` takes a DNS name, a TLS front, or a **private address** — a node in the scan's VPC can register `https://10.x.x.x:50052`, which only the scan reaches; everyone else verifies it through the scan relay. To move a node's `teeUrl`, pass `--tee-url` to `start-app --register-onchain` or `update-node-onchain` (signer unchanged, nothing else touched).
 
