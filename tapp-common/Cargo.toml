@@ -17,7 +17,7 @@ tower = "0.4"
 http = "1.0"
 
 # Async runtime (Mutex etc.)
-tokio = { version = "1.0", features = ["sync", "net", "time"] }
+tokio = { version = "1.0", features = ["sync", "net", "time", "rt-multi-thread"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -64,3 +64,8 @@ tonic-build = "0.12"
 
 [dev-dependencies]
 tempfile = "3.23.0"
+
+[features]
+# Drive a Ledger for --external-signer (tapp-cli --ledger). Needs the platform's HID
+# library: built into macOS, libudev on Linux.
+ledger = ["ethers/ledger"]

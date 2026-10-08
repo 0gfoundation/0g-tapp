@@ -638,6 +638,27 @@ So multi-step commands such as `start-app --register-onchain` run to the end, wi
 prompt per signature and per transaction. The signer sees a hash, not the compose: what it
 approves is "this exact request", and the request is what this CLI run built.
 
+#### With a Ledger: `--ledger`
+
+Add `--ledger` and tapp-cli drives a Ledger on this machine's USB instead of prompting:
+
+```bash
+tapp-cli --external-signer 0x<the Ledger address> --ledger start-app -f docker-compose.yml -a my-app ...
+```
+
+- The account is found **by the address**: the first ten Ledger Live and legacy accounts are
+  searched, so there is no derivation index to get wrong.
+- A message shows on the device as text; approve it if it matches what the CLI printed.
+- A transaction is **signed only**. tapp-cli checks the signed transaction (signer, chain,
+  contract, data, value) and broadcasts it itself, so a wrong one never reaches the chain.
+  A registry call is contract data, which the Ethereum app signs only with **Blind
+  signing** enabled in its settings.
+- Keep the device unlocked with the Ethereum app open.
+
+Ledger support is built in on **macOS**: install Rust and protobuf (`brew install
+protobuf`), then `cargo build --release -p tapp-cli`. The release binaries are built for
+Linux without it. On Linux, build with `--features ledger`, which needs libudev.
+
 ## On-chain Registration
 
 Register your app and TEE nodes on the TappRegistry contract using `tapp-cli`. These commands require `--private-key` (the deployer's Ethereum private key), or `--external-signer` for a key held elsewhere (see above), and `--server` (the tapp gRPC endpoint).

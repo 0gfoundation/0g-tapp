@@ -174,6 +174,14 @@ struct Cli {
     #[arg(long, global = true, env = "TAPP_EXTERNAL_SIGNER", conflicts_with = "private_key")]
     external_signer: Option<String>,
 
+    /// With --external-signer: sign on a Ledger connected to this machine instead of pasting.
+    /// The account is found by that address. The device shows each message, and each
+    /// transaction, which it signs only; the transaction is checked and broadcast from here.
+    /// A contract call needs Blind signing enabled in the device's Ethereum app. Built in on
+    /// macOS; elsewhere build with --features ledger.
+    #[arg(long, global = true, requires = "external_signer")]
+    ledger: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -887,6 +895,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
     let _ = TLS_PIN.set(pin);
 
+    if cli.ledger {
+        if let Err(e) = tapp_common::external_signer::use_backend(tapp_common::external_signer::Backend::Ledger) {
+            eprintln!("✗ --ledger: {e}");
+            std::process::exit(2);
+        }
+    }
     // An external signer stands in for the private key everywhere one is taken.
     if let Some(addr) = &cli.external_signer {
         match addr.trim().parse::<ethers::types::Address>() {
