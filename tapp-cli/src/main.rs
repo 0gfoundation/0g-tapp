@@ -165,6 +165,23 @@ struct Cli {
     #[arg(short = 'k', long, global = true)]
     private_key: Option<String>,
 
+    /// Sign with a key that is not on this machine — a hardware wallet, or an MPC or
+    /// multisig custodian such as Fordefi — given its address, instead of -k. Each
+    /// signature is shown as text to sign as a message (personal_sign) and the signature
+    /// pasted back; each on-chain call is shown as a transaction to send and its hash
+    /// pasted back. Both are checked before the command goes on. A request signature has
+    /// to come back within the server's ±10 min window.
+    #[arg(long, global = true, env = "TAPP_EXTERNAL_SIGNER", conflicts_with = "private_key")]
+    external_signer: Option<String>,
+
+    /// With --external-signer: sign on a Ledger connected to this machine instead of pasting.
+    /// The account is found by that address. The device shows each message, and each
+    /// transaction, which it signs only; the transaction is checked and broadcast from here.
+    /// A contract call needs Blind signing enabled in the device's Ethereum app. Built in on
+    /// macOS; elsewhere build with --features ledger.
+    #[arg(long, global = true, requires = "external_signer")]
+    ledger: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -878,6 +895,22 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
     let _ = TLS_PIN.set(pin);
 
+    if cli.ledger {
+        if let Err(e) = tapp_common::external_signer::use_backend(tapp_common::external_signer::Backend::Ledger) {
+            eprintln!("✗ --ledger: {e}");
+            std::process::exit(2);
+        }
+    }
+    // An external signer stands in for the private key everywhere one is taken.
+    if let Some(addr) = &cli.external_signer {
+        match addr.trim().parse::<ethers::types::Address>() {
+            Ok(a) => cli.private_key = Some(tapp_common::external_signer::as_key_value(&a)),
+            Err(_) => {
+                eprintln!("✗ --external-signer {:?} is not a 0x… address", addr);
+                std::process::exit(2);
+            }
+        }
+    }
     // Handle environment variables for private_key if not provided
     if cli.private_key.is_none() {
         if let Ok(env_key) = std::env::var("TAPP_PRIVATE_KEY") {
@@ -1197,7 +1230,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
 fn require_private_key(key: &Option<String>) -> Result<String, Box<dyn std::error::Error>> {
     key.clone().ok_or_else(|| {
-        "Private key required. Use --private-key or set TAPP_PRIVATE_KEY environment variable"
+        "A signer is required: --private-key / TAPP_PRIVATE_KEY, or --external-signer 0x<address> \
+         / TAPP_EXTERNAL_SIGNER for a key held elsewhere"
             .into()
     })
 }
@@ -3307,13 +3341,7 @@ async fn claim_config(
     scan_url: String,
     scan_public_key: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use ethers::signers::Signer;
-
-    let key_bytes = hex::decode(private_key.trim_start_matches("0x"))
-        .map_err(|e| format!("Invalid private key: {}", e))?;
-    let wallet = ethers::signers::LocalWallet::from_bytes(&key_bytes)
-        .map_err(|e| format!("Invalid private key: {}", e))?;
-    let my_address = format!("0x{:x}", wallet.address());
+    let my_address = format!("0x{:x}", wallet_address(&private_key)?);
 
     let mut client = create_client(server).await?;
 
@@ -4286,6 +4314,11 @@ async fn revoke_invalidator_onchain(
 
 fn wallet_address(private_key: &str) -> Result<ethers::types::Address, Box<dyn std::error::Error>> {
     use ethers::signers::Signer;
+    if let tapp_common::external_signer::Signer::External(a) =
+        tapp_common::external_signer::Signer::parse(private_key)?
+    {
+        return Ok(a);
+    }
     let key_bytes = hex::decode(private_key.trim_start_matches("0x"))
         .map_err(|e| format!("Invalid private key: {}", e))?;
     let wallet = ethers::signers::LocalWallet::from_bytes(&key_bytes)
@@ -4414,6 +4447,25 @@ fn add_signature_metadata<T: prost::Message>(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use k256::ecdsa::{signature::hazmat::PrehashSigner, RecoveryId, Signature, SigningKey};
     use sha3::{Digest, Keccak256};
+    use tapp_common::external_signer::{self, Signer as KeySigner};
+
+    let legacy = *LEGACY_SIGN.get().unwrap_or(&false);
+    if let KeySigner::External(address) = KeySigner::parse(private_key_hex)? {
+        // The server accepts a signature up to 600s either side of its timestamp. One that
+        // comes back later is asked for again over a fresh timestamp — same request, nothing
+        // sent yet — rather than ending a multi-step command half-way.
+        loop {
+            let timestamp = chrono::Utc::now().timestamp();
+            let message = sign_message_for(request, method_name, timestamp, legacy);
+            match external_signer::request_signature(&address, &message, method_name, Some(timestamp + 600)) {
+                Ok(sig) => return attach_signature(request, &hex::encode(sig), timestamp, legacy),
+                Err(e) if e.downcast_ref::<external_signer::Expired>().is_some() => {
+                    eprintln!("  ✗ that signature came after its deadline; here is a new message for the same request");
+                }
+                Err(e) => return Err(e.to_string().into()),
+            }
+        }
+    }
 
     let private_key_hex = private_key_hex
         .trim_start_matches("0x")
@@ -4430,7 +4482,6 @@ fn add_signature_metadata<T: prost::Message>(
     let private_key = hex::decode(private_key_hex)?;
     let timestamp = chrono::Utc::now().timestamp();
 
-    let legacy = *LEGACY_SIGN.get().unwrap_or(&false);
     let message = sign_message_for(request, method_name, timestamp, legacy);
 
     // Build Ethereum signed message hash (EIP-191) - same as Python's encode_defunct
@@ -4460,8 +4511,15 @@ fn add_signature_metadata<T: prost::Message>(
     let v = recovery_id.to_byte() + 27;
     sig_bytes.push(v);
 
-    let signature_hex = hex::encode(&sig_bytes);
+    attach_signature(request, &hex::encode(&sig_bytes), timestamp, legacy)
+}
 
+fn attach_signature<T>(
+    request: &mut Request<T>,
+    signature_hex: &str,
+    timestamp: i64,
+    legacy: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     request
         .metadata_mut()
         .insert("x-signature", MetadataValue::try_from(signature_hex)?);
@@ -4474,7 +4532,6 @@ fn add_signature_metadata<T: prost::Message>(
             .metadata_mut()
             .insert("x-signature-version", MetadataValue::from_static("2"));
     }
-
     Ok(())
 }
 
@@ -4483,6 +4540,21 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    /// With --external-signer the CLI never holds a key: the owner address it acts as is the
+    /// one given, which is what claim-config and the on-chain commands compare against.
+    #[test]
+    fn an_external_signer_acts_as_the_address_given() {
+        let a: ethers::types::Address = "0x1E524e3a3Ef3Af6F62b2732015b216A8c6ce05cd".parse().unwrap();
+        let value = tapp_common::external_signer::as_key_value(&a);
+        assert_eq!(wallet_address(&value).unwrap(), a);
+        // A key still derives its own address.
+        let key = "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+        assert_eq!(
+            format!("{:#x}", wallet_address(key).unwrap()),
+            "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266"
+        );
+    }
 
     #[test]
     fn only_0_9_and_later_read_body_bound_signatures() {

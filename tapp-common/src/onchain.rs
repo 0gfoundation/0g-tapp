@@ -218,6 +218,30 @@ pub async fn chain_id(rpc_url: &str) -> Result<u64> {
         .as_u64())
 }
 
+/// The registry calls this module sends, by name, so a transaction handed to an external
+/// signer says what it is rather than showing only calldata. Kept in step with the calls
+/// below by a test.
+const WRITE_CALLS: &[&str] = &[
+    "registerApp(string,bytes,bytes,bytes[],address,string)",
+    "updateApp(string,bytes,bytes,bytes[])",
+    "addNode(string,address,string,bytes,bytes)",
+    "updateNode(string,address,address,string,bytes,bytes)",
+    "removeNode(string,address)",
+    "withdraw()",
+    "authorizeInvalidator(string,address)",
+    "revokeInvalidator(string,address)",
+    "transferAppOwnership(string,address)",
+    "acceptAppOwnership(string)",
+];
+
+fn call_name(data: &[u8]) -> String {
+    WRITE_CALLS
+        .iter()
+        .find(|sig| data.len() >= 4 && data[..4] == selector(sig))
+        .map(|sig| sig.to_string())
+        .unwrap_or_else(|| "a registry call".to_string())
+}
+
 async fn send_tx(
     rpc_url: &str,
     private_key_hex: &str,
@@ -233,6 +257,22 @@ async fn send_tx(
         .await
         .map_err(|e| anyhow!("Failed to get chain ID: {}", e))?
         .as_u64();
+
+    // A key held elsewhere: the holder sends the call, and what landed is checked.
+    if let crate::external_signer::Signer::External(from) =
+        crate::external_signer::Signer::parse(private_key_hex)?
+    {
+        return crate::external_signer::request_transaction(
+            &provider,
+            chain_id,
+            &from,
+            &contract,
+            &data,
+            value,
+            &call_name(&data),
+        )
+        .await;
+    }
 
     let key_bytes = hex::decode(private_key_hex.trim_start_matches("0x"))
         .map_err(|e| anyhow!("Invalid private key: {}", e))?;
@@ -537,3 +577,31 @@ pub async fn revoke_invalidator(
     send_tx(&params.rpc_url, &params.private_key, params.contract_address()?, data, U256::zero()).await
 }
 
+#[cfg(test)]
+mod external_signer_tests {
+    use super::*;
+
+    /// Every call this module sends has a name for the external-signer prompt.
+    #[test]
+    fn every_write_call_is_named() {
+        // The production part of this file: every `calldata("…"` / `selector("…"` literal.
+        let src = include_str!("onchain.rs");
+        let src = &src[..src.find("mod external_signer_tests").unwrap_or(src.len())];
+        let reads = ["getAppInfo(string)", "getNode(string,address)", "getNodeList(string)", "pendingAppOwner(string)"];
+        let mut seen = 0;
+        for call in ["calldata(", "selector("] {
+            for (i, _) in src.match_indices(call) {
+                let rest = src[i + call.len()..].trim_start();
+                let Some(rest) = rest.strip_prefix('"') else { continue };
+                let sig = &rest[..rest.find('"').unwrap()];
+                seen += 1;
+                if !reads.contains(&sig) {
+                    assert!(WRITE_CALLS.contains(&sig), "{sig} is sent but not named in WRITE_CALLS");
+                }
+            }
+        }
+        assert!(seen > 10, "found only {seen} calls; the scan is broken");
+        assert_eq!(call_name(&selector("updateNode(string,address,address,string,bytes,bytes)")), "updateNode(string,address,address,string,bytes,bytes)");
+        assert_eq!(call_name(&[0, 1, 2, 3]), "a registry call");
+    }
+}
