@@ -58,7 +58,7 @@ Create a new ECS instance with the following specifications:
 - **Instance Type**: `ecs.gn8v-tee.4xlarge`
 - **Image**: Select the imported confidential image
 
-Attach a data disk as well: it holds what must persist — the app volumes and tapp-server's logs —
+Attach a data disk as well: it holds what must persist — the app volumes, and nothing else —
 and `tapp-server` does not start without it (the root filesystem is a RAM overlay, so writing
 there would be lost on reboot). The node mounts it at `/var/lib/tapp/disk` and provisions a single
 blank attached disk by itself. `/data` is not that disk: it is the node's runtime volume, encrypted
@@ -418,7 +418,7 @@ socket_path = "/var/run/docker.sock"
 [logging]
 level = "info"
 format = "pretty"              # "json" or "pretty"
-file_path = "/var/log/tapp/"   # daily-rotated files; on RAM-rootfs CVM images use the data disk, /var/lib/tapp/disk/log/tapp/
+file_path = "/var/log/tapp/"   # daily-rotated files; CVM images use the runtime volume, /data/log/tapp/ (gone after a reboot)
 max_log_files = 7              # rotated daily files to keep; oldest deleted at startup and rotation (default: 7)
 
 # Optional: KMS cluster for hardware-independent app secrets

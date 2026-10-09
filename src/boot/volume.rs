@@ -26,10 +26,11 @@ use tracing::info;
 pub const FDE_MATERIAL: &str = "666465";
 
 /// The node's data disk (LABEL=tapp-data), mounted here and used only by tapp-server: what
-/// must persist is on it — the apps' volumes and plain data, and tapp-server's logs. It is
-/// deliberately NOT `/data`: that path is the runtime volume, encrypted with a key made at
-/// every boot and empty after every boot, where docker keeps its state and where anything an
-/// app writes to an absolute `/data/...` path lands (cvm/build-tapp.sh, tapp-runtime-volume).
+/// must persist is on it — the apps' volumes and plain data, nothing else (apps cannot mount
+/// it writable, see compose_lint::data_disk_exposures). It is deliberately NOT `/data`: that
+/// path is the runtime volume, encrypted with a key made at every boot and empty after every
+/// boot, where docker keeps its state, tapp-server writes its logs, and anything an app writes
+/// to an absolute `/data/...` path lands (cvm/build-tapp.sh, tapp-runtime-volume).
 pub const DATA_DISK: &str = "/var/lib/tapp/disk";
 
 /// Where volume image files live. On the persistent data disk — NEVER the RAM

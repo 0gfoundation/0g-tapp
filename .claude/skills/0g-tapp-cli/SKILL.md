@@ -142,10 +142,11 @@ Owner-only, and **every call is extended into the runtime measurement** carrying
 
 ### The node has no data disk (apps will not start)
 
-The data disk (mounted at `/var/lib/tapp/disk`, server ≥0.9.1) holds the app volumes and logs, and
-`tapp-server` does not start without it — the rootfs is a RAM overlay, so anything written there is
-lost at reboot. `/data` is not the data disk: it is the runtime volume (container storage, absolute
-`/data/...` binds), encrypted per boot and **empty after every reboot**. A node
+The data disk (mounted at `/var/lib/tapp/disk`, server ≥0.9.1) holds the app volumes and nothing
+else (apps may not mount it writable), and `tapp-server` does not start without it — the rootfs is a RAM overlay, so anything written there is
+lost at reboot. `/data` is not the data disk: it is the runtime volume (container storage, tapp-server's
+logs, absolute `/data/...` binds), encrypted per boot and **empty after every reboot** — so after a
+reboot there are no logs of the previous boot on the node. A node
 that could not pick a data disk by itself says so **on the console** (serial log on a cloud),
 naming the disks it saw. Cloud scratch disks are excluded, so a GPU machine type with one
 attached data disk provisions itself; a host with several genuine spare disks does not, and the

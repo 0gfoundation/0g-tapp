@@ -16,7 +16,8 @@ assumption that they are will be wrong in a way nothing reports.
 
 Container storage — images, containers, their environment (the values of an uploaded `.env`),
 writable layers, logs — is not app data and does not persist. Neither does anything an app writes
-to an absolute `/data/...` path. Both live on the node's **runtime volume**, mounted at `/data`: a
+to an absolute `/data/...` path, nor tapp-server's logs. All of it lives on the node's **runtime
+volume**, mounted at `/data`: a
 file on the data disk that is encrypted at every boot with a key read from the kernel RNG and
 held only in TEE memory, and re-created at the next boot (`tapp-runtime-volume`, see
 [cvm/README](../cvm/README.md#data-disk-and-runtime-volume--always-configured)). The host can neither
@@ -24,8 +25,8 @@ read it nor plant chosen content in it — so an image layer cannot be altered u
 digest — and nothing a previous boot left there, containers included, comes back. Corruption is as
 below: possible, and unreported.
 
-What the data disk keeps in the clear, by design: a `plain` app's data and tapp-server's logs
-(`/var/lib/tapp/disk/log/tapp`, which carry no secrets). Nothing else on it persists.
+The data disk keeps the apps' declared data and nothing else — apps may not mount it writable.
+The only thing on it in the clear is a `plain` app's data, which that app chose.
 
 ## Corruption
 

@@ -70,6 +70,49 @@ pub fn state_dir_exposures(
     state_dir: &std::path::Path,
     socket: Option<&std::path::Path>,
 ) -> Vec<String> {
+    let state_dir = resolve(state_dir);
+    writable_mounts_reaching(compose_content, &state_dir, socket)
+        .into_iter()
+        .map(|(service, source)| {
+            format!(
+                "service '{service}': writable mount of '{}' reaches tapp-server's \
+                 own state in {} (claimed owner, trust anchors) — mount only the socket, \
+                 or mount read-only",
+                source.display(),
+                state_dir.display()
+            )
+        })
+        .collect()
+}
+
+/// Writable bind mounts that reach the node's data disk. What persists there is meant to be
+/// exactly the apps' declared data — each app's volume or plain directory, created by
+/// tapp-server — so an app writing to the disk directly would keep data no declaration
+/// covers, in the clear. Refused like the state directory: the disk itself, anything above
+/// it, or anything inside it. Read-only mounts are fine.
+pub fn data_disk_exposures(compose_content: &str, data_disk: &std::path::Path) -> Vec<String> {
+    let data_disk = resolve(data_disk);
+    writable_mounts_reaching(compose_content, &data_disk, None)
+        .into_iter()
+        .map(|(service, source)| {
+            format!(
+                "service '{service}': writable mount of '{}' reaches the node's data disk \
+                 ({}), where only the apps' declared data may persist — keep data under \
+                 './data/...'",
+                source.display(),
+                data_disk.display()
+            )
+        })
+        .collect()
+}
+
+/// (service, host path) of every writable bind mount whose source is `dir`, above it, or
+/// inside it — except `allowed`, a path inside it apps are meant to mount.
+fn writable_mounts_reaching(
+    compose_content: &str,
+    dir: &std::path::Path,
+    allowed: Option<&std::path::Path>,
+) -> Vec<(String, std::path::PathBuf)> {
     let doc: serde_yaml::Value = match serde_yaml::from_str(compose_content) {
         Ok(v) => v,
         Err(_) => return Vec::new(),
@@ -77,9 +120,8 @@ pub fn state_dir_exposures(
     let Some(services) = doc.get("services").and_then(|s| s.as_mapping()) else {
         return Vec::new();
     };
-    let state_dir = resolve(state_dir);
-    let socket = socket.map(resolve);
-    let mut findings = Vec::new();
+    let allowed = allowed.map(resolve);
+    let mut found = Vec::new();
     for (name, service) in services {
         let service_name = name.as_str().unwrap_or("?");
         let Some(volumes) = service.get("volumes").and_then(|v| v.as_sequence()) else {
@@ -91,20 +133,14 @@ pub fn state_dir_exposures(
                 continue;
             }
             let source = resolve(std::path::Path::new(source));
-            let covers = state_dir.starts_with(&source);
-            let inside = source.starts_with(&state_dir) && Some(&source) != socket.as_ref();
+            let covers = dir.starts_with(&source);
+            let inside = source.starts_with(dir) && Some(&source) != allowed.as_ref();
             if covers || inside {
-                findings.push(format!(
-                    "service '{service_name}': writable mount of '{}' reaches tapp-server's \
-                     own state in {} (claimed owner, trust anchors) — mount only the socket, \
-                     or mount read-only",
-                    source.display(),
-                    state_dir.display()
-                ));
+                found.push((service_name.to_string(), source));
             }
         }
     }
-    findings
+    found
 }
 
 /// The host path a bind mount names and whether it is read-only, in either syntax.
@@ -237,6 +273,23 @@ mod state_dir_tests {
     fn check(volume: &str) -> Vec<String> {
         let compose = format!("services:\n  app:\n    image: x\n    volumes:\n      - {volume}\n");
         state_dir_exposures(&compose, Path::new("/run/tapp"), Some(Path::new("/run/tapp/tapp.sock")))
+    }
+
+    /// The data disk is the apps' declared data only: an app cannot write there directly,
+    /// nor through a mount above it. /data is the runtime volume, not the disk, and is fine.
+    #[test]
+    fn a_writable_mount_reaching_the_data_disk_is_refused() {
+        let disk = Path::new("/var/lib/tapp/disk");
+        let with = |volume: &str| {
+            let compose = format!("services:\n  app:\n    image: x\n    volumes:\n      - {volume}\n");
+            data_disk_exposures(&compose, disk)
+        };
+        for v in ["/var/lib/tapp/disk/logs:/logs", "/var/lib/tapp/disk:/disk", "/var/lib/tapp:/t", "/var/lib:/l", "/:/host"] {
+            assert_eq!(with(v).len(), 1, "{v}");
+        }
+        for v in ["/var/lib/tapp/disk:/disk:ro", "./data:/data", "/data/kms:/var/lib/kms", "/var/lib/tapp/apps-x:/x"] {
+            assert!(with(v).is_empty(), "{v}");
+        }
     }
 
     #[test]

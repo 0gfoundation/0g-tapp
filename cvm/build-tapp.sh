@@ -29,13 +29,14 @@ HARDEN="${HARDEN:-1}"                                   # 1=hardened (purge Tier
 # Pin to the last 27.x; set DOCKER_VERSION="" to install the (unpinned) repo default instead.
 DOCKER_VERSION="${DOCKER_VERSION:-5:27.5.1-1~ubuntu.24.04~noble}"
 # Disk layout. The data disk (LABEL=tapp-data) is mounted at /var/lib/tapp/disk and holds only what
-# must persist: each app's volume (encrypted, KMS key) or plain directory, and tapp-server's logs.
+# must persist: each app's volume (encrypted, KMS key) or plain directory -- the apps' declared data,
+# nothing else.
 # /data is the RUNTIME VOLUME (tapp-runtime-volume, below): a file on the data disk, encrypted with a
 # key made at random on every boot and re-created on every boot. Container storage lives there --
 # too big for the RAM rootfs (rw_overlay="ram"), and on a disk in the clear images, containers, their
 # env and logs would be readable, image layers could be altered before the next start, and a previous
-# boot's containers would come back by themselves -- as does anything an app writes to an absolute
-# /data/... path. All of it is secret, cannot be altered from outside, and does not outlive the boot.
+# boot's containers would come back by themselves -- as do tapp-server's logs and anything an app
+# writes to an absolute /data/... path. All of it is secret, cannot be altered from outside, and does not outlive the boot.
 # Independent of Sysbox.
 DATA_ROOT="${DATA_ROOT:-/data/docker}"                 # docker data-root (metadata/volumes/buildkit)
 CONTAINERD_ROOT="${CONTAINERD_ROOT:-/data/containerd}" # containerd root (image layers + snapshots)
@@ -121,9 +122,11 @@ cat > "$TMPD/tapp-server.service" <<'EOF'
 Description=TAPP gRPC Server - Trusted Application
 After=network.target
 Wants=network.target
-# Persistent app data and file logs live on the data disk (the RAM rootfs would lose
-# them and grow unbounded, issue #23) — fail loud: no data disk, no start.
+# App volumes live on the data disk, and file logs on the runtime volume (/data) — not
+# the RAM rootfs, which they would grow unbounded (issue #23). Fail loud without either.
 RequiresMountsFor=/var/lib/tapp/disk
+Requires=tapp-runtime-volume.service
+After=tapp-runtime-volume.service
 
 [Service]
 Type=simple
@@ -165,11 +168,11 @@ cat > "$TMPD/config.toml" <<EOF
 [logging]
 level = "info"
 format = "pretty"
-# On the persistent data disk, NOT the RAM rootfs (rw_overlay="ram") nor /data (the
-# runtime volume) — those are lost on reboot, and these logs are what explains one
-# (issue #23). In the clear, so they must carry no secrets. tapp-server keeps
-# at most \`max_log_files\` daily files (default 7).
-file_path = "/var/lib/tapp/disk/log/tapp/"
+# On the runtime volume (/data): encrypted, disk-sized, and gone after a reboot like all
+# else that is not an app's declared data. NOT the RAM rootfs (rw_overlay="ram"), which
+# file logs would grow unbounded (issue #23). tapp-server keeps at most
+# \`max_log_files\` daily files (default 7).
+file_path = "/data/log/tapp/"
 
 [server]
 # Explicit: tapp-server ≥0.7.1 defaults to loopback. A node must stay reachable
