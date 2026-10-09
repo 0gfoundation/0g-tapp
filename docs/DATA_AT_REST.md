@@ -1,6 +1,6 @@
 # Data at rest: what the platform promises, and what it does not
 
-An app's persistent data lives in a LUKS volume on the `/data` disk, keyed per app by the KMS
+An app's persistent data lives in a LUKS volume on the node's data disk, keyed per app by the KMS
 (see [README](../README.md#where-app-data-lives-encrypted-volumes)). Two of the three things
 "the data is protected" is usually taken to mean are **not** provided, and an app built on the
 assumption that they are will be wrong in a way nothing reports.
@@ -15,17 +15,17 @@ assumption that they are will be wrong in a way nothing reports.
 ## Everything else on the disk
 
 Container storage — images, containers, their environment (the values of an uploaded `.env`),
-writable layers, logs — is not app data and does not persist. It lives on the node's **runtime
-volume**: a file on `/data` that is encrypted at every boot with a key read from the kernel RNG and
+writable layers, logs — is not app data and does not persist. Neither does anything an app writes
+to an absolute `/data/...` path. Both live on the node's **runtime volume**, mounted at `/data`: a
+file on the data disk that is encrypted at every boot with a key read from the kernel RNG and
 held only in TEE memory, and re-created at the next boot (`tapp-runtime-volume`, see
-[cvm/README](../cvm/README.md#persistent-data-disk-data--always-configured)). The host can neither
+[cvm/README](../cvm/README.md#data-disk-and-runtime-volume--always-configured)). The host can neither
 read it nor plant chosen content in it — so an image layer cannot be altered under an unchanged
 digest — and nothing a previous boot left there, containers included, comes back. Corruption is as
 below: possible, and unreported.
 
-What `/data` keeps in the clear, by design: a `plain` app's data, tapp-server's logs
-(`/data/log/tapp`, which carry no secrets), and anything an app bind-mounts from an absolute
-`/data/...` path rather than its own `./data`.
+What the data disk keeps in the clear, by design: a `plain` app's data and tapp-server's logs
+(`/var/lib/tapp/disk/log/tapp`, which carry no secrets). Nothing else on it persists.
 
 ## Corruption
 
@@ -174,7 +174,7 @@ silent-corruption reasons and it covers this case too, more cheaply and more pre
 paying for it on every block of every app.
 
 **Neither applies to plenty of apps** — a stateless service, a cache, anything that treats
-`/data` as expendable needs none of it.
+its `./data` as expendable needs none of it.
 
 ## Proposed: `integrity` as a per-app data mode
 

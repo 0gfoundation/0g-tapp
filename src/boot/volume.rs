@@ -25,9 +25,16 @@ use tracing::info;
 /// (the app's base key) — the whole registry of namespaces in use.
 pub const FDE_MATERIAL: &str = "666465";
 
-/// Where volume image files live. On the persistent /data disk — NEVER the RAM
-/// rootfs, which is size-capped and wiped on reboot.
-const VOLUME_DIR: &str = "/data/tapp/volumes";
+/// The node's data disk (LABEL=tapp-data), mounted here and used only by tapp-server: what
+/// must persist is on it — the apps' volumes and plain data, and tapp-server's logs. It is
+/// deliberately NOT `/data`: that path is the runtime volume, encrypted with a key made at
+/// every boot and empty after every boot, where docker keeps its state and where anything an
+/// app writes to an absolute `/data/...` path lands (cvm/build-tapp.sh, tapp-runtime-volume).
+pub const DATA_DISK: &str = "/var/lib/tapp/disk";
+
+/// Where volume image files live. On the persistent data disk — NEVER the RAM
+/// rootfs, which is size-capped and wiped on reboot, nor the runtime volume.
+const VOLUME_DIR: &str = "/var/lib/tapp/disk/tapp/volumes";
 
 fn image_path(app_id: &str) -> PathBuf {
     PathBuf::from(VOLUME_DIR).join(format!("{app_id}.img"))
@@ -35,9 +42,9 @@ fn image_path(app_id: &str) -> PathBuf {
 
 /// Where plain-mode data directories live: persistent, unencrypted — the disk
 /// holder can read them, which is exactly what `data: plain` consents to.
-const PLAIN_DIR: &str = "/data/tapp/plain";
+const PLAIN_DIR: &str = "/var/lib/tapp/disk/tapp/plain";
 
-/// Scratch volumes: LUKS on /data keyed by a per-boot key that lives only in
+/// Scratch volumes: LUKS on the data disk keyed by a per-boot key that lives only in
 /// /run (tmpfs). Reboot loses the key; the unopenable volume is wiped and
 /// recreated. Disk-sized, TEE-secret, boot-scoped.
 const SCRATCH_KEY_PATH: &str = "/run/tapp/scratch.key";
@@ -168,13 +175,38 @@ async fn quiet_success(program: &str, args: &[&str]) -> bool {
         .unwrap_or(false)
 }
 
-/// Nominal (sparse) size of a new volume: the whole /data filesystem. All apps on
+/// Nominal (sparse) size of a new volume: the whole data disk. All apps on
 /// a node belong to one owner, so there is no quota to arbitrate between tenants —
 /// the only real limit is the physical disk, and this makes the virtual limit
 /// coincide with it. Actual usage grows with actual writes.
 fn nominal_size() -> TappResult<u64> {
-    let stat = nix_statvfs("/data")?;
+    let stat = nix_statvfs(DATA_DISK)?;
     Ok(stat)
+}
+
+/// Persistent app data goes on the data disk or nowhere. Were it not mounted — an image
+/// with the older layout (the disk at /data), or a disk that failed to mount — the
+/// directories below would be created on the RAM rootfs and the data lost at the next
+/// reboot, with nothing saying so.
+fn require_data_disk() -> TappResult<()> {
+    if is_mount_point(std::path::Path::new(DATA_DISK)) {
+        Ok(())
+    } else {
+        Err(err(format!(
+            "the data disk is not mounted at {DATA_DISK}; refusing to put persistent app \
+             data anywhere else (this tapp-server needs an image with that layout)"
+        ))
+        .into())
+    }
+}
+
+/// A directory is a mount point when it sits on another device than its parent.
+fn is_mount_point(dir: &std::path::Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let (Ok(md), Some(parent)) = (std::fs::metadata(dir), dir.parent()) else {
+        return false;
+    };
+    std::fs::metadata(parent).map(|p| p.dev() != md.dev()).unwrap_or(false)
 }
 
 fn nix_statvfs(path: &str) -> TappResult<u64> {
@@ -186,7 +218,7 @@ fn nix_statvfs(path: &str) -> TappResult<u64> {
     let rc = unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) };
     if rc != 0 {
         return Err(err(format!(
-            "statvfs({path}) failed: {} — is the /data disk mounted?",
+            "statvfs({path}) failed: {} — is the data disk mounted?",
             std::io::Error::last_os_error()
         ))
         .into());
@@ -214,6 +246,7 @@ async fn ensure_luks(app_id: &str, img: &PathBuf, mapper: &str, key: &[u8]) -> T
         return Ok(());
     }
 
+    require_data_disk()?;
     tokio::fs::create_dir_all(VOLUME_DIR)
         .await
         .map_err(|e| err(format!("failed to create {VOLUME_DIR}: {e}")))?;
@@ -388,11 +421,12 @@ pub async fn ensure_scratch(app_id: &str, key: &[u8]) -> TappResult<()> {
     ensure_luks(app_id, &img, &mapper, key).await
 }
 
-/// Point `<app_dir>/data` at a plain, persistent directory on /data. The app
+/// Point `<app_dir>/data` at a plain, persistent directory on the data disk. The app
 /// declared `data: plain`: readable by whoever holds the disk, survives reboots
-/// — and, like the encrypted image files, `/data/tapp/plain/<app_id>` is left
+/// — and, like the encrypted image files, `<PLAIN_DIR>/<app_id>` is left
 /// in place forever after stop-app, so the data is there for a later start.
 pub async fn ensure_plain(app_id: &str) -> TappResult<()> {
+    require_data_disk()?;
     let target = PathBuf::from(PLAIN_DIR).join(app_id);
     let app_dir = super::manager::DockerComposeManager::get_app_dir(app_id);
     link_data_dir(&app_dir.join("data"), &target).await?;
@@ -675,11 +709,23 @@ mod tests {
         std::fs::write(&probe, "new boot").expect("recreated volume must be writable");
     }
 
+    /// Persistent data is refused anywhere but a mounted data disk: a directory that merely
+    /// exists on the root filesystem is not one.
+    #[test]
+    fn only_a_mounted_filesystem_counts_as_the_data_disk() {
+        assert!(is_mount_point(std::path::Path::new("/proc")));
+        let plain_dir = std::env::temp_dir().join(format!("tapp-not-a-mount-{}", std::process::id()));
+        std::fs::create_dir_all(&plain_dir).unwrap();
+        assert!(!is_mount_point(&plain_dir));
+        assert!(!is_mount_point(std::path::Path::new("/nonexistent/tapp/disk")));
+        let _ = std::fs::remove_dir_all(&plain_dir);
+    }
+
     #[test]
     fn paths_are_per_app_and_stay_inside_the_volume_dir() {
         assert_eq!(
             image_path("my-app_1").to_string_lossy(),
-            "/data/tapp/volumes/my-app_1.img"
+            "/var/lib/tapp/disk/tapp/volumes/my-app_1.img"
         );
         assert_eq!(mapper_name("my-app_1"), "tapp-fde-my-app_1");
         // validate_app_id guarantees [A-Za-z0-9_-]; this is the belt to that

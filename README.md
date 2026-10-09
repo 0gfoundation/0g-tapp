@@ -58,15 +58,17 @@ Create a new ECS instance with the following specifications:
 - **Instance Type**: `ecs.gn8v-tee.4xlarge`
 - **Image**: Select the imported confidential image
 
-Attach a data disk as well: `/data` holds the app volumes, the container stores and the logs,
+Attach a data disk as well: it holds what must persist — the app volumes and tapp-server's logs —
 and `tapp-server` does not start without it (the root filesystem is a RAM overlay, so writing
-there would be lost on reboot). The node provisions a single blank attached disk by itself.
+there would be lost on reboot). The node mounts it at `/var/lib/tapp/disk` and provisions a single
+blank attached disk by itself. `/data` is not that disk: it is the node's runtime volume, encrypted
+with a key made at every boot and empty after every reboot, where the container storage lives.
 
 Ephemeral cloud scratch disks are excluded, so a GPU machine type — where the cloud attaches
 local SSDs that cannot be declined — still provisions its one attached data disk by itself.
 
 On a host with **more than one** spare disk, which is normal on bare metal, the node cannot tell
-which one is meant to be `/data` and refuses to guess rather than risk formatting the wrong disk.
+which one is meant to be the data disk and refuses to guess rather than risk formatting the wrong disk.
 **Label the intended disk before attaching it**, on any machine with a shell:
 
 ```bash
@@ -139,8 +141,8 @@ What the compose file writes decides what protects it:
 | named volume (plainly declared) | auto-redirected into the encrypted volume | ✅ | ✅ |
 | `./data/...` bind mount | encrypted volume, explicit path | ✅ | ✅ |
 | other `./...` relative paths | RAM rootfs — fine for configs, wrong for state | – (never on disk) | ❌ |
-| absolute paths | host disk, plaintext (warned) | ❌ | ✅ |
-| `external:` / custom-driver volumes | wherever the user configured (warned) | ❌ | depends |
+| absolute `/data/...` paths | the runtime volume (warned) | ✅ per-boot key | ❌ emptied at every boot |
+| anonymous volumes, `external:` / custom-driver volumes, the container's own filesystem | docker's storage on the runtime volume (warned) | ✅ per-boot key | ❌ |
 
 The first row is the important one: the standard compose idiom
 (`pgdata:/var/lib/postgresql/data` plus a top-level `volumes: pgdata:`) is
@@ -416,7 +418,7 @@ socket_path = "/var/run/docker.sock"
 [logging]
 level = "info"
 format = "pretty"              # "json" or "pretty"
-file_path = "/var/log/tapp/"   # daily-rotated files; on RAM-rootfs CVM images use the persistent disk, e.g. /data/log/tapp/
+file_path = "/var/log/tapp/"   # daily-rotated files; on RAM-rootfs CVM images use the data disk, /var/lib/tapp/disk/log/tapp/
 max_log_files = 7              # rotated daily files to keep; oldest deleted at startup and rotation (default: 7)
 
 # Optional: KMS cluster for hardware-independent app secrets

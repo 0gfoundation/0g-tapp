@@ -1,11 +1,14 @@
 //! Compose-file checks for data placement and container privilege.
 //!
-//! The encrypted per-app volume protects what lands under `./data` — which,
-//! since compose_override.rs redirects them, includes plainly-declared named
-//! volumes. What this lint flags is everything that still escapes: bind mounts
-//! outside the app directory, volumes the user configured to live elsewhere
-//! (`external`, a driver), anonymous volumes, plus the two privilege escapes
-//! (docker.sock, privileged) that hand the app the whole machine.
+//! The per-app volume holds what lands under `./data` — which, since
+//! compose_override.rs redirects them, includes plainly-declared named volumes —
+//! and it is the only place an app's data persists. Everything else a container
+//! writes is in docker's storage or under an absolute `/data/...` path, both on the
+//! runtime volume: encrypted, and empty after every reboot. What this lint flags is
+//! what escapes the app's volume: bind mounts outside the app directory, volumes the
+//! user configured to live elsewhere (`external`, a driver), anonymous volumes, plus
+//! the two privilege escapes (docker.sock, privileged) that hand the app the whole
+//! machine.
 //!
 //! Warning-only for now: rejection starts as a migration signal, not a gate.
 //! Tightening to refusal is a one-line change at the call site.
@@ -169,8 +172,8 @@ fn check_volume(service: &str, vol: &serde_yaml::Value, redirected: &[String]) -
         Some(s) if entry.contains(':') => s,
         _ => {
             return Some(format!(
-                "service '{service}': anonymous volume '{entry}' stores data in \
-                 docker's shared data-root, outside the app's encrypted volume"
+                "service '{service}': anonymous volume '{entry}' lives in docker's own \
+                 storage, outside the app's volume — it is gone after a reboot"
             ))
         }
     };
@@ -196,8 +199,8 @@ fn named_volume_finding(service: &str, source: &str, redirected: &[String]) -> O
     }
     Some(format!(
         "service '{service}': named volume '{source}' is configured to live outside \
-         the app's encrypted volume (external / custom driver / undeclared) — its \
-         data is NOT encrypted at rest"
+         the app's volume (external / custom driver / undeclared) — it is NOT kept \
+         with the app's data, and in docker's own storage it is gone after a reboot"
     ))
 }
 
@@ -210,8 +213,9 @@ fn check_bind_source(service: &str, source: &str) -> Option<String> {
     }
     if source.starts_with('/') || source.starts_with('~') {
         return Some(format!(
-            "service '{service}': absolute bind mount '{source}' writes outside the \
-             app's encrypted volume — keep app data under './data/...'"
+            "service '{service}': absolute bind mount '{source}' is outside the app's \
+             volume — under /data it is encrypted but emptied at every reboot; keep data \
+             that must persist under './data/...'"
         ));
     }
     // Relative: fine as long as it cannot climb out of the app directory.
@@ -295,7 +299,7 @@ mod tests {
             "services:\n  db:\n    volumes:\n      - pgdata:/var/lib/postgresql/data\nvolumes:\n  pgdata:\n    external: true\n",
         );
         assert_eq!(external.len(), 1);
-        assert!(external[0].contains("NOT encrypted"));
+        assert!(external[0].contains("NOT kept"));
 
         // Undeclared: compose refuses it anyway, but the reason shows here too.
         let undeclared =

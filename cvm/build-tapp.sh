@@ -28,15 +28,17 @@ HARDEN="${HARDEN:-1}"                                   # 1=hardened (purge Tier
 # `sysbox-runc features` (unsupported) on startup. Nestybox officially supports Docker 20.10-27.x.
 # Pin to the last 27.x; set DOCKER_VERSION="" to install the (unpinned) repo default instead.
 DOCKER_VERSION="${DOCKER_VERSION:-5:27.5.1-1~ubuntu.24.04~noble}"
-# Container storage lives on the RUNTIME VOLUME (tapp-runtime-volume, below): a volume on the /data
-# disk that is encrypted with a key generated at random on every boot and re-created on every boot.
-# It is too big for the RAM rootfs (rw_overlay="ram"), and it must not be on /data in the clear:
-# images, containers, their env and logs would be readable there, image layers could be altered
-# before the next start, and a previous boot's containers would come back by themselves. On the
-# runtime volume they are secret, cannot be altered from outside, and do not outlive the boot.
-# Independent of Sysbox. Only what must persist is on /data itself: each app's ./data.
-DATA_ROOT="${DATA_ROOT:-/var/lib/tapp-runtime/docker}"                 # docker data-root (metadata/volumes/buildkit)
-CONTAINERD_ROOT="${CONTAINERD_ROOT:-/var/lib/tapp-runtime/containerd}" # containerd root (image layers + snapshots)
+# Disk layout. The data disk (LABEL=tapp-data) is mounted at /var/lib/tapp/disk and holds only what
+# must persist: each app's volume (encrypted, KMS key) or plain directory, and tapp-server's logs.
+# /data is the RUNTIME VOLUME (tapp-runtime-volume, below): a file on the data disk, encrypted with a
+# key made at random on every boot and re-created on every boot. Container storage lives there --
+# too big for the RAM rootfs (rw_overlay="ram"), and on a disk in the clear images, containers, their
+# env and logs would be readable, image layers could be altered before the next start, and a previous
+# boot's containers would come back by themselves -- as does anything an app writes to an absolute
+# /data/... path. All of it is secret, cannot be altered from outside, and does not outlive the boot.
+# Independent of Sysbox.
+DATA_ROOT="${DATA_ROOT:-/data/docker}"                 # docker data-root (metadata/volumes/buildkit)
+CONTAINERD_ROOT="${CONTAINERD_ROOT:-/data/containerd}" # containerd root (image layers + snapshots)
 # Sysbox (issue #21): hostile-multi-tenant container isolation (sysbox-runc). Opt-in; default OFF.
 # When ON: installs sysbox-ce and registers sysbox-runc as a dockerd runtime (storage pinning above
 # happens regardless). Requires Docker <=27.x (see DOCKER_VERSION).
@@ -119,9 +121,9 @@ cat > "$TMPD/tapp-server.service" <<'EOF'
 Description=TAPP gRPC Server - Trusted Application
 After=network.target
 Wants=network.target
-# File logs live on the persistent /data disk (RAM rootfs would grow unbounded,
-# issue #23) — same fail-loud policy as docker/containerd: no /data, no start.
-RequiresMountsFor=/data
+# Persistent app data and file logs live on the data disk (the RAM rootfs would lose
+# them and grow unbounded, issue #23) — fail loud: no data disk, no start.
+RequiresMountsFor=/var/lib/tapp/disk
 
 [Service]
 Type=simple
@@ -163,10 +165,11 @@ cat > "$TMPD/config.toml" <<EOF
 [logging]
 level = "info"
 format = "pretty"
-# On the persistent /data disk, NOT the RAM rootfs (rw_overlay="ram") — file
-# logs on "/" consume RAM and are lost on reboot (issue #23). tapp-server keeps
+# On the persistent data disk, NOT the RAM rootfs (rw_overlay="ram") nor /data (the
+# runtime volume) — those are lost on reboot, and these logs are what explains one
+# (issue #23). In the clear, so they must carry no secrets. tapp-server keeps
 # at most \`max_log_files\` daily files (default 7).
-file_path = "/data/log/tapp/"
+file_path = "/var/lib/tapp/disk/log/tapp/"
 
 [server]
 # Explicit: tapp-server ≥0.7.1 defaults to loopback. A node must stay reachable
@@ -295,9 +298,9 @@ echo "auto-update: apt-daily* masked, unattended-upgrades purged, needrestart=li
 #   - docker's data-root : metadata, volumes, buildkit                              -> $DATA_ROOT
 #   - containerd's root  : image layers + snapshots (docker-ce defaults to the      -> $CONTAINERD_ROOT
 #                          containerd image store, so layers live here, NOT data-root)
-# docker + containerd require the runtime volume and FAIL LOUD without it -- never falling back to
-# the RAM root or to /data in the clear.
-mkdir -p /data /etc/docker /etc/containerd
+# docker + containerd require the runtime volume and FAIL LOUD without it -- never writing to the
+# RAM root, nor to the data disk in the clear.
+mkdir -p /data /var/lib/tapp/disk /etc/docker /etc/containerd
 printf '%s\n' '{' "  \"data-root\": \"$DATA_ROOT\"" '}' > /etc/docker/daemon.json
 containerd config default > /etc/containerd/config.toml
 sed -i "s|^root = .*|root = \"$CONTAINERD_ROOT\"|" /etc/containerd/config.toml
@@ -306,16 +309,17 @@ for unit in docker containerd; do
   printf '%s\n' '[Unit]' 'Requires=tapp-runtime-volume.service' 'After=tapp-runtime-volume.service' \
     > "/etc/systemd/system/$unit.service.d/10-runtime-volume.conf"
 done
-# fstab: nofail so a missing/blank /data disk NEVER blocks boot (a non-nofail mount failure drops the
-# whole system into emergency mode -> no network/SSH). With nofail only docker/containerd fail loud
-# (RequiresMountsFor). x-systemd.requires pulls the provisioner first. device-timeout must comfortably
+# fstab: the data disk at /var/lib/tapp/disk (NOT /data, which is the runtime volume). nofail so a
+# missing/blank data disk NEVER blocks boot (a non-nofail mount failure drops the whole system into
+# emergency mode -> no network/SSH). With nofail only tapp-server, docker and containerd fail loud
+# (they require it). x-systemd.requires pulls the provisioner first. device-timeout must comfortably
 # exceed the provisioner's first-boot mkfs time: on a blank disk the by-label device only appears AFTER
 # tapp-data-provision formats it, and the .device wait (which starts early in boot) must not expire
-# before then, or data.mount fails on first boot. 60s >> the few seconds mkfs needs; it only ever
+# before then, or the mount fails on first boot. 60s >> the few seconds mkfs needs; it only ever
 # delays boot in the (misconfigured) no-data-disk case, where nofail then lets boot proceed anyway.
-grep -q 'LABEL=tapp-data' /etc/fstab || printf '%s\n' 'LABEL=tapp-data /data ext4 defaults,nofail,x-systemd.device-timeout=60s,x-systemd.requires=tapp-data-provision.service 0 2' >> /etc/fstab
+grep -q 'LABEL=tapp-data' /etc/fstab || printf '%s\n' 'LABEL=tapp-data /var/lib/tapp/disk ext4 defaults,nofail,x-systemd.device-timeout=60s,x-systemd.requires=tapp-data-provision.service 0 2' >> /etc/fstab
 
-# Auto-provision /data on first boot with NO SSH. Find the single non-boot whole disk and:
+# Auto-provision the data disk on first boot with NO SSH. Find the single non-boot whole disk and:
 #   - blank (no filesystem signature)      -> mkfs.ext4 -L tapp-data     (fresh node)
 #   - already ext4 (e.g. a migrated disk)  -> e2label tapp-data          (adopt, NEVER reformat)
 # SAFE: only real disks (sd*/nvme*/vd*), never the boot disk, never a partitioned disk, never an
@@ -326,9 +330,9 @@ grep -q 'LABEL=tapp-data' /etc/fstab || printf '%s\n' 'LABEL=tapp-data /data ext
 cat > /usr/local/sbin/tapp-data-provision.sh <<'PROVSH'
 #!/bin/bash
 set -u
-# A node that ends up without /data does not start tapp-server, and on a hardened image there is
+# A node that ends up without its data disk does not start tapp-server, and on a hardened image there is
 # no shell to read the journal with -- the failure is invisible, and looks like the node is simply
-# broken. So anything that leaves /data unprovisioned is said on the console too, where the cloud's
+# broken. So anything that leaves the data disk unprovisioned is said on the console too, where the cloud's
 # serial log (or a bare-metal screen) shows it, together with the one command that fixes it.
 say() {
   echo "tapp-data-provision: $*" >&2
@@ -341,12 +345,12 @@ blkid -L tapp-data >/dev/null 2>&1 && exit 0
 esp="$(blkid -L UEFI 2>/dev/null)" || true
 bootdisk=""
 [ -n "${esp:-}" ] && bootdisk="$(lsblk -no pkname "$esp" 2>/dev/null | head -1)"
-# Cloud scratch ("local SSD") is ephemeral -- wiped on stop/start -- so it must never become /data.
+# Cloud scratch ("local SSD") is ephemeral -- wiped on stop/start -- so it must never become the data disk.
 # This is not a corner case: GCP attaches local SSDs unconditionally to every GPU machine type
 # (a3-highgpu-1g gets two, and they cannot be declined), which leaves the "exactly one candidate"
 # rule permanently unsatisfiable on a GPU host -- measured on a3-highgpu-1g, where the candidate
-# set was (local-ssd, local-ssd, data-pd) and provisioning refused, so /data never mounted and
-# tapp-server never started.
+# set was (local-ssd, local-ssd, data-pd) and provisioning refused, so the data disk never mounted
+# and tapp-server never started.
 #
 # GCP's own /dev/disk/by-id/google-local-nvme-ssd-N aliases are NOT available to us: those udev
 # rules ship in google-guest-configs, which this image deliberately does not install. The alias
@@ -362,7 +366,7 @@ is_scratch() {
   done
   model="$(tr -d ' ' < "/sys/block/$n/device/model" 2>/dev/null)"
   case "$model" in
-    nvme_card-pd) return 1 ;;      # persistent disk -- a legitimate /data candidate
+    nvme_card-pd) return 1 ;;      # persistent disk -- a legitimate data disk candidate
     nvme_card*)   return 0 ;;      # nvme_card0, nvme_card1, ... -- local SSD
   esac
   return 1
@@ -378,12 +382,12 @@ while read -r name type; do
   cands+=("/dev/$name")
 done < <(lsblk -dno NAME,TYPE 2>/dev/null)
 if [ "${#cands[@]}" -eq 0 ]; then
-  say "no candidate data disk found; /data stays unmounted, so tapp-server will NOT start."
+  say "no candidate data disk found; it stays unmounted, so tapp-server will NOT start."
   say "remedy: attach a data disk, or pre-label one with: mkfs.ext4 -L tapp-data <device>"
   exit 0
 elif [ "${#cands[@]}" -gt 1 ]; then
-  say "multiple candidate disks (${cands[*]}); refusing to guess which one is /data."
-  say "/data stays unmounted, so tapp-server will NOT start."
+  say "multiple candidate disks (${cands[*]}); refusing to guess which one is the data disk."
+  say "it stays unmounted, so tapp-server will NOT start."
   say "remedy: pre-label the intended disk and reboot: mkfs.ext4 -L tapp-data <device>"
   exit 0
 fi
@@ -396,7 +400,7 @@ elif [ "$fstype" = ext4 ]; then
   e2label "$dev" tapp-data                                                         # adopt existing data, no reformat
   echo "tapp-data-provision: adopted existing ext4 $dev -> LABEL=tapp-data (data preserved)"
 else
-  say "$dev has unexpected fs '$fstype'; not touching it. /data stays unmounted, so tapp-server"
+  say "$dev has unexpected fs '$fstype'; not touching it. The data disk stays unmounted, so tapp-server"
   say "will NOT start. remedy: pre-label an ext4 disk with: mkfs.ext4 -L tapp-data <device>"
   exit 0
 fi
@@ -404,10 +408,10 @@ PROVSH
 chmod 0755 /usr/local/sbin/tapp-data-provision.sh
 cat > /etc/systemd/system/tapp-data-provision.service <<'PROVUNIT'
 [Unit]
-Description=Auto-provision /data (format a blank data disk, or adopt an existing one, as tapp-data)
+Description=Auto-provision the data disk (format a blank one, or adopt an existing one, as tapp-data)
 After=systemd-udev-settle.service
 Wants=systemd-udev-settle.service
-Before=data.mount
+Before=var-lib-tapp-disk.mount
 
 [Service]
 Type=oneshot
@@ -415,20 +419,20 @@ RemainAfterExit=yes
 ExecStart=/usr/local/sbin/tapp-data-provision.sh
 PROVUNIT
 
-# Auto-grow /data to fill its disk on boot. A hardened image has no SSH and no cloud-init/growpart,
+# Auto-grow the data disk's filesystem to fill the disk on boot. A hardened image has no SSH and no cloud-init/growpart,
 # so an oversized persistent disk would otherwise strip nothing back -- the extra space is wasted
-# forever. This oneshot resizes the /data ext4 online to consume the whole device (idempotent;
-# no-op once full), so operators can attach an arbitrarily large /data disk and it is fully used.
+# forever. This oneshot resizes its ext4 online to consume the whole device (idempotent;
+# no-op once full), so operators can attach an arbitrarily large data disk and it is fully used.
 # NOTE: the BOOT disk is NOT grown -- the rootfs is verity + RAM overlay, so extra boot-disk space
-# is unusable by design; size the boot disk ~= the image and put capacity on the /data disk.
+# is unusable by design; size the boot disk ~= the image and put capacity on the data disk.
 cat > /usr/local/sbin/tapp-data-grow.sh <<'GROWSH'
 #!/bin/bash
-# grow the ext4 fs mounted at /data to fill its backing device (online resize; idempotent)
+# grow the ext4 fs of the data disk to fill its backing device (online resize; idempotent)
 set -u
-dev="$(findmnt -no SOURCE /data 2>/dev/null)" || exit 0
+dev="$(findmnt -no SOURCE /var/lib/tapp/disk 2>/dev/null)" || exit 0
 [ -n "$dev" ] || exit 0
 dev="$(readlink -f "$dev")"
-# if /data lives on a partition (not a whole disk), grow the partition first -- best-effort,
+# if the data disk is a partition (not a whole disk), grow the partition first -- best-effort,
 # needs growpart (cloud-guest-utils), which the hardened image does not ship; whole-disk ext4
 # (the documented deploy: mkfs.ext4 -L tapp-data on the raw disk) needs no growpart.
 base=""; partnum=""
@@ -443,11 +447,11 @@ GROWSH
 chmod 0755 /usr/local/sbin/tapp-data-grow.sh
 cat > /etc/systemd/system/tapp-data-grow.service <<'GROWUNIT'
 [Unit]
-Description=Grow the /data filesystem to fill its disk (no-SSH auto-expand)
-After=data.mount
-Requires=data.mount
+Description=Grow the data disk's filesystem to fill the disk (no-SSH auto-expand)
+After=var-lib-tapp-disk.mount
+Requires=var-lib-tapp-disk.mount
 Before=docker.service containerd.service
-ConditionPathIsMountPoint=/data
+ConditionPathIsMountPoint=/var/lib/tapp/disk
 
 [Service]
 Type=oneshot
@@ -459,20 +463,22 @@ WantedBy=multi-user.target
 GROWUNIT
 systemctl enable tapp-data-grow.service || true
 
-# The RUNTIME VOLUME: where docker, containerd (and sysbox) keep their state. A sparse file on the
-# tapp-data disk, encrypted with a key read from the kernel RNG at boot and held only in the kernel
-# (TEE memory), re-created on every boot. It acts only when /data is the tapp-data disk (otherwise
-# docker stays down), and touches nothing there but its own file -- and, once, the container storage
-# older images left in the clear (/data/docker, /data/containerd, /data/sysbox), which it removes.
-# Restarting the unit within a boot keeps the volume (docker is using it). Discards reach /data, so
-# deleted images free disk space.
+# The RUNTIME VOLUME, mounted at /data: where docker, containerd (and sysbox) keep their state, and
+# where an app's absolute /data/... paths land. A sparse file on the data disk, encrypted with a key
+# read from the kernel RNG at boot and held only in the kernel (TEE memory), re-created on every
+# boot. It acts only when /var/lib/tapp/disk is the tapp-data disk and /data is not already a mount
+# (otherwise docker stays down), and touches nothing on the disk but its own file -- and, once, the
+# container storage older images left there in the clear (docker/, containerd/, sysbox/), which it
+# removes. Restarting the unit within a boot keeps the volume (docker is using it). Discards reach
+# the disk, so deleted images free its space.
 cat > /usr/local/sbin/tapp-runtime-volume.sh <<'RTVSH'
 #!/bin/bash
-# Create this boot's runtime volume and mount it at /var/lib/tapp-runtime (see build-tapp.sh).
+# Create this boot's runtime volume and mount it at /data (see build-tapp.sh).
 set -euo pipefail
-IMG=/data/tapp/runtime.img
+DISK=/var/lib/tapp/disk
+IMG=$DISK/tapp/runtime.img
 NAME=tapp-runtime
-MNT=/var/lib/tapp-runtime
+MNT=/data
 say() {
   echo "tapp-runtime-volume: $*" >&2
   { echo "tapp-runtime-volume: $*" > /dev/console; } 2>/dev/null || true
@@ -482,32 +488,37 @@ if [ -e "/dev/mapper/$NAME" ]; then
   mountpoint -q "$MNT" || mount -o discard "/dev/mapper/$NAME" "$MNT"
   exit 0
 fi
-# Only ever on the tapp data disk. Anything else mounted at /data is left alone, and docker
+# Only ever on the tapp data disk. Anything else mounted there is left alone, and docker
 # stays down rather than putting its state somewhere unintended.
-data_dev="$(findmnt -no SOURCE /data 2>/dev/null || true)"
+disk_dev="$(findmnt -no SOURCE "$DISK" 2>/dev/null || true)"
 want_dev="$(blkid -L tapp-data 2>/dev/null || true)"
-if [ -z "$data_dev" ] || [ -z "$want_dev" ] || [ "$(readlink -f "$data_dev")" != "$(readlink -f "$want_dev")" ]; then
-  say "/data is not the tapp-data disk; no runtime volume, so docker will NOT start."
+if [ -z "$disk_dev" ] || [ -z "$want_dev" ] || [ "$(readlink -f "$disk_dev")" != "$(readlink -f "$want_dev")" ]; then
+  say "$DISK is not the tapp-data disk; no runtime volume, so docker will NOT start."
+  exit 1
+fi
+# Never mount over something already there -- above all an older layout's data disk at /data.
+if mountpoint -q "$MNT"; then
+  say "$MNT is already a mount point; not covering it, so docker will NOT start."
   exit 1
 fi
 # Container storage from images older than the runtime volume: docker's, containerd's and
 # sysbox's state in the clear on this disk (old containers' env -- the values of their .env --
 # images, logs). Nothing uses it any more, and on a node without a shell nobody else can remove it.
 # Only these three paths, never crossing into another filesystem.
-for old in /data/docker /data/containerd /data/sysbox; do
+for old in "$DISK/docker" "$DISK/containerd" "$DISK/sysbox"; do
   if [ -d "$old" ]; then
     rm -rf --one-file-system "$old" && echo "tapp-runtime-volume: removed $old (pre-runtime-volume container storage)" \
       || say "could not fully remove $old; continuing"
   fi
 done
-mkdir -p /data/tapp "$MNT"
+mkdir -p "$DISK/tapp" "$MNT"
 # The previous boot's volume cannot be read any more -- its key died with that boot -- so it is
 # dropped, with any loop device a failed attempt earlier in this boot left attached to it.
 for d in $(losetup -n -O NAME -j "$IMG" 2>/dev/null); do losetup -d "$d" || true; done
 rm -f "$IMG"
-# Sparse and nominally the whole /data filesystem, the same rule as the app volumes: the only real
-# limit is the disk. With discards passed down, what docker deletes is given back to /data.
-truncate -s "$(( $(stat -f -c %b /data) * $(stat -f -c %S /data) ))" "$IMG"
+# Sparse and nominally the whole data disk, the same rule as the app volumes: the only real
+# limit is the disk. With discards passed down, what docker deletes is given back to the disk.
+truncate -s "$(( $(stat -f -c %b "$DISK") * $(stat -f -c %S "$DISK") ))" "$IMG"
 loop="$(losetup --find --show "$IMG")"
 # Plain dm-crypt (AES-256-XTS) keyed with 64 bytes from the kernel RNG, which exist only in the
 # kernel, in TEE memory: no header and nothing stored, so nothing outlives this boot.
@@ -522,8 +533,8 @@ RTVSH
 chmod 0755 /usr/local/sbin/tapp-runtime-volume.sh
 cat > /etc/systemd/system/tapp-runtime-volume.service <<'RTVUNIT'
 [Unit]
-Description=Per-boot encrypted runtime volume for container storage
-RequiresMountsFor=/data
+Description=Per-boot encrypted runtime volume at /data
+RequiresMountsFor=/var/lib/tapp/disk
 After=tapp-data-grow.service
 Before=containerd.service docker.service
 
@@ -642,7 +653,7 @@ if [ "$ENABLE_SYSBOX" = 1 ]; then
   # NOTE: heredoc is unquoted so $SYSBOX_DEB_URL is interpolated here (host side).
   cat >> "$TMPD/provision-base.sh" <<EOF
 # --- Sysbox: hostile-multi-tenant container isolation (sysbox-runc, userns remap) ---
-# Only the runtime registration is gated behind ENABLE_SYSBOX; the /data storage pinning above is
+# Only the runtime registration is gated behind ENABLE_SYSBOX; the runtime volume above is
 # unconditional. Requires Docker <=27.x (pinned above) -- sysbox-runc rejects the Linux time
 # namespace that Docker 28+/29+ emits in the OCI spec.
 export DEBIAN_FRONTEND=noninteractive
@@ -662,7 +673,7 @@ if [ -n "\$sbx_unit" ]; then
   mkdir -p /etc/systemd/system/sysbox-mgr.service.d
   sbx_exec="\$(sed -n 's/^ExecStart=//p' "\$sbx_unit" | head -1)"
   printf '%s\n' '[Unit]' 'Requires=tapp-runtime-volume.service' 'After=tapp-runtime-volume.service' \
-    '[Service]' 'ExecStart=' "ExecStart=\$sbx_exec --data-root /var/lib/tapp-runtime/sysbox" \
+    '[Service]' 'ExecStart=' "ExecStart=\$sbx_exec --data-root /data/sysbox" \
     > /etc/systemd/system/sysbox-mgr.service.d/10-data-root.conf
 fi
 # Merge the sysbox-runc runtime into the existing daemon.json (which already pins data-root),

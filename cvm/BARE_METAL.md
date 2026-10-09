@@ -167,7 +167,7 @@ few minutes, through a laptop expect an hour.
 ## 3. Launch the TD
 
 ```bash
-qemu-img create -f qcow2 tapp-data.qcow2 200G     # the /data disk — exactly one, see below
+qemu-img create -f qcow2 tapp-data.qcow2 200G     # the data disk — exactly one, see below
 sudo ./run-tapp-td.sh                             # see the invocation below
 ```
 
@@ -201,7 +201,7 @@ Four things to get right:
   cloud-init seed as a *disk*; as a `-cdrom` it appears as `sr0` and is correctly skipped.
 - **Memory is your writable `/`.** The rootfs overlay is RAM-backed zram, so `/` ≈ 4 GB of baked
   base plus whatever you pass to `-m`. More `/` means more `-m`, not a bigger boot disk — and
-  anything written to `/` competes with the workload. Persistent state belongs on `/data`.
+  anything written to `/` competes with the workload. Persistent state belongs in the apps' `./data`.
 - **No debug.** `policy.rego` requires `td_attributes.debug == false`; a TD launched with debug on
   fails verification with an error that looks nothing like the cause.
 - **Serial is your console.** `HARDEN=1` masks the getty, so a hardened image has no serial login —
