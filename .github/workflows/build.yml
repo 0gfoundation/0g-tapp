@@ -117,6 +117,9 @@ jobs:
         # Default GITHUB_TOKEN is enough: build-cvm no longer auto-triggers on release, so we no
         # longer need a PAT to dodge the "GITHUB_TOKEN releases don't fire on: release" anti-recursion rule.
         token: ${{ secrets.GITHUB_TOKEN }}
+        # A tag like v0.9.1-rc.1 is a pre-release: built and signed the same way, so a test image
+        # can be made from it, but never shown as the latest release.
+        prerelease: ${{ contains(github.ref_name, '-') }}
         files: |
           artifacts/${{ env.BINARY_NAME_SERVER }}
           artifacts/${{ env.BINARY_NAME_CLI }}
