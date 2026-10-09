@@ -461,9 +461,11 @@ systemctl enable tapp-data-grow.service || true
 
 # The RUNTIME VOLUME: where docker, containerd (and sysbox) keep their state. A sparse file on the
 # tapp-data disk, encrypted with a key read from the kernel RNG at boot and held only in the kernel
-# (TEE memory), re-created on every boot. It touches nothing on /data but its own file, and only
-# when /data is the tapp-data disk; otherwise docker stays down. Restarting the unit within a boot
-# keeps the volume (docker is using it). Discards reach /data, so deleted images free disk space.
+# (TEE memory), re-created on every boot. It acts only when /data is the tapp-data disk (otherwise
+# docker stays down), and touches nothing there but its own file -- and, once, the container storage
+# older images left in the clear (/data/docker, /data/containerd, /data/sysbox), which it removes.
+# Restarting the unit within a boot keeps the volume (docker is using it). Discards reach /data, so
+# deleted images free disk space.
 cat > /usr/local/sbin/tapp-runtime-volume.sh <<'RTVSH'
 #!/bin/bash
 # Create this boot's runtime volume and mount it at /var/lib/tapp-runtime (see build-tapp.sh).
@@ -488,6 +490,16 @@ if [ -z "$data_dev" ] || [ -z "$want_dev" ] || [ "$(readlink -f "$data_dev")" !=
   say "/data is not the tapp-data disk; no runtime volume, so docker will NOT start."
   exit 1
 fi
+# Container storage from images older than the runtime volume: docker's, containerd's and
+# sysbox's state in the clear on this disk (old containers' env -- the values of their .env --
+# images, logs). Nothing uses it any more, and on a node without a shell nobody else can remove it.
+# Only these three paths, never crossing into another filesystem.
+for old in /data/docker /data/containerd /data/sysbox; do
+  if [ -d "$old" ]; then
+    rm -rf --one-file-system "$old" && echo "tapp-runtime-volume: removed $old (pre-runtime-volume container storage)" \
+      || say "could not fully remove $old; continuing"
+  fi
+done
 mkdir -p /data/tapp "$MNT"
 # The previous boot's volume cannot be read any more -- its key died with that boot -- so it is
 # dropped, with any loop device a failed attempt earlier in this boot left attached to it.
