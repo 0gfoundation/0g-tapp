@@ -12,6 +12,21 @@ assumption that they are will be wrong in a way nothing reports.
 | The host cannot **corrupt** the data undetectably | **no** | [below](#corruption) |
 | The data is the **latest** state | **no** | [below](#rollback) |
 
+## Everything else on the disk
+
+Container storage — images, containers, their environment (the values of an uploaded `.env`),
+writable layers, logs — is not app data and does not persist. It lives on the node's **runtime
+volume**: a file on `/data` that is encrypted at every boot with a key read from the kernel RNG and
+held only in TEE memory, and re-created at the next boot (`tapp-runtime-volume`, see
+[cvm/README](../cvm/README.md#persistent-data-disk-data--always-configured)). The host can neither
+read it nor plant chosen content in it — so an image layer cannot be altered under an unchanged
+digest — and nothing a previous boot left there, containers included, comes back. Corruption is as
+below: possible, and unreported.
+
+What `/data` keeps in the clear, by design: a `plain` app's data, tapp-server's logs
+(`/data/log/tapp`, which carry no secrets), and anything an app bind-mounts from an absolute
+`/data/...` path rather than its own `./data`.
+
 ## Corruption
 
 Volumes are `cryptsetup luksFormat --type luks2` with no `--integrity` (`src/boot/volume.rs`),
