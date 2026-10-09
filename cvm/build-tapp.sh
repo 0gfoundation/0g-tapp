@@ -16,7 +16,7 @@ export DEBIAN_FRONTEND=noninteractive
 
 # ===== Tunables =====
 TAPP_SERVER_BIN="${TAPP_SERVER_BIN:-}"                              # path to a local tapp-server binary; empty -> download from URL
-TAPP_SERVER_URL="${TAPP_SERVER_URL:-https://github.com/0gfoundation/0g-tapp/releases/download/v0.8.0/tapp-server}"
+TAPP_SERVER_URL="${TAPP_SERVER_URL:-https://github.com/0gfoundation/0g-tapp/releases/download/v0.10.0/tapp-server}"
 BUILD_MODE="${BUILD_MODE:-canonical}"  # canonical (default): owner-agnostic image, one refval set for all owners.
                                        # custom: OWNER_ADDRESS baked in, per-owner initrd measurement + refval set.
 OWNER_ADDRESS="${OWNER_ADDRESS:-}"     # Required when BUILD_MODE=custom; ignored in canonical mode.
@@ -126,7 +126,7 @@ Wants=network.target
 # the RAM rootfs, which they would grow unbounded (issue #23). Fail loud without either.
 RequiresMountsFor=/var/lib/tapp/disk
 Requires=tapp-runtime-volume.service
-After=tapp-runtime-volume.service
+After=tapp-runtime-volume.service data.mount
 
 [Service]
 Type=simple
@@ -231,6 +231,17 @@ else
   DOCKER_PKGS="docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin"
 fi
 apt-get install -y libtdx-attest $DOCKER_PKGS
+# This image's disk layout needs tapp-server >= 0.10.0: an older one keeps app volumes under
+# /data/tapp, which here is the runtime volume -- every app would start empty after each reboot,
+# and an upgraded node's real volumes (now under /var/lib/tapp/disk) would be ignored. Checked
+# here, in the guest, where the binary is meant to run (the build host's libc may be older), once
+# its libtdx_attest is installed.
+tapp_server_version="$(/usr/local/bin/tapp-server --version 2>/dev/null | awk '{print $2}')"
+if [ -z "$tapp_server_version" ] || [ "$(printf '%s\n' 0.10.0 "$tapp_server_version" | sort -V | head -1)" != 0.10.0 ]; then
+  echo "ERROR: tapp-server ${tapp_server_version:-<unknown version>} is too old for this image: its disk layout needs >= 0.10.0" >&2
+  exit 1
+fi
+echo "tapp-server $tapp_server_version"
 mkdir -p /var/log/tapp
 systemctl enable docker tapp-server
 
@@ -309,7 +320,9 @@ containerd config default > /etc/containerd/config.toml
 sed -i "s|^root = .*|root = \"$CONTAINERD_ROOT\"|" /etc/containerd/config.toml
 mkdir -p /etc/systemd/system/docker.service.d /etc/systemd/system/containerd.service.d
 for unit in docker containerd; do
-  printf '%s\n' '[Unit]' 'Requires=tapp-runtime-volume.service' 'After=tapp-runtime-volume.service' \
+  # After data.mount too: the volume is mounted by the unit's script, and at shutdown that ordering
+  # is what stops docker before /data goes away.
+  printf '%s\n' '[Unit]' 'Requires=tapp-runtime-volume.service' 'After=tapp-runtime-volume.service data.mount' \
     > "/etc/systemd/system/$unit.service.d/10-runtime-volume.conf"
 done
 # fstab: the data disk at /var/lib/tapp/disk (NOT /data, which is the runtime volume). nofail so a
@@ -320,7 +333,9 @@ done
 # tapp-data-provision formats it, and the .device wait (which starts early in boot) must not expire
 # before then, or the mount fails on first boot. 60s >> the few seconds mkfs needs; it only ever
 # delays boot in the (misconfigured) no-data-disk case, where nofail then lets boot proceed anyway.
-grep -q 'LABEL=tapp-data' /etc/fstab || printf '%s\n' 'LABEL=tapp-data /var/lib/tapp/disk ext4 defaults,nofail,x-systemd.device-timeout=60s,x-systemd.requires=tapp-data-provision.service 0 2' >> /etc/fstab
+# Replaced, not skipped when present: a line from an older layout would mount the disk at /data.
+sed -i '/LABEL=tapp-data/d' /etc/fstab
+printf '%s\n' 'LABEL=tapp-data /var/lib/tapp/disk ext4 defaults,nofail,x-systemd.device-timeout=60s,x-systemd.requires=tapp-data-provision.service 0 2' >> /etc/fstab
 
 # Auto-provision the data disk on first boot with NO SSH. Find the single non-boot whole disk and:
 #   - blank (no filesystem signature)      -> mkfs.ext4 -L tapp-data     (fresh node)
@@ -472,8 +487,9 @@ systemctl enable tapp-data-grow.service || true
 # boot. It acts only when /var/lib/tapp/disk is the tapp-data disk and /data is not already a mount
 # (otherwise docker stays down), and touches nothing on the disk but its own file -- and, once, the
 # container storage older images left there in the clear (docker/, containerd/, sysbox/), which it
-# removes. Restarting the unit within a boot keeps the volume (docker is using it). Discards reach
-# the disk, so deleted images free its space.
+# removes. Run again within a boot, it keeps the volume (docker is using it) -- though a restart of
+# the unit also restarts docker and tapp-server, which require it. Discards reach the disk, so
+# deleted images free its space.
 cat > /usr/local/sbin/tapp-runtime-volume.sh <<'RTVSH'
 #!/bin/bash
 # Create this boot's runtime volume and mount it at /data (see build-tapp.sh).
@@ -486,9 +502,12 @@ say() {
   echo "tapp-runtime-volume: $*" >&2
   { echo "tapp-runtime-volume: $*" > /dev/console; } 2>/dev/null || true
 }
+# Docker and tapp-server require this unit, and a hardened node has no shell to read the journal
+# with: whatever stops it is said on the console (the cloud's serial log) as well.
+trap 'say "failed at line $LINENO: $BASH_COMMAND -- docker and tapp-server will NOT start"' ERR
 # Already created in this boot (the unit was restarted): docker is using it, keep it.
 if [ -e "/dev/mapper/$NAME" ]; then
-  mountpoint -q "$MNT" || mount -o discard "/dev/mapper/$NAME" "$MNT"
+  mountpoint -q "$MNT" || mount -o discard,noinit_itable "/dev/mapper/$NAME" "$MNT"
   exit 0
 fi
 # Only ever on the tapp data disk. Anything else mounted there is left alone, and docker
@@ -527,9 +546,11 @@ loop="$(losetup --find --show "$IMG")"
 # kernel, in TEE memory: no header and nothing stored, so nothing outlives this boot.
 cryptsetup open --type plain --cipher aes-xts-plain64 --key-size 512 \
   --key-file /dev/urandom --allow-discards "$loop" "$NAME"
-# No journal: after a crash the node reboots, and a reboot re-creates the volume anyway.
-mkfs.ext4 -q -O ^has_journal -E nodiscard "/dev/mapper/$NAME"
-mount -o discard "/dev/mapper/$NAME" "$MNT"
+# No journal: after a crash the node reboots, and a reboot re-creates the volume anyway. And no
+# zeroing of the inode tables (noinit_itable): through dm-crypt those zeros would become ~1/64 of
+# the disk in real, encrypted blocks at every boot, only to protect an fsck this volume never gets.
+mkfs.ext4 -q -O ^has_journal -E nodiscard,lazy_itable_init=1 "/dev/mapper/$NAME"
+mount -o discard,noinit_itable "/dev/mapper/$NAME" "$MNT"
 mkdir -p "$MNT/docker" "$MNT/containerd" "$MNT/sysbox"
 echo "tapp-runtime-volume: $MNT ready on $loop (per-boot key)"
 RTVSH
@@ -660,7 +681,7 @@ if [ "$ENABLE_SYSBOX" = 1 ]; then
 # unconditional. Requires Docker <=27.x (pinned above) -- sysbox-runc rejects the Linux time
 # namespace that Docker 28+/29+ emits in the OCI spec.
 export DEBIAN_FRONTEND=noninteractive
-# fuse3 (not fuse/fuse2): sysbox-fs 0.7.0 uses libfuse3 and needs `fusermount3` to mount its
+# fuse3 (not fuse/fuse2): sysbox-fs 0.7.0 uses libfuse3 and needs fusermount3 to mount its
 # per-container FUSE fs, else container launch fails with "fusermount3: not found / FuseServer InitWait".
 apt-get install -y jq rsync fuse3 || true
 wget -qO /tmp/sysbox-ce.deb "$SYSBOX_DEB_URL"
@@ -675,7 +696,7 @@ sbx_unit="\$(ls /lib/systemd/system/sysbox-mgr.service /usr/lib/systemd/system/s
 if [ -n "\$sbx_unit" ]; then
   mkdir -p /etc/systemd/system/sysbox-mgr.service.d
   sbx_exec="\$(sed -n 's/^ExecStart=//p' "\$sbx_unit" | head -1)"
-  printf '%s\n' '[Unit]' 'Requires=tapp-runtime-volume.service' 'After=tapp-runtime-volume.service' \
+  printf '%s\n' '[Unit]' 'Requires=tapp-runtime-volume.service' 'After=tapp-runtime-volume.service data.mount' \
     '[Service]' 'ExecStart=' "ExecStart=\$sbx_exec --data-root /data/sysbox" \
     > /etc/systemd/system/sysbox-mgr.service.d/10-data-root.conf
 fi

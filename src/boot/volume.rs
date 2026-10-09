@@ -1,7 +1,7 @@
 //! Per-app encrypted data volumes.
 //!
 //! Each app gets a LUKS2 volume backed by a sparse image file on the persistent
-//! /data disk, mounted at `<app_dir>/data` before its containers start. The
+//! data disk ([`DATA_DISK`]), mounted at `<app_dir>/data` before its containers start. The
 //! passphrase is derived by the KMS cluster under the `fde` material namespace,
 //! so it is never stored anywhere: any registered node of the app re-derives the
 //! same key on demand, which is what lets data survive reboots (where the RAM
@@ -26,8 +26,8 @@ use tracing::info;
 pub const FDE_MATERIAL: &str = "666465";
 
 /// The node's data disk (LABEL=tapp-data), mounted here and used only by tapp-server: what
-/// must persist is on it — the apps' volumes and plain data, nothing else (apps cannot mount
-/// it writable, see compose_lint::data_disk_exposures). It is deliberately NOT `/data`: that
+/// must persist is on it — the apps' volumes and plain data, nothing else (start-app refuses a
+/// compose that mounts it writable, see compose_lint::data_disk_exposures). It is deliberately NOT `/data`: that
 /// path is the runtime volume, encrypted with a key made at every boot and empty after every
 /// boot, where docker keeps its state, tapp-server writes its logs, and anything an app writes
 /// to an absolute `/data/...` path lands (cvm/build-tapp.sh, tapp-runtime-volume).
@@ -64,15 +64,15 @@ fn scratch_mapper_name(app_id: &str) -> String {
 /// registered on-chain and measured like everything else about the app.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DataMode {
-    /// LUKS volume on /data, key derived by the KMS. Persistent + secret. Default.
+    /// LUKS volume on the data disk, key derived by the KMS. Persistent + secret. Default.
     Encrypted,
-    /// Plain directory on /data. Persistent, readable by whoever holds the disk —
+    /// Plain directory on the data disk. Persistent, readable by whoever holds the disk —
     /// for data that protects itself (a TEE-sealed share) or is public anyway.
     Plain,
     /// Plain directory on the RAM rootfs. Secret (TEE memory) but gone on reboot
     /// and counted against RAM.
     Ram,
-    /// LUKS volume on /data with a per-boot key. Secret and disk-sized, gone on
+    /// LUKS volume on the data disk with a per-boot key. Secret and disk-sized, gone on
     /// reboot (the key evaporates with /run; the volume is then recreated).
     Scratch,
 }
@@ -338,7 +338,7 @@ pub fn scratch_key_from_signer(signer_private_key: &[u8]) -> Vec<u8> {
     h.finalize().to_vec()
 }
 
-/// Open (creating if necessary) the app's scratch volume: LUKS on /data, keyed
+/// Open (creating if necessary) the app's scratch volume: LUKS on the data disk, keyed
 /// per boot. A volume this key cannot open is the expected corpse of a previous
 /// boot and is wiped and recreated — but ONLY on a proven key mismatch. Every
 /// other failure (mount EBUSY, ENOSPC, tooling errors) propagates and stays
@@ -610,8 +610,9 @@ mod tests {
     /// Real end-to-end: create → format → open → mkfs → mount, write a file,
     /// tear everything down (simulating a reboot), then ensure again with the
     /// same key and read the file back. Needs root, cryptsetup and loop
-    /// support, so it is ignored by default and run explicitly in a privileged
-    /// container:
+    /// support, and a filesystem mounted at DATA_DISK (volumes are refused
+    /// anywhere else — e.g. `mount -t tmpfs tmpfs /var/lib/tapp/disk`), so it is
+    /// ignored by default and run explicitly in a privileged container:
     ///
     ///   cargo test --lib -- --ignored boot::volume
     #[tokio::test]

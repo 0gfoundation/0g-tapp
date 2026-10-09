@@ -193,6 +193,13 @@ jobs:
               FAIL=1
             fi
           fi
+          # The image's disk layout (data disk at /var/lib/tapp/disk, /data the per-boot runtime
+          # volume) needs tapp-server >= 0.10.0; an older one would keep app volumes on /data and
+          # every app would start empty after each reboot. build-tapp.sh checks the binary too.
+          if [ "$(printf '%s\n' 0.10.0 "${VERSION#v}" | sort -V | head -1)" != 0.10.0 ]; then
+            echo "error: this image needs tapp-server >= v0.10.0 (disk layout); got $VERSION." >&2
+            FAIL=1
+          fi
           # image_rev keys the image identity (name / refval path / policy id) — a non-numeric or
           # zero value would silently produce a bogus identity, so reject it before building.
           if ! printf '%s' "$IMAGE_REV" | grep -qE '^[1-9][0-9]*$'; then

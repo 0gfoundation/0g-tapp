@@ -25,7 +25,9 @@ read it nor plant chosen content in it — so an image layer cannot be altered u
 digest — and nothing a previous boot left there, containers included, comes back. Corruption is as
 below: possible, and unreported.
 
-The data disk keeps the apps' declared data and nothing else — apps may not mount it writable.
+The data disk keeps the apps' declared data and nothing else. `start-app` refuses a compose that
+mounts it writable — a guard against mistakes, not a boundary: a privileged container can reach any
+disk.
 The only thing on it in the clear is a `plain` app's data, which that app chose.
 
 ## Corruption

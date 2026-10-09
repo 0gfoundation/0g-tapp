@@ -142,8 +142,8 @@ Owner-only, and **every call is extended into the runtime measurement** carrying
 
 ### The node has no data disk (apps will not start)
 
-The data disk (mounted at `/var/lib/tapp/disk`, server ≥0.9.1) holds the app volumes and nothing
-else (apps may not mount it writable), and `tapp-server` does not start without it — the rootfs is a RAM overlay, so anything written there is
+The data disk (mounted at `/var/lib/tapp/disk`, server ≥0.10.0) holds the app volumes and nothing
+else (`start-app` refuses a compose mounting it writable — a guard against mistakes; a privileged container can still reach it), and `tapp-server` does not start without it — the rootfs is a RAM overlay, so anything written there is
 lost at reboot. `/data` is not the data disk: it is the runtime volume (container storage, tapp-server's
 logs, absolute `/data/...` binds), encrypted per boot and **empty after every reboot** — so after a
 reboot there are no logs of the previous boot on the node. A node
@@ -293,13 +293,13 @@ Each app gets its **own encrypted volume** (LUKS; key derived per-app by the KMS
 | named volume (`pgdata:`, plainly declared) | **auto-redirected into the encrypted volume** | ✅ | ✅ |
 | `./data/...` bind mount | encrypted volume (explicit path control) | ✅ | ✅ |
 | other `./xxx` relative paths | RAM rootfs — fine for configs, **data-loss trap for state** | – (never on disk) | ❌ |
-| absolute paths (`/data/...`) | runtime volume (server ≥0.9.1; plaintext disk before) | ✅ per-boot key | ❌ emptied every boot |
+| absolute paths (`/data/...`) | runtime volume (server ≥0.10.0; plaintext disk before) | ✅ per-boot key | ❌ emptied every boot |
 | anonymous / `external:` / custom-driver volumes, the container's own filesystem | docker's storage on the runtime volume — NOT redirected | ✅ per-boot key | ❌ |
 
 - The standard internet compose (`pgdata:/var/lib/postgresql/data` + top-level `volumes: pgdata:`) is encrypted **with zero changes** — the server generates a `docker-compose.override.yml` redirecting it. Don't upload your own override file, it disables the redirect (loudly).
 - `start-app` prints **⚠ compose warnings** from the server's lint (data placement, `docker.sock`, `privileged`). The app starts anyway — but relay these to the user, they're the only notice.
 - **KMS gate**: on a KMS-configured server, start **fails** if the volume key can't be fetched — no silent plaintext downgrade. The app must be registered on-chain first (`--register-onchain` handles ordering), and the server must trust a verifier for the KMS's self-signed TLS (`update-trust-anchors --scan-url --scan-pubkey`, or `claim-config` with those flags). No KMS configured at all → plaintext dir + warning.
-- `stop-app` leaves the volume open (key stays in the kernel); a CVM reboot locks everything; data survives because a registered node re-derives the same key. Volume file: `/var/lib/tapp/disk/tapp/volumes/<app_id>.img` (`/data/tapp/volumes/` before 0.9.1) (sparse — apparent size = whole disk, real usage = real writes).
+- `stop-app` leaves the volume open (key stays in the kernel); a CVM reboot locks everything; data survives because a registered node re-derives the same key. Volume file: `/var/lib/tapp/disk/tapp/volumes/<app_id>.img` (`/data/tapp/volumes/` before 0.10.0) (sparse — apparent size = whole disk, real usage = real writes).
 - Migration of plaintext data into the volume: `stop-app` → copy into `<app_dir>/data/` (volume stays mounted) → `start-app`.
 - **Per-app data mode** (server ≥0.8.0): compose top-level `x-tapp: {data: encrypted|plain|ram|scratch}` (absent = encrypted). `plain` = persistent plaintext dir on the data disk — for self-protecting data, canonically the KMS's own sealed share (breaks the KMS↔FDE bootstrap circle). `ram` = TEE-secret, gone on reboot, eats RAM. `scratch` = LUKS keyed from the app signer per boot — disk-sized secret cache, auto-wiped+recreated when the key rotates. The declaration rides the compose → hashed on-chain, third-party visible. Switching modes never migrates data (old volume/dir left in place, app starts empty). Typo → start-app refused with `x-tapp.data must be one of…`.
 
