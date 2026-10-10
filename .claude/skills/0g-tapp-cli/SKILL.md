@@ -1,7 +1,7 @@
 ---
 name: 0g-tapp-cli
 description: Use this skill when the user wants to deploy, manage, or troubleshoot applications on a 0G Tapp (Trusted Application Platform) server using tapp-cli. Covers start/stop apps, on-chain registration, registry login, check task status, view logs, and manage docker compose deployments across multiple remote TEE servers.
-version: 1.21.0
+version: 1.22.0
 author: 0G Labs
 tags: [0g, tapp, tee, docker, deployment, cli, onchain]
 ---
@@ -24,7 +24,7 @@ Deploy and manage containerized applications on 0G Tapp TEE servers using `tapp-
   - **Getting a trustworthy pin needs no out-of-band channel** (server ≥0.8.0): the node has a **common signer** (generated per boot; every app signer derives from it), the :50052 TLS key derives from it too, and `get-evidence` **without --app-id** returns the node's own evidence whose `runtime_data.tls_public_key` is that key's SPKI sha256 — Intel-signed, so it survives a hostile channel. Flow: `get-evidence` (any channel) → verify the quote → `--tls-pin 0x<tls_public_key>` for all management calls. A MITM can relay evidence but cannot forge the key inside it, and its own cert then fails the pin.
   - Two limits of that bootstrap: (1) it proves "a genuine TDX node with this measurement", **not** "the node at this address" — an attacker running their own genuine node could redirect you to it; it defends interception, not redirection (on-chain anchoring of the common signer is the follow-up). (2) The pin is **boot-scoped**: a node reboot rotates the common signer and the TLS key with it, so a stale pin fails closed — re-fetch evidence after any reboot.
   - tapp-server ≥0.7.1 defaults `bind_address` to **loopback** when the config omits it. CVM images bake an explicit `0.0.0.0:50051` (teeUrl/evidence fetching and remote claim need it), so image nodes are unaffected — the loopback default bites hand-rolled configs. "Connection refused from outside, works on the host" means the config omits `bind_address`.
-- **Auth**: private key via `-k` flag or `TAPP_PRIVATE_KEY` env var — or, for a key held elsewhere (Ledger, Fordefi/MPC, someone else's hardware wallet), `--external-signer 0x<address>` / `TAPP_EXTERNAL_SIGNER` (tapp-cli ≥ 0.10.0), plus `--ledger` for a Ledger on this machine. **Before any owner-level job, follow "Signing with a key held elsewhere" below** — it starts by asking the owner where the key is. Read-only commands (`get-tapp-info`, `get-service-status`, `get-app-info`, `get-app-key`, `get-evidence`, `list-apps`, `verify-app` direct mode) need no signer.
+- **Auth**: private key via `-k` flag or `TAPP_PRIVATE_KEY` env var — or, for a key held elsewhere (Ledger, Fordefi/MPC, someone else's hardware wallet), `--external-signer 0x<address>` / `TAPP_EXTERNAL_SIGNER` (tapp-cli ≥ 0.10.0), plus `--ledger` for a Ledger on this machine or `--fordefi` for a Fordefi vault reached through its API. **Before any owner-level job, follow "Signing with a key held elsewhere" below** — it starts by asking the owner where the key is. Read-only commands (`get-tapp-info`, `get-service-status`, `get-app-info`, `get-app-key`, `get-evidence`, `list-apps`, `verify-app` direct mode) need no signer.
 - **TappRegistry (testnet)**: proxy `0x2Ce80374318B1d7Fb3345724457a182E0ad165c9`, RPC `https://evmrpc-testnet.0g.ai`, chainId `16602`. See `contract/CONTRACTS.md`.
 - **TappRegistry (mainnet)**: proxy `0x54874F536301c993922Dd95097e3902e7FBfe612`, RPC `https://evmrpc.0g.ai`, chainId `16661`. Min stake **10 OG**, withdraw lock 7 days. Upgrades go through a 1-day TimelockController (`0xD070792b1dB64F858ACE3E5443f2d21c0edE0BAc`) — see `contract/CONTRACTS.md`.
   - An older deployment `0x95a0BF4148b30F6F8D86870534c51df46Da5511c` is **superseded** — no `version()`, and `getNode` returns 3 fields instead of 5. Some long-lived apps (testnet sandbox provider / attestor) are still registered there, so you may still have to query it; just don't put anything new on it. Tell them apart with `cast call <proxy> "version()(string)"` — `"0.1.0"` = current, revert = old.
@@ -150,7 +150,7 @@ A node's owner is whoever signed its first `claim-config` after boot. Settle how
 
 **1. Ask the owner:**
 1. The owner address.
-2. Where its key is: **(a)** a key the operator may use on this machine; **(b)** a **Ledger plugged into this machine**; **(c)** elsewhere — Fordefi/MPC, or a hardware wallet (Ledger, Trezor, …) held by someone else (which one?).
+2. Where its key is: **(a)** a key the operator may use on this machine; **(b)** a **Ledger plugged into this machine**; **(c)** elsewhere — Fordefi/MPC, or a hardware wallet (Ledger, Trezor, …) held by someone else (which one?); **(d)** a **Fordefi vault this machine may drive through the API** — an API user's access token and P-256 key are here and the organisation's API Signer is running.
 3. For (c): the channel for sending each line to sign and getting the signature back, and whether the holder is available now — each signature must come back within 10 minutes while the command waits.
 
 | Answer | Setup | Each signature |
@@ -158,8 +158,9 @@ A node's owner is whoever signed its first `claim-config` after boot. Settle how
 | (a) | `-k` / `TAPP_PRIVATE_KEY` | automatic |
 | (b) | `--external-signer 0x<owner>` (or `TAPP_EXTERNAL_SIGNER`) **and** `--ledger` on every command — it has no env var | approve on the device |
 | (c) | `--external-signer 0x<owner>` / `TAPP_EXTERNAL_SIGNER` | round trip with the holder |
+| (d) | `--external-signer 0x<owner>` **and** `--fordefi` on every command, with `FORDEFI_API_USER_TOKEN`, `FORDEFI_PRIVATE_KEY_PATH`, `FORDEFI_EVM_VAULT_ID` set | automatic once Fordefi's policy approves |
 
-With both `TAPP_PRIVATE_KEY` and `TAPP_EXTERNAL_SIGNER` set, the external signer is used. `--ledger` without an address is refused.
+With both `TAPP_PRIVATE_KEY` and `TAPP_EXTERNAL_SIGNER` set, the external signer is used. `--ledger` or `--fordefi` without an address is refused, and the two cannot be combined.
 
 **2. Tell the holder what is coming.** Each run of an owner-level command is one signature, named in the prompt by its RPC method. Before starting, send the holder the methods in order so anything else can be refused — e.g. claim + deploy: `ClaimConfig`, `DockerLogin`, `StartApp`, `GetAppContainerStatus`, `GetAppLogs`.
 
@@ -183,6 +184,13 @@ On-chain commands (`register-onchain`, `update-onchain`, `start-app --register-o
 - The holder checks the method is the next one on the list — the hash and timestamp cannot be checked by eye — and signs the line as a text message (personal_sign / EIP-191) with the owner account: Fordefi message signing; `cast wallet sign --ledger '<line>'`; `cast wallet sign --trezor '<line>'`. For a hardware wallet pick the account with `--mnemonic-index <n>` and check it first: `cast wallet address --ledger --mnemonic-index <n>` (or `--trezor`) must print the owner address.
 - Paste the returned `0x…` (65 bytes). A signature by another account, or over text changed on the way (extra space or line break), is refused with the address it came from — the holder signs again. One that arrives after the deadline is refused and the CLI prints a new line for the same request — send that; no re-run.
 - On-chain: the CLI prints the transaction (chain, from, to, value in wei and OG, data, registry function). The holder sends it from the owner address and returns the hash; the CLI waits for it to be mined and checks it is exactly that transaction and that it succeeded.
+
+**(d) Fordefi through its API.**
+- Settings are environment variables, named as 0g-fordefi-signer names them, so its `.env` can be exported as it is: `FORDEFI_API_USER_TOKEN` (the API user's access token), `FORDEFI_PRIVATE_KEY_PATH` (the API user's P-256 private key, PEM — the one whose public key was registered in the API Signer), `FORDEFI_EVM_VAULT_ID` (the vault whose address is the owner); optional `FORDEFI_API_HOST` (default `api.fordefi.com`). The chain comes from the RPC; 0G mainnet is built into Fordefi, any other chain (testnet) must be added to the Fordefi organisation as a custom chain first, or the transaction is refused saying so. tapp-cli does not read `.env` files. A missing or unreadable setting stops the command before anything is signed.
+- Each signature: the CLI prints `signing in Fordefi: <Method>`, the signer and vault, a deadline and the text, creates a Fordefi transaction (note `tapp-cli: <Method>`) and follows its state. It goes on once the vault has signed and the signature recovers to the owner; a signature from another vault is refused, naming `FORDEFI_EVM_VAULT_ID`.
+- `waiting for approval` is Fordefi's policy: approvers act in Fordefi; the 10-minute deadline still applies, after which the CLI aborts that Fordefi transaction and creates a new one for the same request. Staying at `approved` means the API Signer has not signed — check that it is running. `aborted` / `error_signing` / `cannot create transaction` end the command; run it again once fixed.
+- On-chain: gas is estimated here, Fordefi signs without broadcasting (`push_mode: manual`), and the CLI checks the signed transaction (signer, chain, contract, data, value) before broadcasting it and waiting for it to be mined. A transaction not signed within 30 minutes is aborted in Fordefi.
+- Whoever holds the token and the key file can have the vault sign anything Fordefi's policy lets through: keep them off shared machines, and do not set a policy that auto-approves everything for this API user.
 
 ### The node has no data disk (apps will not start)
 
