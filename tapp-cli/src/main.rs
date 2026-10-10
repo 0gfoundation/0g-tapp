@@ -1415,8 +1415,9 @@ async fn send_start_app(
         }
         eprintln!(
             "  To persist data encrypted: use a named volume (auto-redirected into the\n\
-             \x20 app's encrypted volume) or a bind mount under ./data/. Other relative\n\
-             \x20 paths live in RAM and vanish on reboot; absolute paths are plaintext.\n"
+             \x20 app's encrypted volume) or a bind mount under ./data/. Everything else\n\
+             \x20 is gone after a reboot: other relative paths live in RAM, absolute /data\n\
+             \x20 paths on a volume re-created every boot (tapp-server >= 0.10.0).\n"
         );
     }
     Ok(result.task_id)

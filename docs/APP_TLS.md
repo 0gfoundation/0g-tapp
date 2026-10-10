@@ -92,8 +92,9 @@ Nothing in the recipe depends on where the image comes from.
 ```
 
 `/run` is tmpfs, so the key stays in memory the TEE protects. A Docker named volume would put
-it in `/data`, which is plain unencrypted ext4 — readable by anyone who can snapshot the disk,
-and the end of the platform's guarantee that an application's private key cannot be extracted.
+it on disk, in the app's persistent volume, where it outlives the boot it belongs to — and under
+`data: plain` is readable by anyone who can snapshot the disk, the end of the platform's guarantee
+that an application's private key cannot be extracted.
 A tmpfs-backed named volume (`driver_opts: {type: tmpfs}`) is not a substitute: each container
 gets its own, so the application finds an empty directory.
 

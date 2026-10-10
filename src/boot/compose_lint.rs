@@ -1,11 +1,14 @@
 //! Compose-file checks for data placement and container privilege.
 //!
-//! The encrypted per-app volume protects what lands under `./data` — which,
-//! since compose_override.rs redirects them, includes plainly-declared named
-//! volumes. What this lint flags is everything that still escapes: bind mounts
-//! outside the app directory, volumes the user configured to live elsewhere
-//! (`external`, a driver), anonymous volumes, plus the two privilege escapes
-//! (docker.sock, privileged) that hand the app the whole machine.
+//! The per-app volume holds what lands under `./data` — which, since
+//! compose_override.rs redirects them, includes plainly-declared named volumes —
+//! and it is the only place an app's data persists. Everything else a container
+//! writes is in docker's storage or under an absolute `/data/...` path, both on the
+//! runtime volume: encrypted, and empty after every reboot. What this lint flags is
+//! what escapes the app's volume: bind mounts outside the app directory, volumes the
+//! user configured to live elsewhere (`external`, a driver), anonymous volumes, plus
+//! the two privilege escapes (docker.sock, privileged) that hand the app the whole
+//! machine.
 //!
 //! Warning-only for now: rejection starts as a migration signal, not a gate.
 //! Tightening to refusal is a one-line change at the call site.
@@ -67,6 +70,49 @@ pub fn state_dir_exposures(
     state_dir: &std::path::Path,
     socket: Option<&std::path::Path>,
 ) -> Vec<String> {
+    let state_dir = resolve(state_dir);
+    writable_mounts_reaching(compose_content, &state_dir, socket)
+        .into_iter()
+        .map(|(service, source)| {
+            format!(
+                "service '{service}': writable mount of '{}' reaches tapp-server's \
+                 own state in {} (claimed owner, trust anchors) — mount only the socket, \
+                 or mount read-only",
+                source.display(),
+                state_dir.display()
+            )
+        })
+        .collect()
+}
+
+/// Writable bind mounts that reach the node's data disk. What persists there is meant to be
+/// exactly the apps' declared data — each app's volume or plain directory, created by
+/// tapp-server — so an app writing to the disk directly would keep data no declaration
+/// covers, in the clear. Refused like the state directory: the disk itself, anything above
+/// it, or anything inside it. Read-only mounts are fine.
+pub fn data_disk_exposures(compose_content: &str, data_disk: &std::path::Path) -> Vec<String> {
+    let data_disk = resolve(data_disk);
+    writable_mounts_reaching(compose_content, &data_disk, None)
+        .into_iter()
+        .map(|(service, source)| {
+            format!(
+                "service '{service}': writable mount of '{}' reaches the node's data disk \
+                 ({}), where only the apps' declared data may persist — keep data under \
+                 './data/...'",
+                source.display(),
+                data_disk.display()
+            )
+        })
+        .collect()
+}
+
+/// (service, host path) of every writable bind mount whose source is `dir`, above it, or
+/// inside it — except `allowed`, a path inside it apps are meant to mount.
+fn writable_mounts_reaching(
+    compose_content: &str,
+    dir: &std::path::Path,
+    allowed: Option<&std::path::Path>,
+) -> Vec<(String, std::path::PathBuf)> {
     let doc: serde_yaml::Value = match serde_yaml::from_str(compose_content) {
         Ok(v) => v,
         Err(_) => return Vec::new(),
@@ -74,9 +120,8 @@ pub fn state_dir_exposures(
     let Some(services) = doc.get("services").and_then(|s| s.as_mapping()) else {
         return Vec::new();
     };
-    let state_dir = resolve(state_dir);
-    let socket = socket.map(resolve);
-    let mut findings = Vec::new();
+    let allowed = allowed.map(resolve);
+    let mut found = Vec::new();
     for (name, service) in services {
         let service_name = name.as_str().unwrap_or("?");
         let Some(volumes) = service.get("volumes").and_then(|v| v.as_sequence()) else {
@@ -88,20 +133,14 @@ pub fn state_dir_exposures(
                 continue;
             }
             let source = resolve(std::path::Path::new(source));
-            let covers = state_dir.starts_with(&source);
-            let inside = source.starts_with(&state_dir) && Some(&source) != socket.as_ref();
+            let covers = dir.starts_with(&source);
+            let inside = source.starts_with(dir) && Some(&source) != allowed.as_ref();
             if covers || inside {
-                findings.push(format!(
-                    "service '{service_name}': writable mount of '{}' reaches tapp-server's \
-                     own state in {} (claimed owner, trust anchors) — mount only the socket, \
-                     or mount read-only",
-                    source.display(),
-                    state_dir.display()
-                ));
+                found.push((service_name.to_string(), source));
             }
         }
     }
-    findings
+    found
 }
 
 /// The host path a bind mount names and whether it is read-only, in either syntax.
@@ -169,8 +208,8 @@ fn check_volume(service: &str, vol: &serde_yaml::Value, redirected: &[String]) -
         Some(s) if entry.contains(':') => s,
         _ => {
             return Some(format!(
-                "service '{service}': anonymous volume '{entry}' stores data in \
-                 docker's shared data-root, outside the app's encrypted volume"
+                "service '{service}': anonymous volume '{entry}' lives in docker's own \
+                 storage, outside the app's volume — it is gone after a reboot"
             ))
         }
     };
@@ -196,8 +235,8 @@ fn named_volume_finding(service: &str, source: &str, redirected: &[String]) -> O
     }
     Some(format!(
         "service '{service}': named volume '{source}' is configured to live outside \
-         the app's encrypted volume (external / custom driver / undeclared) — its \
-         data is NOT encrypted at rest"
+         the app's volume (external / custom driver / undeclared) — it is NOT kept \
+         with the app's data, and in docker's own storage it is gone after a reboot"
     ))
 }
 
@@ -210,8 +249,9 @@ fn check_bind_source(service: &str, source: &str) -> Option<String> {
     }
     if source.starts_with('/') || source.starts_with('~') {
         return Some(format!(
-            "service '{service}': absolute bind mount '{source}' writes outside the \
-             app's encrypted volume — keep app data under './data/...'"
+            "service '{service}': absolute bind mount '{source}' is outside the app's \
+             volume — under /data it is encrypted but emptied at every reboot; keep data \
+             that must persist under './data/...'"
         ));
     }
     // Relative: fine as long as it cannot climb out of the app directory.
@@ -233,6 +273,23 @@ mod state_dir_tests {
     fn check(volume: &str) -> Vec<String> {
         let compose = format!("services:\n  app:\n    image: x\n    volumes:\n      - {volume}\n");
         state_dir_exposures(&compose, Path::new("/run/tapp"), Some(Path::new("/run/tapp/tapp.sock")))
+    }
+
+    /// The data disk is the apps' declared data only: an app cannot write there directly,
+    /// nor through a mount above it. /data is the runtime volume, not the disk, and is fine.
+    #[test]
+    fn a_writable_mount_reaching_the_data_disk_is_refused() {
+        let disk = Path::new("/var/lib/tapp/disk");
+        let with = |volume: &str| {
+            let compose = format!("services:\n  app:\n    image: x\n    volumes:\n      - {volume}\n");
+            data_disk_exposures(&compose, disk)
+        };
+        for v in ["/var/lib/tapp/disk/logs:/logs", "/var/lib/tapp/disk:/disk", "/var/lib/tapp:/t", "/var/lib:/l", "/:/host"] {
+            assert_eq!(with(v).len(), 1, "{v}");
+        }
+        for v in ["/var/lib/tapp/disk:/disk:ro", "./data:/data", "/data/kms:/var/lib/kms", "/var/lib/tapp/apps-x:/x"] {
+            assert!(with(v).is_empty(), "{v}");
+        }
     }
 
     #[test]
@@ -295,7 +352,7 @@ mod tests {
             "services:\n  db:\n    volumes:\n      - pgdata:/var/lib/postgresql/data\nvolumes:\n  pgdata:\n    external: true\n",
         );
         assert_eq!(external.len(), 1);
-        assert!(external[0].contains("NOT encrypted"));
+        assert!(external[0].contains("NOT kept"));
 
         // Undeclared: compose refuses it anyway, but the reason shows here too.
         let undeclared =

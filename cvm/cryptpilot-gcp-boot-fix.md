@@ -449,6 +449,8 @@ cryptpilot-fde show-reference-value --disk gcp-tapp.qcow2 --hash-algo sha384
 
 ## 13. Persistent `/data` disk (container storage off the RAM rootfs) + Sysbox
 
+> **Layout since tapp-server 0.10.0** (see [cvm/README](README.md#data-disk-and-runtime-volume--always-configured)): the data disk is mounted at `/var/lib/tapp/disk` and holds only the apps' declared data; `/data` is the **runtime volume** — a per-boot encrypted file on that disk — holding container storage (`/data/docker`, `/data/containerd`, `/data/sysbox`), and its mount unit is `var-lib-tapp-disk.mount`, not `data.mount`. The gotchas below still apply, read with those paths.
+
 The rootfs writable overlay is `rw_overlay = "ram"` (zram) — **anything written to `/` at runtime lives in RAM and is lost on reboot**, and is bounded by instance memory. So all persistent container state must live on a separate **`/data`** disk. `build-tapp.sh` bakes this in **unconditionally** (not tied to `ENABLE_SYSBOX`); see the cvm README for the deploy model. The non-obvious gotchas that cost real debugging:
 
 - **fstab `/data` MUST use `nofail`.** A plain `LABEL=tapp-data /data ext4 defaults 0 2` will, when the data disk is missing or not yet labelled, fail `local-fs.target` → the whole system drops into **emergency mode → no network, no SSH** (verified: a fresh instance with a blank data disk was unreachable; serial console showed `Timed out waiting for device .../tapp-data` → `emergency.target`). Use `defaults,nofail,x-systemd.device-timeout=60s,x-systemd.requires=tapp-data-provision.service`. With `nofail`, a missing `/data` only makes docker/containerd fail-loud (`RequiresMountsFor=/data`), the OS still boots and is reachable.

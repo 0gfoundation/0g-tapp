@@ -10,7 +10,7 @@
 # Differences from their examples, both deliberate:
 #   * disk boot, not -kernel/-initrd direct boot: this image carries its own UEFI/UKI on its
 #     ESP and cryptpilot assembles the rootfs in the initrd stage, so it must boot itself.
-#   * a SECOND disk for /data. The image's tapp-data-provision.service formats and labels
+#   * a SECOND disk, the data disk. The image's tapp-data-provision.service formats and labels
 #     "the single non-boot disk", and refuses to guess with 0 or >1 candidates -- so attach
 #     exactly one, and never a seed ISO as a disk (a CD-ROM is fine, it shows up as sr0).
 #

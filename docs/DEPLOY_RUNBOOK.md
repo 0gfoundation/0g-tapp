@@ -67,7 +67,7 @@ PROVIDER_KEY=0x<owner-key> go run ./cmd/provider register --app-id <appId> --url
 - **Private-registry temporary tokens are short-lived**: they expire soon after docker-login; if an image pull hits `unauthorized`, just log in again.
 - **Some cloud hosts have no docker DNS**: `docker.io` fails to resolve and public images can't be pulled; configure docker DNS on the host (`"dns"` in `/etc/docker/daemon.json`).
 - **FDE (≥0.7.0): `fde_volume_key - KMS refused the volume key` refuses to start**: a node configured with KMS must obtain the volume key before starting an app. Three possible causes — the app is not yet registered on-chain to this node (use `--register-onchain`, which handles the ordering); the KMS trust anchors are not configured (`update-trust-anchors --scan-url --scan-pubkey`, or provide them together at claim-config time); or the KMS cluster is genuinely down. There is **no** silent fallback to plaintext startup — that is by design.
-- **FDE: where the data lands depends on how the compose spells it**: named volumes go into the encrypted volume automatically (zero changes); `./data/` goes in explicitly; other `./` relative paths live in RAM and are lost on restart; absolute paths are plaintext (start-app prints a warning). See README "Where app data lives".
+- **FDE: where the data lands depends on how the compose spells it**: named volumes go into the encrypted volume automatically (zero changes); `./data/` goes in explicitly; other `./` relative paths live in RAM and are lost on restart; absolute `/data/...` paths are on the runtime volume — encrypted, but emptied at every reboot (start-app prints a warning). See README "Where app data lives".
 
 ---
 
