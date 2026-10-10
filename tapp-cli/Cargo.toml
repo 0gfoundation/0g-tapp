@@ -1,6 +1,6 @@
 [package]
 name = "tapp-cli"
-version = "0.9.1"
+version = "0.10.0"
 edition.workspace = true
 description = "Standalone CLI for TAPP gRPC server and on-chain operations"
 license.workspace = true
@@ -45,3 +45,11 @@ thiserror = "1.0"
 
 [dev-dependencies]
 tempfile = "3.23.0"
+
+[features]
+# Ledger support for --external-signer (--ledger). On by default on macOS, below; elsewhere
+# opt in with --features ledger (Linux: libusb; Ledger's udev rules for non-root access).
+ledger = ["tapp-common/ledger"]
+
+[target.'cfg(target_os = "macos")'.dependencies]
+tapp-common = { path = "../tapp-common", features = ["ledger"] }

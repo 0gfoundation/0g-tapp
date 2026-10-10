@@ -1,7 +1,7 @@
 ---
 name: 0g-tapp-cli
 description: Use this skill when the user wants to deploy, manage, or troubleshoot applications on a 0G Tapp (Trusted Application Platform) server using tapp-cli. Covers start/stop apps, on-chain registration, registry login, check task status, view logs, and manage docker compose deployments across multiple remote TEE servers.
-version: 1.21.0
+version: 1.22.0
 author: 0G Labs
 tags: [0g, tapp, tee, docker, deployment, cli, onchain]
 ---
@@ -13,6 +13,10 @@ Deploy and manage containerized applications on 0G Tapp TEE servers using `tapp-
 ## Environment
 
 - **tapp-cli binary**: `/usr/local/bin/tapp-cli`
+- **Getting tapp-cli**: check `tapp-cli --version` first — a CVM-era copy in `/usr/local/bin` can be far behind.
+  - Linux: the release binary, checked against the release's sums:
+    `V=v<x.y.z>; U=https://github.com/0gfoundation/0g-tapp/releases/download/$V; curl -fsSL -O "$U/tapp-cli" -O "$U/SHA256SUMS" && grep ' tapp-cli$' SHA256SUMS | sha256sum -c - && chmod +x tapp-cli`
+  - macOS, or Linux with Ledger support: build the CLI alone — `cargo build --release -p tapp-cli` (building the whole workspace fails on tapp-server off Linux); Linux adds `--features ledger`.
 - **Server**: `-s <url>` (e.g. `http://<host>:50051`). There are MANY tapp servers; always pass `-s` explicitly.
   - `https://` works too (tapp-cli ≥0.8.0): certificate checked against system CAs; add `--insecure` (long-only — `-k` is taken) for a self-signed cert, which encrypts but does not authenticate.
   - tapp-server ≥0.8.0 serves a **native TLS listener on :50052** (`[server] tls_bind_address`, per-boot in-memory self-signed cert): `https://<host>:50052 --insecure` is the encrypted management path from first boot. Prefer it over plaintext :50051 for anything remote — docker-login sends a registry token, start-app sends env/mount secrets. IP or domain in the URL both work (the cert is never read).
@@ -20,7 +24,7 @@ Deploy and manage containerized applications on 0G Tapp TEE servers using `tapp-
   - **Getting a trustworthy pin needs no out-of-band channel** (server ≥0.8.0): the node has a **common signer** (generated per boot; every app signer derives from it), the :50052 TLS key derives from it too, and `get-evidence` **without --app-id** returns the node's own evidence whose `runtime_data.tls_public_key` is that key's SPKI sha256 — Intel-signed, so it survives a hostile channel. Flow: `get-evidence` (any channel) → verify the quote → `--tls-pin 0x<tls_public_key>` for all management calls. A MITM can relay evidence but cannot forge the key inside it, and its own cert then fails the pin.
   - Two limits of that bootstrap: (1) it proves "a genuine TDX node with this measurement", **not** "the node at this address" — an attacker running their own genuine node could redirect you to it; it defends interception, not redirection (on-chain anchoring of the common signer is the follow-up). (2) The pin is **boot-scoped**: a node reboot rotates the common signer and the TLS key with it, so a stale pin fails closed — re-fetch evidence after any reboot.
   - tapp-server ≥0.7.1 defaults `bind_address` to **loopback** when the config omits it. CVM images bake an explicit `0.0.0.0:50051` (teeUrl/evidence fetching and remote claim need it), so image nodes are unaffected — the loopback default bites hand-rolled configs. "Connection refused from outside, works on the host" means the config omits `bind_address`.
-- **Auth**: private key via `-k` flag or `TAPP_PRIVATE_KEY` env var. Read-only commands (`get-tapp-info`, `get-service-status`, `get-app-info`, `get-app-key`, `get-evidence`, `list-apps`, `verify-app` direct mode) work without `-k`; owner-only commands require it.
+- **Auth**: private key via `-k` flag or `TAPP_PRIVATE_KEY` env var — or, for a key held elsewhere (Ledger, Fordefi/MPC, someone else's hardware wallet), `--external-signer 0x<address>` / `TAPP_EXTERNAL_SIGNER` (tapp-cli ≥ 0.10.0), plus `--ledger` for a Ledger on this machine. **Before any owner-level job, follow "Signing with a key held elsewhere" below** — it starts by asking the owner where the key is. Read-only commands (`get-tapp-info`, `get-service-status`, `get-app-info`, `get-app-key`, `get-evidence`, `list-apps`, `verify-app` direct mode) need no signer.
 - **TappRegistry (testnet)**: proxy `0x2Ce80374318B1d7Fb3345724457a182E0ad165c9`, RPC `https://evmrpc-testnet.0g.ai`, chainId `16602`. See `contract/CONTRACTS.md`.
 - **TappRegistry (mainnet)**: proxy `0x54874F536301c993922Dd95097e3902e7FBfe612`, RPC `https://evmrpc.0g.ai`, chainId `16661`. Min stake **10 OG**, withdraw lock 7 days. Upgrades go through a 1-day TimelockController (`0xD070792b1dB64F858ACE3E5443f2d21c0edE0BAc`) — see `contract/CONTRACTS.md`.
   - An older deployment `0x95a0BF4148b30F6F8D86870534c51df46Da5511c` is **superseded** — no `version()`, and `getNode` returns 3 fields instead of 5. Some long-lived apps (testnet sandbox provider / attestor) are still registered there, so you may still have to query it; just don't put anything new on it. Tell them apart with `cast call <proxy> "version()(string)"` — `"0.1.0"` = current, revert = old.
@@ -139,6 +143,46 @@ Owner-only, and **every call is extended into the runtime measurement** carrying
 - tapp-cli >= 0.9.0 signs `Method:0x<sha256(encoded request)>:timestamp` with header `x-signature-version: 2` — the signature covers the request body, so a request altered in flight is refused. Window **±10 min**; every signature is **single-use**, and one made before tapp-server last started is refused (the previous process may have used it).
 - Against tapp-server < 0.9.0 this shows up as `Insufficient permission for this operation` (old server cannot read v2): add the global flag `--legacy-sign`. Never automatic.
 - tapp-server >= 0.9.0 accepts **only** body-bound signatures; legacy `Method:timestamp` is refused ("accepts only body-bound signatures"). Old tapp-cli cannot manage a 0.9.0 node — upgrade it.
+
+### Signing with a key held elsewhere (`--external-signer`, tapp-cli ≥ 0.10.0)
+
+A node's owner is whoever signed its first `claim-config` after boot. Settle how that owner signs **before** starting a job that needs owner signatures — do not guess, and do not ask for a private key the owner has not offered.
+
+**1. Ask the owner:**
+1. The owner address.
+2. Where its key is: **(a)** a key the operator may use on this machine; **(b)** a **Ledger plugged into this machine**; **(c)** elsewhere — Fordefi/MPC, or a hardware wallet (Ledger, Trezor, …) held by someone else (which one?).
+3. For (c): the channel for sending each line to sign and getting the signature back, and whether the holder is available now — each signature must come back within 10 minutes while the command waits.
+
+| Answer | Setup | Each signature |
+|---|---|---|
+| (a) | `-k` / `TAPP_PRIVATE_KEY` | automatic |
+| (b) | `--external-signer 0x<owner>` (or `TAPP_EXTERNAL_SIGNER`) **and** `--ledger` on every command — it has no env var | approve on the device |
+| (c) | `--external-signer 0x<owner>` / `TAPP_EXTERNAL_SIGNER` | round trip with the holder |
+
+With both `TAPP_PRIVATE_KEY` and `TAPP_EXTERNAL_SIGNER` set, the external signer is used. `--ledger` without an address is refused.
+
+**2. Tell the holder what is coming.** Each run of an owner-level command is one signature, named in the prompt by its RPC method. Before starting, send the holder the methods in order so anything else can be refused — e.g. claim + deploy: `ClaimConfig`, `DockerLogin`, `StartApp`, `GetAppContainerStatus`, `GetAppLogs`.
+
+| Needs | Commands (method in the prompt) |
+|---|---|
+| owner signature | `claim-config` (ClaimConfig; the first one after boot makes its signer the owner), `start-app` (StartApp), `stop-app` (StopApp), `start-service`/`stop-service`, `get-app-container-status` (GetAppContainerStatus), `update-trust-anchors` (UpdateTrustAnchors), whitelist commands |
+| owner, or an address the owner whitelisted | `docker-login` (DockerLogin), `docker-logout`, `get-app-logs` (GetAppLogs), `get-service-logs`, `prune-images`, `withdraw-balance` |
+| no signature | `get-tapp-info`, `get-service-status`, `get-app-info`, `get-app-key`, `get-app-csr`, `get-evidence`, `get-task-status`, `list-apps` |
+
+On-chain commands (`register-onchain`, `update-onchain`, `start-app --register-onchain`, …) additionally ask for transactions from the owner address.
+
+**(b) Ledger on this machine.**
+- Needs a tapp-cli built with Ledger support (see "Getting tapp-cli"); a build without it refuses `--ledger` and says so. Linux non-root access also needs Ledger's udev rules.
+- Close Ledger Live (one program per device), unlock the device, open the Ethereum app. The account is found by the address among the first 10 accounts of the Ledger Live, BIP44 and legacy paths — no index to pass.
+- Each signature: the CLI prints `confirm on the Ledger: <Method>`, the signer, a deadline and the text; the device shows the same text. Approve only if it matches and the method is the next expected one.
+- A transaction is signed on the device, then checked and broadcast by the CLI. Contract calls need **Blind signing** enabled in the Ethereum app.
+- Device errors are translated into what to do (rejected, locked, Ethereum app not open, Ledger Live holding the device, blind signing off, address not on this device): fix it and run the command again.
+
+**(c) Paste, with the holder.**
+- The command stops with `signature needed: <Method>`, the signer, a deadline, and one line `<Method>:0x<hash>:<timestamp>`. Send the holder **exactly that line** (nothing before or after) and the step it belongs to; leave the command waiting.
+- The holder checks the method is the next one on the list — the hash and timestamp cannot be checked by eye — and signs the line as a text message (personal_sign / EIP-191) with the owner account: Fordefi message signing; `cast wallet sign --ledger '<line>'`; `cast wallet sign --trezor '<line>'`. For a hardware wallet pick the account with `--mnemonic-index <n>` and check it first: `cast wallet address --ledger --mnemonic-index <n>` (or `--trezor`) must print the owner address.
+- Paste the returned `0x…` (65 bytes). A signature by another account, or over text changed on the way (extra space or line break), is refused with the address it came from — the holder signs again. One that arrives after the deadline is refused and the CLI prints a new line for the same request — send that; no re-run.
+- On-chain: the CLI prints the transaction (chain, from, to, value in wei and OG, data, registry function). The holder sends it from the owner address and returns the hash; the CLI waits for it to be mined and checks it is exactly that transaction and that it succeeded.
 
 ### The node has no data disk (apps will not start)
 

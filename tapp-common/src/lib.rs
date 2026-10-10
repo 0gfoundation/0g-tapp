@@ -10,6 +10,7 @@ pub mod pinned_tls;
 pub mod refvalues;
 pub mod verify;
 pub mod compat;
+pub mod external_signer;
 
 pub mod proto {
     tonic::include_proto!("tapp_service");
