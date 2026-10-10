@@ -170,7 +170,8 @@ struct Cli {
     /// signature is shown as text to sign as a message (personal_sign) and the signature
     /// pasted back; each on-chain call is shown as a transaction to send and its hash
     /// pasted back. Both are checked before the command goes on. A request signature has
-    /// to come back within the server's ±10 min window.
+    /// to come back within the server's ±10 min window. --ledger or --fordefi replace the
+    /// pasting.
     #[arg(long, global = true, env = "TAPP_EXTERNAL_SIGNER", conflicts_with = "private_key")]
     external_signer: Option<String>,
 
@@ -179,8 +180,18 @@ struct Cli {
     /// transaction, which it signs only; the transaction is checked and broadcast from here.
     /// A contract call needs Blind signing enabled in the device's Ethereum app. Built in on
     /// macOS; elsewhere build with --features ledger.
-    #[arg(long, global = true, requires = "external_signer")]
+    #[arg(long, global = true, requires = "external_signer", conflicts_with = "fordefi")]
     ledger: bool,
+
+    /// With --external-signer: sign through Fordefi's API as an API user, instead of pasting.
+    /// The vault signs each message, and each transaction, once its policy has approved it
+    /// and the organisation's API Signer has taken part; a transaction is signed only, then
+    /// checked and broadcast from here. Reads FORDEFI_API_USER_TOKEN,
+    /// FORDEFI_PRIVATE_KEY_PATH (the API user's P-256 key, PEM) and FORDEFI_EVM_VAULT_ID —
+    /// the names 0g-fordefi-signer uses — and optionally FORDEFI_API_HOST. A chain other
+    /// than 0G mainnet must exist in the Fordefi organisation (added as a custom chain).
+    #[arg(long, global = true, requires = "external_signer")]
+    fordefi: bool,
 
     #[command(subcommand)]
     command: Commands,
@@ -898,6 +909,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     if cli.ledger {
         if let Err(e) = tapp_common::external_signer::use_backend(tapp_common::external_signer::Backend::Ledger) {
             eprintln!("✗ --ledger: {e}");
+            std::process::exit(2);
+        }
+    }
+    if cli.fordefi {
+        if let Err(e) = tapp_common::external_signer::use_backend(tapp_common::external_signer::Backend::Fordefi) {
+            eprintln!("✗ --fordefi: {e}");
             std::process::exit(2);
         }
     }

@@ -23,6 +23,9 @@
 //! - [`Backend::Ledger`]: a Ledger on this machine's USB. The device shows the message or
 //!   the transaction and signs on a button press; a transaction is signed only, checked,
 //!   and broadcast here. Built with the `ledger` feature (on by default on macOS).
+//! - [`Backend::Fordefi`]: Fordefi's API. The vault holding the address signs once its
+//!   approval policy has run; a transaction is signed only, checked, and broadcast here, as
+//!   with a Ledger. See [`fordefi`].
 
 use std::io::{BufRead, Write};
 use std::str::FromStr;
@@ -44,17 +47,24 @@ pub enum Backend {
     Paste,
     /// A Ledger on this machine's USB.
     Ledger,
+    /// Fordefi's API, as the API user configured in the environment (see [`fordefi`]).
+    Fordefi,
 }
 
 static BACKEND: OnceLock<Backend> = OnceLock::new();
 
-/// Choose the backend for this process (once, before anything is signed).
+/// Choose the backend for this process (once, before anything is signed). Fordefi's
+/// settings are read and checked here, so a missing one stops the command before it starts
+/// rather than at its first signature.
 pub fn use_backend(backend: Backend) -> Result<()> {
     if backend == Backend::Ledger && !LEDGER_SUPPORTED {
         return Err(anyhow!(
             "this tapp-cli was built without Ledger support. It is built in on macOS; \
              elsewhere build with `cargo build --release -p tapp-cli --features ledger`"
         ));
+    }
+    if backend == Backend::Fordefi {
+        fordefi::configure(fordefi::Config::from_env()?)?;
     }
     BACKEND
         .set(backend)
@@ -152,6 +162,7 @@ pub fn request_signature(
     match backend() {
         Backend::Paste => paste_signature(address, message, what, valid_until),
         Backend::Ledger => ledger_signature(address, message, what, valid_until),
+        Backend::Fordefi => fordefi_signature(address, message, what, valid_until),
     }
 }
 
@@ -194,6 +205,42 @@ fn ledger_signature(
     let who = recover_personal(message, &sig)?;
     if who != *address {
         return Err(anyhow!("the device signed as 0x{:x}, not 0x{:x}", who, address));
+    }
+    eprintln!("  ✓ signed by 0x{:x}", who);
+    Ok(sig)
+}
+
+fn fordefi_signature(
+    address: &Address,
+    message: &str,
+    what: &str,
+    valid_until: Option<i64>,
+) -> Result<[u8; 65]> {
+    let config = fordefi::config()?;
+    eprintln!();
+    eprintln!("──── signing in Fordefi: {what} ────");
+    eprintln!("  signer   0x{:x}  (vault {})", address, config.vault_id());
+    print_deadline(valid_until);
+    eprintln!("  message (personal_sign):");
+    eprintln!();
+    eprintln!("{message}");
+    eprintln!();
+    let raw = block_on(fordefi::sign_message(config, message, what, valid_until))?;
+    if let Some(t) = valid_until {
+        if chrono::Utc::now().timestamp() > t {
+            return Err(Expired.into());
+        }
+    }
+    let sig = parse_signature(&hex::encode(raw))
+        .map_err(|e| anyhow!("Fordefi returned a malformed signature: {}", e))?;
+    let who = recover_personal(message, &sig)?;
+    if who != *address {
+        return Err(anyhow!(
+            "Fordefi vault {} signed as 0x{:x}, not 0x{:x} — FORDEFI_EVM_VAULT_ID names another vault",
+            config.vault_id(),
+            who,
+            address
+        ));
     }
     eprintln!("  ✓ signed by 0x{:x}", who);
     Ok(sig)
@@ -356,19 +403,21 @@ pub async fn request_transaction(
     match backend() {
         Backend::Paste => paste_transaction(provider, chain_id, from, to, data, value, what).await,
         Backend::Ledger => ledger_transaction(provider, chain_id, from, to, data, value, what).await,
+        Backend::Fordefi => fordefi_transaction(provider, chain_id, from, to, data, value, what).await,
     }
 }
 
-/// The Ledger signs only; the transaction is checked here and broadcast from here.
-async fn ledger_transaction(
+/// A legacy transaction for the call, with nonce, gas price and a gas limit 20% over the
+/// estimate. Estimating also catches a call that would revert (not the app's owner, say)
+/// before anyone is asked to sign it.
+async fn prepare_call(
     provider: &Provider<Http>,
     chain_id: u64,
     from: &Address,
     to: &Address,
     data: &[u8],
     value: U256,
-    what: &str,
-) -> Result<TxHash> {
+) -> Result<ethers::types::TransactionRequest> {
     use ethers::types::{BlockNumber, TransactionRequest};
 
     let nonce = provider
@@ -387,31 +436,87 @@ async fn ledger_transaction(
         .nonce(nonce)
         .gas_price(gas_price)
         .chain_id(chain_id);
-    // Also catches a call that would revert (not the app's owner, say) before the device is asked.
     let gas = provider
         .estimate_gas(&request.clone().into(), None)
         .await
         .map_err(|e| anyhow!("the call would fail: {}", e))?;
-    let tx: TypedTransaction = request.gas(gas * 12 / 10).into();
+    Ok(request.gas(gas * 12 / 10))
+}
 
-    eprintln!();
-    eprintln!("──── confirm on the Ledger: {what} ────");
+fn print_call(chain_id: u64, from: &Address, to: &Address, data: &[u8], value: U256) {
     eprintln!("  from     0x{:x}  (chain {chain_id})", from);
     eprintln!("  to       0x{:x}", to);
     eprintln!("  value    {} wei ({} OG)", value, ethers::utils::format_ether(value));
     eprintln!("  data     0x{}", hex::encode(data));
+}
+
+/// The Ledger signs only; the transaction is checked here and broadcast from here.
+async fn ledger_transaction(
+    provider: &Provider<Http>,
+    chain_id: u64,
+    from: &Address,
+    to: &Address,
+    data: &[u8],
+    value: U256,
+    what: &str,
+) -> Result<TxHash> {
+    let tx: TypedTransaction = prepare_call(provider, chain_id, from, to, data, value).await?.into();
+
+    eprintln!();
+    eprintln!("──── confirm on the Ledger: {what} ────");
+    print_call(chain_id, from, to, data, value);
     eprintln!("  (a contract call needs Blind signing enabled in the device's Ethereum app)");
     let signature = ledger::sign_tx(from, chain_id, &tx).await?;
     let raw = tx.rlp_signed(&signature);
     let hash = check_signed_transaction(&raw, chain_id, from, to, data, value)
         .map_err(|e| anyhow!("the device returned a transaction that is not the one asked for: {}", e))?;
+    broadcast_checked(provider, raw.to_vec(), hash, from, to, data, value).await
+}
 
+/// Fordefi signs only (push_mode manual); the transaction is checked here and broadcast
+/// from here, as a Ledger's is. Fordefi picks the nonce; the gas is set here.
+async fn fordefi_transaction(
+    provider: &Provider<Http>,
+    chain_id: u64,
+    from: &Address,
+    to: &Address,
+    data: &[u8],
+    value: U256,
+    what: &str,
+) -> Result<TxHash> {
+    let config = fordefi::config()?;
+    let call = prepare_call(provider, chain_id, from, to, data, value).await?;
+    let (Some(gas), Some(gas_price)) = (call.gas, call.gas_price) else {
+        return Err(anyhow!("no gas estimate for the call"));
+    };
+
+    eprintln!();
+    eprintln!("──── signing in Fordefi: {what} ────");
+    eprintln!("  vault    {}", config.vault_id());
+    print_call(chain_id, from, to, data, value);
+    let raw = fordefi::sign_transaction(config, chain_id, to, data, value, gas, gas_price, what).await?;
+    let hash = check_signed_transaction(&raw, chain_id, from, to, data, value)
+        .map_err(|e| anyhow!("Fordefi returned a transaction that is not the one asked for: {}", e))?;
+    broadcast_checked(provider, raw, hash, from, to, data, value).await
+}
+
+/// Broadcast a signed transaction that [`check_signed_transaction`] passed, wait for it to
+/// be mined, and check what landed (see [`check_transaction`]).
+async fn broadcast_checked(
+    provider: &Provider<Http>,
+    raw: Vec<u8>,
+    hash: TxHash,
+    from: &Address,
+    to: &Address,
+    data: &[u8],
+    value: U256,
+) -> Result<TxHash> {
     let asked_at = provider
         .get_block_number()
         .await
         .map_err(|e| anyhow!("reading the chain head: {}", e))?
         .as_u64();
-    if let Err(e) = provider.send_raw_transaction(raw).await {
+    if let Err(e) = provider.send_raw_transaction(raw.into()).await {
         // The answer can be lost after the node took it (a timeout, say); it is out if the
         // node knows it, and stopping here would leave a sent transaction unaccounted for.
         if !matches!(provider.get_transaction(hash).await, Ok(Some(_))) {
@@ -457,10 +562,7 @@ async fn paste_transaction(
         .as_u64();
     eprintln!();
     eprintln!("──── transaction needed: {what} ────");
-    eprintln!("  from     0x{:x}  (chain {chain_id})", from);
-    eprintln!("  to       0x{:x}", to);
-    eprintln!("  value    {} wei ({} OG)", value, ethers::utils::format_ether(value));
-    eprintln!("  data     0x{}", hex::encode(data));
+    print_call(chain_id, from, to, data, value);
     eprintln!();
     loop {
         let pasted = prompt("hash of the sent transaction (0x…, 32 bytes)")?;
@@ -509,6 +611,8 @@ fn prompt(label: &str) -> Result<String> {
     }
     Ok(line.trim().to_string())
 }
+
+pub mod fordefi;
 
 /// The Ledger itself. The account is found by the address the operator gave, not by a
 /// derivation index they have to know, across the three path styles wallets use.
