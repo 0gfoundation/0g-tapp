@@ -3,8 +3,9 @@
 //!
 //! The Fordefi API user's credentials (its token and P-256 key) stay with the service; what
 //! this machine holds is the service's address and a token that names this caller to it, and
-//! which the service can revoke. The service also decides what the vault may sign — which
-//! contracts, which messages — on top of Fordefi's own policy.
+//! which the service can revoke. The service also decides what the vault may sign for this
+//! caller — which contracts and functions, how much value, which messages — on top of
+//! Fordefi's own policy.
 //!
 //! | variable               |                                                              |
 //! |------------------------|--------------------------------------------------------------|
@@ -43,6 +44,7 @@ pub struct Config {
     base: String,
     token: String,
     poll: Duration,
+    client: reqwest::Client,
 }
 
 static CONFIG: OnceLock<Config> = OnceLock::new();
@@ -73,11 +75,21 @@ impl Config {
             .ok_or_else(|| anyhow!("FORDEFI_SIGNER_URL is not set (the 0g-fordefi-signer service)"))?;
         let token = var("FORDEFI_SIGNER_TOKEN")
             .ok_or_else(|| anyhow!("FORDEFI_SIGNER_TOKEN is not set (this caller's token for the service)"))?;
-        Ok(Config {
-            base: base_url(&url)?,
-            token,
-            poll: Duration::from_secs(2),
-        })
+        Self::new(base_url(&url)?, token, Duration::from_secs(2))
+    }
+
+    fn new(base: String, token: String, poll: Duration) -> Result<Self> {
+        // The service never redirects, and following one could carry the token to plain HTTP.
+        let mut client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(90))
+            .redirect(reqwest::redirect::Policy::none());
+        // Plain HTTP goes only to this machine, so never through a proxy: HTTP_PROXY does not
+        // exempt loopback by itself, and the proxy would read the token.
+        if base.starts_with("http://") {
+            client = client.no_proxy();
+        }
+        let client = client.build().map_err(|e| anyhow!("building the HTTP client: {}", e))?;
+        Ok(Config { base, token, poll, client })
     }
 
     /// The service, for showing where a signature is asked for.
@@ -89,8 +101,16 @@ impl Config {
 /// The service's base URL. The token travels on every call, so plain HTTP is taken only to
 /// this machine (an SSH tunnel, say).
 fn base_url(url: &str) -> Result<String> {
-    let url = url.trim().trim_end_matches('/');
+    let url = url.trim();
     let parsed = reqwest::Url::parse(url).map_err(|e| anyhow!("FORDEFI_SIGNER_URL {}: {}", url, e))?;
+    // A password would be printed with the URL, and a query would swallow every path after it.
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(anyhow!("FORDEFI_SIGNER_URL must not carry a user or password; the token is the credential"));
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(anyhow!("FORDEFI_SIGNER_URL {}: no query or fragment, only the service's address", url));
+    }
+    let url = parsed.as_str().trim_end_matches('/');
     let loopback = match parsed.host_str() {
         Some("localhost") => true,
         Some(host) => host
@@ -145,14 +165,8 @@ fn error_text(text: &str) -> String {
 }
 
 async fn call(config: &Config, method: reqwest::Method, path: &str, body: Option<&Value>) -> Result<Value> {
-    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    let client = CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
-            .timeout(Duration::from_secs(90))
-            .build()
-            .unwrap_or_default()
-    });
-    let mut request = client
+    let mut request = config
+        .client
         .request(method, format!("{}{}", config.base, path))
         .bearer_auth(&config.token);
     if let Some(body) = body {
@@ -181,7 +195,9 @@ fn hex_field(request: &Value, name: &str) -> Result<Vec<u8>> {
 
 enum Waited<T> {
     Done(T),
-    TimedOut,
+    /// `until` passed. `late` is what was signed while the request was being aborted, and
+    /// `aborted` whether the abort went through.
+    TimedOut { late: Option<T>, aborted: bool },
 }
 
 /// Follow a request until it is signed, it fails, or `until` passes — then it is aborted, so
@@ -210,20 +226,63 @@ async fn wait_for(config: &Config, created: Value, until: Instant, result: &str)
             eprintln!("  … {}", describe(&state));
             shown = state;
         }
+        let read = format!("/v1/requests/{id}");
         if Instant::now() >= until {
-            let path = format!("/v1/requests/{id}/abort");
-            if let Err(e) = call(config, reqwest::Method::POST, &path, None).await {
-                eprintln!("  (aborting {id}: {e})");
+            let abort = format!("/v1/requests/{id}/abort");
+            let aborted = match call(config, reqwest::Method::POST, &abort, None).await {
+                Ok(v) => {
+                    request = v;
+                    true
+                }
+                Err(e) => {
+                    eprintln!("  (aborting {id}: {e})");
+                    // Most likely it was signed in the meantime.
+                    if let Ok(v) = call(config, reqwest::Method::GET, &read, None).await {
+                        request = v;
+                    }
+                    false
+                }
+            };
+            let late = match field(&request, "outcome") {
+                "signed" => hex_field(&request, result).ok(),
+                _ => None,
+            };
+            let aborted = aborted && late.is_none();
+            if !aborted && late.is_none() {
+                eprintln!("  ! Fordefi request {id} could not be aborted and may still be approved: abort it in Fordefi");
             }
-            return Ok(Waited::TimedOut);
+            return Ok(Waited::TimedOut { late, aborted });
         }
         tokio::time::sleep(config.poll).await;
-        let path = format!("/v1/requests/{id}");
-        match call(config, reqwest::Method::GET, &path, None).await {
+        match call(config, reqwest::Method::GET, &read, None).await {
             Ok(v) => request = v,
-            Err(e) => eprintln!("  (reading {id}: {e}; retrying)"),
+            Err(e) => match e.downcast_ref::<Refused>() {
+                // Asking again will not change the answer: a revoked token, a request the
+                // service does not show this caller.
+                Some(r)
+                    if r.status.is_client_error()
+                        && r.status != reqwest::StatusCode::REQUEST_TIMEOUT
+                        && r.status != reqwest::StatusCode::TOO_MANY_REQUESTS =>
+                {
+                    return Err(anyhow!("following Fordefi request {}: {}", id, e))
+                }
+                _ => eprintln!("  (reading {id}: {e}; retrying)"),
+            },
         }
     }
+}
+
+/// Why a request was not signed in time, for the error.
+fn timed_out(aborted: bool) -> anyhow::Error {
+    anyhow!(
+        "not signed within {} min; {}",
+        APPROVAL_WAIT.as_secs() / 60,
+        if aborted {
+            "the Fordefi request was aborted"
+        } else {
+            "the Fordefi request could not be aborted — abort it in Fordefi"
+        }
+    )
 }
 
 /// When to stop waiting for a request signature: its deadline, as an instant.
@@ -250,18 +309,26 @@ pub(super) async fn sign_message(
     let created = call(config, reqwest::Method::POST, "/v1/messages", Some(&body)).await?;
     match wait_for(config, created, deadline(valid_until), "signature").await? {
         Waited::Done(sig) => Ok(sig),
-        Waited::TimedOut if valid_until.is_some() => Err(super::Expired.into()),
-        Waited::TimedOut => Err(anyhow!(
-            "not signed within {} min; the Fordefi request was aborted",
-            APPROVAL_WAIT.as_secs() / 60
-        )),
+        // A signature past the server's window would only be refused.
+        Waited::TimedOut { .. } if valid_until.is_some() => Err(super::Expired.into()),
+        Waited::TimedOut { late: Some(sig), .. } => Ok(sig),
+        Waited::TimedOut { late: None, aborted } => Err(timed_out(aborted)),
     }
 }
 
 /// The body asking the vault to sign, not send, a legacy contract call. Amounts are decimal
 /// strings: wei does not fit the double a JSON number becomes.
 #[allow(clippy::too_many_arguments)]
-fn transaction_body(chain_id: u64, to: &Address, data: &[u8], value: U256, gas: U256, gas_price: U256, what: &str) -> Value {
+fn transaction_body(
+    chain_id: u64,
+    to: &Address,
+    data: &[u8],
+    value: U256,
+    gas: U256,
+    gas_price: U256,
+    nonce: U256,
+    what: &str,
+) -> Value {
     json!({
         "chain_id": chain_id,
         "to": format!("0x{:x}", to),
@@ -269,12 +336,15 @@ fn transaction_body(chain_id: u64, to: &Address, data: &[u8], value: U256, gas: 
         "value": value.to_string(),
         "gas_limit": gas.to_string(),
         "gas_price": gas_price.to_string(),
+        "nonce": nonce.to_string(),
         "note": format!("tapp-cli: {what}"),
     })
 }
 
-/// Have the vault sign, not send, a contract call. Returns the signed transaction for the
-/// caller to check and broadcast.
+/// Have the vault sign, not send, a contract call with the account's next `nonce` — the one
+/// read here, not one Fordefi picks: a transaction it signed earlier and nobody sent would
+/// otherwise push every later one past a nonce the chain is still waiting for. Returns the
+/// signed transaction for the caller to check and broadcast.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn sign_transaction(
     config: &Config,
@@ -284,14 +354,15 @@ pub(super) async fn sign_transaction(
     value: U256,
     gas: U256,
     gas_price: U256,
+    nonce: U256,
     what: &str,
 ) -> Result<Vec<u8>> {
-    let body = transaction_body(chain_id, to, data, value, gas, gas_price, what);
+    let body = transaction_body(chain_id, to, data, value, gas, gas_price, nonce, what);
     let created = call(config, reqwest::Method::POST, "/v1/transactions", Some(&body))
         .await
         .map_err(|e| match e.downcast_ref::<Refused>() {
-            // 502: Fordefi itself refused, most often over a chain it does not know.
-            Some(r) if r.status == reqwest::StatusCode::BAD_GATEWAY => anyhow!(
+            // 502 is anything Fordefi refused or failed at; a chain it does not know is common.
+            Some(r) if r.status == reqwest::StatusCode::BAD_GATEWAY && r.text.to_lowercase().contains("chain") => anyhow!(
                 "{} (a chain Fordefi does not support out of the box — the 0G testnet, for one — \
                  must be added to the organisation: Settings > Chains > Add EVM chain)",
                 e
@@ -300,10 +371,13 @@ pub(super) async fn sign_transaction(
         })?;
     match wait_for(config, created, Instant::now() + APPROVAL_WAIT, "raw_transaction").await? {
         Waited::Done(raw) => Ok(raw),
-        Waited::TimedOut => Err(anyhow!(
-            "not signed within {} min; the Fordefi request was aborted",
-            APPROVAL_WAIT.as_secs() / 60
-        )),
+        // Signed after all: it is checked like any other, and a nonce or fee that no longer
+        // fits stops it then.
+        Waited::TimedOut { late: Some(raw), .. } => {
+            eprintln!("  signed just as the wait ran out; going on with it");
+            Ok(raw)
+        }
+        Waited::TimedOut { late: None, aborted } => Err(timed_out(aborted)),
     }
 }
 
@@ -319,11 +393,7 @@ mod tests {
     const WALLET: &str = "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
 
     fn config(base: String) -> Config {
-        Config {
-            base,
-            token: "token".into(),
-            poll: Duration::from_millis(10),
-        }
+        Config::new(base, "token".into(), Duration::from_millis(10)).unwrap()
     }
 
     /// A stand-in for the service on 127.0.0.1: refuses a call without the token, otherwise
@@ -396,7 +466,14 @@ mod tests {
         assert_eq!(base_url("http://127.0.0.1:5000").unwrap(), "http://127.0.0.1:5000");
         assert_eq!(base_url("http://localhost:5000").unwrap(), "http://localhost:5000");
         assert_eq!(base_url("http://[::1]:5000").unwrap(), "http://[::1]:5000");
+        assert_eq!(base_url("HTTPS://Signer.Example/fordefi/").unwrap(), "https://signer.example/fordefi");
         assert!(base_url("http://10.0.0.5:5000").is_err());
+        assert!(base_url("http://localhost.signer.example").is_err());
+        assert!(base_url("http://127.0.0.1@signer.example").is_err());
+        let e = base_url("https://user:secret@signer.example").unwrap_err().to_string();
+        assert!(e.contains("user or password") && !e.contains("secret"), "{e}");
+        assert!(base_url("https://signer.example/?x=1").is_err());
+        assert!(base_url("https://signer.example/#x").is_err());
         assert!(base_url("http://signer.example").is_err());
         assert!(base_url("ftp://signer.example").is_err());
         assert!(base_url("signer.example").is_err());
@@ -412,6 +489,7 @@ mod tests {
             U256::from(10u64).pow(U256::from(21u64)),
             U256::from(120_000u64),
             U256::from(4_000_000_000u64),
+            U256::from(7u64),
             "addNode",
         );
         assert_eq!(
@@ -423,6 +501,7 @@ mod tests {
                 "value": "1000000000000000000000",
                 "gas_limit": "120000",
                 "gas_price": "4000000000",
+                "nonce": "7",
                 "note": "tapp-cli: addNode",
             })
         );
@@ -473,7 +552,7 @@ mod tests {
                 .value(U256::from_dec_str(d["value"].as_str().unwrap()).unwrap())
                 .gas(U256::from_dec_str(d["gas_limit"].as_str().unwrap()).unwrap())
                 .gas_price(U256::from_dec_str(d["gas_price"].as_str().unwrap()).unwrap())
-                .nonce(3)
+                .nonce(U256::from_dec_str(d["nonce"].as_str().unwrap()).unwrap())
                 .chain_id(d["chain_id"].as_u64().unwrap())
                 .into();
             let sig = wallet.sign_transaction_sync(&tx).unwrap();
@@ -485,10 +564,12 @@ mod tests {
         let to: Address = "0x5f0d9c243048F5a55468472c6F090184E2E333c7".parse().unwrap();
         let data = vec![0x81, 0x73, 0x0e, 0xad];
         let value = U256::from(5u64);
-        let raw = sign_transaction(&config(base), 16661, &to, &data, value, U256::from(90_000u64), U256::from(4_000_000_000u64), "addNode")
+        let (gas, gas_price, nonce) = (U256::from(90_000u64), U256::from(4_000_000_000u64), U256::from(3u64));
+        let raw = sign_transaction(&config(base), 16661, &to, &data, value, gas, gas_price, nonce, "addNode")
             .await
             .unwrap();
         super::super::check_signed_transaction(&raw, 16661, &from, &to, &data, value).unwrap();
+        super::super::check_fordefi_terms(&raw, gas, gas_price, nonce).unwrap();
         assert_eq!(seen.lock().unwrap().as_slice(), ["POST /v1/transactions"]);
     }
 
@@ -521,17 +602,61 @@ mod tests {
         let (base, _) = service(|_, _, _| (403, json!({"error": "0x5f0d… on chain 16661 is not one of tapp's contracts"})));
         let to: Address = "0x5f0d9c243048F5a55468472c6F090184E2E333c7".parse().unwrap();
         let one = U256::one();
-        let e = sign_transaction(&config(base.clone()), 16661, &to, &[], one, one, one, "x").await.unwrap_err().to_string();
+        let e = sign_transaction(&config(base.clone()), 16661, &to, &[], one, one, one, one, "x").await.unwrap_err().to_string();
         assert!(e.contains("403") && e.contains("not one of tapp's contracts") && !e.contains("Add EVM chain"), "{e}");
 
         let (fordefi_refused, _) = service(|_, _, _| (502, json!({"error": "Fordefi …: 400 — Chain evm_16602 is not supported"})));
-        let e = sign_transaction(&config(fordefi_refused), 16602, &to, &[], one, one, one, "x").await.unwrap_err().to_string();
+        let e = sign_transaction(&config(fordefi_refused), 16602, &to, &[], one, one, one, one, "x").await.unwrap_err().to_string();
         assert!(e.contains("502") && e.contains("evm_16602") && e.contains("Add EVM chain"), "{e}");
+
+        let (unreachable, _) = service(|_, _, _| (502, json!({"error": "Fordefi …: connection refused"})));
+        let e = sign_transaction(&config(unreachable), 16661, &to, &[], one, one, one, one, "x").await.unwrap_err().to_string();
+        assert!(e.contains("502") && !e.contains("Add EVM chain"), "{e}");
 
         let mut bad = config(base.clone());
         bad.token = "wrong".into();
         let e = sign_message(&bad, "StopApp:0x00:1", "StopApp", None).await.unwrap_err().to_string();
         assert!(e.contains("401") && e.contains("FORDEFI_SIGNER_TOKEN"), "{e}");
+    }
+
+    /// A refusal while following a request will not change on asking again; it ends the wait.
+    #[tokio::test]
+    async fn a_request_the_service_will_not_show_ends_the_wait() {
+        let (base, seen) = service(|method, _, _| {
+            if method == "POST" {
+                (200, json!({"id": "r-6", "state": "waiting_for_approval", "outcome": "pending"}))
+            } else {
+                (404, json!({"error": "request r-6 was not made by tapp through this service"}))
+            }
+        });
+        let e = sign_message(&config(base), "StopApp:0x00:1", "StopApp", None).await.unwrap_err().to_string();
+        assert!(e.contains("r-6") && e.contains("404"), "{e}");
+        assert_eq!(seen.lock().unwrap().as_slice(), ["POST /v1/messages", "GET /v1/requests/r-6"]);
+    }
+
+    /// A transaction signed just as its wait ran out, so the abort failed, is still used; one
+    /// that could not be aborted and was not signed says so.
+    #[tokio::test]
+    async fn past_the_deadline_a_late_signature_is_kept() {
+        let (base, _) = service(|method, path, _| match (method, path) {
+            ("POST", "/v1/transactions") => (200, json!({"id": "r-7", "state": "waiting_for_approval", "outcome": "pending"})),
+            ("POST", _) => (502, json!({"error": "Fordefi …: 400 — the transaction is already signed"})),
+            _ => (200, json!({"id": "r-7", "state": "signed", "outcome": "signed", "raw_transaction": "0xf86b01"})),
+        });
+        let created = json!({"id": "r-7", "state": "waiting_for_approval", "outcome": "pending"});
+        match wait_for(&config(base), created.clone(), Instant::now(), "raw_transaction").await.unwrap() {
+            Waited::TimedOut { late: Some(raw), aborted: false } => assert_eq!(raw, vec![0xf8, 0x6b, 0x01]),
+            _ => panic!("the late signature was dropped"),
+        }
+
+        let (stuck, _) = service(|method, _, _| match method {
+            "POST" => (502, json!({"error": "Fordefi …: unreachable"})),
+            _ => (200, json!({"id": "r-7", "state": "waiting_for_approval", "outcome": "pending"})),
+        });
+        match wait_for(&config(stuck), created, Instant::now(), "raw_transaction").await.unwrap() {
+            Waited::TimedOut { late: None, aborted } => assert!(!aborted && timed_out(aborted).to_string().contains("could not be aborted")),
+            _ => panic!("expected a timeout"),
+        }
     }
 
     /// A signed answer without what was asked for is an error, not an empty signature.

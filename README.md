@@ -624,7 +624,8 @@ tapp-cli -s https://<node>:50052 --tls-pin 0x<pin> \
   --external-signer 0x<owner address> start-app -f docker-compose.yml -a my-app
 ```
 
-(or set `TAPP_EXTERNAL_SIGNER`). Every command that would sign then stops and asks:
+(or set `TAPP_EXTERNAL_SIGNER`). Every command that would sign then stops and asks, unless
+`--ledger` or `--fordefi` (below) has the device or the vault asked instead:
 
 - **a request signature**: the CLI prints the one line of text above (`<Method>:0x<hash>:<ts>`).
   Sign it as a *message* (`personal_sign`), for example in Fordefi's message signing, and
@@ -678,17 +679,39 @@ tapp-cli --external-signer 0x<the vault address> --fordefi start-app -f docker-c
 
 The Fordefi API user's credentials (its access token and P-256 key) stay with the service.
 This machine holds only a token that names it to the service, which the service's operator can
-revoke on its own. `FORDEFI_SIGNER_URL` must be `https://`. Plain `http://` is taken only to
-this machine, for example through an SSH tunnel, since the token travels on every call.
+revoke on its own. `FORDEFI_SIGNER_URL` must be `https://`, with a certificate from a public CA
+(tapp-cli trusts no other). Plain `http://` is taken only to this machine, for example through an
+SSH tunnel, and never through a proxy, since the token travels on every call.
 
 What has to exist:
 
-- **The service**, with an entry for this caller in its policy file (see the service's README):
-  - `token_sha256`: the hash of this caller's token.
-  - `contracts`: the TappRegistry on each chain used, as `chain_id:0xaddress`. A call to any
-    other contract is refused.
-  - `messages`: a pattern admitting tapp's owner messages, `[A-Za-z]+(:0x[0-9a-f]{64})?:[0-9]+`.
-    Without it, no request can be signed.
+- **The service**, with an entry for this caller in its policy file (see the service's README).
+  The service's operator makes the token with `python auth.py <name>`.
+
+  ```json
+  "tapp": {
+    "token_sha256": "<sha256 of this caller's token>",
+    "contracts": ["16661:0x54874F536301c993922Dd95097e3902e7FBfe612",
+                  "16602:0x2Ce80374318B1d7Fb3345724457a182E0ad165c9"],
+    "functions": ["registerApp(string,bytes,bytes,bytes[],address,string)",
+                  "updateApp(string,bytes,bytes,bytes[])",
+                  "addNode(string,address,string,bytes,bytes)",
+                  "updateNode(string,address,address,string,bytes,bytes)",
+                  "removeNode(string,address)", "withdraw()",
+                  "authorizeInvalidator(string,address)", "revokeInvalidator(string,address)",
+                  "transferAppOwnership(string,address)", "acceptAppOwnership(string)"],
+    "max_value": "100000000000000000000",
+    "messages": "[A-Z][A-Za-z]+:0x[0-9a-f]{64}:[0-9]{10}"
+  }
+  ```
+
+  - `contracts`: the TappRegistry on each chain used. A call to any other contract is refused.
+  - `functions`: the registry functions tapp-cli calls, and none of the registry's admin ones.
+  - `max_value`: the most stake one call may carry, in wei (here 100 OG). Without it, no stake
+    can be sent, so `registerApp` and `addNode` are refused.
+  - `messages`: tapp's request signatures. Without it, none can be signed. `--legacy-sign`
+    (tapp-server < 0.9.0) signs `Method:timestamp` and needs `(:0x[0-9a-f]{64})?` in place of
+    `:0x[0-9a-f]{64}`, which also admits that older, weaker form for any node.
 - **On Fordefi's side:**
   - The service's API user.
   - The organisation's **API Signer**, running and activated, with that API user's public key
@@ -697,27 +720,38 @@ What has to exist:
     Fordefi takes part once its **policy** has approved the request.
 - **The chain.** 0G mainnet is built into Fordefi. Any other chain, such as the Galileo testnet,
   must first be added to the organisation as a custom chain (Settings > Chains > Add EVM chain).
+- **Funds.** The vault is the sender. It pays the gas of every call, and the stake of
+  `registerApp` and `addNode` (at least 10 OG on mainnet), on each chain used.
 
 What tapp-cli does:
 
-- **A request signature** is a personal_sign request (note `tapp-cli: <Method>`).
+- **A request signature** is a personal_sign request. Approvers see it noted
+  `0g-fordefi-signer: <caller>: tapp-cli: <Method>`.
   - The CLI follows its state: `waiting for approval` is the policy; `approved` means the API
     Signer has not signed yet.
   - It goes on once the signature recovers to the given address.
-  - If the signature does not come within the server's ±10-minute window, the request is
-    aborted and a new one is made for the same request.
-- **An on-chain call** is estimated here and signed without being broadcast.
-  - tapp-cli checks the signed transaction (signer, chain, contract, data, value).
+  - Approvers have until the server's ±10-minute window closes. After that the request is
+    aborted and a new one is made for the same request, every 10 minutes until one is signed
+    or the command is stopped.
+- **An on-chain call** is estimated here and signed without being broadcast, with the gas, the
+  gas price and the account's next nonce set here. Approvers see the registry function, for
+  example `tapp-cli: addNode(string,address,string,bytes,bytes)`.
+  - tapp-cli checks the signed transaction: signer, chain, contract, data, value, gas, gas
+    price, and that its nonce is still the account's next.
   - It then broadcasts it, waits for it to be mined and checks it again: the same path as a
     Ledger's.
   - A call not signed within 30 minutes is aborted.
+- **Stopping the command** (Ctrl-C) leaves its Fordefi request open. Reject it in Fordefi, or it
+  can still be approved.
 
 Neither the service nor Fordefi is trusted for what comes back. A signature from another vault,
-or a transaction other than the one asked for, stops the command.
+or a transaction that differs from the one asked for in any of the fields above, stops the
+command before anything is sent.
 
 Whoever holds a token can have the vault sign whatever that caller's entry and Fordefi's policy
-let through. So keep tokens off shared machines, and give the API user a policy that requires
-approval for anything it should not sign alone.
+let through. Within its entry, that is the owner's full authority over the vault's apps, for
+example `transferAppOwnership`. So keep tokens off shared machines, and give the API user a
+policy that requires approval for anything it should not sign alone.
 
 ## On-chain Registration
 

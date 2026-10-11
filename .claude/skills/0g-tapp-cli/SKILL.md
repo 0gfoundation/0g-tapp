@@ -187,26 +187,35 @@ On-chain commands (`register-onchain`, `update-onchain`, `start-app --register-o
 
 **(d) Fordefi through 0g-fordefi-signer (tapp-cli ≥ 0.11.0).**
 - **Settings.**
-  - `FORDEFI_SIGNER_URL`: the service. It must be `https://`; plain `http://` is accepted only to this machine, for example an SSH tunnel.
+  - `FORDEFI_SIGNER_URL`: the service. It must be `https://` with a certificate from a public CA; plain `http://` is accepted only to this machine, for example an SSH tunnel, and never goes through a proxy.
   - `FORDEFI_SIGNER_TOKEN`: this caller's token, made by the service's operator with `python auth.py <name>`.
   - The Fordefi API user's token and P-256 key stay with the service, so never ask for them here. tapp-cli does not read `.env` files.
   - A missing setting, or a plain-http URL to another machine, stops the command before anything is signed.
-- **The service's own configuration.** This caller's entry in the service's policy file decides what it may have signed.
+- **The service's own configuration.** This caller's entry in the service's policy file decides what it may have signed. The README's "With Fordefi" section has a complete entry for tapp.
   - `contracts` must list the TappRegistry for the chain, as `chain_id:0xaddress`. Otherwise every on-chain call is refused with `403 … is not one of <caller>'s contracts`.
-  - `messages` must admit tapp's `Method:0x<hash>:timestamp`, for example `[A-Za-z]+(:0x[0-9a-f]{64})?:[0-9]+`. Otherwise every request signature is refused with `403`.
+  - `functions`, if listed, must include the registry function the command calls. Otherwise `403 … is not one of <caller>'s functions`.
+  - `max_value` must cover the stake of `registerApp`/`addNode`. Otherwise `403 … max_value`.
+  - `messages` must admit tapp's `Method:0x<hash>:timestamp`, for example `[A-Z][A-Za-z]+:0x[0-9a-f]{64}:[0-9]{10}`. Otherwise every request signature is refused with `403`. `--legacy-sign` needs a pattern that also admits `Method:timestamp`.
   - `401` means the service does not take this token.
   - Only the service's operator can change these. Report the `403` text to them; do not retry.
-- **The chain.** 0G mainnet is built into Fordefi. Any other chain (testnet) must first be added to the Fordefi organisation as a custom chain. Otherwise the request is refused with `502`, which the CLI explains.
+- **The chain.** 0G mainnet is built into Fordefi. Any other chain (testnet) must first be added to the Fordefi organisation as a custom chain. Otherwise the request is refused with `502`, and the CLI points at the chain when Fordefi's reason mentions it.
+- **Funds.** The vault is the sender: it pays the gas, and the stake of `registerApp`/`addNode` (at least 10 OG on mainnet).
 - **Each signature.**
   - The CLI prints `signing in Fordefi: <Method>`, the signer, the service, a deadline and the text.
-  - It then asks the service for a signature (note `tapp-cli: <Method>`) and follows the Fordefi request's state.
+  - It then asks the service for a signature and follows the Fordefi request's state. Approvers see it noted `0g-fordefi-signer: <caller>: tapp-cli: <Method>`.
   - It goes on once the vault has signed and the signature recovers to the owner. A signature from another vault is refused, because the service signs with another vault than `--external-signer` names.
 - **States.**
-  - `waiting for approval` is Fordefi's policy, and approvers act in Fordefi. The 10-minute deadline still applies: after it, the CLI aborts the request and makes a new one for the same request.
+  - `waiting for approval` is Fordefi's policy, and approvers act in Fordefi. The 10-minute deadline still applies: after it, the CLI aborts the request and makes a new one for the same request, until one is signed or the command is stopped.
   - Staying at `approved` means the API Signer has not signed; check that it is running.
-  - `aborted`, `error_signing` and `cannot create transaction` end the command. Run it again once fixed.
-- **On-chain.** Gas is estimated here. The vault signs without broadcasting. The CLI checks the signed transaction (signer, chain, contract, data, value), then broadcasts it and waits for it to be mined. A request not signed within 30 minutes is aborted.
-- **Security.** Whoever holds a token can have the vault sign whatever that caller's entry and Fordefi's policy let through. Keep tokens off shared machines, and do not give the service's API user a policy that auto-approves everything.
+  - `ended aborted`, `ended error_signing` or any other end state stops the command. Run it again once fixed.
+  - A `4xx` while following a request (a revoked token, say) stops the command. Network errors are retried.
+  - Ctrl-C leaves the Fordefi request open: tell the holder to reject it in Fordefi.
+- **On-chain.**
+  - The CLI sets the gas, the gas price and the nonce (the account's next). The vault signs without broadcasting.
+  - The CLI checks the signed transaction (signer, chain, contract, data, value, gas, gas price, nonce), then broadcasts it and waits for it to be mined.
+  - A request not signed within 30 minutes is aborted.
+  - `its nonce is …, but the account's next is …` means another transaction from the vault landed or is pending while this one waited for approval. Nothing was sent; run the command again.
+- **Security.** Whoever holds a token can have the vault sign whatever that caller's entry and Fordefi's policy let through, which within the entry is the owner's full authority (`transferAppOwnership`, for one). Keep tokens off shared machines, and do not give the service's API user a policy that auto-approves everything.
 
 ### The node has no data disk (apps will not start)
 
