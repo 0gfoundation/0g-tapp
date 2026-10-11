@@ -664,46 +664,56 @@ with `--features ledger` (libusb; non-root access needs Ledger's udev rules).
 
 #### With Fordefi: `--fordefi`
 
-Add `--fordefi` and tapp-cli asks a Fordefi vault through Fordefi's API instead of
-prompting, as a Fordefi *API user*:
+Add `--fordefi` and tapp-cli asks a Fordefi vault for each signature instead of prompting.
+It goes through the [0g-fordefi-signer](https://github.com/0gfoundation/0g-fordefi-signer)
+service:
 
 ```bash
-export FORDEFI_API_USER_TOKEN=<the API user's access token>
-export FORDEFI_PRIVATE_KEY_PATH=/path/to/api-user-private.pem
-export FORDEFI_EVM_VAULT_ID=<the vault whose address is the owner>
+export FORDEFI_SIGNER_URL=https://<the service>
+export FORDEFI_SIGNER_TOKEN=<this caller's token for it>
 tapp-cli --external-signer 0x<the vault address> --fordefi start-app -f docker-compose.yml -a my-app ...
 ```
 
-The variables are the ones 0g-fordefi-signer reads, so its `.env` can be exported as it is
-(tapp-cli does not read `.env` files). `FORDEFI_API_HOST` (default `api.fordefi.com`) is
-optional. The chain is the one the RPC reports, named to Fordefi by its id (`evm_16661`):
-0G mainnet is built in, and any other chain — the Galileo testnet, say — must first be added
-to the organisation as a custom chain (Settings > Chains > Add EVM chain).
+The Fordefi API user's credentials (its access token and P-256 key) stay with the service.
+This machine holds only a token that names it to the service, which the service's operator can
+revoke on its own. `FORDEFI_SIGNER_URL` must be `https://`. Plain `http://` is taken only to
+this machine, for example through an SSH tunnel, since the token travels on every call.
 
-What has to exist on Fordefi's side:
+What has to exist:
 
-- An **API user**, with its P-256 key pair (`openssl ecparam -name prime256v1 -genkey -noout
-  -out api-user-private.pem`). The private key stays with tapp-cli; the public key is
-  **registered in the API Signer**.
-- The organisation's **API Signer** running and activated. Fordefi's MPC is 2-of-2: one share
-  is Fordefi's, the other is held by the API Signer, which signs only requests carrying the API
-  user's signature. Fordefi takes part once its **policy** has approved the transaction.
+- **The service**, with this caller's token in its `SIGNER_CLIENT_TOKENS`. Its
+  `SIGNER_ALLOWED_TARGETS` must list the TappRegistry on each chain used; a call to any other
+  contract is refused. To restrict it to tapp's owner messages, set `SIGNER_MESSAGE_PATTERN`
+  (see the service's README).
+- **On Fordefi's side:**
+  - The service's API user.
+  - The organisation's **API Signer**, running and activated, with that API user's public key
+    registered.
+  - Fordefi's MPC is 2-of-2: one share is Fordefi's, the other is held by the API Signer.
+    Fordefi takes part once its **policy** has approved the request.
+- **The chain.** 0G mainnet is built into Fordefi. Any other chain, such as the Galileo testnet,
+  must first be added to the organisation as a custom chain (Settings > Chains > Add EVM chain).
 
 What tapp-cli does:
 
-- **A request signature** is a Fordefi `personal_message_type` transaction (note
-  `tapp-cli: <Method>`). The CLI follows its state — `waiting for approval` is the policy,
-  `approved` means the API Signer has not signed yet — and goes on once the signature recovers
-  to the given address. If it does not come within the server's ±10-minute window, the Fordefi
-  transaction is aborted and a new one is created for the same request.
-- **An on-chain call** is estimated here and created with `push_mode: manual`: Fordefi signs
-  and does not broadcast. tapp-cli checks the signed transaction (signer, chain, contract,
-  data, value), broadcasts it, waits for it to be mined and checks it again — the same path as
-  a Ledger's. One not signed within 30 minutes is aborted.
+- **A request signature** is a personal_sign request (note `tapp-cli: <Method>`).
+  - The CLI follows its state: `waiting for approval` is the policy; `approved` means the API
+    Signer has not signed yet.
+  - It goes on once the signature recovers to the given address.
+  - If the signature does not come within the server's ±10-minute window, the request is
+    aborted and a new one is made for the same request.
+- **An on-chain call** is estimated here and signed without being broadcast.
+  - tapp-cli checks the signed transaction (signer, chain, contract, data, value).
+  - It then broadcasts it, waits for it to be mined and checks it again: the same path as a
+    Ledger's.
+  - A call not signed within 30 minutes is aborted.
 
-Whoever holds the token and the key file can have the vault sign whatever Fordefi's policy
-lets through, so keep both off shared machines and give this API user a policy that requires
-approval for anything it should not sign alone.
+Neither the service nor Fordefi is trusted for what comes back. A signature from another vault,
+or a transaction other than the one asked for, stops the command.
+
+Whoever holds a token can have the vault sign whatever the service's allowlist and Fordefi's
+policy let through. So keep tokens off shared machines, and give the API user a policy that
+requires approval for anything it should not sign alone.
 
 ## On-chain Registration
 

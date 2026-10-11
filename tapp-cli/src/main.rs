@@ -183,13 +183,12 @@ struct Cli {
     #[arg(long, global = true, requires = "external_signer", conflicts_with = "fordefi")]
     ledger: bool,
 
-    /// With --external-signer: sign through Fordefi's API as an API user, instead of pasting.
-    /// The vault signs each message, and each transaction, once its policy has approved it
-    /// and the organisation's API Signer has taken part; a transaction is signed only, then
-    /// checked and broadcast from here. Reads FORDEFI_API_USER_TOKEN,
-    /// FORDEFI_PRIVATE_KEY_PATH (the API user's P-256 key, PEM) and FORDEFI_EVM_VAULT_ID —
-    /// the names 0g-fordefi-signer uses — and optionally FORDEFI_API_HOST. A chain other
-    /// than 0G mainnet must exist in the Fordefi organisation (added as a custom chain).
+    /// With --external-signer: sign with a Fordefi vault through the 0g-fordefi-signer
+    /// service, instead of pasting. The vault signs each message, and each transaction, once
+    /// Fordefi's policy has approved it and the organisation's API Signer has taken part; a
+    /// transaction is signed only, then checked and broadcast from here. Reads
+    /// FORDEFI_SIGNER_URL (https, or http to this machine) and FORDEFI_SIGNER_TOKEN (this
+    /// caller's token for the service); the Fordefi credentials stay with the service.
     #[arg(long, global = true, requires = "external_signer")]
     fordefi: bool,
 

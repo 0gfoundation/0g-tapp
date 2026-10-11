@@ -1,45 +1,32 @@
-//! Fordefi's API, for `--fordefi`: the vault holding the owner key signs once its approval
-//! policy has run, and nothing is pasted.
+//! A Fordefi vault, for `--fordefi`, reached through 0g-fordefi-signer: the vault holding the
+//! owner key signs once Fordefi's approval policy has run, and nothing is pasted.
 //!
-//! Calls are made as a Fordefi *API user*. Fordefi takes a request only when it carries a
-//! signature by the API user's own P-256 key over `<path>|<timestamp>|<body>`, so the access
-//! token alone cannot make the vault sign; the key is a PEM file on this machine. The
-//! settings, and their names, are the ones 0g-fordefi-signer reads, so its `.env` works here
-//! unchanged:
+//! The Fordefi API user's credentials (its token and P-256 key) stay with the service; what
+//! this machine holds is the service's address and a token that names this caller to it, and
+//! which the service can revoke. The service also decides what the vault may sign — which
+//! contracts, which messages — on top of Fordefi's own policy.
 //!
-//! | variable                   |                                                         |
-//! |----------------------------|---------------------------------------------------------|
-//! | `FORDEFI_API_USER_TOKEN`   | the API user's access token                             |
-//! | `FORDEFI_PRIVATE_KEY_PATH` | the API user's P-256 private key, PEM                   |
-//! | `FORDEFI_EVM_VAULT_ID`     | the EVM vault whose address is the signer               |
-//! | `FORDEFI_API_HOST`         | optional, default `api.fordefi.com`                     |
+//! | variable               |                                                              |
+//! |------------------------|--------------------------------------------------------------|
+//! | `FORDEFI_SIGNER_URL`   | the service, `https://…` (plain `http://` only on loopback)  |
+//! | `FORDEFI_SIGNER_TOKEN` | this caller's token for it                                   |
 //!
 //! What comes back is never trusted as it is: a signature must recover to the signer, and a
-//! transaction is created with `push_mode: manual` — Fordefi signs and hands it back, and it
-//! is checked and broadcast by the caller exactly like a Ledger's.
+//! transaction is signed only — handed back, checked, and broadcast from here exactly like a
+//! Ledger's.
 
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use ethers::types::{Address, U256};
-use p256::ecdsa::{signature::Signer as _, Signature, SigningKey};
 use serde_json::{json, Value};
-
-/// Creates a transaction and waits (server side, briefly) for it to reach `wait_for_state`.
-const CREATE: &str = "/api/v1/transactions/create-and-wait";
 
 /// How long a transaction may wait for approval and signing before it is aborted. A request
 /// signature has a shorter limit of its own: the server's window.
 const APPROVAL_WAIT: Duration = Duration::from_secs(30 * 60);
 
-/// States after which nothing will be signed. The others that end a transaction (dropped,
-/// canceled, error_pushing_to_blockchain, …) come after a push, which `push_mode: manual`
-/// and a message never reach.
-const FAILED: &[&str] = &["cannot_create_transaction", "aborted", "error_signing"];
-
-/// What a state means for whoever is waiting. `approved` is where a transaction waits for
+/// What a Fordefi state means for whoever is waiting. `approved` is where a request waits for
 /// the API Signer, so one that stays there points at the API Signer, not at Fordefi.
 fn describe(state: &str) -> String {
     match state {
@@ -51,12 +38,10 @@ fn describe(state: &str) -> String {
     }
 }
 
-/// The API user, its key, and the vault it signs with.
+/// The service and this caller's token for it.
 pub struct Config {
     base: String,
     token: String,
-    vault_id: String,
-    key: SigningKey,
     poll: Duration,
 }
 
@@ -75,9 +60,8 @@ pub(super) fn config() -> Result<&'static Config> {
 }
 
 impl Config {
-    /// From the environment (see the module documentation). Everything is checked here,
-    /// including that the key file holds a P-256 key, so a bad setting stops the command
-    /// before anything is asked of Fordefi.
+    /// From the environment (see the module documentation), checked here so a bad setting
+    /// stops the command before anything is asked for.
     pub fn from_env() -> Result<Self> {
         let var = |name: &str| {
             std::env::var(name)
@@ -85,65 +69,73 @@ impl Config {
                 .map(|v| v.trim().to_string())
                 .filter(|v| !v.is_empty())
         };
-        let token = var("FORDEFI_API_USER_TOKEN")
-            .ok_or_else(|| anyhow!("FORDEFI_API_USER_TOKEN is not set (the API user's access token)"))?;
-        let vault_id = var("FORDEFI_EVM_VAULT_ID")
-            .ok_or_else(|| anyhow!("FORDEFI_EVM_VAULT_ID is not set (the vault whose address signs)"))?;
-        let key_path = var("FORDEFI_PRIVATE_KEY_PATH").ok_or_else(|| {
-            anyhow!("FORDEFI_PRIVATE_KEY_PATH is not set (the API user's P-256 private key, PEM)")
-        })?;
-        let pem = std::fs::read_to_string(&key_path)
-            .map_err(|e| anyhow!("FORDEFI_PRIVATE_KEY_PATH {}: {}", key_path, e))?;
-        let key = parse_key(&pem).map_err(|e| anyhow!("FORDEFI_PRIVATE_KEY_PATH {}: {}", key_path, e))?;
-        let host = var("FORDEFI_API_HOST").unwrap_or_else(|| "api.fordefi.com".to_string());
+        let url = var("FORDEFI_SIGNER_URL")
+            .ok_or_else(|| anyhow!("FORDEFI_SIGNER_URL is not set (the 0g-fordefi-signer service)"))?;
+        let token = var("FORDEFI_SIGNER_TOKEN")
+            .ok_or_else(|| anyhow!("FORDEFI_SIGNER_TOKEN is not set (this caller's token for the service)"))?;
         Ok(Config {
-            base: base_url(&host),
+            base: base_url(&url)?,
             token,
-            vault_id,
-            key,
             poll: Duration::from_secs(2),
         })
     }
 
-    pub fn vault_id(&self) -> &str {
-        &self.vault_id
+    /// The service, for showing where a signature is asked for.
+    pub fn url(&self) -> &str {
+        &self.base
     }
 }
 
-/// `api.fordefi.com` → `https://api.fordefi.com`; a value with a scheme is taken as it is.
-fn base_url(host: &str) -> String {
-    let host = host.trim().trim_end_matches('/');
-    if host.contains("://") {
-        host.to_string()
-    } else {
-        format!("https://{host}")
+/// The service's base URL. The token travels on every call, so plain HTTP is taken only to
+/// this machine (an SSH tunnel, say).
+fn base_url(url: &str) -> Result<String> {
+    let url = url.trim().trim_end_matches('/');
+    let parsed = reqwest::Url::parse(url).map_err(|e| anyhow!("FORDEFI_SIGNER_URL {}: {}", url, e))?;
+    let loopback = match parsed.host_str() {
+        Some("localhost") => true,
+        Some(host) => host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback()),
+        None => false,
+    };
+    match parsed.scheme() {
+        "https" => Ok(url.to_string()),
+        "http" if loopback => Ok(url.to_string()),
+        "http" => Err(anyhow!(
+            "FORDEFI_SIGNER_URL {}: the token would cross the network in the clear; use https \
+             (or an SSH tunnel to http://127.0.0.1)",
+            url
+        )),
+        other => Err(anyhow!("FORDEFI_SIGNER_URL {}: {} is not http(s)", url, other)),
     }
 }
 
-/// The API user's key, as `openssl ecparam -name prime256v1 -genkey` writes it (SEC1,
-/// `EC PRIVATE KEY`) or as PKCS#8 (`PRIVATE KEY`).
-fn parse_key(pem: &str) -> Result<SigningKey> {
-    use p256::pkcs8::DecodePrivateKey;
-    if let Ok(secret) = p256::SecretKey::from_sec1_pem(pem) {
-        return Ok(secret.into());
+/// A call the service answered with an error status.
+#[derive(Debug)]
+struct Refused {
+    path: String,
+    status: reqwest::StatusCode,
+    text: String,
+}
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "fordefi signer {}: {} — {}", self.path, self.status, self.text)?;
+        if self.status == reqwest::StatusCode::UNAUTHORIZED {
+            write!(f, " (the service does not take FORDEFI_SIGNER_TOKEN)")?;
+        }
+        Ok(())
     }
-    SigningKey::from_pkcs8_pem(pem)
-        .map_err(|_| anyhow!("not a P-256 private key in PEM (EC PRIVATE KEY or PRIVATE KEY)"))
 }
 
-/// The `x-signature` header: ECDSA P-256 / SHA-256 over `<path>|<timestamp>|<body>`, DER,
-/// base64. The timestamp is in milliseconds, as Fordefi's authentication page specifies
-/// (0g-fordefi-signer sends seconds).
-fn sign_request(key: &SigningKey, path: &str, timestamp: i64, body: &str) -> String {
-    let signature: Signature = key.sign(format!("{path}|{timestamp}|{body}").as_bytes());
-    BASE64.encode(signature.to_der().as_bytes())
-}
+impl std::error::Error for Refused {}
 
-/// What Fordefi said, in one line: its `detail` or `title` when the answer is its JSON error,
-/// else the start of the text.
+/// What the service said, in one line: its `error`, else the start of the text.
 fn error_text(text: &str) -> String {
     if let Ok(v) = serde_json::from_str::<Value>(text) {
-        for field in ["detail", "title", "message"] {
+        for field in ["error", "detail", "title", "message"] {
             if let Some(s) = v.get(field).and_then(Value::as_str) {
                 return s.to_string();
             }
@@ -156,116 +148,35 @@ async fn call(config: &Config, method: reqwest::Method, path: &str, body: Option
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     let client = CLIENT.get_or_init(|| {
         reqwest::Client::builder()
-            .timeout(Duration::from_secs(60))
+            .timeout(Duration::from_secs(90))
             .build()
             .unwrap_or_default()
     });
-    let body = body.map(Value::to_string).unwrap_or_default();
-    let timestamp = chrono::Utc::now().timestamp_millis();
     let mut request = client
         .request(method, format!("{}{}", config.base, path))
-        .bearer_auth(&config.token)
-        .header("x-timestamp", timestamp.to_string())
-        .header("x-signature", sign_request(&config.key, path, timestamp, &body));
-    if !body.is_empty() {
-        request = request.header("content-type", "application/json").body(body);
+        .bearer_auth(&config.token);
+    if let Some(body) = body {
+        request = request.json(body);
     }
-    let response = request.send().await.map_err(|e| anyhow!("Fordefi {}: {}", path, e))?;
+    let response = request.send().await.map_err(|e| anyhow!("fordefi signer {}: {}", path, e))?;
     let status = response.status();
     let text = response.text().await.unwrap_or_default();
     if !status.is_success() {
-        return Err(anyhow!("Fordefi {}: {} — {}", path, status, error_text(&text)));
+        return Err(Refused { path: path.to_string(), status, text: error_text(&text) }.into());
     }
-    serde_json::from_str(&text).map_err(|e| anyhow!("Fordefi {}: the answer is not JSON ({})", path, e))
+    serde_json::from_str(&text).map_err(|e| anyhow!("fordefi signer {}: the answer is not JSON ({})", path, e))
 }
 
-/// A transaction's state, which Fordefi gives either as a string or as `{"status": …}`.
-fn state_of(tx: &Value) -> &str {
-    match tx.get("state") {
-        Some(Value::String(s)) => s,
-        Some(v) => v.get("status").and_then(Value::as_str).unwrap_or("unknown"),
-        None => "unknown",
-    }
+/// A field of the service's answer about a request.
+fn field<'a>(request: &'a Value, name: &str) -> &'a str {
+    request.get(name).and_then(Value::as_str).unwrap_or("")
 }
 
-/// The first signature of a signed message, decoded (`signatures[0].data`, base64).
-fn signature_of(tx: &Value) -> Option<Result<Vec<u8>>> {
-    let first = tx.get("signatures")?.as_array()?.first()?;
-    let b64 = first.get("data").and_then(Value::as_str).or_else(|| first.as_str())?;
-    Some(
-        BASE64
-            .decode(b64)
-            .map_err(|e| anyhow!("its signature is not base64: {}", e)),
-    )
-}
-
-/// The signed transaction of a `push_mode: manual` transaction (`raw_transaction`, 0x-hex).
-fn raw_transaction_of(tx: &Value) -> Option<Result<Vec<u8>>> {
-    let raw = tx.get("raw_transaction")?.as_str().filter(|s| !s.is_empty())?;
-    Some(match raw.strip_prefix("0x") {
-        Some(hex_str) => hex::decode(hex_str).map_err(|e| anyhow!("its raw_transaction is not hex: {}", e)),
-        None => BASE64
-            .decode(raw)
-            .map_err(|_| anyhow!("its raw_transaction is neither 0x-hex nor base64")),
-    })
-}
-
-/// A request for a `personal_sign` (EIP-191) of `message`. A personal message is not tied to
-/// a chain; the chain only tells Fordefi which kind of vault signs it.
-fn message_request(vault_id: &str, message: &str, note: &str) -> Value {
-    json!({
-        "vault_id": vault_id,
-        "signer_type": "api_signer",
-        "type": "evm_message",
-        "details": {
-            "type": "personal_message_type",
-            "raw_data": format!("0x{}", hex::encode(message.as_bytes())),
-            "chain": "ethereum_mainnet",
-        },
-        "note": note,
-        "wait_for_state": "signed",
-    })
-}
-
-/// A request to sign, not send, a legacy contract call.
-#[allow(clippy::too_many_arguments)]
-fn transaction_request(
-    vault_id: &str,
-    chain: &str,
-    to: &Address,
-    data: &[u8],
-    value: U256,
-    gas: U256,
-    gas_price: U256,
-    note: &str,
-) -> Value {
-    json!({
-        "vault_id": vault_id,
-        "signer_type": "api_signer",
-        "sign_mode": "auto",
-        "type": "evm_transaction",
-        "details": {
-            "type": "evm_raw_transaction",
-            "push_mode": "manual",
-            "chain": chain,
-            "to": format!("0x{:x}", to),
-            "value": value.to_string(),
-            "data": { "type": "hex", "hex_data": format!("0x{}", hex::encode(data)) },
-            "gas": {
-                "type": "custom",
-                "gas_limit": gas.to_string(),
-                "details": { "type": "legacy", "price": gas_price.to_string() },
-            },
-        },
-        "note": note,
-        "wait_for_state": "signed",
-    })
-}
-
-/// Fordefi's id for an EVM chain: `evm_<chain id>`, for its built-in chains (0G mainnet is
-/// `evm_16661`) and for custom ones alike.
-fn chain_unique_id(chain_id: u64) -> String {
-    format!("evm_{chain_id}")
+/// `0x…` from the service, decoded.
+fn hex_field(request: &Value, name: &str) -> Result<Vec<u8>> {
+    let s = field(request, name);
+    let digits = s.strip_prefix("0x").ok_or_else(|| anyhow!("its {} is not 0x-hex", name))?;
+    hex::decode(digits).map_err(|e| anyhow!("its {} is not hex: {}", name, e))
 }
 
 enum Waited<T> {
@@ -273,47 +184,43 @@ enum Waited<T> {
     TimedOut,
 }
 
-/// Follow a created transaction until `ready` finds what was asked for in it, it fails, or
-/// `until` passes — then it is aborted, so nobody approves something no longer waited for.
-async fn wait_for<T>(
-    config: &Config,
-    created: Value,
-    until: Instant,
-    ready: impl Fn(&Value) -> Option<Result<T>>,
-) -> Result<Waited<T>> {
-    let id = created
-        .get("id")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("Fordefi did not say which transaction it created"))?
-        .to_string();
-    eprintln!("  Fordefi transaction {id}");
-    let mut tx = created;
+/// Follow a request until it is signed, it fails, or `until` passes — then it is aborted, so
+/// nobody approves something no longer waited for. `result` is the field that holds what was
+/// asked for once `outcome` is `signed`.
+async fn wait_for(config: &Config, created: Value, until: Instant, result: &str) -> Result<Waited<Vec<u8>>> {
+    let id = field(&created, "id").to_string();
+    if id.is_empty() {
+        return Err(anyhow!("the service did not say which request it made"));
+    }
+    eprintln!("  Fordefi request {id}");
+    let mut request = created;
     let mut shown = String::new();
     loop {
-        if let Some(found) = ready(&tx) {
-            return found
-                .map(Waited::Done)
-                .map_err(|e| anyhow!("Fordefi transaction {}: {}", id, e));
-        }
-        let state = state_of(&tx).to_string();
-        if FAILED.contains(&state.as_str()) {
-            return Err(anyhow!("Fordefi transaction {} ended {}", id, state));
+        let state = field(&request, "state").to_string();
+        match field(&request, "outcome") {
+            "signed" => {
+                return hex_field(&request, result)
+                    .map(Waited::Done)
+                    .map_err(|e| anyhow!("Fordefi request {}: {}", id, e))
+            }
+            "failed" => return Err(anyhow!("Fordefi request {} ended {}", id, state)),
+            _ => {}
         }
         if state != shown {
             eprintln!("  … {}", describe(&state));
             shown = state;
         }
         if Instant::now() >= until {
-            let path = format!("/api/v1/transactions/{id}/abort");
+            let path = format!("/v1/requests/{id}/abort");
             if let Err(e) = call(config, reqwest::Method::POST, &path, None).await {
                 eprintln!("  (aborting {id}: {e})");
             }
             return Ok(Waited::TimedOut);
         }
         tokio::time::sleep(config.poll).await;
-        let path = format!("/api/v1/transactions/{id}");
+        let path = format!("/v1/requests/{id}");
         match call(config, reqwest::Method::GET, &path, None).await {
-            Ok(v) => tx = v,
+            Ok(v) => request = v,
             Err(e) => eprintln!("  (reading {id}: {e}; retrying)"),
         }
     }
@@ -330,25 +237,40 @@ fn deadline(valid_until: Option<i64>) -> Instant {
     }
 }
 
-/// Have the vault `personal_sign` `message`. Returns the signature as Fordefi gave it; the
-/// caller normalises it and checks who made it. Past `valid_until` the request is aborted
-/// and [`super::Expired`] returned.
+/// Have the vault `personal_sign` `message`. Returns the signature as it came; the caller
+/// normalises it and checks who made it. Past `valid_until` the request is aborted and
+/// [`super::Expired`] returned.
 pub(super) async fn sign_message(
     config: &Config,
     message: &str,
     what: &str,
     valid_until: Option<i64>,
 ) -> Result<Vec<u8>> {
-    let request = message_request(&config.vault_id, message, &format!("tapp-cli: {what}"));
-    let created = call(config, reqwest::Method::POST, CREATE, Some(&request)).await?;
-    match wait_for(config, created, deadline(valid_until), signature_of).await? {
+    let body = json!({ "message": message, "note": format!("tapp-cli: {what}") });
+    let created = call(config, reqwest::Method::POST, "/v1/messages", Some(&body)).await?;
+    match wait_for(config, created, deadline(valid_until), "signature").await? {
         Waited::Done(sig) => Ok(sig),
         Waited::TimedOut if valid_until.is_some() => Err(super::Expired.into()),
         Waited::TimedOut => Err(anyhow!(
-            "not signed within {} min; the Fordefi transaction was aborted",
+            "not signed within {} min; the Fordefi request was aborted",
             APPROVAL_WAIT.as_secs() / 60
         )),
     }
+}
+
+/// The body asking the vault to sign, not send, a legacy contract call. Amounts are decimal
+/// strings: wei does not fit the double a JSON number becomes.
+#[allow(clippy::too_many_arguments)]
+fn transaction_body(chain_id: u64, to: &Address, data: &[u8], value: U256, gas: U256, gas_price: U256, what: &str) -> Value {
+    json!({
+        "chain_id": chain_id,
+        "to": format!("0x{:x}", to),
+        "data": format!("0x{}", hex::encode(data)),
+        "value": value.to_string(),
+        "gas_limit": gas.to_string(),
+        "gas_price": gas_price.to_string(),
+        "note": format!("tapp-cli: {what}"),
+    })
 }
 
 /// Have the vault sign, not send, a contract call. Returns the signed transaction for the
@@ -364,31 +286,22 @@ pub(super) async fn sign_transaction(
     gas_price: U256,
     what: &str,
 ) -> Result<Vec<u8>> {
-    let chain = chain_unique_id(chain_id);
-    let request = transaction_request(
-        &config.vault_id,
-        &chain,
-        to,
-        data,
-        value,
-        gas,
-        gas_price,
-        &format!("tapp-cli: {what}"),
-    );
-    let created = call(config, reqwest::Method::POST, CREATE, Some(&request))
+    let body = transaction_body(chain_id, to, data, value, gas, gas_price, what);
+    let created = call(config, reqwest::Method::POST, "/v1/transactions", Some(&body))
         .await
-        .map_err(|e| {
-            anyhow!(
-                "{} (chain {} — one Fordefi does not support out of the box must be added to the \
-                 organisation as a custom chain: Settings > Chains > Add EVM chain)",
-                e,
-                chain
-            )
+        .map_err(|e| match e.downcast_ref::<Refused>() {
+            // 502: Fordefi itself refused, most often over a chain it does not know.
+            Some(r) if r.status == reqwest::StatusCode::BAD_GATEWAY => anyhow!(
+                "{} (a chain Fordefi does not support out of the box — the 0G testnet, for one — \
+                 must be added to the organisation: Settings > Chains > Add EVM chain)",
+                e
+            ),
+            _ => e,
         })?;
-    match wait_for(config, created, Instant::now() + APPROVAL_WAIT, raw_transaction_of).await? {
+    match wait_for(config, created, Instant::now() + APPROVAL_WAIT, "raw_transaction").await? {
         Waited::Done(raw) => Ok(raw),
         Waited::TimedOut => Err(anyhow!(
-            "not signed within {} min; the Fordefi transaction was aborted",
+            "not signed within {} min; the Fordefi request was aborted",
             APPROVAL_WAIT.as_secs() / 60
         )),
     }
@@ -400,44 +313,29 @@ mod tests {
     use ethers::signers::{LocalWallet, Signer as _};
     use ethers::types::transaction::eip2718::TypedTransaction;
     use ethers::types::TransactionRequest;
-    use p256::ecdsa::{signature::Verifier as _, VerifyingKey};
     use std::io::{BufRead, BufReader, Read, Write};
     use std::sync::{Arc, Mutex};
 
     const WALLET: &str = "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
 
-    fn api_key() -> SigningKey {
-        SigningKey::from_slice(&[7u8; 32]).unwrap()
-    }
-
     fn config(base: String) -> Config {
         Config {
             base,
             token: "token".into(),
-            vault_id: "vault-1".into(),
-            key: api_key(),
             poll: Duration::from_millis(10),
         }
     }
 
-    /// Does `x-signature` verify, with `key`, over `<path>|<x-timestamp>|<body>`?
-    fn verifies(key: &VerifyingKey, path: &str, timestamp: &str, body: &str, signature: &str) -> bool {
-        let Ok(der) = BASE64.decode(signature) else { return false };
-        let Ok(sig) = Signature::from_der(&der) else { return false };
-        key.verify(format!("{path}|{timestamp}|{body}").as_bytes(), &sig).is_ok()
-    }
-
-    /// A stand-in for Fordefi on 127.0.0.1: refuses a request whose x-signature does not
-    /// verify with the API user's key, otherwise answers with `answer(method, path, body)`.
-    /// Returns its base URL and the requests it took, as "METHOD path".
-    fn fordefi(
-        answer: impl Fn(&str, &str, &str) -> Value + Send + 'static,
+    /// A stand-in for the service on 127.0.0.1: refuses a call without the token, otherwise
+    /// answers with `answer(method, path, body)` → (status, body). Returns its base URL and
+    /// the calls it took, as "METHOD path".
+    fn service(
+        answer: impl Fn(&str, &str, &str) -> (u16, Value) + Send + 'static,
     ) -> (String, Arc<Mutex<Vec<String>>>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let seen = Arc::new(Mutex::new(Vec::new()));
         let log = seen.clone();
-        let key = VerifyingKey::from(&api_key());
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let mut stream = stream.unwrap();
@@ -446,7 +344,7 @@ mod tests {
                 reader.read_line(&mut line).unwrap();
                 let mut parts = line.split_whitespace();
                 let (method, path) = (parts.next().unwrap().to_string(), parts.next().unwrap().to_string());
-                let (mut length, mut timestamp, mut signature, mut bearer) = (0, String::new(), String::new(), String::new());
+                let (mut length, mut bearer) = (0, String::new());
                 loop {
                     let mut header = String::new();
                     reader.read_line(&mut header).unwrap();
@@ -458,8 +356,6 @@ mod tests {
                     let value = value.trim().to_string();
                     match name.to_ascii_lowercase().as_str() {
                         "content-length" => length = value.parse().unwrap(),
-                        "x-timestamp" => timestamp = value,
-                        "x-signature" => signature = value,
                         "authorization" => bearer = value,
                         _ => {}
                     }
@@ -468,15 +364,15 @@ mod tests {
                 reader.read_exact(&mut body).unwrap();
                 let body = String::from_utf8(body).unwrap();
                 log.lock().unwrap().push(format!("{method} {path}"));
-                let (status, reply) = if bearer != "Bearer token" || !verifies(&key, &path, &timestamp, &body, &signature) {
-                    ("401 Unauthorized", json!({"title": "bad request signature"}))
+                let (status, reply) = if bearer != "Bearer token" {
+                    (401, json!({"error": "a valid bearer token is required"}))
                 } else {
-                    ("200 OK", answer(&method, &path, &body))
+                    answer(&method, &path, &body)
                 };
                 let reply = reply.to_string();
                 write!(
                     stream,
-                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
                     reply.len()
                 )
                 .unwrap();
@@ -485,128 +381,70 @@ mod tests {
         (base, seen)
     }
 
-    /// What the vault would return for a personal message: the wallet's signature, base64.
+    /// What the service returns for a signed message: the wallet's signature, 0x-hex.
     fn signed_message(body: &str) -> Value {
         let request: Value = serde_json::from_str(body).unwrap();
-        let raw = request["details"]["raw_data"].as_str().unwrap();
-        let message = String::from_utf8(hex::decode(raw.trim_start_matches("0x")).unwrap()).unwrap();
+        let message = request["message"].as_str().unwrap();
         let wallet: LocalWallet = WALLET.parse().unwrap();
-        let sig = wallet.sign_hash(ethers::utils::hash_message(&message)).unwrap();
-        json!({"id": "tx-1", "state": "signed", "signatures": [{"data": BASE64.encode(sig.to_vec())}]})
+        let sig = wallet.sign_hash(ethers::utils::hash_message(message)).unwrap();
+        json!({"id": "r-1", "state": "signed", "outcome": "signed", "signature": format!("0x{}", hex::encode(sig.to_vec()))})
     }
 
     #[test]
-    fn a_request_is_signed_over_path_timestamp_and_body() {
-        let key = api_key();
-        let signature = sign_request(&key, CREATE, 1_760_000_000_000, "{\"a\":1}");
-        let verifying = VerifyingKey::from(&key);
-        assert!(verifies(&verifying, CREATE, "1760000000000", "{\"a\":1}", &signature));
-        assert!(!verifies(&verifying, CREATE, "1760000000000", "{\"a\":2}", &signature), "other body");
-        assert!(!verifies(&verifying, CREATE, "1760000000001", "{\"a\":1}", &signature), "other time");
-        assert!(!verifies(&verifying, "/api/v1/transactions", "1760000000000", "{\"a\":1}", &signature), "other path");
-    }
-
-    /// `openssl ecparam -genkey` writes SEC1; other tools write PKCS#8. Both are read.
-    #[test]
-    fn the_api_users_key_is_read_from_either_pem_form() {
-        use p256::pkcs8::{EncodePrivateKey, LineEnding};
-        let secret = p256::SecretKey::from_slice(&[7u8; 32]).unwrap();
-        let sec1 = secret.to_sec1_pem(LineEnding::LF).unwrap();
-        let pkcs8 = secret.to_pkcs8_pem(LineEnding::LF).unwrap();
-        assert_eq!(parse_key(&sec1).unwrap(), api_key());
-        assert_eq!(parse_key(&pkcs8).unwrap(), api_key());
-        assert!(parse_key("-----BEGIN EC PRIVATE KEY-----\nnope\n-----END EC PRIVATE KEY-----").is_err());
+    fn the_token_goes_only_over_tls_or_to_this_machine() {
+        assert_eq!(base_url("https://signer.example/").unwrap(), "https://signer.example");
+        assert_eq!(base_url("http://127.0.0.1:5000").unwrap(), "http://127.0.0.1:5000");
+        assert_eq!(base_url("http://localhost:5000").unwrap(), "http://localhost:5000");
+        assert_eq!(base_url("http://[::1]:5000").unwrap(), "http://[::1]:5000");
+        assert!(base_url("http://10.0.0.5:5000").is_err());
+        assert!(base_url("http://signer.example").is_err());
+        assert!(base_url("ftp://signer.example").is_err());
+        assert!(base_url("signer.example").is_err());
     }
 
     #[test]
-    fn the_host_becomes_a_url() {
-        assert_eq!(base_url("api.fordefi.com"), "https://api.fordefi.com");
-        assert_eq!(base_url("api.fordefi.com/"), "https://api.fordefi.com");
-        assert_eq!(base_url("http://127.0.0.1:8080"), "http://127.0.0.1:8080");
-    }
-
-    #[test]
-    fn a_message_request_carries_the_text_as_hex() {
-        let request = message_request("vault-1", "StartApp:0x00ff:1791400000", "tapp-cli: StartApp");
-        assert_eq!(request["vault_id"], "vault-1");
-        assert_eq!(request["signer_type"], "api_signer");
-        assert_eq!(request["type"], "evm_message");
-        assert_eq!(request["details"]["type"], "personal_message_type");
-        assert_eq!(
-            request["details"]["raw_data"],
-            format!("0x{}", hex::encode("StartApp:0x00ff:1791400000"))
-        );
-        assert_eq!(request["wait_for_state"], "signed");
-    }
-
-    #[test]
-    fn a_transaction_request_is_signed_only() {
+    fn a_transaction_is_asked_for_in_decimal_strings() {
         let to: Address = "0x5f0d9c243048F5a55468472c6F090184E2E333c7".parse().unwrap();
-        let request = transaction_request(
-            "vault-1",
-            "evm_16661",
+        let body = transaction_body(
+            16661,
             &to,
             &[0x81, 0x73],
-            U256::from(10u64).pow(U256::from(18u64)),
+            U256::from(10u64).pow(U256::from(21u64)),
             U256::from(120_000u64),
             U256::from(4_000_000_000u64),
-            "note",
+            "addNode",
         );
-        let details = &request["details"];
-        assert_eq!(details["push_mode"], "manual", "Fordefi must not broadcast");
-        assert_eq!(details["type"], "evm_raw_transaction");
-        assert_eq!(details["chain"], "evm_16661");
-        assert_eq!(details["to"], "0x5f0d9c243048f5a55468472c6f090184e2e333c7");
-        assert_eq!(details["value"], "1000000000000000000");
-        assert_eq!(details["data"]["hex_data"], "0x8173");
-        assert_eq!(details["gas"]["gas_limit"], "120000");
-        assert_eq!(details["gas"]["details"]["price"], "4000000000");
-    }
-
-    #[test]
-    fn answers_are_read_in_the_shapes_fordefi_uses() {
-        assert_eq!(state_of(&json!({"state": "signed"})), "signed");
-        assert_eq!(state_of(&json!({"state": {"status": "approved"}})), "approved");
-        assert_eq!(state_of(&json!({})), "unknown");
-
-        let sig = signature_of(&json!({"signatures": [{"data": BASE64.encode([1u8, 2, 3])}]}));
-        assert_eq!(sig.unwrap().unwrap(), vec![1, 2, 3]);
-        assert!(signature_of(&json!({"signatures": []})).is_none());
-        assert!(signature_of(&json!({"signatures": [{"data": "%%"}]})).unwrap().is_err());
-
-        assert_eq!(raw_transaction_of(&json!({"raw_transaction": "0x0102"})).unwrap().unwrap(), vec![1, 2]);
         assert_eq!(
-            raw_transaction_of(&json!({"raw_transaction": BASE64.encode([1u8, 2])})).unwrap().unwrap(),
-            vec![1, 2]
+            body,
+            json!({
+                "chain_id": 16661,
+                "to": "0x5f0d9c243048f5a55468472c6f090184e2e333c7",
+                "data": "0x8173",
+                "value": "1000000000000000000000",
+                "gas_limit": "120000",
+                "gas_price": "4000000000",
+                "note": "tapp-cli: addNode",
+            })
         );
-        assert!(raw_transaction_of(&json!({"raw_transaction": ""})).is_none());
-        assert!(raw_transaction_of(&json!({"state": "approved"})).is_none());
     }
 
-    /// The chain id read from the RPC is all Fordefi needs: no table of names to keep.
-    #[test]
-    fn a_chain_is_named_by_its_id() {
-        assert_eq!(chain_unique_id(16661), "evm_16661");
-        assert_eq!(chain_unique_id(16602), "evm_16602");
-    }
-
-    /// Created waiting for approval, then signed: the signature is followed to the end.
+    /// Created waiting for approval, then signed: the request is followed to the end.
     #[tokio::test]
     async fn a_message_is_followed_until_the_vault_has_signed_it() {
         let created: Arc<Mutex<String>> = Arc::default();
         let reads = Arc::new(Mutex::new(0));
         let (c, r) = (created.clone(), reads.clone());
-        let (base, seen) = fordefi(move |method, _path, body| {
+        let (base, seen) = service(move |method, _path, body| {
             if method == "POST" {
                 *c.lock().unwrap() = body.to_string();
-                return json!({"id": "tx-1", "state": "waiting_for_approval", "has_timed_out": true});
+                return (200, json!({"id": "r-1", "state": "waiting_for_approval", "outcome": "pending"}));
             }
             let mut n = r.lock().unwrap();
             *n += 1;
             if *n < 2 {
-                json!({"id": "tx-1", "state": {"status": "approved"}})
+                (200, json!({"id": "r-1", "state": "approved", "outcome": "pending"}))
             } else {
-                signed_message(&c.lock().unwrap())
+                (200, signed_message(&c.lock().unwrap()))
             }
         });
         let message = "StartApp:0x00ff:1791400000";
@@ -614,33 +452,33 @@ mod tests {
         let sig = super::super::parse_signature(&hex::encode(raw)).unwrap();
         let wallet: LocalWallet = WALLET.parse().unwrap();
         assert_eq!(super::super::recover_personal(message, &sig).unwrap(), wallet.address());
+        let sent: Value = serde_json::from_str(&created.lock().unwrap()).unwrap();
+        assert_eq!(sent, json!({"message": message, "note": "tapp-cli: StartApp"}));
         let seen = seen.lock().unwrap();
-        assert_eq!(seen[0], format!("POST {CREATE}"));
-        assert!(seen[1..].iter().all(|s| s == "GET /api/v1/transactions/tx-1"), "{seen:?}");
+        assert_eq!(seen[0], "POST /v1/messages");
+        assert!(seen[1..].iter().all(|s| s == "GET /v1/requests/r-1"), "{seen:?}");
     }
 
     /// The vault signs a transaction it is asked for and hands it back unsent; what comes
     /// back passes the same check a Ledger's does.
     #[tokio::test]
     async fn a_transaction_comes_back_signed_and_unsent() {
-        let (base, _) = fordefi(|_, _, body| {
-            let request: Value = serde_json::from_str(body).unwrap();
-            let d = &request["details"];
-            assert_eq!(d["push_mode"], "manual");
-            assert_eq!(d["chain"], "evm_16661");
+        let (base, seen) = service(|_, _, body| {
+            let d: Value = serde_json::from_str(body).unwrap();
             let wallet: LocalWallet = WALLET.parse::<LocalWallet>().unwrap().with_chain_id(16661u64);
             let tx: TypedTransaction = TransactionRequest::new()
                 .from(wallet.address())
                 .to(d["to"].as_str().unwrap().parse::<Address>().unwrap())
-                .data(hex::decode(d["data"]["hex_data"].as_str().unwrap().trim_start_matches("0x")).unwrap())
+                .data(hex::decode(d["data"].as_str().unwrap().trim_start_matches("0x")).unwrap())
                 .value(U256::from_dec_str(d["value"].as_str().unwrap()).unwrap())
-                .gas(U256::from_dec_str(d["gas"]["gas_limit"].as_str().unwrap()).unwrap())
-                .gas_price(U256::from_dec_str(d["gas"]["details"]["price"].as_str().unwrap()).unwrap())
+                .gas(U256::from_dec_str(d["gas_limit"].as_str().unwrap()).unwrap())
+                .gas_price(U256::from_dec_str(d["gas_price"].as_str().unwrap()).unwrap())
                 .nonce(3)
-                .chain_id(16661u64)
+                .chain_id(d["chain_id"].as_u64().unwrap())
                 .into();
             let sig = wallet.sign_transaction_sync(&tx).unwrap();
-            json!({"id": "tx-2", "state": "signed", "raw_transaction": format!("0x{}", hex::encode(tx.rlp_signed(&sig)))})
+            let raw = format!("0x{}", hex::encode(tx.rlp_signed(&sig)));
+            (200, json!({"id": "r-2", "state": "signed", "outcome": "signed", "raw_transaction": raw}))
         });
         let wallet: LocalWallet = WALLET.parse().unwrap();
         let from = wallet.address();
@@ -651,44 +489,56 @@ mod tests {
             .await
             .unwrap();
         super::super::check_signed_transaction(&raw, 16661, &from, &to, &data, value).unwrap();
+        assert_eq!(seen.lock().unwrap().as_slice(), ["POST /v1/transactions"]);
     }
 
     #[tokio::test]
-    async fn an_aborted_transaction_ends_the_wait() {
-        let (base, _) = fordefi(|method, _, _| {
+    async fn an_aborted_request_ends_the_wait() {
+        let (base, _) = service(|method, _, _| {
             if method == "POST" {
-                json!({"id": "tx-3", "state": "waiting_for_approval"})
+                (200, json!({"id": "r-3", "state": "waiting_for_approval", "outcome": "pending"}))
             } else {
-                json!({"id": "tx-3", "state": "aborted"})
+                (200, json!({"id": "r-3", "state": "aborted", "outcome": "failed"}))
             }
         });
         let e = sign_message(&config(base), "StopApp:0x00:1", "StopApp", None).await.unwrap_err();
-        assert!(e.to_string().contains("aborted"), "{e}");
+        assert!(e.to_string().contains("ended aborted"), "{e}");
     }
 
-    /// A request signature not given before the server's deadline is of no use: the Fordefi
-    /// transaction is aborted, so nobody approves it later, and the caller asks again.
+    /// A request signature not given before the server's deadline is of no use: the request
+    /// is aborted, so nobody approves it later, and the caller asks again.
     #[tokio::test]
     async fn past_the_deadline_the_request_is_aborted() {
-        let (base, seen) = fordefi(|_, path, _| {
-            if path.ends_with("/abort") {
-                json!({})
-            } else {
-                json!({"id": "tx-4", "state": "waiting_for_approval"})
-            }
-        });
+        let (base, seen) = service(|_, _, _| (200, json!({"id": "r-4", "state": "waiting_for_approval", "outcome": "pending"})));
         let now = chrono::Utc::now().timestamp();
         let e = sign_message(&config(base), "StopApp:0x00:1", "StopApp", Some(now)).await.unwrap_err();
         assert!(e.downcast_ref::<super::super::Expired>().is_some(), "{e}");
-        assert!(seen.lock().unwrap().contains(&"POST /api/v1/transactions/tx-4/abort".to_string()));
+        assert!(seen.lock().unwrap().contains(&"POST /v1/requests/r-4/abort".to_string()));
     }
 
     #[tokio::test]
-    async fn a_refused_request_says_what_fordefi_said() {
-        let (base, _) = fordefi(|_, _, _| json!({}));
-        let mut bad = config(base);
+    async fn a_refusal_says_why() {
+        let (base, _) = service(|_, _, _| (403, json!({"error": "0x5f0d… on chain 16661 is not in SIGNER_ALLOWED_TARGETS"})));
+        let to: Address = "0x5f0d9c243048F5a55468472c6F090184E2E333c7".parse().unwrap();
+        let one = U256::one();
+        let e = sign_transaction(&config(base.clone()), 16661, &to, &[], one, one, one, "x").await.unwrap_err().to_string();
+        assert!(e.contains("403") && e.contains("SIGNER_ALLOWED_TARGETS") && !e.contains("Add EVM chain"), "{e}");
+
+        let (fordefi_refused, _) = service(|_, _, _| (502, json!({"error": "Fordefi …: 400 — Chain evm_16602 is not supported"})));
+        let e = sign_transaction(&config(fordefi_refused), 16602, &to, &[], one, one, one, "x").await.unwrap_err().to_string();
+        assert!(e.contains("502") && e.contains("evm_16602") && e.contains("Add EVM chain"), "{e}");
+
+        let mut bad = config(base.clone());
         bad.token = "wrong".into();
         let e = sign_message(&bad, "StopApp:0x00:1", "StopApp", None).await.unwrap_err().to_string();
-        assert!(e.contains("401") && e.contains("bad request signature"), "{e}");
+        assert!(e.contains("401") && e.contains("FORDEFI_SIGNER_TOKEN"), "{e}");
+    }
+
+    /// A signed answer without what was asked for is an error, not an empty signature.
+    #[tokio::test]
+    async fn a_signed_answer_must_carry_the_signature() {
+        let (base, _) = service(|_, _, _| (200, json!({"id": "r-5", "state": "signed", "outcome": "signed"})));
+        let e = sign_message(&config(base), "StopApp:0x00:1", "StopApp", None).await.unwrap_err().to_string();
+        assert!(e.contains("r-5") && e.contains("signature"), "{e}");
     }
 }

@@ -23,9 +23,9 @@
 //! - [`Backend::Ledger`]: a Ledger on this machine's USB. The device shows the message or
 //!   the transaction and signs on a button press; a transaction is signed only, checked,
 //!   and broadcast here. Built with the `ledger` feature (on by default on macOS).
-//! - [`Backend::Fordefi`]: Fordefi's API. The vault holding the address signs once its
-//!   approval policy has run; a transaction is signed only, checked, and broadcast here, as
-//!   with a Ledger. See [`fordefi`].
+//! - [`Backend::Fordefi`]: a Fordefi vault, through the 0g-fordefi-signer service. The vault
+//!   holding the address signs once Fordefi's approval policy has run; a transaction is
+//!   signed only, checked, and broadcast here, as with a Ledger. See [`fordefi`].
 
 use std::io::{BufRead, Write};
 use std::str::FromStr;
@@ -47,7 +47,8 @@ pub enum Backend {
     Paste,
     /// A Ledger on this machine's USB.
     Ledger,
-    /// Fordefi's API, as the API user configured in the environment (see [`fordefi`]).
+    /// A Fordefi vault, through the 0g-fordefi-signer service named in the environment (see
+    /// [`fordefi`]).
     Fordefi,
 }
 
@@ -219,7 +220,7 @@ fn fordefi_signature(
     let config = fordefi::config()?;
     eprintln!();
     eprintln!("──── signing in Fordefi: {what} ────");
-    eprintln!("  signer   0x{:x}  (vault {})", address, config.vault_id());
+    eprintln!("  signer   0x{:x}  (via {})", address, config.url());
     print_deadline(valid_until);
     eprintln!("  message (personal_sign):");
     eprintln!();
@@ -236,8 +237,9 @@ fn fordefi_signature(
     let who = recover_personal(message, &sig)?;
     if who != *address {
         return Err(anyhow!(
-            "Fordefi vault {} signed as 0x{:x}, not 0x{:x} — FORDEFI_EVM_VAULT_ID names another vault",
-            config.vault_id(),
+            "the Fordefi vault behind {} signed as 0x{:x}, not 0x{:x} — the service signs with \
+             another vault than the one --external-signer names",
+            config.url(),
             who,
             address
         ));
@@ -492,7 +494,7 @@ async fn fordefi_transaction(
 
     eprintln!();
     eprintln!("──── signing in Fordefi: {what} ────");
-    eprintln!("  vault    {}", config.vault_id());
+    eprintln!("  via      {}", config.url());
     print_call(chain_id, from, to, data, value);
     let raw = fordefi::sign_transaction(config, chain_id, to, data, value, gas, gas_price, what).await?;
     let hash = check_signed_transaction(&raw, chain_id, from, to, data, value)
