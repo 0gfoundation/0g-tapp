@@ -16,11 +16,11 @@ pub type VolumeKeyFut =
 /// How this start provides the app's `./data`, resolved by the RPC layer from
 /// the compose's declared `x-tapp.data` mode plus what the node can actually do.
 pub enum DataPlan {
-    /// LUKS on /data, key from the KMS (mode `encrypted` on a KMS node).
+    /// LUKS on the data disk, key from the KMS (mode `encrypted` on a KMS node).
     Encrypted(VolumeKeyFut),
-    /// Plain persistent directory on /data (mode `plain`).
+    /// Plain persistent directory on the data disk (mode `plain`).
     Plain,
-    /// LUKS on /data keyed from the app signer, wiped when unopenable (mode `scratch`).
+    /// LUKS on the data disk keyed from the app signer, wiped when unopenable (mode `scratch`).
     Scratch(VolumeKeyFut),
     /// Plain directory on the RAM rootfs (mode `ram`).
     Ram,
@@ -953,7 +953,7 @@ enable_eventlog = true
                 // <app_dir>/data must detach first or the removal hits EBUSY —
                 // only the mount point is released; the LUKS mapping (and the
                 // key in the kernel) stays open, and the volume's data lives in
-                // the image file on /data, untouched. The next start remounts.
+                // the image file on the data disk, untouched. The next start remounts.
                 volume::unmount(app_id).await?;
                 let app_dir = DockerComposeManager::get_app_dir(app_id);
                 if app_dir.exists() {

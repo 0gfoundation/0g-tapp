@@ -754,6 +754,13 @@ impl TappService for TappServiceImpl {
                 return Err(Status::invalid_argument(exposures.join("; ")));
             }
         }
+        let disk_exposures = boot::compose_lint::data_disk_exposures(
+            &req_inner.compose_content,
+            std::path::Path::new(boot::volume::DATA_DISK),
+        );
+        if !disk_exposures.is_empty() {
+            return Err(Status::invalid_argument(disk_exposures.join("; ")));
+        }
         let data_plan = if req_inner.measure_only {
             // Measure-only returns before any data directory is provisioned.
             boot::DataPlan::Ram
