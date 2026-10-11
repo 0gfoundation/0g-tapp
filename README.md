@@ -683,10 +683,12 @@ this machine, for example through an SSH tunnel, since the token travels on ever
 
 What has to exist:
 
-- **The service**, with this caller's token in its `SIGNER_CLIENT_TOKENS`. Its
-  `SIGNER_ALLOWED_TARGETS` must list the TappRegistry on each chain used; a call to any other
-  contract is refused. To restrict it to tapp's owner messages, set `SIGNER_MESSAGE_PATTERN`
-  (see the service's README).
+- **The service**, with an entry for this caller in its policy file (see the service's README):
+  - `token_sha256`: the hash of this caller's token.
+  - `contracts`: the TappRegistry on each chain used, as `chain_id:0xaddress`. A call to any
+    other contract is refused.
+  - `messages`: a pattern admitting tapp's owner messages, `[A-Za-z]+(:0x[0-9a-f]{64})?:[0-9]+`.
+    Without it, no request can be signed.
 - **On Fordefi's side:**
   - The service's API user.
   - The organisation's **API Signer**, running and activated, with that API user's public key
@@ -713,9 +715,9 @@ What tapp-cli does:
 Neither the service nor Fordefi is trusted for what comes back. A signature from another vault,
 or a transaction other than the one asked for, stops the command.
 
-Whoever holds a token can have the vault sign whatever the service's allowlist and Fordefi's
-policy let through. So keep tokens off shared machines, and give the API user a policy that
-requires approval for anything it should not sign alone.
+Whoever holds a token can have the vault sign whatever that caller's entry and Fordefi's policy
+let through. So keep tokens off shared machines, and give the API user a policy that requires
+approval for anything it should not sign alone.
 
 ## On-chain Registration
 

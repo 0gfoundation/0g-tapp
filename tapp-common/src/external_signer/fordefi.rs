@@ -518,11 +518,11 @@ mod tests {
 
     #[tokio::test]
     async fn a_refusal_says_why() {
-        let (base, _) = service(|_, _, _| (403, json!({"error": "0x5f0d… on chain 16661 is not in SIGNER_ALLOWED_TARGETS"})));
+        let (base, _) = service(|_, _, _| (403, json!({"error": "0x5f0d… on chain 16661 is not one of tapp's contracts"})));
         let to: Address = "0x5f0d9c243048F5a55468472c6F090184E2E333c7".parse().unwrap();
         let one = U256::one();
         let e = sign_transaction(&config(base.clone()), 16661, &to, &[], one, one, one, "x").await.unwrap_err().to_string();
-        assert!(e.contains("403") && e.contains("SIGNER_ALLOWED_TARGETS") && !e.contains("Add EVM chain"), "{e}");
+        assert!(e.contains("403") && e.contains("not one of tapp's contracts") && !e.contains("Add EVM chain"), "{e}");
 
         let (fordefi_refused, _) = service(|_, _, _| (502, json!({"error": "Fordefi …: 400 — Chain evm_16602 is not supported"})));
         let e = sign_transaction(&config(fordefi_refused), 16602, &to, &[], one, one, one, "x").await.unwrap_err().to_string();
