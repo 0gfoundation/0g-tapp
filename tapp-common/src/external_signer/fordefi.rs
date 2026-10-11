@@ -13,8 +13,8 @@
 //! | `FORDEFI_SIGNER_TOKEN` | this caller's token for it                                   |
 //!
 //! What comes back is never trusted as it is: a signature must recover to the signer, and a
-//! transaction is signed only — handed back, checked, and broadcast from here exactly like a
-//! Ledger's.
+//! transaction is signed only — handed back, checked, and broadcast from here like a Ledger's,
+//! with its gas, gas price and nonce checked too.
 
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -26,6 +26,10 @@ use serde_json::{json, Value};
 /// How long a transaction may wait for approval and signing before it is aborted. A request
 /// signature has a shorter limit of its own: the server's window.
 const APPROVAL_WAIT: Duration = Duration::from_secs(30 * 60);
+
+/// How long before the server's window closes a request signature stops being waited for: a
+/// signature still has to reach the server inside the window.
+const WINDOW_MARGIN: i64 = 15;
 
 /// What a Fordefi state means for whoever is waiting. `approved` is where a request waits for
 /// the API Signer, so one that stays there points at the API Signer, not at Fordefi.
@@ -211,6 +215,8 @@ async fn wait_for(config: &Config, created: Value, until: Instant, result: &str)
     eprintln!("  Fordefi request {id}");
     let mut request = created;
     let mut shown = String::new();
+    // A service that is down would otherwise fill the screen, one line per poll.
+    let mut last_error = String::new();
     loop {
         let state = field(&request, "state").to_string();
         match field(&request, "outcome") {
@@ -255,7 +261,10 @@ async fn wait_for(config: &Config, created: Value, until: Instant, result: &str)
         }
         tokio::time::sleep(config.poll).await;
         match call(config, reqwest::Method::GET, &read, None).await {
-            Ok(v) => request = v,
+            Ok(v) => {
+                request = v;
+                last_error.clear();
+            }
             Err(e) => match e.downcast_ref::<Refused>() {
                 // Asking again will not change the answer: a revoked token, a request the
                 // service does not show this caller.
@@ -266,7 +275,13 @@ async fn wait_for(config: &Config, created: Value, until: Instant, result: &str)
                 {
                     return Err(anyhow!("following Fordefi request {}: {}", id, e))
                 }
-                _ => eprintln!("  (reading {id}: {e}; retrying)"),
+                _ => {
+                    let error = e.to_string();
+                    if error != last_error {
+                        eprintln!("  (reading {id}: {error}; retrying)");
+                        last_error = error;
+                    }
+                }
             },
         }
     }
@@ -285,11 +300,11 @@ fn timed_out(aborted: bool) -> anyhow::Error {
     )
 }
 
-/// When to stop waiting for a request signature: its deadline, as an instant.
+/// When to stop waiting for a request signature: shortly before its deadline, as an instant.
 fn deadline(valid_until: Option<i64>) -> Instant {
     match valid_until {
         Some(t) => {
-            let left = t - chrono::Utc::now().timestamp();
+            let left = t - WINDOW_MARGIN - chrono::Utc::now().timestamp();
             Instant::now() + Duration::from_secs(left.max(0) as u64)
         }
         None => Instant::now() + APPROVAL_WAIT,
@@ -657,6 +672,16 @@ mod tests {
             Waited::TimedOut { late: None, aborted } => assert!(!aborted && timed_out(aborted).to_string().contains("could not be aborted")),
             _ => panic!("expected a timeout"),
         }
+    }
+
+    /// A signature has to reach the server inside its window, so the wait ends a little before.
+    #[test]
+    fn a_request_signature_is_waited_for_until_shortly_before_the_window_closes() {
+        let now = chrono::Utc::now().timestamp();
+        assert!(deadline(Some(now + WINDOW_MARGIN)) <= Instant::now());
+        let d = deadline(Some(now + 600));
+        assert!(d > Instant::now() + Duration::from_secs(580));
+        assert!(d <= Instant::now() + Duration::from_secs(600 - WINDOW_MARGIN as u64));
     }
 
     /// A signed answer without what was asked for is an error, not an empty signature.

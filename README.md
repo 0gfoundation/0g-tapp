@@ -699,7 +699,7 @@ What has to exist:
                   "updateNode(string,address,address,string,bytes,bytes)",
                   "removeNode(string,address)", "withdraw()",
                   "authorizeInvalidator(string,address)", "revokeInvalidator(string,address)",
-                  "transferAppOwnership(string,address)", "acceptAppOwnership(string)"],
+                  "acceptAppOwnership(string)"],
     "max_value": "100000000000000000000",
     "messages": "[A-Z][A-Za-z]+:0x[0-9a-f]{64}:[0-9]{10}"
   }
@@ -707,8 +707,13 @@ What has to exist:
 
   - `contracts`: the TappRegistry on each chain used. A call to any other contract is refused.
   - `functions`: the registry functions tapp-cli calls, and none of the registry's admin ones.
+    `transferAppOwnership(string,address)` is left out: it hands an app, and the stake later
+    locked under it, to another address, so with it a token could move the vault's coin out a
+    call at a time. Add it only if this caller is to run `transfer-app-ownership`, and have
+    Fordefi's policy require an approver for it.
   - `max_value`: the most stake one call may carry, in wei (here 100 OG). Without it, no stake
     can be sent, so `registerApp` and `addNode` are refused.
+  - `max_fee` (not set here): the most gas × gas price one call may cost, default 0.1 OG.
   - `messages`: tapp's request signatures. Without it, none can be signed. `--legacy-sign`
     (tapp-server < 0.9.0) signs `Method:timestamp` and needs `(:0x[0-9a-f]{64})?` in place of
     `:0x[0-9a-f]{64}`, which also admits that older, weaker form for any node.
@@ -721,7 +726,8 @@ What has to exist:
 - **The chain.** 0G mainnet is built into Fordefi. Any other chain, such as the Galileo testnet,
   must first be added to the organisation as a custom chain (Settings > Chains > Add EVM chain).
 - **Funds.** The vault is the sender. It pays the gas of every call, and the stake of
-  `registerApp` and `addNode` (at least 10 OG on mainnet), on each chain used.
+  `registerApp` and `addNode`, on each chain used. The stake must be at least the registry's
+  `minStakeAmount()`: 0.1 OG on mainnet and 1 OG on testnet as of October 2026.
 
 What tapp-cli does:
 
@@ -734,8 +740,8 @@ What tapp-cli does:
     aborted and a new one is made for the same request, every 10 minutes until one is signed
     or the command is stopped.
 - **An on-chain call** is estimated here and signed without being broadcast, with the gas, the
-  gas price and the account's next nonce set here. Approvers see the registry function, for
-  example `tapp-cli: addNode(string,address,string,bytes,bytes)`.
+  gas price and the account's next nonce set here. Approvers see it noted with the registry
+  function: `0g-fordefi-signer: <caller>: tapp-cli: addNode(string,address,string,bytes,bytes)`.
   - tapp-cli checks the signed transaction: signer, chain, contract, data, value, gas, gas
     price, and that its nonce is still the account's next.
   - It then broadcasts it, waits for it to be mined and checks it again: the same path as a

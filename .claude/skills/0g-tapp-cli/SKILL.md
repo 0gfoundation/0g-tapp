@@ -26,7 +26,7 @@ Deploy and manage containerized applications on 0G Tapp TEE servers using `tapp-
   - tapp-server ≥0.7.1 defaults `bind_address` to **loopback** when the config omits it. CVM images bake an explicit `0.0.0.0:50051` (teeUrl/evidence fetching and remote claim need it), so image nodes are unaffected — the loopback default bites hand-rolled configs. "Connection refused from outside, works on the host" means the config omits `bind_address`.
 - **Auth**: private key via `-k` flag or `TAPP_PRIVATE_KEY` env var — or, for a key held elsewhere (Ledger, Fordefi/MPC, someone else's hardware wallet), `--external-signer 0x<address>` / `TAPP_EXTERNAL_SIGNER` (tapp-cli ≥ 0.10.0), plus `--ledger` for a Ledger on this machine or `--fordefi` (tapp-cli ≥ 0.11.0) for a Fordefi vault reached through the 0g-fordefi-signer service. **Before any owner-level job, follow "Signing with a key held elsewhere" below** — it starts by asking the owner where the key is. Read-only commands (`get-tapp-info`, `get-service-status`, `get-app-info`, `get-app-key`, `get-evidence`, `list-apps`, `verify-app` direct mode) need no signer.
 - **TappRegistry (testnet)**: proxy `0x2Ce80374318B1d7Fb3345724457a182E0ad165c9`, RPC `https://evmrpc-testnet.0g.ai`, chainId `16602`. See `contract/CONTRACTS.md`.
-- **TappRegistry (mainnet)**: proxy `0x54874F536301c993922Dd95097e3902e7FBfe612`, RPC `https://evmrpc.0g.ai`, chainId `16661`. Min stake **10 OG**, withdraw lock 7 days. Upgrades go through a 1-day TimelockController (`0xD070792b1dB64F858ACE3E5443f2d21c0edE0BAc`) — see `contract/CONTRACTS.md`.
+- **TappRegistry (mainnet)**: proxy `0x54874F536301c993922Dd95097e3902e7FBfe612`, RPC `https://evmrpc.0g.ai`, chainId `16661`. Min stake: the registry's `minStakeAmount()`, 0.1 OG as of October 2026 (it was 10 OG at deployment; read it with `cast call <registry> 'minStakeAmount()(uint256)'`), withdraw lock 7 days. Upgrades go through a 1-day TimelockController (`0xD070792b1dB64F858ACE3E5443f2d21c0edE0BAc`) — see `contract/CONTRACTS.md`.
   - An older deployment `0x95a0BF4148b30F6F8D86870534c51df46Da5511c` is **superseded** — no `version()`, and `getNode` returns 3 fields instead of 5. Some long-lived apps (testnet sandbox provider / attestor) are still registered there, so you may still have to query it; just don't put anything new on it. Tell them apart with `cast call <proxy> "version()(string)"` — `"0.1.0"` = current, revert = old.
 - **Short flags**: `-s` = `--server` and `-k` = `--private-key` (both global). The earlier `-s` collision is **fixed** — the formerly-clashing subcommand flags (`--stake-wei`, `--service`, `--service-name`, `--signature`, `--chain-id`) are long-only now, so `-s` always means `--server`.
 
@@ -193,13 +193,14 @@ On-chain commands (`register-onchain`, `update-onchain`, `start-app --register-o
   - A missing setting, or a plain-http URL to another machine, stops the command before anything is signed.
 - **The service's own configuration.** This caller's entry in the service's policy file decides what it may have signed. The README's "With Fordefi" section has a complete entry for tapp.
   - `contracts` must list the TappRegistry for the chain, as `chain_id:0xaddress`. Otherwise every on-chain call is refused with `403 … is not one of <caller>'s contracts`.
-  - `functions`, if listed, must include the registry function the command calls. Otherwise `403 … is not one of <caller>'s functions`.
+  - `functions` must include the registry function the command calls. Otherwise `403 … is not one of <caller>'s functions`. The README's entry leaves out `transferAppOwnership`, so `transfer-app-ownership` is refused until the operator adds it.
   - `max_value` must cover the stake of `registerApp`/`addNode`. Otherwise `403 … max_value`.
+  - `max_fee` (default 0.1 OG) caps gas × gas price. `403 … max_fee` means the gas price rose past it.
   - `messages` must admit tapp's `Method:0x<hash>:timestamp`, for example `[A-Z][A-Za-z]+:0x[0-9a-f]{64}:[0-9]{10}`. Otherwise every request signature is refused with `403`. `--legacy-sign` needs a pattern that also admits `Method:timestamp`.
   - `401` means the service does not take this token.
   - Only the service's operator can change these. Report the `403` text to them; do not retry.
 - **The chain.** 0G mainnet is built into Fordefi. Any other chain (testnet) must first be added to the Fordefi organisation as a custom chain. Otherwise the request is refused with `502`, and the CLI points at the chain when Fordefi's reason mentions it.
-- **Funds.** The vault is the sender: it pays the gas, and the stake of `registerApp`/`addNode` (at least 10 OG on mainnet).
+- **Funds.** The vault is the sender: it pays the gas, and the stake of `registerApp`/`addNode` (at least the registry's `minStakeAmount()`).
 - **Each signature.**
   - The CLI prints `signing in Fordefi: <Method>`, the signer, the service, a deadline and the text.
   - It then asks the service for a signature and follows the Fordefi request's state. Approvers see it noted `0g-fordefi-signer: <caller>: tapp-cli: <Method>`.
@@ -208,7 +209,7 @@ On-chain commands (`register-onchain`, `update-onchain`, `start-app --register-o
   - `waiting for approval` is Fordefi's policy, and approvers act in Fordefi. The 10-minute deadline still applies: after it, the CLI aborts the request and makes a new one for the same request, until one is signed or the command is stopped.
   - Staying at `approved` means the API Signer has not signed; check that it is running.
   - `ended aborted`, `ended error_signing` or any other end state stops the command. Run it again once fixed.
-  - A `4xx` while following a request (a revoked token, say) stops the command. Network errors are retried.
+  - A `4xx` other than 408/429 while following a request (a revoked token, say) stops the command. Network errors, 408, 429 and `5xx` are retried, each distinct error printed once.
   - Ctrl-C leaves the Fordefi request open: tell the holder to reject it in Fordefi.
 - **On-chain.**
   - The CLI sets the gas, the gas price and the nonce (the account's next). The vault signs without broadcasting.

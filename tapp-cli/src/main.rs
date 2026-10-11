@@ -185,8 +185,9 @@ struct Cli {
 
     /// With --external-signer: sign with a Fordefi vault through the 0g-fordefi-signer
     /// service, instead of pasting. The vault signs each message, and each transaction, once
-    /// Fordefi's policy has approved it and the organisation's API Signer has taken part; a
-    /// transaction is signed only, then checked and broadcast from here. Reads
+    /// the service's policy allows it for this caller, Fordefi's policy has approved it and
+    /// the organisation's API Signer has taken part; a transaction is signed only, then
+    /// checked and broadcast from here. Reads
     /// FORDEFI_SIGNER_URL (https, or http to this machine) and FORDEFI_SIGNER_TOKEN (this
     /// caller's token for the service); the Fordefi credentials stay with the service.
     #[arg(long, global = true, requires = "external_signer")]
