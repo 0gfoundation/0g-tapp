@@ -210,12 +210,13 @@ On-chain commands (`register-onchain`, `update-onchain`, `start-app --register-o
   - Staying at `approved` means the API Signer has not signed; check that it is running.
   - `ended aborted`, `ended error_signing` or any other end state stops the command. Run it again once fixed.
   - A `4xx` other than 408/429 while following a request (a revoked token, say) stops the command. Network errors, 408, 429 and `5xx` are retried, each distinct error printed once.
-  - Ctrl-C leaves the Fordefi request open: tell the holder to reject it in Fordefi.
+  - Ctrl-C leaves the Fordefi request open: tell the holder to reject it in Fordefi. So does a create that got no answer or a server error; the error ends with `Fordefi may have made the request all the same: reject any request noted "… tapp-cli: <what>"`.
 - **On-chain.**
   - The CLI sets the gas, the gas price and the nonce (the account's next). The vault signs without broadcasting.
   - The CLI checks the signed transaction (signer, chain, contract, data, value, gas, gas price, nonce), then broadcasts it and waits for it to be mined.
   - A request not signed within 30 minutes is aborted.
-  - `its nonce is …, but the account's next is …` means another transaction from the vault landed or is pending while this one waited for approval. Nothing was sent; run the command again.
+  - `its nonce is …, but the account's next is now …` means another transaction from the vault was sent while this one waited for approval. Nothing was sent; run the command again.
+  - Any `Fordefi returned a transaction that is not the one asked for` leaves that transaction signed but unsent. It stays valid until the vault's next transaction uses its nonce, which rerunning the command does.
 - **Security.** Whoever holds a token can have the vault sign whatever that caller's entry and Fordefi's policy let through, which within the entry is the owner's full authority (`transferAppOwnership`, for one). Keep tokens off shared machines, and do not give the service's API user a policy that auto-approves everything.
 
 ### The node has no data disk (apps will not start)

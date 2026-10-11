@@ -4065,7 +4065,7 @@ async fn remove_node_onchain(
     println!("  App ID: {}", app_id);
     println!("  Signer Address: 0x{}", hex::encode(signer));
     println!("  Tx Hash: 0x{:x}", tx);
-    println!("  (stake locked; run withdraw-node-stake after lock period)");
+    println!("  (stake locked; run withdraw after the lock period)");
 
     Ok(())
 }
@@ -4480,7 +4480,7 @@ fn add_signature_metadata<T: prost::Message>(
                 Err(e) if e.downcast_ref::<external_signer::Expired>().is_some() => {
                     eprintln!("  ✗ that signature came after its deadline; here is a new message for the same request");
                 }
-                Err(e) => return Err(e.to_string().into()),
+                Err(e) => return Err(e.into()),
             }
         }
     }

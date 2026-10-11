@@ -156,6 +156,48 @@ impl std::fmt::Display for Refused {
 
 impl std::error::Error for Refused {}
 
+/// The service could not be connected to: nothing was asked of it.
+#[derive(Debug)]
+struct NotReached(String);
+
+impl std::fmt::Display for NotReached {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for NotReached {}
+
+/// An error and what caused it, in one line: reqwest's own text ("error sending request")
+/// leaves out whether it timed out or was refused.
+fn with_causes(e: &dyn std::error::Error) -> String {
+    let mut text = e.to_string();
+    let mut cause = e.source();
+    while let Some(c) = cause {
+        text.push_str(": ");
+        text.push_str(&c.to_string());
+        cause = c.source();
+    }
+    text
+}
+
+/// A create the service did not answer, or answered with a server error, may have made the
+/// request all the same, where nobody would abort it.
+fn maybe_made(e: anyhow::Error, what: &str) -> anyhow::Error {
+    if e.downcast_ref::<NotReached>().is_some() {
+        return e;
+    }
+    match e.downcast_ref::<Refused>() {
+        Some(r) if r.status.is_client_error() => e,
+        _ => anyhow!(
+            "{} (Fordefi may have made the request all the same: reject any request noted \
+             \"… tapp-cli: {}\" still waiting in Fordefi)",
+            e,
+            what
+        ),
+    }
+}
+
 /// What the service said, in one line: its `error`, else the start of the text.
 fn error_text(text: &str) -> String {
     if let Ok(v) = serde_json::from_str::<Value>(text) {
@@ -176,7 +218,14 @@ async fn call(config: &Config, method: reqwest::Method, path: &str, body: Option
     if let Some(body) = body {
         request = request.json(body);
     }
-    let response = request.send().await.map_err(|e| anyhow!("fordefi signer {}: {}", path, e))?;
+    let response = request.send().await.map_err(|e| {
+        let text = format!("fordefi signer {}: {}", path, with_causes(&e));
+        if e.is_connect() {
+            anyhow::Error::new(NotReached(text))
+        } else {
+            anyhow!(text)
+        }
+    })?;
     let status = response.status();
     let text = response.text().await.unwrap_or_default();
     if !status.is_success() {
@@ -321,7 +370,9 @@ pub(super) async fn sign_message(
     valid_until: Option<i64>,
 ) -> Result<Vec<u8>> {
     let body = json!({ "message": message, "note": format!("tapp-cli: {what}") });
-    let created = call(config, reqwest::Method::POST, "/v1/messages", Some(&body)).await?;
+    let created = call(config, reqwest::Method::POST, "/v1/messages", Some(&body))
+        .await
+        .map_err(|e| maybe_made(e, what))?;
     match wait_for(config, created, deadline(valid_until), "signature").await? {
         Waited::Done(sig) => Ok(sig),
         // A signature past the server's window would only be refused.
@@ -382,7 +433,7 @@ pub(super) async fn sign_transaction(
                  must be added to the organisation: Settings > Chains > Add EVM chain)",
                 e
             ),
-            _ => e,
+            _ => maybe_made(e, what),
         })?;
     match wait_for(config, created, Instant::now() + APPROVAL_WAIT, "raw_transaction").await? {
         Waited::Done(raw) => Ok(raw),
@@ -584,7 +635,7 @@ mod tests {
             .await
             .unwrap();
         super::super::check_signed_transaction(&raw, 16661, &from, &to, &data, value).unwrap();
-        super::super::check_fordefi_terms(&raw, gas, gas_price, nonce).unwrap();
+        super::super::check_fordefi_terms(&raw, gas, gas_price, nonce, nonce).unwrap();
         assert_eq!(seen.lock().unwrap().as_slice(), ["POST /v1/transactions"]);
     }
 
@@ -632,6 +683,25 @@ mod tests {
         bad.token = "wrong".into();
         let e = sign_message(&bad, "StopApp:0x00:1", "StopApp", None).await.unwrap_err().to_string();
         assert!(e.contains("401") && e.contains("FORDEFI_SIGNER_TOKEN"), "{e}");
+    }
+
+    /// A create that got no answer may have made the request; the error says to look for it.
+    #[tokio::test]
+    async fn a_create_without_an_answer_says_to_look_for_the_request() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        // Not even connected to: nothing was made, and the cause is kept.
+        let e = sign_message(&config(base), "StopApp:0x00:1", "StopApp", None).await.unwrap_err().to_string();
+        assert!(e.contains("Connection refused") && !e.contains("reject"), "{e}");
+
+        let (failing, _) = service(|_, _, _| (502, json!({"error": "Fordefi …/create-and-wait: Read timed out"})));
+        let e = sign_message(&config(failing), "StopApp:0x00:1", "StopApp", None).await.unwrap_err().to_string();
+        assert!(e.contains("tapp-cli: StopApp") && e.contains("reject"), "{e}");
+
+        let (refusing, _) = service(|_, _, _| (403, json!({"error": "the message is not one tapp may have signed"})));
+        let e = sign_message(&config(refusing), "StopApp:0x00:1", "StopApp", None).await.unwrap_err().to_string();
+        assert!(!e.contains("reject"), "{e}");
     }
 
     /// A refusal while following a request will not change on asking again; it ends the wait.

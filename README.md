@@ -748,11 +748,13 @@ What tapp-cli does:
     Ledger's.
   - A call not signed within 30 minutes is aborted.
 - **Stopping the command** (Ctrl-C) leaves its Fordefi request open. Reject it in Fordefi, or it
-  can still be approved.
+  can still be approved. The same holds when asking for a signature gets no answer or a server
+  error: Fordefi may have made the request anyway, and the error says which note to look for.
 
 Neither the service nor Fordefi is trusted for what comes back. A signature from another vault,
 or a transaction that differs from the one asked for in any of the fields above, stops the
-command before anything is sent.
+command before anything is sent. Such a transaction is still signed, though: whoever holds it
+can send it until the vault's next transaction uses its nonce.
 
 Whoever holds a token can have the vault sign whatever that caller's entry and Fordefi's policy
 let through. Within its entry, that is the owner's full authority over the vault's apps, for
