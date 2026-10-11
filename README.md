@@ -666,7 +666,7 @@ with `--features ledger` (libusb; non-root access needs Ledger's udev rules).
 
 #### With Fordefi: `--fordefi`
 
-Add `--fordefi` and tapp-cli asks a Fordefi vault for each signature instead of prompting.
+Add `--fordefi` (tapp-cli ≥ 0.11.0) and tapp-cli asks a Fordefi vault for each signature instead of prompting.
 It goes through the [0g-fordefi-signer](https://github.com/0gfoundation/0g-fordefi-signer)
 service:
 

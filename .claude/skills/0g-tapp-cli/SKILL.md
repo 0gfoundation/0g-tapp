@@ -1,7 +1,7 @@
 ---
 name: 0g-tapp-cli
 description: Use this skill when the user wants to deploy, manage, or troubleshoot applications on a 0G Tapp (Trusted Application Platform) server using tapp-cli. Covers start/stop apps, on-chain registration, registry login, check task status, view logs, and manage docker compose deployments across multiple remote TEE servers.
-version: 1.22.0
+version: 1.23.0
 author: 0G Labs
 tags: [0g, tapp, tee, docker, deployment, cli, onchain]
 ---
@@ -24,7 +24,7 @@ Deploy and manage containerized applications on 0G Tapp TEE servers using `tapp-
   - **Getting a trustworthy pin needs no out-of-band channel** (server ≥0.8.0): the node has a **common signer** (generated per boot; every app signer derives from it), the :50052 TLS key derives from it too, and `get-evidence` **without --app-id** returns the node's own evidence whose `runtime_data.tls_public_key` is that key's SPKI sha256 — Intel-signed, so it survives a hostile channel. Flow: `get-evidence` (any channel) → verify the quote → `--tls-pin 0x<tls_public_key>` for all management calls. A MITM can relay evidence but cannot forge the key inside it, and its own cert then fails the pin.
   - Two limits of that bootstrap: (1) it proves "a genuine TDX node with this measurement", **not** "the node at this address" — an attacker running their own genuine node could redirect you to it; it defends interception, not redirection (on-chain anchoring of the common signer is the follow-up). (2) The pin is **boot-scoped**: a node reboot rotates the common signer and the TLS key with it, so a stale pin fails closed — re-fetch evidence after any reboot.
   - tapp-server ≥0.7.1 defaults `bind_address` to **loopback** when the config omits it. CVM images bake an explicit `0.0.0.0:50051` (teeUrl/evidence fetching and remote claim need it), so image nodes are unaffected — the loopback default bites hand-rolled configs. "Connection refused from outside, works on the host" means the config omits `bind_address`.
-- **Auth**: private key via `-k` flag or `TAPP_PRIVATE_KEY` env var — or, for a key held elsewhere (Ledger, Fordefi/MPC, someone else's hardware wallet), `--external-signer 0x<address>` / `TAPP_EXTERNAL_SIGNER` (tapp-cli ≥ 0.10.0), plus `--ledger` for a Ledger on this machine or `--fordefi` for a Fordefi vault reached through the 0g-fordefi-signer service. **Before any owner-level job, follow "Signing with a key held elsewhere" below** — it starts by asking the owner where the key is. Read-only commands (`get-tapp-info`, `get-service-status`, `get-app-info`, `get-app-key`, `get-evidence`, `list-apps`, `verify-app` direct mode) need no signer.
+- **Auth**: private key via `-k` flag or `TAPP_PRIVATE_KEY` env var — or, for a key held elsewhere (Ledger, Fordefi/MPC, someone else's hardware wallet), `--external-signer 0x<address>` / `TAPP_EXTERNAL_SIGNER` (tapp-cli ≥ 0.10.0), plus `--ledger` for a Ledger on this machine or `--fordefi` (tapp-cli ≥ 0.11.0) for a Fordefi vault reached through the 0g-fordefi-signer service. **Before any owner-level job, follow "Signing with a key held elsewhere" below** — it starts by asking the owner where the key is. Read-only commands (`get-tapp-info`, `get-service-status`, `get-app-info`, `get-app-key`, `get-evidence`, `list-apps`, `verify-app` direct mode) need no signer.
 - **TappRegistry (testnet)**: proxy `0x2Ce80374318B1d7Fb3345724457a182E0ad165c9`, RPC `https://evmrpc-testnet.0g.ai`, chainId `16602`. See `contract/CONTRACTS.md`.
 - **TappRegistry (mainnet)**: proxy `0x54874F536301c993922Dd95097e3902e7FBfe612`, RPC `https://evmrpc.0g.ai`, chainId `16661`. Min stake **10 OG**, withdraw lock 7 days. Upgrades go through a 1-day TimelockController (`0xD070792b1dB64F858ACE3E5443f2d21c0edE0BAc`) — see `contract/CONTRACTS.md`.
   - An older deployment `0x95a0BF4148b30F6F8D86870534c51df46Da5511c` is **superseded** — no `version()`, and `getNode` returns 3 fields instead of 5. Some long-lived apps (testnet sandbox provider / attestor) are still registered there, so you may still have to query it; just don't put anything new on it. Tell them apart with `cast call <proxy> "version()(string)"` — `"0.1.0"` = current, revert = old.
@@ -185,7 +185,7 @@ On-chain commands (`register-onchain`, `update-onchain`, `start-app --register-o
 - Paste the returned `0x…` (65 bytes). A signature by another account, or over text changed on the way (extra space or line break), is refused with the address it came from — the holder signs again. One that arrives after the deadline is refused and the CLI prints a new line for the same request — send that; no re-run.
 - On-chain: the CLI prints the transaction (chain, from, to, value in wei and OG, data, registry function). The holder sends it from the owner address and returns the hash; the CLI waits for it to be mined and checks it is exactly that transaction and that it succeeded.
 
-**(d) Fordefi through 0g-fordefi-signer.**
+**(d) Fordefi through 0g-fordefi-signer (tapp-cli ≥ 0.11.0).**
 - **Settings.**
   - `FORDEFI_SIGNER_URL`: the service. It must be `https://`; plain `http://` is accepted only to this machine, for example an SSH tunnel.
   - `FORDEFI_SIGNER_TOKEN`: this caller's token, made by the service's operator with `python auth.py <name>`.
