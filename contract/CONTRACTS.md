@@ -16,19 +16,9 @@ TAPP_REGISTRY_CONTRACT=0x2Ce80374318B1d7Fb3345724457a182E0ad165c9
 **Deployed:** 2026-06-23  **Deployer:** `0xea695C312CE119dE347425B29AFf85371c9d1837`
 **Min stake:** 1 0G (`1000000000000000000` wei)  **Lock period:** 86400 s (1 day)
 All three contracts source-verified on the explorer.
-Registry `admin` and beacon owner = `0x9C58F839451EBf3e7f82442bC48E4088746380Bb`
-since 2026-10-12, both signed by the previous holder
-`0x73443d8C05c74F8C2F5D499Da2597a1EE49E431b` (held them from 2026-09-05):
-`transferAdmin` tx `0xc15a268970eb003558e41859cc2c096f28292b505b325657d791a33bc3a374d7`
-(block 59668974), beacon `transferOwnership` tx
-`0x3d05bee5b2cbd4d207dcd5086f8b84fb27579857ad7df5464c644d9ae94e8846` (block 59669089).
-No timelock here — upgrades apply immediately, which is intended for a dev chain.
-To re-check:
-
-```bash
-cast call 0x2Ce80374318B1d7Fb3345724457a182E0ad165c9 "admin()(address)" --rpc-url https://evmrpc-testnet.0g.ai
-cast call 0x1Cd7544068AdC525b9Cb21cC13aF25D95a53645E "owner()(address)" --rpc-url https://evmrpc-testnet.0g.ai
-```
+Registry `admin` and beacon owner were moved to
+`0x9C58F839451EBf3e7f82442bC48E4088746380Bb` on 2026-10-12 (no timelock here —
+upgrades apply immediately, which is intended for a dev chain).
 
 | Contract | Address |
 |----------|---------|
@@ -142,7 +132,7 @@ Events `AppOwnershipTransferStarted(appId, owner, pendingOwner)` and
   upgrades a populated 0.1.0 proxy and checks every field.
 
 Rollout with `go run ./cmd/upgrade/` (Go Tools below), which keeps the beacon
-owner's key off the machine doing the work. Testnet: the beacon owner (a wallet) signs
+owner's key off the machine doing the work. Testnet: the owner (`0x9C58…`) signs
 the printed `upgradeTo`. Mainnet: the owner is the timelock — its proposer
 (`0x87605ec8…`) schedules, and after the 1-day delay an executor executes. Then
 `go run ./cmd/verify/ --network <net>`. Record each in its network's upgrades table
