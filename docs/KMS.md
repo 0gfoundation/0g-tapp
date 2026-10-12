@@ -23,7 +23,7 @@ unchanged).
 ### Mainnet (chain 16661)
 
 Registered on TappRegistry `0x54874F536301c993922Dd95097e3902e7FBfe612`,
-app_id `0g-kms`, **2-of-5**, owner `0x73443d8C05c74F8C2F5D499Da2597a1EE49E431b`.
+app_id `0g-kms`, **2-of-5**, owner `0x9C58F839451EBf3e7f82442bC48E4088746380Bb`.
 
 ```
 group_pubkey = 8c30fd0e713be395d8f85ca5e0a879989fa8a4bbf019f0db00c4ee38c05f463a0079ab8c2ccda195f3171b98d0522050
@@ -40,19 +40,26 @@ group_pubkey = 8c30fd0e713be395d8f85ca5e0a879989fa8a4bbf019f0db00c4ee38c05f463a0
 ### Testnet (0G Galileo, chain 16602)
 
 Registered on TappRegistry `0x2Ce80374318B1d7Fb3345724457a182E0ad165c9`,
-app_id `0g-kms`, **2-of-5**.
+app_id `0g-kms`, **2-of-5**, owner `0x9C58F839451EBf3e7f82442bC48E4088746380Bb`.
+Attested admission is on: a node fetching keys must also be verified by the testnet
+scan, and must run tapp-server ≥ 0.9.0 (below, "With attested admission on").
 
 ```
-group_pubkey = 8fbb1b3f6309f35e93e069f5268bcea64617a20ab8dfc5f9b79251169e62356168e2d64d8936d52dadc1c8c0eb733541
+group_pubkey = 80be83e5fa1110a6c4ff55db2d991db2f5a296b001f9ec63b559007875e1eae4de879f9fbb1bd4c053a0925eaa753beb
 ```
 
 | node | zone | KBS endpoint (`--kbs-urls`) |
 |---|---|---|
-| 1 | us-central1-a | `https://104.197.68.77:9443` |
-| 2 | us-east1-c | `https://34.148.132.90:9443` |
-| 3 | us-east4-a | `https://34.11.104.41:9443` |
-| 4 | us-west1-a | `https://136.66.159.190:9443` |
-| 5 | us-east5-b | `https://136.83.14.240:9443` |
+| 1 | us-central1-a | `https://34.30.142.206:9443` |
+| 2 | us-east1-c | `https://35.185.85.8:9443` |
+| 3 | us-east4-a | `https://136.90.95.17:9443` |
+| 4 | us-west1-a | `https://136.86.212.43:9443` |
+| 5 | us-east5-b | `https://34.162.61.63:9443` |
+
+This cluster replaced, on 2026-10-11, the one with `group_pubkey 8fbb1b3f…3541` (a new
+master, not a reshare): every key derived from the old one is gone, and a testnet node
+still pointing at the old endpoints gets no key. Point it here with
+`update-trust-anchors --kbs-urls …`.
 
 Node signers and teeUrls live on-chain (`getNodeList("0g-kms")` /
 `getNode`) and rotate with reboots — the chain, not this table, is the
