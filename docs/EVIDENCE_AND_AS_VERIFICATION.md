@@ -48,7 +48,7 @@ its own overrides if present, otherwise resolved to the app-level defaults. `ima
 
 > ⚠️ `getNode` on the **current** registry has 5 fields. The old deployment (`0x95a0…511c`, deprecated) has only 3;
 > using the wrong arity yields a decode error or silent truncation. Distinguish them with `cast call <proxy> "version()(string)"`:
-> the current one returns `"0.1.0"`, the old one simply reverts. See `contract/CONTRACTS.md`.
+> the current one returns `"0.2.0"`, the old one simply reverts. See `contract/CONTRACTS.md`.
 
 ```bash
 C=0x2Ce80374318B1d7Fb3345724457a182E0ad165c9 ; R=https://evmrpc-testnet.0g.ai

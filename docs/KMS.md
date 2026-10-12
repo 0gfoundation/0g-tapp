@@ -23,7 +23,7 @@ unchanged).
 ### Mainnet (chain 16661)
 
 Registered on TappRegistry `0x54874F536301c993922Dd95097e3902e7FBfe612`,
-app_id `0g-kms`, **2-of-5**, owner `0x73443d8C05c74F8C2F5D499Da2597a1EE49E431b`.
+app_id `0g-kms`, **2-of-5**, owner `0x9C58F839451EBf3e7f82442bC48E4088746380Bb`.
 
 ```
 group_pubkey = 8c30fd0e713be395d8f85ca5e0a879989fa8a4bbf019f0db00c4ee38c05f463a0079ab8c2ccda195f3171b98d0522050

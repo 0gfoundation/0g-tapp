@@ -60,15 +60,22 @@ TAPP_REGISTRY_CONTRACT=0x54874F536301c993922Dd95097e3902e7FBfe612
 
 **Deployed:** 2026-09-04 **Deployer:** `0x60BF67E31784af4E58371cBEfd7a5B6c00C3EBe4` (throwaway,
 retains no authority) **Min stake:** 10 OG (initial, will be raised to 100)
-**Lock period:** 604800 s (7 days) **Implementation:** v0.1.0 (has `version()`, 5-field `getNode`)
-All four contracts (impl, beacon, proxy, timelock) source-verified on https://chainscan.0g.ai.
+**Lock period:** 604800 s (7 days) **Implementation:** v0.2.0 since 2026-10-12 (deployed as v0.1.0)
+All five contracts (both implementations, beacon, proxy, timelock) source-verified on https://chainscan.0g.ai.
 
 | Contract | Address |
 |----------|---------|
-| TappRegistry Implementation | `0xf399583d108346e48aDF54cd8727d7433C652949` |
+| TappRegistry Implementation (initial, v0.1.0) | `0xf399583d108346e48aDF54cd8727d7433C652949` |
+| **TappRegistry Implementation (current, v0.2.0 — app-owner transfer)** | `0x826cC06009F900Dc01a218624B03Ae46dBF29890` |
 | UpgradeableBeacon | `0x32fFeDa56E1e12646661E1fe9B17c13D2709975f` |
 | **BeaconProxy (stable)** | `0x54874F536301c993922Dd95097e3902e7FBfe612` |
 | TimelockController (beacon owner) | `0xD070792b1dB64F858ACE3E5443f2d21c0edE0BAc` |
+
+**Upgrades**
+
+| Date | New Implementation | Upgrade Tx | Notes |
+|------|--------------------|-----------|-------|
+| 2026-10-12 | `0x826cC06009F900Dc01a218624B03Ae46dBF29890` | `0x33d6c1707292a6178ce1b47590435348ad63125a535744c614bdbede639728ee` | `0.2.0`: two-step app-owner transfer. Scheduled 2026-10-06, executed by `0x87605ec8…`; `cmd/upgrade --check` confirmed 18 values unchanged (admin, stake parameters, and the five apps' records). Source-verified |
 
 **Authority** — the deployer key holds nothing:
 
@@ -84,8 +91,9 @@ Both moved from `0x73443d8C05c74F8C2F5D499Da2597a1EE49E431b` on 2026-10-04, all
 signed by the old address: the registry admin first (`AdminTransferred`, block
 46146695, 13:28:45 UTC), then the four timelock roles — granted to the new address
 and revoked from the old one (blocks 46146918–46146998, 13:32:00–13:33:10 UTC). App
-ownership is separate and did not move — e.g. `0g-kms` is still owned by
-`0x73443d…` (see [`docs/KMS.md`](../docs/KMS.md)).
+ownership is separate: the five apps here, `0g-kms` among them, moved from `0x73443d…`
+to `0x9C58F839451EBf3e7f82442bC48E4088746380Bb` on 2026-10-12 (`transferAppOwnership`,
+once 0.2.0 was live; see [`docs/KMS.md`](../docs/KMS.md)).
 
 One address holds every timelock role, so the delay is the only check: whoever holds
 that key can schedule, execute and cancel. Moving the roles to a multisig would
@@ -109,8 +117,8 @@ timelock can call it.
 
 ## Implementation 0.2.0 (app ownership transfer)
 
-**Testnet: deployed 2026-10-05** (see its upgrades table). **Mainnet: pending** —
-the proxy still answers `version()` = `"0.1.0"`. Adds a two-step app-owner transfer:
+**Testnet: deployed 2026-10-05** (see its upgrades table). **Mainnet: deployed 2026-10-12**
+(see its upgrades table). Adds a two-step app-owner transfer:
 
 | Function | Who | Effect |
 |---|---|---|
