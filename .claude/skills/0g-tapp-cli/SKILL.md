@@ -1,7 +1,7 @@
 ---
 name: 0g-tapp-cli
 description: Use this skill when the user wants to deploy, manage, or troubleshoot applications on a 0G Tapp (Trusted Application Platform) server using tapp-cli. Covers start/stop apps, on-chain registration, registry login, check task status, view logs, and manage docker compose deployments across multiple remote TEE servers.
-version: 1.22.0
+version: 1.22.1
 author: 0G Labs
 tags: [0g, tapp, tee, docker, deployment, cli, onchain]
 ---
@@ -113,7 +113,7 @@ tapp-cli -s <server> -k 0x<key> claim-config \
   --tls-key-source kms                                                       # claim + set KMS + TLS key source
 ```
 - First-come-first-served, exactly once per boot. CLI verifies result end-to-end.
-- `--kbs-urls` and `--tls-key-source` optional if already baked into config.toml.
+- **Always pass `--kbs-urls`** on a node whose apps use the KMS (FDE volumes, `kms` TLS, secrets): CVM images bake no KMS list (#169 — one image serves both networks). Forgetting it is quiet for FDE: an app in the default `encrypted` mode starts on a RAM directory (lost at reboot), warned only in the server log. KMS nodes themselves claim without it. `--tls-key-source` defaults to `local`.
 - No chain is claimed (`--chain-rpc-url`/`--chain-contract` were removed in tapp-cli 0.9.0 and are now rejected; tapp-server 0.9.0 ignores them from older CLIs). A node is not tied to one registry — on-chain commands take `--rpc-url`/`--contract`, so one node can be registered on testnet and mainnet.
 - **What to put in `--kbs-urls`**: the deployed cluster endpoints per network are in `docs/KMS.md` — mainnet and testnet both run app_id `0g-kms` but are two clusters with two masters; the doc's group pubkeys are how you check you reached the right one.
 - `--tls-key-source local|kms` (v0.4.0+, default `local`) — decides whether app TLS keys survive a restart, see App TLS certificates above. Must be decided at claim time; `kms` on a node with no KMS config, or whose app is not registered on chain, will fail when a cert is requested.
