@@ -17,7 +17,7 @@ TAPP_REGISTRY_CONTRACT=0x2Ce80374318B1d7Fb3345724457a182E0ad165c9
 **Min stake:** 1 0G (`1000000000000000000` wei)  **Lock period:** 86400 s (1 day)
 All three contracts source-verified on the explorer.
 Registry `admin` and beacon owner were moved to
-`0x73443d8C05c74F8C2F5D499Da2597a1EE49E431b` on 2026-09-05 (no timelock here —
+`0x9C58F839451EBf3e7f82442bC48E4088746380Bb` on 2026-10-12 (no timelock here —
 upgrades apply immediately, which is intended for a dev chain).
 
 | Contract | Address |
@@ -132,7 +132,7 @@ Events `AppOwnershipTransferStarted(appId, owner, pendingOwner)` and
   upgrades a populated 0.1.0 proxy and checks every field.
 
 Rollout with `go run ./cmd/upgrade/` (Go Tools below), which keeps the beacon
-owner's key off the machine doing the work. Testnet: the owner (`0x73443d…`) signs
+owner's key off the machine doing the work. Testnet: the owner (`0x9C58…`) signs
 the printed `upgradeTo`. Mainnet: the owner is the timelock — its proposer
 (`0x87605ec8…`) schedules, and after the 1-day delay an executor executes. Then
 `go run ./cmd/verify/ --network <net>`. Record each in its network's upgrades table
@@ -217,7 +217,7 @@ The key only pays for putting the new implementation on chain. The switch
 | beacon owner | what happens |
 |---|---|
 | this key | the switch is sent (dev chains) |
-| a wallet (testnet: `0x73443d…`) | the exact transaction is printed for the owner to sign elsewhere — wallet, hardware key — after simulating it **as** the owner |
+| a wallet (testnet: `0x9C58…`) | the exact transaction is printed for the owner to sign elsewhere — wallet, hardware key — after simulating it **as** the owner |
 | a TimelockController (mainnet) | the schedule and execute transactions are printed, with the delay read from it; `--proposer <addr>` simulates the schedule as that proposer |
 
 `--check <impl>` confirms the beacon moved and that the switch itself changed
