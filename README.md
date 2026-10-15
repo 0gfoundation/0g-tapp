@@ -639,7 +639,17 @@ tapp-cli -s https://<node>:50052 --tls-pin 0x<pin> \
 
 So multi-step commands such as `start-app --register-onchain` run to the end, with one
 prompt per signature and per transaction. The signer sees a hash, not the compose: what it
-approves is "this exact request", and the request is what this CLI run built.
+approves is "this exact request", and the request is what this CLI run built. Each prompt
+names what the request is for: the method, the app and the node (`StartApp app my-app on
+203.0.113.7`), or for a transaction the registry function and the app.
+
+`start-app --register-onchain` asks for the StartApp before the last registry transaction, not
+after it, and sends it the moment that transaction is mined. A StartApp that arrived minutes
+later could find that the scan had already looked for the app on the node, found nothing, and
+kept that answer for about a minute, during which the KMS refuses the app its volume key. If
+the StartApp's signature runs out of time while the transaction waits, it is asked for again
+after the transaction. Should the start still fail with `GetEvidence: … App … not found`, run
+`start-app` again without `--register-onchain` after a minute.
 
 #### With a Ledger: `--ledger`
 
@@ -732,7 +742,8 @@ What has to exist:
 What tapp-cli does:
 
 - **A request signature** is a personal_sign request. Approvers see it noted
-  `0g-fordefi-signer: <caller>: tapp-cli: <Method>`.
+  `0g-fordefi-signer: <caller>: tapp-cli: <Method> app <app> on <node>` (no app for a request
+  about the node).
   - The CLI follows its state: `waiting for approval` is the policy; `approved` means the API
     Signer has not signed yet.
   - It goes on once the signature recovers to the given address.
@@ -741,7 +752,7 @@ What tapp-cli does:
     or the command is stopped.
 - **An on-chain call** is estimated here and signed without being broadcast, with the gas, the
   gas price and the account's next nonce set here. Approvers see it noted with the registry
-  function: `0g-fordefi-signer: <caller>: tapp-cli: addNode(string,address,string,bytes,bytes)`.
+  function and the app: `0g-fordefi-signer: <caller>: tapp-cli: addNode(string,address,string,bytes,bytes) app <app>`.
   - tapp-cli checks the signed transaction: signer, chain, contract, data, value, gas, gas
     price, and that its nonce is still the account's next.
   - It then broadcasts it, waits for it to be mined and checks it again: the same path as a
@@ -754,12 +765,14 @@ What tapp-cli does:
 Neither the service nor Fordefi is trusted for what comes back. A signature from another vault,
 or a transaction that differs from the one asked for in any of the fields above, stops the
 command before anything is sent. Such a transaction is still signed, though: whoever holds it
-can send it until the vault's next transaction uses its nonce.
+can send it until the vault's next transaction uses its nonce. The error says when that nonce
+is already used and the transaction can no longer be sent.
 
 Whoever holds a token can have the vault sign whatever that caller's entry and Fordefi's policy
-let through. Within its entry, that is the owner's full authority over the vault's apps, for
-example `transferAppOwnership`. So keep tokens off shared machines, and give the API user a
-policy that requires approval for anything it should not sign alone.
+let through. Within its entry, that is the owner's authority over the vault's apps: starting,
+stopping and registering them, and, if the entry lists `transferAppOwnership` (the one above does
+not), handing them to another address. So keep tokens off shared machines, and give the API user
+a policy that requires approval for anything it should not sign alone.
 
 ## On-chain Registration
 

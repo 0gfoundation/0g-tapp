@@ -948,9 +948,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             tee_url,
         } => {
             let private_key = require_private_key(&cli.private_key)?;
+            let mut signed = None;
             if register_onchain {
                 // requires_all guarantees these are present
-                ensure_registered_onchain(
+                signed = ensure_registered_onchain(
                     &cli.server,
                     &compose_file,
                     &app_id,
@@ -964,7 +965,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 )
                 .await?;
             }
-            start_app(&cli.server, compose_file, app_id, private_key).await?;
+            start_app(&cli.server, compose_file, app_id, private_key, signed).await?;
         }
         Commands::StopApp { app_id } => {
             let private_key = require_private_key(&cli.private_key)?;
@@ -1398,7 +1399,18 @@ async fn send_start_app(
     measure_only: bool,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let mut client = create_client(server).await?;
+    let request = signed_start_app(server, compose_file, app_id, private_key, measure_only)?;
+    submit_start_app(&mut client, request).await
+}
 
+/// A StartApp request, signed and not yet sent.
+fn signed_start_app(
+    server: &str,
+    compose_file: &PathBuf,
+    app_id: &str,
+    private_key: &str,
+    measure_only: bool,
+) -> Result<Request<StartAppRequest>, Box<dyn std::error::Error>> {
     // Read compose file
     let compose_content = std::fs::read_to_string(compose_file)?;
 
@@ -1414,8 +1426,31 @@ async fn send_start_app(
     });
 
     // Add signature metadata
-    add_signature_metadata(&mut request, private_key, "StartApp")?;
+    let subject = if measure_only {
+        format!("app {app_id} (measure only)")
+    } else {
+        format!("app {app_id}")
+    };
+    add_signature_metadata(&mut request, private_key, "StartApp", &about(server, &subject))?;
+    Ok(request)
+}
 
+/// Whether a request signed at `x-timestamp` still has `margin` seconds of the server's
+/// ±600 s window left.
+fn signature_still_fresh<T>(request: &Request<T>, margin: i64) -> bool {
+    request
+        .metadata()
+        .get("x-timestamp")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|t| t.parse::<i64>().ok())
+        .is_some_and(|t| chrono::Utc::now().timestamp() < t + 600 - margin)
+}
+
+/// Send a signed StartApp request and return the task id.
+async fn submit_start_app(
+    client: &mut TappServiceClient<tonic::transport::Channel>,
+    request: Request<StartAppRequest>,
+) -> Result<String, Box<dyn std::error::Error>> {
     let response = client.start_app(request).await?;
     let result = response.into_inner();
     if !result.success {
@@ -1440,13 +1475,26 @@ async fn send_start_app(
     Ok(result.task_id)
 }
 
+/// Start the app. `signed` is a StartApp signed earlier (see [`ensure_registered_onchain`]),
+/// sent as it is while the server's window still has room for it.
 async fn start_app(
     server: &str,
     compose_file: PathBuf,
     app_id: String,
     private_key: String,
+    signed: Option<Request<StartAppRequest>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let task_id = send_start_app(server, &compose_file, &app_id, &private_key, false).await?;
+    let task_id = match signed {
+        Some(request) if signature_still_fresh(&request, 30) => {
+            let mut client = create_client(server).await?;
+            submit_start_app(&mut client, request).await?
+        }
+        Some(_) => {
+            eprintln!("  the StartApp signed before the registry call has run out of time; signing it again");
+            send_start_app(server, &compose_file, &app_id, &private_key, false).await?
+        }
+        None => send_start_app(server, &compose_file, &app_id, &private_key, false).await?,
+    };
 
     println!("✓ Application start requested");
     println!("  App ID: {}", app_id);
@@ -1742,6 +1790,9 @@ fn kept_tee_url(recorded: &str, tls_listener: bool) -> String {
 ///
 /// "Measure" = a measure_only StartApp: the server pulls images and computes the
 /// hashes without starting containers.
+///
+/// Returns the StartApp to send next, signed before the last registry call, or `None`
+/// when the chain needed nothing.
 #[allow(clippy::too_many_arguments)]
 async fn ensure_registered_onchain(
     server: &str,
@@ -1754,7 +1805,7 @@ async fn ensure_registered_onchain(
     old_signer: Option<&str>,
     add_node: bool,
     tee_url: Option<&str>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<Option<Request<StartAppRequest>>, Box<dyn std::error::Error>> {
     use ethers::types::{Address, U256};
     use tapp_common::onchain::{self, OnchainParams};
 
@@ -1828,7 +1879,7 @@ async fn ensure_registered_onchain(
     let steps = plan_chain_sync(chain.as_ref(), &deployed, signer, stated_old, add_node, app_id)?;
     if steps.is_empty() {
         println!("✓ On-chain registration already matches this deployment");
-        return Ok(());
+        return Ok(None);
     }
 
     let params = OnchainParams {
@@ -1836,7 +1887,17 @@ async fn ensure_registered_onchain(
         contract: contract.clone(),
         private_key: private_key.to_owned(),
     };
-    for step in steps {
+    // The scan checks the node once the registry names it. Before the StartApp arrives the
+    // node has no evidence for the app, and the scan keeps that answer for about a minute —
+    // long enough for the KMS to refuse the app its volume key. So the StartApp is signed
+    // before the last registry call and sent the moment that call is mined, not after another
+    // round with a signer who may take minutes.
+    let last_call = steps.iter().rposition(|s| !matches!(s, SyncStep::ImagesDifferFromApp));
+    let mut start = None;
+    for (i, step) in steps.into_iter().enumerate() {
+        if Some(i) == last_call {
+            start = Some(signed_start_app(server, compose_file, app_id, private_key, false)?);
+        }
         match step {
             SyncStep::RegisterApp { tee_url } => {
                 let tx = onchain::register_app(
@@ -1945,7 +2006,7 @@ async fn ensure_registered_onchain(
             }
         }
     }
-    Ok(())
+    Ok(start)
 }
 
 /// What this deployment measured, in the registry's encoding, and where its evidence is.
@@ -2160,7 +2221,7 @@ async fn stop_app(
         app_id: app_id.clone(),
     });
 
-    add_signature_metadata(&mut request, &private_key, "StopApp")?;
+    add_signature_metadata(&mut request, &private_key, "StopApp", &about(server, &format!("app {app_id}")))?;
 
     let response = client.stop_app(request).await?;
     let result = response.into_inner();
@@ -2838,7 +2899,8 @@ async fn get_app_logs(
         service_name: service.unwrap_or_default(),
     });
 
-    add_signature_metadata(&mut request, &private_key, "GetAppLogs")?;
+    let label = about(server, &format!("app {}", request.get_ref().app_id));
+    add_signature_metadata(&mut request, &private_key, "GetAppLogs", &label)?;
 
     let response = client.get_app_logs(request).await?;
     let result = response.into_inner();
@@ -2864,7 +2926,7 @@ async fn get_app_container_status(
         app_id: app_id.clone(),
     });
 
-    add_signature_metadata(&mut request, &private_key, "GetAppContainerStatus")?;
+    add_signature_metadata(&mut request, &private_key, "GetAppContainerStatus", &about(server, &format!("app {app_id}")))?;
 
     let response = client.get_app_container_status(request).await?;
     let result = response.into_inner();
@@ -3219,7 +3281,7 @@ async fn start_service(
         pull_image: pull,
     });
 
-    add_signature_metadata(&mut request, &private_key, "StartService")?;
+    add_signature_metadata(&mut request, &private_key, "StartService", &about(server, &format!("{service_name} of app {app_id}")))?;
 
     let response = client.start_service(request).await?;
     let result = response.into_inner();
@@ -3261,7 +3323,7 @@ async fn stop_service(
         service_name: service_name.clone(),
     });
 
-    add_signature_metadata(&mut request, &private_key, "StopService")?;
+    add_signature_metadata(&mut request, &private_key, "StopService", &about(server, &format!("{service_name} of app {app_id}")))?;
 
     let response = client.stop_service(request).await?;
     let result = response.into_inner();
@@ -3303,7 +3365,7 @@ async fn update_trust_anchors(
         scan_url,
         scan_public_key,
     });
-    add_signature_metadata(&mut request, &private_key, "UpdateTrustAnchors")?;
+    add_signature_metadata(&mut request, &private_key, "UpdateTrustAnchors", &about(server, ""))?;
 
     let result = match client.update_trust_anchors(request).await {
         Ok(r) => r.into_inner(),
@@ -3393,7 +3455,7 @@ async fn claim_config(
         scan_url: scan_url.clone(),
         scan_public_key: scan_public_key.clone(),
     });
-    add_signature_metadata(&mut request, &private_key, "ClaimConfig")?;
+    add_signature_metadata(&mut request, &private_key, "ClaimConfig", &about(server, ""))?;
 
     let result = match client.claim_config(request).await {
         Ok(response) => response.into_inner(),
@@ -3467,7 +3529,7 @@ async fn add_to_whitelist(
         evm_address: address.clone(),
     });
 
-    add_signature_metadata(&mut request, &private_key, "AddToWhitelist")?;
+    add_signature_metadata(&mut request, &private_key, "AddToWhitelist", &about(server, address.trim()))?;
 
     let response = client.add_to_whitelist(request).await?;
     let result = response.into_inner();
@@ -3494,7 +3556,7 @@ async fn remove_from_whitelist(
         evm_address: address.clone(),
     });
 
-    add_signature_metadata(&mut request, &private_key, "RemoveFromWhitelist")?;
+    add_signature_metadata(&mut request, &private_key, "RemoveFromWhitelist", &about(server, address.trim()))?;
 
     let response = client.remove_from_whitelist(request).await?;
     let result = response.into_inner();
@@ -3518,7 +3580,7 @@ async fn list_whitelist(
 
     let mut request = Request::new(ListWhitelistRequest {});
 
-    add_signature_metadata(&mut request, &private_key, "ListWhitelist")?;
+    add_signature_metadata(&mut request, &private_key, "ListWhitelist", &about(server, ""))?;
 
     let response = client.list_whitelist(request).await?;
     let result = response.into_inner();
@@ -3555,7 +3617,7 @@ async fn docker_login(
         password,
     });
 
-    add_signature_metadata(&mut request, &private_key, "DockerLogin")?;
+    add_signature_metadata(&mut request, &private_key, "DockerLogin", &about(server, ""))?;
 
     let response = client.docker_login(request).await?;
     let result = response.into_inner();
@@ -3582,7 +3644,7 @@ async fn docker_logout(
         registry: registry.unwrap_or_default(),
     });
 
-    add_signature_metadata(&mut request, &private_key, "DockerLogout")?;
+    add_signature_metadata(&mut request, &private_key, "DockerLogout", &about(server, ""))?;
 
     let response = client.docker_logout(request).await?;
     let result = response.into_inner();
@@ -3609,7 +3671,7 @@ async fn prune_images(
 
     let mut request = Request::new(PruneImagesRequest { all });
 
-    add_signature_metadata(&mut request, &private_key, "PruneImages")?;
+    add_signature_metadata(&mut request, &private_key, "PruneImages", &about(server, ""))?;
 
     println!("Pruning Docker images... (this may take a while)");
 
@@ -3742,7 +3804,7 @@ async fn get_service_logs(
         download_full,
     });
 
-    add_signature_metadata(&mut request, &private_key, "GetServiceLogs")?;
+    add_signature_metadata(&mut request, &private_key, "GetServiceLogs", &about(server, ""))?;
 
     let response = client.get_service_logs(request).await?;
     let result = response.into_inner();
@@ -3781,7 +3843,11 @@ async fn withdraw_balance(
         recipient: recipient.unwrap_or_default(),
     });
 
-    add_signature_metadata(&mut request, &private_key, "WithdrawBalance")?;
+    let label = match request.get_ref().recipient.as_str() {
+        "" => format!("app {app_id}"),
+        to => format!("app {app_id} to {to}"),
+    };
+    add_signature_metadata(&mut request, &private_key, "WithdrawBalance", &about(server, &label))?;
 
     let response = client.withdraw_balance(request).await?;
     let result = response.into_inner();
@@ -4458,10 +4524,29 @@ fn sign_message_for<T: prost::Message>(
     }
 }
 
+/// What a request is for, after its method, as whoever signs it is shown: `subject` (the app,
+/// say) on the node. The signed line itself is a hash, so this is all a holder or a Fordefi
+/// approver has to tell one request from another.
+fn about(server: &str, subject: &str) -> String {
+    let node = server
+        .parse::<http::Uri>()
+        .ok()
+        .and_then(|u| u.host().map(str::to_string))
+        .unwrap_or_else(|| server.to_string());
+    if subject.is_empty() {
+        format!("on {node}")
+    } else {
+        format!("{subject} on {node}")
+    }
+}
+
+/// Sign `request` as `method_name`. `about` (see [`about`]) is shown to an external signer
+/// beside the method; it is not signed.
 fn add_signature_metadata<T: prost::Message>(
     request: &mut Request<T>,
     private_key_hex: &str,
     method_name: &str,
+    about: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use k256::ecdsa::{signature::hazmat::PrehashSigner, RecoveryId, Signature, SigningKey};
     use sha3::{Digest, Keccak256};
@@ -4469,13 +4554,14 @@ fn add_signature_metadata<T: prost::Message>(
 
     let legacy = *LEGACY_SIGN.get().unwrap_or(&false);
     if let KeySigner::External(address) = KeySigner::parse(private_key_hex)? {
+        let what = format!("{method_name} {about}");
         // The server accepts a signature up to 600s either side of its timestamp. One that
         // comes back later is asked for again over a fresh timestamp — same request, nothing
         // sent yet — rather than ending a multi-step command half-way.
         loop {
             let timestamp = chrono::Utc::now().timestamp();
             let message = sign_message_for(request, method_name, timestamp, legacy);
-            match external_signer::request_signature(&address, &message, method_name, Some(timestamp + 600)) {
+            match external_signer::request_signature(&address, &message, what.trim_end(), Some(timestamp + 600)) {
                 Ok(sig) => return attach_signature(request, &hex::encode(sig), timestamp, legacy),
                 Err(e) if e.downcast_ref::<external_signer::Expired>().is_some() => {
                     eprintln!("  ✗ that signature came after its deadline; here is a new message for the same request");
@@ -4558,6 +4644,28 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    /// Beside the method, a signer is shown what the request is for: the app, if any, and
+    /// the node by its host.
+    #[test]
+    fn a_signature_request_names_the_app_and_the_node() {
+        assert_eq!(about("https://35.222.55.79:50052", "app my-app"), "app my-app on 35.222.55.79");
+        assert_eq!(about("http://127.0.0.1:50051", ""), "on 127.0.0.1");
+        assert_eq!(about("/run/tapp/tapp.sock", ""), "on /run/tapp/tapp.sock");
+    }
+
+    /// A StartApp signed before the last registry call is sent only while the server's
+    /// window still has room for it; otherwise it is signed again.
+    #[test]
+    fn a_start_signed_ahead_is_sent_only_while_the_server_takes_it() {
+        let now = chrono::Utc::now().timestamp();
+        let mut request = Request::new(StartAppRequest::default());
+        assert!(!signature_still_fresh(&request, 30), "not signed");
+        attach_signature(&mut request, "00", now - 500, false).unwrap();
+        assert!(signature_still_fresh(&request, 30));
+        attach_signature(&mut request, "00", now - 580, false).unwrap();
+        assert!(!signature_still_fresh(&request, 30));
+    }
 
     /// With --external-signer the CLI never holds a key: the owner address it acts as is the
     /// one given, which is what claim-config and the on-chain commands compare against.

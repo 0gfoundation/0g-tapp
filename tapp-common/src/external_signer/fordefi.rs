@@ -186,6 +186,20 @@ fn with_causes(e: &dyn std::error::Error) -> String {
     text
 }
 
+/// The most the service takes in a note.
+const MAX_NOTE: usize = 200;
+
+/// The request's note in Fordefi, which is what approvers read: `what` names the method or
+/// function, the app and the node. The service takes one line of printable characters, at most
+/// [`MAX_NOTE`], and refuses the request otherwise; an app id is the caller's to choose.
+fn note(what: &str) -> String {
+    format!("tapp-cli: {what}")
+        .chars()
+        .map(|c| if c == ' ' || c.is_ascii_graphic() { c } else { '?' })
+        .take(MAX_NOTE)
+        .collect()
+}
+
 /// A create the service did not answer, or answered with a server error, may have made the
 /// request all the same, where nobody would abort it.
 fn maybe_made(e: anyhow::Error, what: &str) -> anyhow::Error {
@@ -196,9 +210,9 @@ fn maybe_made(e: anyhow::Error, what: &str) -> anyhow::Error {
         Some(r) if r.status.is_client_error() => e,
         _ => anyhow!(
             "{} (Fordefi may have made the request all the same: reject any request noted \
-             \"… tapp-cli: {}\" still waiting in Fordefi)",
+             \"… {}\" still waiting in Fordefi)",
             e,
-            what
+            note(what)
         ),
     }
 }
@@ -374,7 +388,7 @@ pub(super) async fn sign_message(
     what: &str,
     valid_until: Option<i64>,
 ) -> Result<Vec<u8>> {
-    let body = json!({ "message": message, "note": format!("tapp-cli: {what}") });
+    let body = json!({ "message": message, "note": note(what) });
     let created = call(config, reqwest::Method::POST, "/v1/messages", Some(&body))
         .await
         .map_err(|e| maybe_made(e, what))?;
@@ -408,7 +422,7 @@ fn transaction_body(
         "gas_limit": gas.to_string(),
         "gas_price": gas_price.to_string(),
         "nonce": nonce.to_string(),
-        "note": format!("tapp-cli: {what}"),
+        "note": note(what),
     })
 }
 
@@ -432,12 +446,21 @@ pub(super) async fn sign_transaction(
     let created = call(config, reqwest::Method::POST, "/v1/transactions", Some(&body))
         .await
         .map_err(|e| match e.downcast_ref::<Refused>() {
-            // 502 is anything Fordefi refused or failed at; a chain it does not know is common.
-            Some(r) if r.status == reqwest::StatusCode::BAD_GATEWAY && r.text.to_lowercase().contains("chain") => anyhow!(
-                "{} (a chain Fordefi does not support out of the box — the 0G testnet, for one — \
-                 must be added to the organisation: Settings > Chains > Add EVM chain)",
-                e
-            ),
+            // 502 is anything Fordefi refused or failed at. One that names the chain as the
+            // service sent it to Fordefi is about the chain, and a chain Fordefi has not been
+            // given is the likely case; the wording of that refusal is not known.
+            Some(r)
+                if r.status == reqwest::StatusCode::BAD_GATEWAY
+                    && r.text.to_lowercase().contains(&format!("evm_{chain_id}")) =>
+            {
+                anyhow!(
+                    "{} (if the organisation does not have chain {} yet: a chain Fordefi does not \
+                     support out of the box — the 0G testnet, for one — must be added to it, \
+                     Settings > Chains > Add EVM chain)",
+                    e,
+                    chain_id
+                )
+            }
             _ => maybe_made(e, what),
         })?;
     match wait_for(config, created, Instant::now() + APPROVAL_WAIT, "raw_transaction").await? {
@@ -615,6 +638,15 @@ mod tests {
         );
     }
 
+    /// The service refuses a note that is not one line of at most 200 printable characters,
+    /// and the app id in it is whatever the operator typed.
+    #[test]
+    fn the_note_is_one_printable_line_the_service_takes() {
+        assert_eq!(note("StopApp app my-app on 10.0.0.1"), "tapp-cli: StopApp app my-app on 10.0.0.1");
+        assert_eq!(note("StopApp app a\nb\u{202e}"), "tapp-cli: StopApp app a?b?");
+        assert_eq!(note(&"x".repeat(500)).chars().count(), MAX_NOTE);
+    }
+
     /// No call goes out on a connection an earlier one left open, which the server may have
     /// closed meanwhile without this end knowing.
     #[tokio::test]
@@ -726,6 +758,12 @@ mod tests {
         let (fordefi_refused, _) = service(|_, _, _| (502, json!({"error": "Fordefi …: 400 — Chain evm_16602 is not supported"})));
         let e = sign_transaction(&config(fordefi_refused), 16602, &to, &[], one, one, one, one, "x").await.unwrap_err().to_string();
         assert!(e.contains("502") && e.contains("evm_16602") && e.contains("Add EVM chain"), "{e}");
+
+        // About something else, though it says "chain": no hint that sends the operator to the
+        // organisation's chains.
+        let (other, _) = service(|_, _, _| (502, json!({"error": "Fordefi …: 400 — chain id mismatch"})));
+        let e = sign_transaction(&config(other), 16602, &to, &[], one, one, one, one, "x").await.unwrap_err().to_string();
+        assert!(e.contains("mismatch") && !e.contains("Add EVM chain"), "{e}");
 
         let (unreachable, _) = service(|_, _, _| (502, json!({"error": "Fordefi …: connection refused"})));
         let e = sign_transaction(&config(unreachable), 16661, &to, &[], one, one, one, one, "x").await.unwrap_err().to_string();

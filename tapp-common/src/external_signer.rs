@@ -506,6 +506,14 @@ fn check_fordefi_terms(raw: &[u8], gas: U256, gas_price: U256, nonce: U256, next
     Ok(())
 }
 
+/// The nonce of a transaction `from` signed, when the account has gone past it: the
+/// transaction can then never be sent.
+fn nonce_taken(raw: &[u8], from: &Address, next_nonce: U256) -> Option<U256> {
+    let (tx, signature) = TypedTransaction::decode_signed(&ethers::utils::rlp::Rlp::new(raw)).ok()?;
+    let nonce = *tx.nonce()?;
+    (signature.recover(tx.sighash()).ok()? == *from && nonce < next_nonce).then_some(nonce)
+}
+
 /// Fordefi signs only (push_mode manual); the transaction is checked here and broadcast
 /// from here, as a Ledger's is. The gas and the nonce are set here.
 async fn fordefi_transaction(
@@ -542,14 +550,14 @@ async fn fordefi_transaction(
             } else {
                 ""
             };
-            anyhow!(
-                "Fordefi returned a transaction that is not the one asked for: {}{}. It was not \
-                 sent, but it is signed: whoever holds it can still send it until the vault's \
-                 nonce {} is used, which the next transaction from the vault does",
-                e,
-                whose,
-                nonce
-            )
+            let after = match nonce_taken(&raw, from, next_nonce) {
+                Some(n) => format!("It was not sent, and cannot be any more: the vault's nonce {n} is taken"),
+                None => format!(
+                    "It was not sent, but it is signed: whoever holds it can still send it until \
+                     the vault's nonce {nonce} is used, which the next transaction from the vault does"
+                ),
+            };
+            anyhow!("Fordefi returned a transaction that is not the one asked for: {}{}. {}", e, whose, after)
         })?;
     broadcast_checked(provider, raw, hash, from, to, data, value).await
 }
@@ -902,6 +910,10 @@ mod tests {
         // It did, but the account moved on while the approval took.
         let e = check_fordefi_terms(&raw, gas, price, seven, U256::from(8u64)).unwrap_err();
         assert!(e.to_string().contains("next is now 8"), "{e}");
+        // Then it can never be sent; with its nonce still to come, it can.
+        assert_eq!(nonce_taken(&raw, &from, U256::from(8u64)), Some(seven));
+        assert_eq!(nonce_taken(&raw, &from, seven), None);
+        assert_eq!(nonce_taken(&raw, &to, U256::from(8u64)), None, "another account's nonce says nothing");
     }
 
     /// A device answer is told to the operator as what to do, not as a connection problem.
