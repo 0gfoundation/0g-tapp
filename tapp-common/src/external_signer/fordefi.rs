@@ -84,8 +84,13 @@ impl Config {
 
     fn new(base: String, token: String, poll: Duration) -> Result<Self> {
         // The service never redirects, and following one could carry the token to plain HTTP.
+        // Every call takes a new connection: a server closes an idle keep-alive connection
+        // (gunicorn after 2 s, shorter than the poll), and through an SSH tunnel this end hears
+        // of it only once the next call has gone out on it and failed — a create that fails
+        // that way cannot safely be asked for again.
         let mut client = reqwest::Client::builder()
             .timeout(Duration::from_secs(90))
+            .pool_max_idle_per_host(0)
             .redirect(reqwest::redirect::Policy::none());
         // Plain HTTP goes only to this machine, so never through a proxy: HTTP_PROXY does not
         // exempt loopback by itself, and the proxy would read the token.
@@ -517,6 +522,43 @@ mod tests {
         (base, seen)
     }
 
+    /// A stand-in that keeps each connection open after its answer, then drops it unanswered
+    /// on the next request it carries: an idle keep-alive connection the server has closed,
+    /// as it looks through an SSH tunnel, which passes the close on only once that request
+    /// arrives. Returns its base URL.
+    fn service_dropping_idle_connections() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = stream.unwrap();
+                std::thread::spawn(move || {
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    // A GET: its request line and headers, no body.
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).unwrap() == 0 {
+                            return;
+                        }
+                        if line.trim_end().is_empty() {
+                            break;
+                        }
+                    }
+                    let reply = json!({"id": "r-1", "state": "waiting_for_approval", "outcome": "pending"}).to_string();
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{reply}",
+                        reply.len()
+                    )
+                    .unwrap();
+                    let mut next = String::new();
+                    let _ = reader.read_line(&mut next);
+                });
+            }
+        });
+        base
+    }
+
     /// What the service returns for a signed message: the wallet's signature, 0x-hex.
     fn signed_message(body: &str) -> Value {
         let request: Value = serde_json::from_str(body).unwrap();
@@ -571,6 +613,16 @@ mod tests {
                 "note": "tapp-cli: addNode",
             })
         );
+    }
+
+    /// No call goes out on a connection an earlier one left open, which the server may have
+    /// closed meanwhile without this end knowing.
+    #[tokio::test]
+    async fn every_call_takes_a_new_connection() {
+        let config = config(service_dropping_idle_connections());
+        for _ in 0..3 {
+            call(&config, reqwest::Method::GET, "/v1/requests/r-1", None).await.unwrap();
+        }
     }
 
     /// Created waiting for approval, then signed: the request is followed to the end.
