@@ -1,7 +1,7 @@
 ---
 name: 0g-tapp-cli
 description: Use this skill when the user wants to deploy, manage, or troubleshoot applications on a 0G Tapp (Trusted Application Platform) server using tapp-cli. Covers start/stop apps, on-chain registration, registry login, check task status, view logs, and manage docker compose deployments across multiple remote TEE servers.
-version: 1.22.0
+version: 1.23.0
 author: 0G Labs
 tags: [0g, tapp, tee, docker, deployment, cli, onchain]
 ---
@@ -24,9 +24,9 @@ Deploy and manage containerized applications on 0G Tapp TEE servers using `tapp-
   - **Getting a trustworthy pin needs no out-of-band channel** (server ≥0.8.0): the node has a **common signer** (generated per boot; every app signer derives from it), the :50052 TLS key derives from it too, and `get-evidence` **without --app-id** returns the node's own evidence whose `runtime_data.tls_public_key` is that key's SPKI sha256 — Intel-signed, so it survives a hostile channel. Flow: `get-evidence` (any channel) → verify the quote → `--tls-pin 0x<tls_public_key>` for all management calls. A MITM can relay evidence but cannot forge the key inside it, and its own cert then fails the pin.
   - Two limits of that bootstrap: (1) it proves "a genuine TDX node with this measurement", **not** "the node at this address" — an attacker running their own genuine node could redirect you to it; it defends interception, not redirection (on-chain anchoring of the common signer is the follow-up). (2) The pin is **boot-scoped**: a node reboot rotates the common signer and the TLS key with it, so a stale pin fails closed — re-fetch evidence after any reboot.
   - tapp-server ≥0.7.1 defaults `bind_address` to **loopback** when the config omits it. CVM images bake an explicit `0.0.0.0:50051` (teeUrl/evidence fetching and remote claim need it), so image nodes are unaffected — the loopback default bites hand-rolled configs. "Connection refused from outside, works on the host" means the config omits `bind_address`.
-- **Auth**: private key via `-k` flag or `TAPP_PRIVATE_KEY` env var — or, for a key held elsewhere (Ledger, Fordefi/MPC, someone else's hardware wallet), `--external-signer 0x<address>` / `TAPP_EXTERNAL_SIGNER` (tapp-cli ≥ 0.10.0), plus `--ledger` for a Ledger on this machine. **Before any owner-level job, follow "Signing with a key held elsewhere" below** — it starts by asking the owner where the key is. Read-only commands (`get-tapp-info`, `get-service-status`, `get-app-info`, `get-app-key`, `get-evidence`, `list-apps`, `verify-app` direct mode) need no signer.
+- **Auth**: private key via `-k` flag or `TAPP_PRIVATE_KEY` env var — or, for a key held elsewhere (Ledger, Fordefi/MPC, someone else's hardware wallet), `--external-signer 0x<address>` / `TAPP_EXTERNAL_SIGNER` (tapp-cli ≥ 0.10.0), plus `--ledger` for a Ledger on this machine or `--fordefi` (tapp-cli ≥ 0.11.0) for a Fordefi vault reached through the 0g-fordefi-signer service. **Before any owner-level job, follow "Signing with a key held elsewhere" below** — it starts by asking the owner where the key is. Read-only commands (`get-tapp-info`, `get-service-status`, `get-app-info`, `get-app-key`, `get-evidence`, `list-apps`, `verify-app` direct mode) need no signer.
 - **TappRegistry (testnet)**: proxy `0x2Ce80374318B1d7Fb3345724457a182E0ad165c9`, RPC `https://evmrpc-testnet.0g.ai`, chainId `16602`. See `contract/CONTRACTS.md`.
-- **TappRegistry (mainnet)**: proxy `0x54874F536301c993922Dd95097e3902e7FBfe612`, RPC `https://evmrpc.0g.ai`, chainId `16661`. Min stake **10 OG**, withdraw lock 7 days. Upgrades go through a 1-day TimelockController (`0xD070792b1dB64F858ACE3E5443f2d21c0edE0BAc`) — see `contract/CONTRACTS.md`.
+- **TappRegistry (mainnet)**: proxy `0x54874F536301c993922Dd95097e3902e7FBfe612`, RPC `https://evmrpc.0g.ai`, chainId `16661`. Min stake: the registry's `minStakeAmount()`, 0.1 OG as of October 2026 (it was 10 OG at deployment; read it with `cast call <registry> 'minStakeAmount()(uint256)'`), withdraw lock 7 days. Upgrades go through a 1-day TimelockController (`0xD070792b1dB64F858ACE3E5443f2d21c0edE0BAc`) — see `contract/CONTRACTS.md`.
   - An older deployment `0x95a0BF4148b30F6F8D86870534c51df46Da5511c` is **superseded** — no `version()`, and `getNode` returns 3 fields instead of 5. Some long-lived apps (testnet sandbox provider / attestor) are still registered there, so you may still have to query it; just don't put anything new on it. Tell them apart with `cast call <proxy> "version()(string)"` — `"0.1.0"` = current, revert = old.
 - **Short flags**: `-s` = `--server` and `-k` = `--private-key` (both global). The earlier `-s` collision is **fixed** — the formerly-clashing subcommand flags (`--stake-wei`, `--service`, `--service-name`, `--signature`, `--chain-id`) are long-only now, so `-s` always means `--server`.
 
@@ -150,7 +150,7 @@ A node's owner is whoever signed its first `claim-config` after boot. Settle how
 
 **1. Ask the owner:**
 1. The owner address.
-2. Where its key is: **(a)** a key the operator may use on this machine; **(b)** a **Ledger plugged into this machine**; **(c)** elsewhere — Fordefi/MPC, or a hardware wallet (Ledger, Trezor, …) held by someone else (which one?).
+2. Where its key is: **(a)** a key the operator may use on this machine; **(b)** a **Ledger plugged into this machine**; **(c)** elsewhere — Fordefi/MPC, or a hardware wallet (Ledger, Trezor, …) held by someone else (which one?); **(d)** a **Fordefi vault this machine may use through the 0g-fordefi-signer service**: the operator has the service's URL and a token for it, and the organisation's API Signer is running.
 3. For (c): the channel for sending each line to sign and getting the signature back, and whether the holder is available now — each signature must come back within 10 minutes while the command waits.
 
 | Answer | Setup | Each signature |
@@ -158,10 +158,11 @@ A node's owner is whoever signed its first `claim-config` after boot. Settle how
 | (a) | `-k` / `TAPP_PRIVATE_KEY` | automatic |
 | (b) | `--external-signer 0x<owner>` (or `TAPP_EXTERNAL_SIGNER`) **and** `--ledger` on every command — it has no env var | approve on the device |
 | (c) | `--external-signer 0x<owner>` / `TAPP_EXTERNAL_SIGNER` | round trip with the holder |
+| (d) | `--external-signer 0x<owner>` **and** `--fordefi` on every command, with `FORDEFI_SIGNER_URL` and `FORDEFI_SIGNER_TOKEN` set | automatic once Fordefi's policy approves |
 
-With both `TAPP_PRIVATE_KEY` and `TAPP_EXTERNAL_SIGNER` set, the external signer is used. `--ledger` without an address is refused.
+With both `TAPP_PRIVATE_KEY` and `TAPP_EXTERNAL_SIGNER` set, the external signer is used. `--ledger` or `--fordefi` without an address is refused, and the two cannot be combined.
 
-**2. Tell the holder what is coming.** Each run of an owner-level command is one signature, named in the prompt by its RPC method. Before starting, send the holder the methods in order so anything else can be refused — e.g. claim + deploy: `ClaimConfig`, `DockerLogin`, `StartApp`, `GetAppContainerStatus`, `GetAppLogs`.
+**2. Tell the holder what is coming.** Each run of an owner-level command is one signature, named in the prompt by its RPC method, then the app (if any) and the node: `StartApp app my-app on 203.0.113.7`. Before starting, send the holder the methods in order so anything else can be refused — e.g. claim + deploy: `ClaimConfig`, `DockerLogin`, `StartApp`, `GetAppContainerStatus`, `GetAppLogs`.
 
 | Needs | Commands (method in the prompt) |
 |---|---|
@@ -169,20 +170,58 @@ With both `TAPP_PRIVATE_KEY` and `TAPP_EXTERNAL_SIGNER` set, the external signer
 | owner, or an address the owner whitelisted | `docker-login` (DockerLogin), `docker-logout`, `get-app-logs` (GetAppLogs), `get-service-logs`, `prune-images`, `withdraw-balance` |
 | no signature | `get-tapp-info`, `get-service-status`, `get-app-info`, `get-app-key`, `get-app-csr`, `get-evidence`, `get-task-status`, `list-apps` |
 
-On-chain commands (`register-onchain`, `update-onchain`, `start-app --register-onchain`, …) additionally ask for transactions from the owner address.
+On-chain commands (`register-onchain`, `update-onchain`, `start-app --register-onchain`, …) additionally ask for transactions from the owner address, named by registry function and app.
+
+`start-app --register-onchain` asks in this order: `StartApp … (measure only)`; any registry transaction but the last; `StartApp` itself; the last registry transaction. Tell the holder the StartApp comes **before** that transaction: it is sent the moment the transaction is mined, because a StartApp that arrives minutes later can be refused its volume key (the scan looked for the app on the node first, found nothing, and keeps that for about a minute). If its signature runs out of time while the transaction waits, the CLI asks for a new one after the transaction.
 
 **(b) Ledger on this machine.**
 - Needs a tapp-cli built with Ledger support (see "Getting tapp-cli"); a build without it refuses `--ledger` and says so. Linux non-root access also needs Ledger's udev rules.
 - Close Ledger Live (one program per device), unlock the device, open the Ethereum app. The account is found by the address among the first 10 accounts of the Ledger Live, BIP44 and legacy paths — no index to pass.
-- Each signature: the CLI prints `confirm on the Ledger: <Method>`, the signer, a deadline and the text; the device shows the same text. Approve only if it matches and the method is the next expected one.
+- Each signature: the CLI prints `confirm on the Ledger: <Method> app <app> on <node>`, the signer, a deadline and the text; the device shows the same text. Approve only if it matches and the method is the next expected one.
 - A transaction is signed on the device, then checked and broadcast by the CLI. Contract calls need **Blind signing** enabled in the Ethereum app.
 - Device errors are translated into what to do (rejected, locked, Ethereum app not open, Ledger Live holding the device, blind signing off, address not on this device): fix it and run the command again.
 
 **(c) Paste, with the holder.**
-- The command stops with `signature needed: <Method>`, the signer, a deadline, and one line `<Method>:0x<hash>:<timestamp>`. Send the holder **exactly that line** (nothing before or after) and the step it belongs to; leave the command waiting.
+- The command stops with `signature needed: <Method> app <app> on <node>`, the signer, a deadline, and one line `<Method>:0x<hash>:<timestamp>`. Send the holder **exactly that line** (nothing before or after) and the step it belongs to; leave the command waiting.
 - The holder checks the method is the next one on the list — the hash and timestamp cannot be checked by eye — and signs the line as a text message (personal_sign / EIP-191) with the owner account: Fordefi message signing; `cast wallet sign --ledger '<line>'`; `cast wallet sign --trezor '<line>'`. For a hardware wallet pick the account with `--mnemonic-index <n>` and check it first: `cast wallet address --ledger --mnemonic-index <n>` (or `--trezor`) must print the owner address.
 - Paste the returned `0x…` (65 bytes). A signature by another account, or over text changed on the way (extra space or line break), is refused with the address it came from — the holder signs again. One that arrives after the deadline is refused and the CLI prints a new line for the same request — send that; no re-run.
 - On-chain: the CLI prints the transaction (chain, from, to, value in wei and OG, data, registry function). The holder sends it from the owner address and returns the hash; the CLI waits for it to be mined and checks it is exactly that transaction and that it succeeded.
+
+**(d) Fordefi through 0g-fordefi-signer (tapp-cli ≥ 0.11.0).**
+- **Settings.**
+  - `FORDEFI_SIGNER_URL`: the service. It must be `https://` with a certificate from a public CA; plain `http://` is accepted only to this machine, for example an SSH tunnel, and never goes through a proxy.
+  - `FORDEFI_SIGNER_TOKEN`: this caller's token, made by the service's operator with `python auth.py <name>`.
+  - The Fordefi API user's token and P-256 key stay with the service, so never ask for them here. tapp-cli does not read `.env` files.
+  - A missing setting, or a plain-http URL to another machine, stops the command before anything is signed.
+- **The service's own configuration.** This caller's entry in the service's policy file decides what it may have signed. The README's "With Fordefi" section has a complete entry for tapp.
+  - `contracts` must list the TappRegistry for the chain, as `chain_id:0xaddress`. Otherwise every on-chain call is refused with `403 … is not one of <caller>'s contracts`.
+  - `functions` must include the registry function the command calls. Otherwise `403 … is not one of <caller>'s functions`. The README's entry leaves out `transferAppOwnership`, so `transfer-app-ownership` is refused until the operator adds it.
+  - `max_value` must cover the stake of `registerApp`/`addNode`. Otherwise `403 … max_value`.
+  - `max_fee` (default 0.1 OG) caps gas × gas price. `403 … max_fee` means the gas price rose past it.
+  - `messages` must admit tapp's `Method:0x<hash>:timestamp`, for example `[A-Z][A-Za-z]+:0x[0-9a-f]{64}:[0-9]{10}`. Otherwise every request signature is refused with `403`. `--legacy-sign` needs a pattern that also admits `Method:timestamp`.
+  - `401` means the service does not take this token.
+  - Only the service's operator can change these. Report the `403` text to them; do not retry.
+- **The chain.** 0G mainnet is built into Fordefi. Any other chain (testnet) must first be added to the Fordefi organisation as a custom chain. Otherwise the request is refused with `502`, and the CLI points at the chain when Fordefi's reason names it as `evm_<chain id>`.
+- **Funds.** The vault is the sender: it pays the gas, and the stake of `registerApp`/`addNode` (at least the registry's `minStakeAmount()`).
+- **Each signature.**
+  - The CLI prints `signing in Fordefi: <Method> app <app> on <node>`, the signer, the service, a deadline and the text.
+  - It then asks the service for a signature and follows the Fordefi request's state. Approvers see it noted `0g-fordefi-signer: <caller>: tapp-cli: <Method> app <app> on <node>`; a transaction, `… tapp-cli: <registry function> app <app>`.
+  - It goes on once the vault has signed and the signature recovers to the owner. A signature from another vault is refused, because the service signs with another vault than `--external-signer` names.
+- **States.**
+  - `waiting for approval` is Fordefi's policy, and approvers act in Fordefi. The 10-minute deadline still applies: after it, the CLI aborts the request and makes a new one for the same request, until one is signed or the command is stopped.
+  - Staying at `approved` means the API Signer has not signed; check that it is running.
+  - `ended aborted`, `ended error_signing` or any other end state stops the command. Run it again once fixed.
+  - A `4xx` other than 408/429 while following a request (a revoked token, say) stops the command. Network errors, 408, 429 and `5xx` are retried, each distinct error printed once.
+  - Ctrl-C leaves the Fordefi request open: tell the holder to reject it in Fordefi. So does a create that got no answer or a server error; the error ends with `Fordefi may have made the request all the same: reject any request noted "… tapp-cli: <what>"`.
+- **On-chain.**
+  - The CLI sets the gas, the gas price and the nonce (the account's next). The vault signs without broadcasting.
+  - The CLI checks the signed transaction (signer, chain, contract, data, value, gas, gas price, nonce), then broadcasts it and waits for it to be mined.
+  - Fordefi may raise the gas limit (it adds a quarter when its simulation finds the limit tight). Up to half as much again as the limit asked is taken, with `Fordefi raised the gas limit to …` in the output. It costs a little more, as 0G charges at least 80% of a gas limit. The gas price must be the one asked for.
+  - A request not signed within 30 minutes is aborted.
+  - `its nonce is …, but the account's next is now …` means another transaction from the vault was sent while this one waited for approval. Nothing was sent; run the command again.
+  - Any `Fordefi returned a transaction that is not the one asked for` leaves that transaction signed but unsent. It stays valid until the vault's next transaction uses its nonce, which rerunning the command does; when the nonce is already used, the error says so.
+  - Fordefi simulates later transactions as if that one had been sent, so rerunning the same call can fail there: a second `removeNode` of an app's last node gives `Transaction was reverted by the contract: execution reverted: not app owner`. If the signed transaction is the right one, push it instead (Fordefi `POST /api/v1/transactions/<id>/push`, or broadcast its raw transaction).
+- **Security.** Whoever holds a token can have the vault sign whatever that caller's entry and Fordefi's policy let through, which within the entry is the owner's authority over the vault's apps — and, if the entry lists `transferAppOwnership` (the README's does not), handing them to another address. Keep tokens off shared machines, and do not give the service's API user a policy that auto-approves everything.
 
 ### The node has no data disk (apps will not start)
 
@@ -364,6 +403,7 @@ Each app gets its **own encrypted volume** (LUKS; key derived per-app by the KMS
 | on-chain `imageHashes` empty `[]` / `Image Hash: {}` | tapp-server bug: old binary parses `docker compose images --format json` (a JSON array) line-by-line as NDJSON → 0 images. **Server-side**: only fixed by deploying the current tapp-server build (array parsing). prune/re-register won't help. Confirm via `get-app-info`. |
 | `app already exists` (register) | app-id taken globally; use add-node/update-node |
 | `fde_volume_key - KMS refused the volume key` | app not registered on-chain for THIS node's signer (`start-app --register-onchain`), or KMS trust anchor missing (`update-trust-anchors --scan-url --scan-pubkey`), or the KMS cluster is actually down |
+| KMS refused the volume key: `attestation not verified: GetEvidence: … App <id> not found`, right after registering | the scan looked for the app on the node before its StartApp arrived and keeps that answer for about a minute. Run `start-app` again **without** `--register-onchain` after a minute. tapp-cli ≥ 0.11.0 signs the StartApp before the registry transaction to avoid it |
 | `gas tip cap ... below minimum` (cast send) | add `--legacy --gas-price 3000000000` |
 
 ## Remote Attestation — verify a node by `app_id`

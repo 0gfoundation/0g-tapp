@@ -4,14 +4,16 @@
 //! for one) that signs only after its own approval policy has run. Such a signer looks like
 //! an ordinary address from outside and produces ordinary signatures, so nothing on the
 //! server or the chain changes. What changes is who holds the key: the CLI shows what needs
-//! signing, the holder signs it, and the result is pasted back and checked before use.
+//! signing, the holder signs it, and the result comes back (pasted, by default) and is
+//! checked before use.
 //!
 //! Two things get signed:
 //! - a tapp-server request: an EIP-191 `personal_sign` of one line of text, which every
 //!   wallet signs as a "message";
-//! - an on-chain call: a transaction, which the holder sends itself. Its hash is pasted back,
-//!   and the transaction that landed is compared with the one asked for before the CLI goes
-//!   on, so a command with several steps (`start-app --register-onchain`) runs to the end.
+//! - an on-chain call: a transaction. Pasted, the holder sends it and pastes its hash back;
+//!   a Ledger or Fordefi only signs it and the CLI sends it. Either way the transaction that
+//!   landed is compared with the one asked for before the CLI goes on, so a command with
+//!   several steps (`start-app --register-onchain`) runs to the end.
 //!
 //! Everywhere the CLI used to take a private key it takes `external:0x<address>` instead
 //! (see [`Signer`]), so every command gets this without being changed one by one.
@@ -23,6 +25,9 @@
 //! - [`Backend::Ledger`]: a Ledger on this machine's USB. The device shows the message or
 //!   the transaction and signs on a button press; a transaction is signed only, checked,
 //!   and broadcast here. Built with the `ledger` feature (on by default on macOS).
+//! - [`Backend::Fordefi`]: a Fordefi vault, through the 0g-fordefi-signer service. The vault
+//!   holding the address signs once Fordefi's approval policy has run; a transaction is
+//!   signed only, checked, and broadcast here, as with a Ledger. See [`fordefi`].
 
 use std::io::{BufRead, Write};
 use std::str::FromStr;
@@ -44,17 +49,25 @@ pub enum Backend {
     Paste,
     /// A Ledger on this machine's USB.
     Ledger,
+    /// A Fordefi vault, through the 0g-fordefi-signer service named in the environment (see
+    /// [`fordefi`]).
+    Fordefi,
 }
 
 static BACKEND: OnceLock<Backend> = OnceLock::new();
 
-/// Choose the backend for this process (once, before anything is signed).
+/// Choose the backend for this process (once, before anything is signed). Fordefi's
+/// settings are read and checked here, so a missing one stops the command before it starts
+/// rather than at its first signature.
 pub fn use_backend(backend: Backend) -> Result<()> {
     if backend == Backend::Ledger && !LEDGER_SUPPORTED {
         return Err(anyhow!(
             "this tapp-cli was built without Ledger support. It is built in on macOS; \
              elsewhere build with `cargo build --release -p tapp-cli --features ledger`"
         ));
+    }
+    if backend == Backend::Fordefi {
+        fordefi::configure(fordefi::Config::from_env()?)?;
     }
     BACKEND
         .set(backend)
@@ -152,6 +165,7 @@ pub fn request_signature(
     match backend() {
         Backend::Paste => paste_signature(address, message, what, valid_until),
         Backend::Ledger => ledger_signature(address, message, what, valid_until),
+        Backend::Fordefi => fordefi_signature(address, message, what, valid_until),
     }
 }
 
@@ -194,6 +208,43 @@ fn ledger_signature(
     let who = recover_personal(message, &sig)?;
     if who != *address {
         return Err(anyhow!("the device signed as 0x{:x}, not 0x{:x}", who, address));
+    }
+    eprintln!("  ✓ signed by 0x{:x}", who);
+    Ok(sig)
+}
+
+fn fordefi_signature(
+    address: &Address,
+    message: &str,
+    what: &str,
+    valid_until: Option<i64>,
+) -> Result<[u8; 65]> {
+    let config = fordefi::config()?;
+    eprintln!();
+    eprintln!("──── signing in Fordefi: {what} ────");
+    eprintln!("  signer   0x{:x}  (via {})", address, config.url());
+    print_deadline(valid_until);
+    eprintln!("  message (personal_sign):");
+    eprintln!();
+    eprintln!("{message}");
+    eprintln!();
+    let raw = block_on(fordefi::sign_message(config, message, what, valid_until))?;
+    if let Some(t) = valid_until {
+        if chrono::Utc::now().timestamp() > t {
+            return Err(Expired.into());
+        }
+    }
+    let sig = parse_signature(&hex::encode(raw))
+        .map_err(|e| anyhow!("Fordefi returned a malformed signature: {}", e))?;
+    let who = recover_personal(message, &sig)?;
+    if who != *address {
+        return Err(anyhow!(
+            "the Fordefi vault behind {} signed as 0x{:x}, not 0x{:x} — the service signs with \
+             another vault than the one --external-signer names",
+            config.url(),
+            who,
+            address
+        ));
     }
     eprintln!("  ✓ signed by 0x{:x}", who);
     Ok(sig)
@@ -356,19 +407,21 @@ pub async fn request_transaction(
     match backend() {
         Backend::Paste => paste_transaction(provider, chain_id, from, to, data, value, what).await,
         Backend::Ledger => ledger_transaction(provider, chain_id, from, to, data, value, what).await,
+        Backend::Fordefi => fordefi_transaction(provider, chain_id, from, to, data, value, what).await,
     }
 }
 
-/// The Ledger signs only; the transaction is checked here and broadcast from here.
-async fn ledger_transaction(
+/// A legacy transaction for the call, with nonce, gas price and a gas limit 20% over the
+/// estimate. Estimating also catches a call that would revert (not the app's owner, say)
+/// before anyone is asked to sign it.
+async fn prepare_call(
     provider: &Provider<Http>,
     chain_id: u64,
     from: &Address,
     to: &Address,
     data: &[u8],
     value: U256,
-    what: &str,
-) -> Result<TxHash> {
+) -> Result<ethers::types::TransactionRequest> {
     use ethers::types::{BlockNumber, TransactionRequest};
 
     let nonce = provider
@@ -387,31 +440,160 @@ async fn ledger_transaction(
         .nonce(nonce)
         .gas_price(gas_price)
         .chain_id(chain_id);
-    // Also catches a call that would revert (not the app's owner, say) before the device is asked.
     let gas = provider
         .estimate_gas(&request.clone().into(), None)
         .await
         .map_err(|e| anyhow!("the call would fail: {}", e))?;
-    let tx: TypedTransaction = request.gas(gas * 12 / 10).into();
+    Ok(request.gas(gas * 12 / 10))
+}
 
-    eprintln!();
-    eprintln!("──── confirm on the Ledger: {what} ────");
+fn print_call(chain_id: u64, from: &Address, to: &Address, data: &[u8], value: U256) {
     eprintln!("  from     0x{:x}  (chain {chain_id})", from);
     eprintln!("  to       0x{:x}", to);
     eprintln!("  value    {} wei ({} OG)", value, ethers::utils::format_ether(value));
     eprintln!("  data     0x{}", hex::encode(data));
+}
+
+/// The Ledger signs only; the transaction is checked here and broadcast from here.
+async fn ledger_transaction(
+    provider: &Provider<Http>,
+    chain_id: u64,
+    from: &Address,
+    to: &Address,
+    data: &[u8],
+    value: U256,
+    what: &str,
+) -> Result<TxHash> {
+    let tx: TypedTransaction = prepare_call(provider, chain_id, from, to, data, value).await?.into();
+
+    eprintln!();
+    eprintln!("──── confirm on the Ledger: {what} ────");
+    print_call(chain_id, from, to, data, value);
     eprintln!("  (a contract call needs Blind signing enabled in the device's Ethereum app)");
     let signature = ledger::sign_tx(from, chain_id, &tx).await?;
     let raw = tx.rlp_signed(&signature);
     let hash = check_signed_transaction(&raw, chain_id, from, to, data, value)
         .map_err(|e| anyhow!("the device returned a transaction that is not the one asked for: {}", e))?;
+    broadcast_checked(provider, raw.to_vec(), hash, from, to, data, value).await
+}
 
+/// What Fordefi could change in a transaction it signed, beyond what
+/// [`check_signed_transaction`] checks: the fee must be the one asked for — a remote party must
+/// not choose what the owner pays — and the nonce must still be the account's next, as an
+/// approval can take long enough for another transaction to have taken it.
+///
+/// The gas limit may come back raised: Fordefi added a quarter to one its own simulation found
+/// within a few percent of the gas used. That costs a little more, as 0G charges at least 80%
+/// of a transaction's limit however little of it is used, so a raise is taken only up to half
+/// as much again as the limit asked. Returns the limit signed.
+fn check_fordefi_terms(raw: &[u8], gas: U256, gas_price: U256, nonce: U256, next_nonce: U256) -> Result<U256> {
+    let (tx, _) = TypedTransaction::decode_signed(&ethers::utils::rlp::Rlp::new(raw))
+        .map_err(|e| anyhow!("not a signed transaction: {}", e))?;
+    let shown = |v: Option<U256>| v.map_or("none".to_string(), |v| v.to_string());
+    let signed_gas = match tx.gas() {
+        Some(g) if *g >= gas && *g <= gas * 3 / 2 => *g,
+        other => {
+            return Err(anyhow!(
+                "its gas limit is {}, not {} as asked (or at most half as much again)",
+                shown(other.copied()),
+                gas
+            ))
+        }
+    };
+    // For a typed transaction this is the most it can pay per gas.
+    if tx.gas_price() != Some(gas_price) {
+        return Err(anyhow!("its gas price is {} wei, not {} as asked", shown(tx.gas_price()), gas_price));
+    }
+    if tx.nonce() != Some(&nonce) {
+        return Err(anyhow!("its nonce is {}, not {} as asked", shown(tx.nonce().copied()), nonce));
+    }
+    if nonce != next_nonce {
+        return Err(anyhow!(
+            "its nonce is {}, but the account's next is now {}: another transaction from the \
+             vault was sent while this one waited for approval",
+            nonce,
+            next_nonce
+        ));
+    }
+    Ok(signed_gas)
+}
+
+/// The nonce of a transaction `from` signed, when the account has gone past it: the
+/// transaction can then never be sent.
+fn nonce_taken(raw: &[u8], from: &Address, next_nonce: U256) -> Option<U256> {
+    let (tx, signature) = TypedTransaction::decode_signed(&ethers::utils::rlp::Rlp::new(raw)).ok()?;
+    let nonce = *tx.nonce()?;
+    (signature.recover(tx.sighash()).ok()? == *from && nonce < next_nonce).then_some(nonce)
+}
+
+/// Fordefi signs only (push_mode manual); the transaction is checked here and broadcast
+/// from here, as a Ledger's is. The gas and the nonce are set here.
+async fn fordefi_transaction(
+    provider: &Provider<Http>,
+    chain_id: u64,
+    from: &Address,
+    to: &Address,
+    data: &[u8],
+    value: U256,
+    what: &str,
+) -> Result<TxHash> {
+    let config = fordefi::config()?;
+    let call = prepare_call(provider, chain_id, from, to, data, value).await?;
+    let (Some(gas), Some(gas_price), Some(nonce)) = (call.gas, call.gas_price, call.nonce) else {
+        return Err(anyhow!("no gas estimate for the call"));
+    };
+
+    eprintln!();
+    eprintln!("──── signing in Fordefi: {what} ────");
+    eprintln!("  via      {}", config.url());
+    print_call(chain_id, from, to, data, value);
+    let raw = fordefi::sign_transaction(config, chain_id, to, data, value, gas, gas_price, nonce, what).await?;
+    // Read now, not when the call was prepared: an approval can take long enough for the
+    // account to have moved on.
+    let next_nonce = provider
+        .get_transaction_count(*from, Some(ethers::types::BlockNumber::Pending.into()))
+        .await
+        .map_err(|e| anyhow!("reading the nonce: {}", e))?;
+    let (hash, signed_gas) = check_signed_transaction(&raw, chain_id, from, to, data, value)
+        .and_then(|hash| check_fordefi_terms(&raw, gas, gas_price, nonce, next_nonce).map(|g| (hash, g)))
+        .map_err(|e| {
+            let whose = if e.to_string().starts_with("it is signed by") {
+                " (the service signs with another vault than --external-signer names)"
+            } else {
+                ""
+            };
+            let after = match nonce_taken(&raw, from, next_nonce) {
+                Some(n) => format!("It was not sent, and cannot be any more: the vault's nonce {n} is taken"),
+                None => format!(
+                    "It was not sent, but it is signed: whoever holds it can still send it until \
+                     the vault's nonce {nonce} is used, which the next transaction from the vault does"
+                ),
+            };
+            anyhow!("Fordefi returned a transaction that is not the one asked for: {}{}. {}", e, whose, after)
+        })?;
+    if signed_gas != gas {
+        eprintln!("  Fordefi raised the gas limit to {} (asked {}); the gas price is the one asked for", signed_gas, gas);
+    }
+    broadcast_checked(provider, raw, hash, from, to, data, value).await
+}
+
+/// Broadcast a signed transaction that [`check_signed_transaction`] passed, wait for it to
+/// be mined, and check what landed (see [`check_transaction`]).
+async fn broadcast_checked(
+    provider: &Provider<Http>,
+    raw: Vec<u8>,
+    hash: TxHash,
+    from: &Address,
+    to: &Address,
+    data: &[u8],
+    value: U256,
+) -> Result<TxHash> {
     let asked_at = provider
         .get_block_number()
         .await
         .map_err(|e| anyhow!("reading the chain head: {}", e))?
         .as_u64();
-    if let Err(e) = provider.send_raw_transaction(raw).await {
+    if let Err(e) = provider.send_raw_transaction(raw.into()).await {
         // The answer can be lost after the node took it (a timeout, say); it is out if the
         // node knows it, and stopping here would leave a sent transaction unaccounted for.
         if !matches!(provider.get_transaction(hash).await, Ok(Some(_))) {
@@ -457,10 +639,7 @@ async fn paste_transaction(
         .as_u64();
     eprintln!();
     eprintln!("──── transaction needed: {what} ────");
-    eprintln!("  from     0x{:x}  (chain {chain_id})", from);
-    eprintln!("  to       0x{:x}", to);
-    eprintln!("  value    {} wei ({} OG)", value, ethers::utils::format_ether(value));
-    eprintln!("  data     0x{}", hex::encode(data));
+    print_call(chain_id, from, to, data, value);
     eprintln!();
     loop {
         let pasted = prompt("hash of the sent transaction (0x…, 32 bytes)")?;
@@ -509,6 +688,8 @@ fn prompt(label: &str) -> Result<String> {
     }
     Ok(line.trim().to_string())
 }
+
+pub mod fordefi;
 
 /// The Ledger itself. The account is found by the address the operator gave, not by a
 /// derivation index they have to know, across the three path styles wallets use.
@@ -730,6 +911,30 @@ mod tests {
         assert!(check_signed_transaction(&raw, 16661, &from, &to, &[9], value).is_err(), "other data");
         assert!(check_signed_transaction(&raw, 16661, &from, &to, &data, U256::zero()).is_err(), "other value");
         assert!(check_signed_transaction(&[0xde, 0xad], 16661, &from, &to, &data, value).is_err(), "garbage");
+
+        // Fordefi's terms: the gas, price and nonce asked for, and a nonce still the next.
+        let (gas, price, seven) = (U256::from(100_000u64), U256::from(3_000_000_000u64), U256::from(7u64));
+        assert_eq!(check_fordefi_terms(&raw, gas, price, seven, seven).unwrap(), gas);
+        let e = check_fordefi_terms(&raw, gas, U256::from(1_000_000_000u64), seven, seven).unwrap_err();
+        assert_eq!(e.to_string(), "its gas price is 3000000000 wei, not 1000000000 as asked");
+        // A raised limit is taken, up to half as much again as the one asked; a lowered one,
+        // which could run the call out of gas, is not.
+        assert_eq!(check_fordefi_terms(&raw, U256::from(80_000u64), price, seven, seven).unwrap(), gas);
+        assert!(check_fordefi_terms(&raw, U256::from(66_667u64), price, seven, seven).is_ok(), "half as much again");
+        let e = check_fordefi_terms(&raw, U256::from(66_666u64), price, seven, seven).unwrap_err();
+        assert!(e.to_string().contains("gas limit is 100000"), "{e}");
+        let e = check_fordefi_terms(&raw, U256::from(110_000u64), price, seven, seven).unwrap_err();
+        assert!(e.to_string().contains("not 110000 as asked"), "{e}");
+        // Fordefi did not take the nonce asked for.
+        let e = check_fordefi_terms(&raw, gas, price, U256::from(6u64), U256::from(6u64)).unwrap_err();
+        assert_eq!(e.to_string(), "its nonce is 7, not 6 as asked");
+        // It did, but the account moved on while the approval took.
+        let e = check_fordefi_terms(&raw, gas, price, seven, U256::from(8u64)).unwrap_err();
+        assert!(e.to_string().contains("next is now 8"), "{e}");
+        // Then it can never be sent; with its nonce still to come, it can.
+        assert_eq!(nonce_taken(&raw, &from, U256::from(8u64)), Some(seven));
+        assert_eq!(nonce_taken(&raw, &from, seven), None);
+        assert_eq!(nonce_taken(&raw, &to, U256::from(8u64)), None, "another account's nonce says nothing");
     }
 
     /// A device answer is told to the operator as what to do, not as a connection problem.
