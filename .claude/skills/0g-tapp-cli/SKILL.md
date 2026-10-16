@@ -216,9 +216,11 @@ On-chain commands (`register-onchain`, `update-onchain`, `start-app --register-o
 - **On-chain.**
   - The CLI sets the gas, the gas price and the nonce (the account's next). The vault signs without broadcasting.
   - The CLI checks the signed transaction (signer, chain, contract, data, value, gas, gas price, nonce), then broadcasts it and waits for it to be mined.
+  - Fordefi may raise the gas limit (it adds a quarter when its simulation finds the limit tight). Up to half as much again as the limit asked is taken, with `Fordefi raised the gas limit to …` in the output. It costs a little more, as 0G charges at least 80% of a gas limit. The gas price must be the one asked for.
   - A request not signed within 30 minutes is aborted.
   - `its nonce is …, but the account's next is now …` means another transaction from the vault was sent while this one waited for approval. Nothing was sent; run the command again.
   - Any `Fordefi returned a transaction that is not the one asked for` leaves that transaction signed but unsent. It stays valid until the vault's next transaction uses its nonce, which rerunning the command does; when the nonce is already used, the error says so.
+  - Fordefi simulates later transactions as if that one had been sent, so rerunning the same call can fail there: a second `removeNode` of an app's last node gives `Transaction was reverted by the contract: execution reverted: not app owner`. If the signed transaction is the right one, push it instead (Fordefi `POST /api/v1/transactions/<id>/push`, or broadcast its raw transaction).
 - **Security.** Whoever holds a token can have the vault sign whatever that caller's entry and Fordefi's policy let through, which within the entry is the owner's authority over the vault's apps — and, if the entry lists `transferAppOwnership` (the README's does not), handing them to another address. Keep tokens off shared machines, and do not give the service's API user a policy that auto-approves everything.
 
 ### The node has no data disk (apps will not start)

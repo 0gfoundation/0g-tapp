@@ -481,13 +481,25 @@ async fn ledger_transaction(
 /// [`check_signed_transaction`] checks: the fee must be the one asked for — a remote party must
 /// not choose what the owner pays — and the nonce must still be the account's next, as an
 /// approval can take long enough for another transaction to have taken it.
-fn check_fordefi_terms(raw: &[u8], gas: U256, gas_price: U256, nonce: U256, next_nonce: U256) -> Result<()> {
+///
+/// The gas limit may come back raised: Fordefi added a quarter to one its own simulation found
+/// within a few percent of the gas used. That costs a little more, as 0G charges at least 80%
+/// of a transaction's limit however little of it is used, so a raise is taken only up to half
+/// as much again as the limit asked. Returns the limit signed.
+fn check_fordefi_terms(raw: &[u8], gas: U256, gas_price: U256, nonce: U256, next_nonce: U256) -> Result<U256> {
     let (tx, _) = TypedTransaction::decode_signed(&ethers::utils::rlp::Rlp::new(raw))
         .map_err(|e| anyhow!("not a signed transaction: {}", e))?;
     let shown = |v: Option<U256>| v.map_or("none".to_string(), |v| v.to_string());
-    if tx.gas() != Some(&gas) {
-        return Err(anyhow!("its gas limit is {}, not {} as asked", shown(tx.gas().copied()), gas));
-    }
+    let signed_gas = match tx.gas() {
+        Some(g) if *g >= gas && *g <= gas * 3 / 2 => *g,
+        other => {
+            return Err(anyhow!(
+                "its gas limit is {}, not {} as asked (or at most half as much again)",
+                shown(other.copied()),
+                gas
+            ))
+        }
+    };
     // For a typed transaction this is the most it can pay per gas.
     if tx.gas_price() != Some(gas_price) {
         return Err(anyhow!("its gas price is {} wei, not {} as asked", shown(tx.gas_price()), gas_price));
@@ -503,7 +515,7 @@ fn check_fordefi_terms(raw: &[u8], gas: U256, gas_price: U256, nonce: U256, next
             next_nonce
         ));
     }
-    Ok(())
+    Ok(signed_gas)
 }
 
 /// The nonce of a transaction `from` signed, when the account has gone past it: the
@@ -542,8 +554,8 @@ async fn fordefi_transaction(
         .get_transaction_count(*from, Some(ethers::types::BlockNumber::Pending.into()))
         .await
         .map_err(|e| anyhow!("reading the nonce: {}", e))?;
-    let hash = check_signed_transaction(&raw, chain_id, from, to, data, value)
-        .and_then(|hash| check_fordefi_terms(&raw, gas, gas_price, nonce, next_nonce).map(|()| hash))
+    let (hash, signed_gas) = check_signed_transaction(&raw, chain_id, from, to, data, value)
+        .and_then(|hash| check_fordefi_terms(&raw, gas, gas_price, nonce, next_nonce).map(|g| (hash, g)))
         .map_err(|e| {
             let whose = if e.to_string().starts_with("it is signed by") {
                 " (the service signs with another vault than --external-signer names)"
@@ -559,6 +571,9 @@ async fn fordefi_transaction(
             };
             anyhow!("Fordefi returned a transaction that is not the one asked for: {}{}. {}", e, whose, after)
         })?;
+    if signed_gas != gas {
+        eprintln!("  Fordefi raised the gas limit to {} (asked {}); the gas price is the one asked for", signed_gas, gas);
+    }
     broadcast_checked(provider, raw, hash, from, to, data, value).await
 }
 
@@ -899,11 +914,17 @@ mod tests {
 
         // Fordefi's terms: the gas, price and nonce asked for, and a nonce still the next.
         let (gas, price, seven) = (U256::from(100_000u64), U256::from(3_000_000_000u64), U256::from(7u64));
-        check_fordefi_terms(&raw, gas, price, seven, seven).unwrap();
+        assert_eq!(check_fordefi_terms(&raw, gas, price, seven, seven).unwrap(), gas);
         let e = check_fordefi_terms(&raw, gas, U256::from(1_000_000_000u64), seven, seven).unwrap_err();
         assert_eq!(e.to_string(), "its gas price is 3000000000 wei, not 1000000000 as asked");
-        let e = check_fordefi_terms(&raw, U256::from(90_000u64), price, seven, seven).unwrap_err();
+        // A raised limit is taken, up to half as much again as the one asked; a lowered one,
+        // which could run the call out of gas, is not.
+        assert_eq!(check_fordefi_terms(&raw, U256::from(80_000u64), price, seven, seven).unwrap(), gas);
+        assert!(check_fordefi_terms(&raw, U256::from(66_667u64), price, seven, seven).is_ok(), "half as much again");
+        let e = check_fordefi_terms(&raw, U256::from(66_666u64), price, seven, seven).unwrap_err();
         assert!(e.to_string().contains("gas limit is 100000"), "{e}");
+        let e = check_fordefi_terms(&raw, U256::from(110_000u64), price, seven, seven).unwrap_err();
+        assert!(e.to_string().contains("not 110000 as asked"), "{e}");
         // Fordefi did not take the nonce asked for.
         let e = check_fordefi_terms(&raw, gas, price, U256::from(6u64), U256::from(6u64)).unwrap_err();
         assert_eq!(e.to_string(), "its nonce is 7, not 6 as asked");

@@ -755,6 +755,9 @@ What tapp-cli does:
   function and the app: `0g-fordefi-signer: <caller>: tapp-cli: addNode(string,address,string,bytes,bytes) app <app>`.
   - tapp-cli checks the signed transaction: signer, chain, contract, data, value, gas, gas
     price, and that its nonce is still the account's next.
+  - Fordefi may raise the gas limit: it added a quarter to one its simulation found within a
+    few percent of the gas used. Up to half as much again as the limit asked is taken, and the
+    output says so. It costs a little more: 0G charges at least 80% of a transaction's limit.
   - It then broadcasts it, waits for it to be mined and checks it again: the same path as a
     Ledger's.
   - A call not signed within 30 minutes is aborted.
@@ -767,6 +770,12 @@ or a transaction that differs from the one asked for in any of the fields above,
 command before anything is sent. Such a transaction is still signed, though: whoever holds it
 can send it until the vault's next transaction uses its nonce. The error says when that nonce
 is already used and the transaction can no longer be sent.
+
+Fordefi keeps that transaction waiting to be pushed, and simulates the vault's later
+transactions as if it had been sent. Asking again for the same call can then fail in Fordefi's
+simulation: a second `removeNode` of an app's last node fails with `not app owner`, because the
+first one unregistered the app. When the transaction is the one wanted, send it instead:
+Fordefi's `POST /api/v1/transactions/<id>/push`, or broadcast its raw transaction.
 
 Whoever holds a token can have the vault sign whatever that caller's entry and Fordefi's policy
 let through. Within its entry, that is the owner's authority over the vault's apps: starting,
