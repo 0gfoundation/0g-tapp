@@ -323,9 +323,65 @@ pub fn verify_signature(public_key: &[u8], message: &[u8], signature: &[u8]) -> 
     }
 }
 
+/// The Ethereum identity of a KMS secret used directly as a secp256k1 private key: its
+/// 20-byte address and its 33-byte compressed public key.
+///
+/// This is the convention the evidence relies on (`report_data::KmsKey`): an app that signs
+/// with the secret `GetSecretResource` returned signs as this address. `None` when the bytes
+/// are not a private key at all: not 32 bytes, zero, or not below the curve order. For a KMS
+/// secret, a 32-byte HKDF output, the last two happen with probability ~2^-128.
+pub fn eth_identity_of_secret(secret: &[u8]) -> Option<([u8; 20], [u8; 33])> {
+    if secret.len() != 32 {
+        return None;
+    }
+    let key = SigningKey::from_slice(secret).ok()?;
+    let point = key.verifying_key().to_encoded_point(true);
+    let compressed: [u8; 33] = point.as_bytes().try_into().ok()?;
+    Some((eth_address_of_public_key(&compressed)?, compressed))
+}
+
+/// The Ethereum address of a SEC1-encoded secp256k1 public key, compressed or not. `None`
+/// when the bytes are not a point on the curve.
+pub fn eth_address_of_public_key(sec1: &[u8]) -> Option<[u8; 20]> {
+    let key = VerifyingKey::from_sec1_bytes(sec1).ok()?;
+    let point = key.to_encoded_point(false);
+    let hash = Keccak256::digest(&point.as_bytes()[1..]);
+    hash[12..].try_into().ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_secret_is_read_as_the_private_key_it_spells() {
+        // Private key 1: its public key is the generator, and its address is a well-known one.
+        let mut one = [0u8; 32];
+        one[31] = 1;
+        let (address, public_key) = eth_identity_of_secret(&one).unwrap();
+        assert_eq!(hex::encode(address), "7e5f4552091a69125d5dfcb7b8c2659029395bdf");
+        assert_eq!(
+            hex::encode(public_key),
+            "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+        );
+        // The same address from the uncompressed form of the point.
+        let uncompressed = hex::decode(
+            "0479be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798\
+             483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8",
+        )
+        .unwrap();
+        assert_eq!(eth_address_of_public_key(&uncompressed), Some(address));
+    }
+
+    #[test]
+    fn bytes_that_are_no_private_key_have_no_identity() {
+        let order =
+            hex::decode("fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141").unwrap();
+        for not_a_key in [vec![0u8; 32], order, vec![1u8; 31], vec![1u8; 33], Vec::new()] {
+            assert!(eth_identity_of_secret(&not_a_key).is_none(), "{}", hex::encode(&not_a_key));
+        }
+        assert!(eth_address_of_public_key(b"not a point").is_none());
+    }
 
     #[test]
     fn test_sign_and_verify() {

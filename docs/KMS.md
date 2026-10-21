@@ -139,6 +139,16 @@ from the node's own signer precisely because they must **not** survive a boot.
 The empty app_id (the node's common signer) is refused by `get-secret-resource`;
 node-scoped material is not servable to app containers.
 
+Whatever material is asked for with `GetSecretResource` (tapp-server ≥ 0.11.0: hex of
+at most 256 bytes), the app's evidence lists, for the rest of the boot, the address and
+public key of the secret read as a secp256k1 key: `runtime_data.kms_keys` names the
+material and that key. An app that signs with the secret therefore has an address that
+stays the same across boots and nodes, and that a verifier can tie to an attested TEE of
+the app, as given by the KMS node that answered (recorded with whether the connection to
+it was checked, in the key's `get_secret_resource` event). Take each key
+once per boot: every request adds an event to the event log that all verification
+carries. See [A stable identity from the KMS](../README.md#a-stable-identity-from-the-kms).
+
 ## Configuring a node to consume the KMS
 
 Two pieces, both usually set at claim time:

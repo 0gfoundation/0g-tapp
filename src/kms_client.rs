@@ -20,12 +20,14 @@ mod tests {
             .await;
 
         let client = KmsClient::new(vec![server.uri()], &Default::default());
-        let result = client
+        let (result, answer) = client
             .get_encrypted_secret("myapp", 1234567890, "pubkey_hex", "sig_hex", "")
             .await
             .unwrap();
 
         assert_eq!(result, vec![0xde, 0xad, 0xbe, 0xef]);
+        // Plain http and no verifier: nothing about who answered was checked.
+        assert_eq!(answer, KmsAnswer { url: server.uri(), attested: false });
     }
 
     #[tokio::test]
@@ -49,7 +51,7 @@ mod tests {
         let client = KmsClient::new(vec![server.uri()], &Default::default());
 
         // material passed through verbatim -> matches
-        let result = client
+        let (result, _) = client
             .get_encrypted_secret("myapp", 1234567890, "pubkey_hex", "sig_hex", "deadbeef01")
             .await
             .unwrap();
@@ -84,12 +86,13 @@ mod tests {
             .await;
 
         let client = KmsClient::new(vec![bad_server.uri(), good_server.uri()], &Default::default());
-        let result = client
+        let (result, answer) = client
             .get_encrypted_secret("myapp", 1234567890, "pubkey_hex", "sig_hex", "")
             .await
             .unwrap();
 
         assert_eq!(result, vec![0xca, 0xfe, 0xba, 0xbe]);
+        assert_eq!(answer.url, good_server.uri(), "the node that answered, not the first tried");
     }
 
     #[tokio::test]
@@ -368,6 +371,19 @@ pub struct KmsClient {
     pins: Option<tokio::sync::Mutex<PinSource>>,
 }
 
+/// Who answered a key request, and whether the connection to it was checked against
+/// attestation. Recorded with each key an app takes, since the client in use is the only
+/// thing that knows: the settings can change while a request is under way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KmsAnswer {
+    /// The KMS node that answered, as configured.
+    pub url: String,
+    /// The answer came over TLS from a node holding a key the verifier attests for the KMS
+    /// cluster. False with no verifier, when an https node is checked only against public
+    /// CAs, and for a node reached over plain http, where there is no handshake to check.
+    pub attested: bool,
+}
+
 /// The KMS's view of the chain does not have what was just written yet: the app (a
 /// registration), or this node's signer in it (a node replaced after a restart, or added) —
 /// in the KMS's own cache or, with attested admission on, in the verifier's.
@@ -543,7 +559,7 @@ impl KmsClient {
         pubkey_hex: &str,
         signature_hex: &str,
         material: &str,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<(Vec<u8>, KmsAnswer)> {
         let deadline =
             std::time::Instant::now() + std::time::Duration::from_millis(self.onchain_wait_ms);
         let mut delay = std::time::Duration::from_secs(5);
@@ -593,7 +609,7 @@ impl KmsClient {
         pubkey_hex: &str,
         signature_hex: &str,
         material: &str,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<(Vec<u8>, KmsAnswer)> {
         let req = KmsRequest {
             app_id,
             timestamp,
@@ -629,7 +645,14 @@ impl KmsClient {
                             .map_err(|e| anyhow!("KMS {} invalid response: {}", url, e))?;
                         let bytes = hex::decode(body.encrypted_secret.trim_start_matches("0x"))
                             .map_err(|e| anyhow!("KMS {} invalid hex: {}", url, e))?;
-                        return Ok(bytes);
+                        // Pinned only means anything over TLS: to a plain-http node the same
+                        // client sends the request with no handshake to check.
+                        let tls = reqwest::Url::parse(&endpoint).is_ok_and(|u| u.scheme() == "https");
+                        let answer = KmsAnswer {
+                            url: url.clone(),
+                            attested: self.pins.is_some() && tls,
+                        };
+                        return Ok((bytes, answer));
                     }
                     Ok(resp) => {
                         let status = resp.status();

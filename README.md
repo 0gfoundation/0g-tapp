@@ -252,23 +252,27 @@ All applications run within TEE boundaries and are cryptographically measured. T
 Attestation evidence returned by `GetEvidence` commits the application's TEE-derived identity into the TDX `report_data` field. `report_data` is `sha512` of a small JSON object — `runtime_data` — that travels as a third field of the evidence alongside `quote` and `cc_eventlog`:
 
 ```json
-{"nonce": "0x…", "signer": "0x…", "tls_public_key": "0x…"}
+{"kms_keys": [{"address": "0x…", "material": "", "public_key": "0x02…"}],
+ "nonce": "0x…", "signer": "0x…", "tls_public_key": "0x…"}
 ```
+
+(Spaced out here for reading; the bytes themselves have no whitespace.)
 
 | field | meaning |
 |---|---|
+| `kms_keys` | tapp-server ≥ 0.11.0. The keys the app has taken from the KMS with `GetSecretResource` this boot (a restarted tapp-server reads them back from the event log), sorted by material and then address. Each entry is the material (hex, lowercase, no `0x`; `""` for the app's base key) and the Ethereum address and compressed public key of the 32-byte secret used as a secp256k1 private key. Normally one entry per material; two for one material mean the node got two different keys for it. This is how a verifier ties a stable address, the same on every node of the app and across restarts, to an attested TEE of the app. See [A stable identity from the KMS](#a-stable-identity-from-the-kms). |
 | `nonce` | Caller-supplied challenge, echoed back. A quote is self-authenticating but undated, so without a challenge a cached quote is indistinguishable from a fresh one. Pass `get-evidence --nonce <hex>` (≤64 bytes, must be random). |
 | `signer` | The Ethereum address derived inside the enclave — the identity `TappRegistry` records. Verifiers match it against the registered `signerAddress` to prove a signed message and the on-chain identity come from the same app on this TEE. |
 | `tls_public_key` | sha256 of the app's TLS SubjectPublicKeyInfo, when it has one. This is what lets a client tie the certificate it was handed during a TLS handshake to a TEE running this app. |
 
 `GetEvidence` with an `app_id` answers for an app that was started this boot (running, or stopped since) and for one that is **being started**. The last is for the KMS's attested admission: before it releases an encrypted app's volume key, the KMS has the verifier check this node's evidence for the app, and the start is waiting for that key. Such evidence proves the app's signer is held in this TEE, not that the app runs — there is no `start_app` event for it yet, and reconciliation (verify-app, the scan) reads that event. A second `start-app` of an app that is being started is refused.
 
-Empty fields are omitted rather than serialised as `""`, so evidence produced before a field existed and after it are byte-identical whenever the field is unused. Two consequences for verifiers:
+Empty top-level fields are omitted rather than serialised as `""` or `[]`, so evidence produced before a field existed and after it are byte-identical whenever the field is unused. (A `kms_keys` entry always carries `material`, `""` included.) Two consequences for verifiers:
 
 - **A quote alone no longer names its signer** — the structure must accompany it. Nothing in the system passes a bare quote.
-- **Hash the bytes exactly as transmitted.** Never re-serialise: there is then no canonical form for the two sides to agree on and drift apart over.
+- **Hash the bytes exactly as transmitted.** Never re-serialise them to check the hash.
 
-`sha512` is not arbitrary — `report_data` is 64 bytes and `sha512` fills it exactly, which is also what CoCo-AS expects when handed `runtime_data` and asked to check the binding itself.
+`sha512` is not arbitrary — `report_data` is 64 bytes and `sha512` fills it exactly. To have CoCo-AS check the binding itself, hand it the object as `structured_runtime_data` with `sha512` named (its default is sha384, and `raw_runtime_data` it compares unhashed). The AS re-serialises a structured object as canonical JSON (sorted keys, no whitespace) before hashing, and tapp-server writes the fields in that order, so the hash matches.
 
 Evidence from servers before v0.4.0 has no `runtime_data` field and a `report_data` whose first 20 bytes are the signer, zero-padded. Both readings are supported (`tapp-common/src/report_data.rs`, `tapp-common/src/verify.rs`); a missing field is reported as such rather than as a signer mismatch.
 
@@ -868,6 +872,8 @@ tapp-cli -s http://<new-node>:50051 -k 0x<deployer-key> add-node-onchain \
 
 # Remove a node (starts lock period). Pass --signer-address explicitly when the
 # node is unreachable; otherwise it is fetched from --server automatically.
+# Removing the LAST node unregisters the app: anyone may then register the same
+# app_id and take its KMS keys. To move an app, re-key or add a node instead.
 tapp-cli -s http://<node>:50051 -k 0x<deployer-key> remove-node-onchain \
   --app-id my-app \
   --rpc-url https://evmrpc-testnet.0g.ai \
@@ -891,7 +897,8 @@ tapp-cli -s http://<any-tapp>:50051 -k 0x<deployer-key> withdraw \
 ### Verifying an App
 
 `tapp-cli verify-app` checks that what a node actually runs is what was published and
-registered — the same checks tappscan makes, made here on your machine:
+registered — the same checks tappscan makes, made here on your machine, plus one tappscan
+does not make yet (the KMS keys below):
 
 - **Quote, TCB, event-log replay** — the AS (`--as-endpoint`) verifies the quote's signature
   chain to Intel, reports TCB, and replays the event log against the signed RTMRs. This is
@@ -915,6 +922,35 @@ comparing it against a live endpoint — that comparison is what ties a TLS conn
 node just verified. The line is absent when the app has never asked for a key, which is not a
 failure.
 
+With tapp-cli ≥ 0.12.0, both modes also print a `kms key : <address>  material <hex>` line
+for each key the app took with `GetSecretResource` on that node this boot (the first 20;
+`get-evidence` prints them all), but only when the node's evidence can be believed: the AS
+verified the quote; it was made for this request; in chain mode it names the node's signer;
+the event log replays; the platform passes (DEBUG off, TCB not revoked); and the image is a
+published production one, or reference values were unavailable. A dev image does not count:
+its operator has a shell in the TD. Otherwise one line says how many are not shown and why.
+See [A stable identity from the KMS](#a-stable-identity-from-the-kms).
+
+- A material for which more than one key is attested fails the run (`kms keys disagree ❌`,
+  exit 1): across the nodes in chain mode, and within the one node in both modes. The KMS
+  gives one key per app and material, so a node holding another got it from somewhere else.
+  Agreement shows the nodes use the same cluster, not that it is the right one.
+- The keys are what the KMS that answered gave the node. Each key's `get_secret_resource`
+  event records which KMS node answered (`kms_url`) and whether the connection to it was
+  checked against attestation (`kms_attested`), as the client that made the request knew it.
+  Keys whose events never say it was (no verifier, or a KMS node reached over plain http)
+  get `⚠️ N of these taken while this node did not check the KMS against attestation`, and
+  the run ends with `kms keys from an unchecked KMS ⚠️` (exit 2). Which cluster that was is
+  the owner's setting either way: compare `kms_url` and the node's `verifier` and `kms` lines
+  with [`docs/TAPPSCAN.md`](docs/TAPPSCAN.md) and [`docs/KMS.md`](docs/KMS.md). Those two
+  lines show the latest settings; if they were revised this boot, the events show which
+  were in force for each key.
+- Keys the event log names that runtime_data does not list are counted
+  (`+ N more taken this boot that only the event log names`) and compared too. A listed key
+  that no event of the app names fails the run (`✗ N of these named by no
+  get_secret_resource event of this app`): tapp-server lists a key only once its event is
+  written, and runtime_data names no app, so such a key is another app's.
+
 ```bash
 # full verification: registry + published reference values
 tapp-cli verify-app \
@@ -935,7 +971,10 @@ not answer here; relayed by …`. That is transport only: the evidence is checke
 if fetched directly, and the quote must echo the random challenge sent for it
 (`fresh : ✓`). An old quote is genuine too, so passing one off as new is the one thing a
 relay could do, and the echo is what rules it out; a quote echoing a different challenge
-fails whichever way it came. `docs/verify_app.py` does all of the above the same way.
+fails whichever way it came. `docs/verify_app.py` does all of the above the same way, except
+the owner check (it does not read `claim_config`) and three KMS-key checks: it does not
+re-derive each address from its public key, read keys only the event log names, or judge
+each key by the KMS settings it was taken under.
 
 The AS is trusted for the quote, so **pin it** (`--as-pubkey`, or `TAPP_AS_PUBKEY` once;
 the current value is in [`docs/TAPPSCAN.md`](docs/TAPPSCAN.md)). Unpinned, anyone on the
@@ -943,10 +982,16 @@ path could forge every verdict: verify-app warns and never reports better than �
 **dev** image's boot chain is reported ⚠️, not ✅ — dev builds can carry an SSH key into
 the TD — and on **mainnet** (chain 16661) it fails, as it does in the scan's verdict and so
 at the KMS. "✅" means the boot chain matches a published image's digests; firmware
-(MRTD/RTMR0) is not compared yet. verify-app **exits non-zero** on a reconcile FAIL or an
-unpublished image, so scripts and CI can use it: **0** everything checked and clean, **1** a
-failure, **2** passed with a warning (unpinned AS, dev image off mainnet, a TCB trailing Intel's
-latest, reference values unavailable).
+(MRTD/RTMR0) is not compared yet. verify-app **exits non-zero** when something fails or warns,
+so scripts and CI can use it:
+
+- **0**: everything checked and clean.
+- **1**: a failure (a reconcile FAIL; in direct mode, a quote made for another request; more
+  than one KMS key for a material; a listed KMS key no event of the app names; an unpublished
+  image; a dev image on mainnet; a platform ✗).
+- **2**: passed with a warning (unpinned AS, dev image off mainnet, a TCB trailing Intel's
+  latest, reference values unavailable, KMS keys taken while the node did not check the KMS
+  against attestation).
 
 The **platform** line reads the TD itself out of the AS token, as the AS policy used to:
 a TD launched with **DEBUG** fails whatever else passes (its host can read and write its
@@ -1029,7 +1074,7 @@ The server always listens on `bind_address` (default `0.0.0.0:50051`) for remote
 
 ### Derivation material (per-caller keys)
 
-`GetSecretResourceRequest` takes an optional `material` field — hex-encoded derivation material, opaque to tapp and forwarded verbatim to the KMS `/app-key` endpoint, which binds it into the derived key alongside `app_id`. This lets an app derive many independent keys from the KMS (e.g. AgenticID derives per-agent seal keys with `material = chainId ‖ contractAddress ‖ sealId`) instead of holding one app-wide secret and deriving locally. The KMS DPRF is one-way: per-material keys expose neither each other nor the app-wide key.
+`GetSecretResourceRequest` takes an optional `material` field — hex-encoded derivation material, forwarded verbatim to the KMS `/app-key` endpoint, which binds it into the derived key alongside `app_id`. (tapp-server ≥ 0.11.0 refuses anything but hex of at most 256 bytes, and lists each key in the app's evidence; see below.) This lets an app derive many independent keys from the KMS (e.g. AgenticID derives per-agent seal keys with `material = chainId ‖ contractAddress ‖ sealId`) instead of holding one app-wide secret and deriving locally. The KMS DPRF is one-way: per-material keys expose neither each other nor the app-wide key.
 
 ```bash
 grpcurl -unix -plaintext \
@@ -1038,3 +1083,26 @@ grpcurl -unix -plaintext \
 ```
 
 Absent/empty `material` derives purely from the `app_id` namespace — byte-identical to the pre-material request, so existing callers and older KMS nodes are unaffected.
+
+### A stable identity from the KMS
+
+The app's signer — the key `GetAppSecretKey` returns and the address registered on chain — is made inside the TEE and changes whenever tapp-server restarts or the VM reboots. That is right for the node's identity, but not for an app whose address is known outside: an address on a contract's allowlist, an oracle's signer, anything a counterparty has pinned. Such an app signs with a KMS key instead. `GetSecretResource` returns the same 32-byte secret for the same `app_id` and `material` on every node of the app, every time.
+
+Use the secret directly as the secp256k1 private key. With tapp-server ≥ 0.11.0:
+
+- The response also carries the key the app signs as: `eth_address` (20 bytes) and `compressed_public_key` (33 bytes). They are proto `bytes`, so grpcurl shows them base64-encoded as `ethAddress` and `compressedPublicKey`; `tapp-cli -s /run/tapp/tapp.sock get-secret-resource` (tapp-cli ≥ 0.12.0) prints them in hex. An older server leaves them empty: derive them from the secret.
+- From then to the end of the boot, `GetEvidence` for the app lists the key in `runtime_data.kms_keys` (see [Trusted Execution Environment](#trusted-execution-environment)). A restarted tapp-server reads the list back from this boot's `get_secret_resource` events, which name the same address; a key is listed only once its event is written.
+- **Ask once per boot.** Every request adds an event (about 1 KB) to the event log, and every verification carries the whole log: an AS on default settings refuses a request past 4 MiB, at which point the node fails verification, and with attested admission on, the KMS. Keep the key in memory instead of asking again.
+- A verifier that checks the evidence learns that this TEE, registered on chain for the app, holds the key. `verify-app` lists each node's keys and fails the run when more than one key is attested for a material.
+- `material` must be hex (digits in either case, with an optional `0x`) of at most 256 bytes; anything else is refused with `INVALID_ARGUMENT` before the KMS is asked.
+- Whatever holds the socket and names the app adds to its list, including `get-secret-resource` run on the host.
+
+Nothing needs switching on, and the on-chain signer is unchanged: the KMS still authenticates the node by it.
+
+Know the limits before relying on it:
+
+- **Every node of the app holds the same key**, so one compromised node exposes it everywhere. That is the trade a stable key makes, as with `tls_key_source = "kms"`.
+- **The key is what the KMS that answered gave it, and the owner chooses the KMS** (`claim-config`, `update-trust-anchors`; measured in the event log). The node checks a KMS against attestation only with a verifier set and the KMS node reached over https. With no verifier it checks an https KMS only against public CAs, and an http one not at all. Each key's event records which KMS node answered and whether that check was made; `verify-app` warns about any key taken without it. An owner who points every node at a KMS of their own gets the same owner-known key listed on every node, and the nodes agree: compare the KMS node in each key's event, and the node's `verifier` and `kms` lines, with [`docs/TAPPSCAN.md`](docs/TAPPSCAN.md) and [`docs/KMS.md`](docs/KMS.md).
+- **The key is as durable as the KMS cluster.** Another cluster or network gives another key, and a cluster that loses its master key loses it. Keep a way to change the address wherever it is recorded.
+- **Whoever holds the app_id on chain holds its KMS keys.** Removing an app's last node unregisters the app, and anyone can then register the same app_id and take the same keys. Do not remove the last node of an app whose KMS key is its identity. Whoever can upgrade the registry can rewrite any app's owner and nodes, and so take its keys too: on testnet one address, immediately; on mainnet one address behind a 1-day timelock ([`contract/CONTRACTS.md`](contract/CONTRACTS.md)).
+- **Attested admission at the KMS** releases the key only to attested TEEs registered for the app: a verified quote naming the registered signer, an event log that replays, DEBUG off, a TCB not revoked, a published image (a dev image is refused on mainnet). Without it, the owner (or anyone with the owner's key) can register a plain address as a node and take the key outside any TEE. Admission does not check the compose: the owner decides that, and one that hands the key out is allowed. That is visible on chain and in the event log, not prevented. The testnet KMS has admission on ([`docs/KMS.md`](docs/KMS.md)); check the network you use.

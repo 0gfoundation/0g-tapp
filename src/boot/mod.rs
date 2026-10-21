@@ -784,6 +784,7 @@ enable_eventlog = true
         request: GetEvidenceRequest,
         signer_eth_address: &[u8],
         tls_public_key: Option<String>,
+        kms_keys: Vec<crate::report_data::KmsKey>,
     ) -> TappResult<GetEvidenceResponse> {
         // Get app_id from request. EMPTY IS VALID: it asks for the node's own
         // evidence — the common signer plus the :50052 TLS key hash — which is
@@ -827,12 +828,14 @@ enable_eventlog = true
         let mut runtime_data =
             crate::report_data::RuntimeData::new(signer_eth_address, &request.nonce)?;
         runtime_data.tls_public_key = tls_public_key.unwrap_or_default();
+        runtime_data.kms_keys = kms_keys;
         let (runtime_data_bytes, report_data) = runtime_data.seal()?;
 
         info!(
             app_id = %app_id,
             signer = %runtime_data.signer,
             nonce_len = request.nonce.len(),
+            kms_keys = runtime_data.kms_keys.len(),
             report_data = %hex::encode(&report_data),
             "Generating evidence"
         );
