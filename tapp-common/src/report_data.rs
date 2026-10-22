@@ -22,12 +22,20 @@
 //! data it compares unhashed).
 
 use crate::error::{DockerError, TappResult};
+pub use crate::identity::{KeyCommitment, KeyIdentity};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha512};
 use std::collections::{BTreeMap, HashMap};
 
 /// Field name under which the hashed bytes travel inside the evidence JSON.
 pub const EVIDENCE_FIELD: &str = "runtime_data";
+
+/// Reserved namespace in the outer evidence envelope, outside RuntimeData and its
+/// SHA-512 quote binding. Current producers emit an empty object. A future proof
+/// must be verified against its own relation and public inputs; neither this
+/// namespace nor a TEE signature authenticates a mathematical proof by itself.
+pub const EXTENSIONS_FIELD: &str = "extensions";
+pub type EvidenceExtensions = BTreeMap<String, serde_json::Value>;
 
 /// Longest challenge accepted, in bytes. A caller only needs enough to be unguessable;
 /// the cap exists so a request cannot inflate every quote this node produces.
@@ -41,9 +49,10 @@ pub const MAX_MATERIAL_LEN: usize = 256;
 
 /// The object `report_data` is the hash of.
 ///
-/// Empty top-level fields are omitted rather than serialised as `""` or `[]`, so evidence
-/// produced before a field existed and evidence produced after it are byte-identical
-/// whenever the field is unused.
+/// Current producers always include `app_id`, `identities` and `key_commitments`
+/// (empty arrays are explicit). Legacy optional nonce/TLS/kms_keys fields retain
+/// their omission behavior. Readers continue accepting older objects without the
+/// typed metadata fields and hash the exact received bytes in either era.
 ///
 /// Fields are declared in alphabetical order, and so are [`KmsKey`]'s. serde writes them in
 /// declaration order, so the bytes are the canonical JSON (sorted keys, no whitespace)
@@ -51,6 +60,14 @@ pub const MAX_MATERIAL_LEN: usize = 256;
 /// checks the binding itself. A new field must keep that order.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RuntimeData {
+    #[serde(default)]
+    pub app_id: String,
+    // Readers of legacy signer fields do not deserialize untrusted typed entries.
+    // Typed consumers validate these independently rather than blocking old evidence.
+    #[serde(default, skip_deserializing)]
+    pub identities: Vec<KeyIdentity>,
+    #[serde(default, skip_deserializing)]
+    pub key_commitments: Vec<KeyCommitment>,
     /// The keys this app has taken from the KMS through `GetSecretResource` this boot,
     /// sorted by material and then address. Normally one per material; two for one
     /// material mean this node got two different keys for it, from two KMS clusters or
@@ -137,7 +154,10 @@ impl KmsKey {
     /// not come from it. Holding entries to that form also lets a verifier compare them as
     /// plain strings, and print them without escaping.
     pub fn problem(&self) -> Option<&'static str> {
-        let lower_hex = |s: &str| s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+        let lower_hex = |s: &str| {
+            s.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        };
         if !lower_hex(&self.material)
             || !self.material.len().is_multiple_of(2)
             || self.material.len() > 2 * MAX_MATERIAL_LEN
@@ -247,7 +267,12 @@ impl<'de> serde::de::Visitor<'de> for StreamedKmsKeysVisitor {
         while let Some(raw) = seq.next_element::<&'de serde_json::value::RawValue>()? {
             let text = raw.get();
             if text.len() > MAX_KMS_KEY_ENTRY_LEN {
-                read.drop_one(|| format!("an entry of {} bytes, longer than any key entry", text.len()));
+                read.drop_one(|| {
+                    format!(
+                        "an entry of {} bytes, longer than any key entry",
+                        text.len()
+                    )
+                });
                 continue;
             }
             if read.keys.len() >= MAX_KMS_KEYS_READ {
@@ -385,10 +410,7 @@ impl RuntimeData {
         if signer_eth_address.len() != 20 {
             return Err(DockerError::ContainerOperationFailed {
                 operation: "runtime_data".to_string(),
-                reason: format!(
-                    "signer must be 20 bytes, got {}",
-                    signer_eth_address.len()
-                ),
+                reason: format!("signer must be 20 bytes, got {}", signer_eth_address.len()),
             }
             .into());
         }
@@ -404,6 +426,9 @@ impl RuntimeData {
             .into());
         }
         Ok(Self {
+            app_id: String::new(),
+            identities: Vec::new(),
+            key_commitments: Vec::new(),
             nonce: if nonce.is_empty() {
                 String::new()
             } else {
@@ -418,8 +443,30 @@ impl RuntimeData {
     /// Serialise, and return the bytes together with the `report_data` they produce.
     /// Callers must transmit *these* bytes; re-serialising elsewhere would change them.
     pub fn seal(&self) -> TappResult<(Vec<u8>, Vec<u8>)> {
+        let mut canonical = self.clone();
+        canonical.identities.sort_by(|a, b| {
+            (
+                &a.role,
+                &a.algorithm,
+                &a.public_key,
+                &a.key_source,
+                &a.derivation,
+            )
+                .cmp(&(
+                    &b.role,
+                    &b.algorithm,
+                    &b.public_key,
+                    &b.key_source,
+                    &b.derivation,
+                ))
+        });
+        canonical.identities.dedup();
+        canonical.key_commitments.sort_by(|a, b| {
+            (&a.material, &a.scheme, &a.commitment).cmp(&(&b.material, &b.scheme, &b.commitment))
+        });
+        canonical.key_commitments.dedup();
         let bytes =
-            serde_json::to_vec(self).map_err(|e| DockerError::ContainerOperationFailed {
+            serde_json::to_vec(&canonical).map_err(|e| DockerError::ContainerOperationFailed {
                 operation: "runtime_data".to_string(),
                 reason: format!("serialise: {}", e),
             })?;
@@ -491,13 +538,17 @@ mod tests {
     }
 
     #[test]
-    fn no_kms_keys_leaves_the_bytes_as_they_were() {
-        // Evidence for an app that took no key must not change at all: a verifier that
-        // predates the field hashes the same bytes it always did.
+    fn new_metadata_fields_are_explicit_while_no_legacy_kms_keys_are_invented() {
+        // New metadata has explicit arrays. Legacy readers still hash exact received
+        // bytes, not a re-serialization, and no curve identity is invented.
         let (bytes, _) = RuntimeData::new(&SIGNER, b"chal").unwrap().seal().unwrap();
         assert_eq!(
             String::from_utf8(bytes).unwrap(),
-            format!(r#"{{"nonce":"0x{}","signer":"0x{}"}}"#, hex::encode(b"chal"), hex::encode(SIGNER))
+            format!(
+                r#"{{"app_id":"","identities":[],"key_commitments":[],"nonce":"0x{}","signer":"0x{}"}}"#,
+                hex::encode(b"chal"),
+                hex::encode(SIGNER)
+            )
         );
     }
 
@@ -512,13 +563,13 @@ mod tests {
     }
 
     #[test]
-    fn kms_keys_come_first_and_read_back() {
+    fn legacy_kms_keys_keep_canonical_order_and_read_back() {
         let rd = full();
         let (bytes, _) = rd.seal().unwrap();
         let s = String::from_utf8(bytes.clone()).unwrap();
         assert!(
             s.starts_with(
-                r#"{"kms_keys":[{"address":"0x7e5f4552091a69125d5dfcb7b8c2659029395bdf","material":"","public_key":"0x0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"},{"address":"0x"#
+                r#"{"app_id":"","identities":[],"key_commitments":[],"kms_keys":[{"address":"0x7e5f4552091a69125d5dfcb7b8c2659029395bdf","material":"","public_key":"0x0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"},{"address":"0x"#
             ),
             "got {}",
             s
@@ -539,9 +590,13 @@ mod tests {
             serde_json::Value::Object(m) => {
                 let mut entries: Vec<_> = m.into_iter().collect();
                 entries.sort_by(|a, b| a.0.cmp(&b.0));
-                serde_json::Value::Object(entries.into_iter().map(|(k, v)| (k, sorted(v))).collect())
+                serde_json::Value::Object(
+                    entries.into_iter().map(|(k, v)| (k, sorted(v))).collect(),
+                )
             }
-            serde_json::Value::Array(a) => serde_json::Value::Array(a.into_iter().map(sorted).collect()),
+            serde_json::Value::Array(a) => {
+                serde_json::Value::Array(a.into_iter().map(sorted).collect())
+            }
             other => other,
         }
     }
@@ -555,7 +610,10 @@ mod tests {
             let (bytes, _) = rd.seal().unwrap();
             let canonical =
                 serde_json::to_vec(&sorted(serde_json::from_slice(&bytes).unwrap())).unwrap();
-            assert_eq!(String::from_utf8(canonical).unwrap(), String::from_utf8(bytes).unwrap());
+            assert_eq!(
+                String::from_utf8(canonical).unwrap(),
+                String::from_utf8(bytes).unwrap()
+            );
         }
     }
 
@@ -586,7 +644,10 @@ mod tests {
             assert!(read_kms_keys(text.as_bytes()).keys.is_empty(), "{kms_keys}");
         }
         let twice = r#"{"kms_keys":[],"kms_keys":[],"signer":"0xab"}"#;
-        assert_eq!(serde_json::from_str::<RuntimeData>(twice).unwrap().signer, "0xab");
+        assert_eq!(
+            serde_json::from_str::<RuntimeData>(twice).unwrap().signer,
+            "0xab"
+        );
         assert_eq!(read_kms_keys(twice.as_bytes()).dropped, 1);
     }
 
@@ -617,9 +678,16 @@ mod tests {
         let read = read_kms_keys(text.as_bytes());
         assert_eq!(read.keys.len(), 1);
         assert_eq!(read.dropped, 3);
-        assert!(read.reasons.iter().all(|r| r.len() < 200), "{:?}", read.reasons);
+        assert!(
+            read.reasons.iter().all(|r| r.len() < 200),
+            "{:?}",
+            read.reasons
+        );
         assert!(read_kms_keys(br#"{"kms_keys":"x"}"#).reasons[0].contains("not a list"));
-        assert_eq!(read_kms_keys(br#"{"signer":"0xab"}"#), KmsKeysRead::default());
+        assert_eq!(
+            read_kms_keys(br#"{"signer":"0xab"}"#),
+            KmsKeysRead::default()
+        );
 
         // Thousands of junk entries: every one counted, only a few explained.
         let junk = format!(r#"{{"kms_keys":[{}0]}}"#, "0,".repeat(10_000));
@@ -642,12 +710,27 @@ mod tests {
             ("0x on material", with(&|k| k.material = "0xab01".into())),
             ("upper-case material", with(&|k| k.material = "AB01".into())),
             ("odd-length material", with(&|k| k.material = "ab0".into())),
-            ("escape in material", with(&|k| k.material = "\u{1b}[8m".into())),
-            ("over-long material", with(&|k| k.material = "ab".repeat(MAX_MATERIAL_LEN + 1))),
-            ("upper-case address", with(&|k| k.address = k.address.to_uppercase().replacen("0X", "0x", 1))),
-            ("address without 0x", with(&|k| k.address = k.address[2..].to_string())),
+            (
+                "escape in material",
+                with(&|k| k.material = "\u{1b}[8m".into()),
+            ),
+            (
+                "over-long material",
+                with(&|k| k.material = "ab".repeat(MAX_MATERIAL_LEN + 1)),
+            ),
+            (
+                "upper-case address",
+                with(&|k| k.address = k.address.to_uppercase().replacen("0X", "0x", 1)),
+            ),
+            (
+                "address without 0x",
+                with(&|k| k.address = k.address[2..].to_string()),
+            ),
             ("short public key", with(&|k| k.public_key.truncate(20))),
-            ("another key's address", with(&|k| k.address = other.address.clone())),
+            (
+                "another key's address",
+                with(&|k| k.address = other.address.clone()),
+            ),
         ] {
             assert!(broken.is_some(), "{what} was accepted");
         }
@@ -669,8 +752,17 @@ mod tests {
         assert_eq!(check_material("0xAB01"), Ok("ab01".to_string()));
         // The KMS strips every leading 0x, so this is the material ab there too.
         assert_eq!(check_material("0x0xab"), Ok("ab".to_string()));
-        assert_eq!(check_material(&"ab".repeat(MAX_MATERIAL_LEN)), Ok("ab".repeat(MAX_MATERIAL_LEN)));
-        for refused in ["zz", "abc", "0Xab", " ab", &"ab".repeat(MAX_MATERIAL_LEN + 1)] {
+        assert_eq!(
+            check_material(&"ab".repeat(MAX_MATERIAL_LEN)),
+            Ok("ab".repeat(MAX_MATERIAL_LEN))
+        );
+        for refused in [
+            "zz",
+            "abc",
+            "0Xab",
+            " ab",
+            &"ab".repeat(MAX_MATERIAL_LEN + 1),
+        ] {
             assert!(check_material(refused).is_err(), "{refused:?} was accepted");
         }
     }
@@ -696,7 +788,10 @@ mod tests {
         log.record("b", KmsKey::of_secret("", &secret(4)).unwrap());
 
         let a = log.of("a");
-        let order: Vec<_> = a.iter().map(|k| (k.material.as_str(), k.address.as_str())).collect();
+        let order: Vec<_> = a
+            .iter()
+            .map(|k| (k.material.as_str(), k.address.as_str()))
+            .collect();
         let mut sorted = order.clone();
         sorted.sort();
         assert_eq!(order, sorted);

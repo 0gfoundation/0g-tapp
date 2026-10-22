@@ -155,7 +155,10 @@ impl ReplayGuard {
     /// which a guard started "now" would cut short.
     #[cfg(test)]
     pub fn started_at(ts: i64) -> Self {
-        Self { seen: Default::default(), started_at: ts }
+        Self {
+            seen: Default::default(),
+            started_at: ts,
+        }
     }
 
     /// Admit a signed request exactly once. `signer` is the recovered address,
@@ -360,7 +363,10 @@ mod replay_guard_tests {
         // one's memory starts empty.
         let g = ReplayGuard::default();
         let before = chrono::Utc::now().timestamp() - 30;
-        assert_eq!(g.admit("0xa", "StartApp:0x01:1", before), Admission::PredatesProcess);
+        assert_eq!(
+            g.admit("0xa", "StartApp:0x01:1", before),
+            Admission::PredatesProcess
+        );
         assert_eq!(g.len(), 0);
     }
 }

@@ -39,11 +39,7 @@ impl NonceManager {
     /// Verify and consume a nonce
     /// Returns Ok(()) if nonce is valid and not used
     /// Returns Err if nonce is invalid, expired, or already used
-    pub async fn verify_and_consume(
-        &self,
-        nonce: &str,
-        timestamp: i64,
-    ) -> Result<(), String> {
+    pub async fn verify_and_consume(&self, nonce: &str, timestamp: i64) -> Result<(), String> {
         let current_time = chrono::Utc::now().timestamp();
 
         // 1. Check timestamp validity
@@ -126,7 +122,10 @@ mod tests {
         let old_timestamp = chrono::Utc::now().timestamp() - 120; // 2 minutes ago
 
         // Should fail due to expired timestamp
-        assert!(manager.verify_and_consume(nonce, old_timestamp).await.is_err());
+        assert!(manager
+            .verify_and_consume(nonce, old_timestamp)
+            .await
+            .is_err());
     }
 
     #[tokio::test]
@@ -136,6 +135,9 @@ mod tests {
         let future_timestamp = chrono::Utc::now().timestamp() + 120; // 2 minutes in future
 
         // Should fail due to future timestamp
-        assert!(manager.verify_and_consume(nonce, future_timestamp).await.is_err());
+        assert!(manager
+            .verify_and_consume(nonce, future_timestamp)
+            .await
+            .is_err());
     }
 }

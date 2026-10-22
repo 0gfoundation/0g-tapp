@@ -1,7 +1,7 @@
 ---
 name: 0g-tapp-cli
 description: Use this skill when the user wants to deploy, manage, or troubleshoot applications on a 0G Tapp (Trusted Application Platform) server using tapp-cli. Covers start/stop apps, on-chain registration, registry login, check task status, view logs, and manage docker compose deployments across multiple remote TEE servers.
-version: 1.24.0
+version: 1.25.0
 author: 0G Labs
 tags: [0g, tapp, tee, docker, deployment, cli, onchain]
 ---
@@ -44,6 +44,15 @@ Record which key maps to which server/owner in memory — it changes per deploym
 
 ## Core Commands
 
+Applications can call the **Unix-socket-only `ResolveAppIdentity` RPC** (server
+≥0.12.0) to query the configured Scan with its claim-time TLS pin. Supply
+`chain_id`, `registry_address` (TappRegistry), and `app_id`; no separate Scan URL
+or pin belongs in the application's configuration. This has no CLI command.
+It returns registered node signers and app TLS SPKI pins with observation times
+and local acceptance deadlines. Node signers are not stable KMS service signers;
+business URLs and service authorization remain the application's responsibility.
+See [`docs/APP_IDENTITY.md`](../../../docs/APP_IDENTITY.md) for the wire contract.
+
 ```bash
 tapp-cli -s <server> -k 0x<key> docker-login -r <registry-host> -u <user> -p <password>
 tapp-cli -s <server> -k 0x<key> start-app -f docker-compose.yaml --app-id <id>   # async → task-id
@@ -72,7 +81,7 @@ tapp-cli -s <server> -k 0x<key> get-app-container-status --app-id <id>
 tapp-cli -s <server> -k 0x<key> get-app-info --app-id <id>        # compose/volume/image hashes the server holds
 tapp-cli -s <server> list-apps                                   # list all apps on this server (no key needed)
 tapp-cli -s <server> -k 0x<key> get-app-logs --app-id <id> --service <name> -n 100  # app's docker compose logs
-tapp-cli -s <server> get-app-key --app-id <id> [--x25519]         # TEE-derived app PUBLIC key (ethereum addr; --x25519 also prints the X25519 pubkey)
+tapp-cli -s <server> get-app-key --app-id <id>                  # local node secp256k1 PUBLIC key and Ethereum address
 tapp-cli -s <server> get-app-csr --app-id <id> --domain api.example.com --out my.csr  # v0.6.0+, PUBLIC (TCP, no key)
 tapp-cli -s <server> verify-app --app-id <id> [--policy-ids <id>]                    # direct: AS-verify this node's evidence+quote, show attested values (no chain)
 tapp-cli verify-app --app-id <id> --rpc-url <rpc> --contract 0x<reg> [--policy-ids <id>]  # chain: verify all nodes + reconcile vs on-chain
@@ -90,7 +99,8 @@ tapp-cli -s <server> -k 0x<key> docker-logout                    # logout from D
 - **`kms : <urls>`** (v0.6.0+) lists the KMS cluster the node draws key material from, one per line, with a warning on any plaintext `http://` entry (those nodes' identity cannot be checked). `none configured` means exactly that — not that it was checked.
 - The deployed clusters per network (mainnet/testnet endpoints for `--kbs-urls`, group pubkeys — **same app_id `0g-kms`, two different masters**), the derivation namespaces, and the authorization model are in `docs/KMS.md`. Pointing a consumer at the wrong network's cluster silently derives every key from the wrong master.
 - **`tls key : <sha256>  (sha256 of the public key, attested)`** (v0.4.0+) appears in both modes when the app has a TLS key, followed by the `openssl s_client | … | openssl dgst -sha256` one-liner for comparing it against a live endpoint. Line absent = no TLS key derived, which is normal, not a failure.
-- **`kms key : <address>  material <hex>`** (tapp-cli ≥ 0.12.0, tapp-server ≥ 0.11.0 — the binary's version, not the release tag: v0.11.0 ships tapp-server 0.10.0): one line per key the app took from the KMS with `GetSecretResource` this boot (first 20; `get-evidence` prints all), read from `runtime_data.kms_keys`.
+- **Typed identities and commitments** (tapp-server ≥0.12.0, tapp-cli ≥0.13.0): `runtime_data.identities` records explicit node/app/TLS algorithms and provenance; `key_commitments` records generic KMS commitments. A malformed typed declaration is rejected for identity use without changing legacy node parsing. See `docs/APP_IDENTITY.md` for the fixed commitment and proof extension boundary.
+- **Legacy `kms key : <address>  material <hex>`** (tapp-server 0.11.x, tapp-cli ≥0.12.0): address entries read from `runtime_data.kms_keys`.
   - Shown only when the node's evidence can be believed: AS-verified quote, made for this request, its signer (chain mode), event log replays, platform passes, a published production image (or values unavailable). A **dev image does not count** (its operator has a shell in the TD). Otherwise `kms keys : N not shown — <why>`.
   - A material with more than one key attested (across nodes, or within one node) → `✗ kms keys : more than one key is attested for material …` and `kms keys disagree ❌` (exit 1), in both modes. The KMS gives one key per app and material, so a node holding another got it elsewhere (another KMS cluster, a substituted answer). Agreement only shows the nodes share a cluster.
   - Each key's `get_secret_resource` event records the KMS node that answered (`kms_url`) and whether that connection was checked against attestation (`kms_attested`). Never checked (no verifier, or a KMS node over plain http) → `⚠️ N of these taken while this node did not check the KMS against attestation …` and `kms keys from an unchecked KMS ⚠️` (exit 2). The KMS is the owner's choice either way: compare `kms_url` and the node's `verifier`/`kms` lines (the latest settings only) with `docs/TAPPSCAN.md` / `docs/KMS.md`.
@@ -274,7 +284,7 @@ tapp-cli -s /run/tapp/tapp.sock get-app-tls-cert --app-id <id> \
 ```
 These three hand over **private key material** and from v0.4.0 are served **only on the Unix socket**. Over TCP — including `http://localhost:50051` and `host.docker.internal:50051` — they return `PermissionDenied` ("served only on the tapp Unix socket"). Before v0.4.0 any host that could reach `:50051` could pull any app's private key; that is now closed.
 
-`get-secret-resource` (tapp-cli ≥ 0.12.0, tapp-server ≥ 0.11.0) also prints the secret's `Address` and compressed `Public key` as a secp256k1 key, and **adds that key to the app's evidence** (`runtime_data.kms_keys`) for the rest of the boot. Running it on the host for an app therefore changes what that app's evidence lists, and every run adds an event (~1 KB) to the event log that all verification carries: an app should take each key **once per boot** and keep it in memory. `--material` must be hex of at most 256 bytes (`INVALID_ARGUMENT` otherwise).
+`get-secret-resource` (tapp-cli ≥0.13.0, tapp-server ≥0.12.0) prints opaque secret bytes, `commitment_scheme`, the canonical Poseidon commitment, and the explicit measurement result. It does not infer an address or signing algorithm. Stable secp256k1 applications use the socket-only `GetAppSigner` RPC with fixed hex(`provider`) material; TLS uses its own P-256 typed identity. Both typed identities refer to the same commitment format in runtime data and the replayed event log. Take generic keys **once per boot** and keep them in memory: every retrieval adds an event carried by verification. `--material` must be hex of at most 256 bytes (`INVALID_ARGUMENT` otherwise). Legacy 0.11.x servers additionally returned inferred secp256k1 address/public-key fields, now reserved.
 
 - `-k` is **not** needed: reaching the socket *is* the authorization. Anything that can open the socket can read every app's secrets, so never bind-mount it into an untrusted container.
 - A container that needs them mounts the socket instead of using `extra_hosts`:
@@ -449,9 +459,9 @@ tapp-cli -s <teeUrl> get-evidence --app-id <APP_ID> --nonce $(openssl rand -hex 
 ```
 - **`report_data` = `sha512(runtime_data)`** (v0.4.0+), where `runtime_data` is a small JSON object travelling as a third field of the evidence beside `quote` and `cc_eventlog`:
   ```json
-  {"kms_keys":[{"address":"0x…","material":"","public_key":"0x02…"}],"nonce":"0x…","signer":"0x…","tls_public_key":"0x…"}
+  {"app_id":"app","identities":[],"key_commitments":[],"nonce":"0x…","signer":"0x…","tls_public_key":"0x…"}
   ```
-  Empty top-level fields are **omitted**, not `""`/`[]` (a `kms_keys` entry always carries `material`, `""` = the base key). A quote therefore no longer names its signer on its own — the structure must accompany it, and verifiers hash the bytes **exactly as received** (never re-serialise). Fields are written in sorted order, so those bytes are also the canonical JSON CoCo-AS hashes when handed the object as `structured_runtime_data` with `sha512`. Format definition: `tapp-common/src/report_data.rs`.
+  `app_id`, `identities`, and `key_commitments` are explicit, including empty values. Optional legacy fields are omitted when empty. A quote no longer names its signer on its own — the structure must accompany it, and verifiers hash the bytes **exactly as received** (never re-serialise). Fields are written in sorted order, so those bytes are also the canonical JSON CoCo-AS hashes when handed the object as `structured_runtime_data` with `sha512`. Format definition: `tapp-common/src/report_data.rs`.
 - **`--nonce <hex>`** (≤64 bytes) is a challenge echoed back inside `runtime_data`. Evidence is self-authenticating but undated, so without a nonce a cached quote is indistinguishable from a fresh one. The CLI prints `challenge : echoed` / `NOT echoed`. Pre-0.4.0 servers print `ignored — this server predates the nonce field`.
 - Pre-0.4.0 evidence has **no `runtime_data` field** and `report_data` is the 20-byte signer, left-aligned and zero-padded. Both readings are supported (`tapp-common/src/verify.rs`); a missing field is reported as "server predates the challenge field", not as a signer mismatch.
 
@@ -464,7 +474,8 @@ tapp-cli -s <teeUrl> get-evidence --app-id <APP_ID> --nonce $(openssl rand -hex 
 - **signer**: read `runtime_data.signer` from the evidence and check `report_data == sha512(runtime_data bytes as received)`. That equality is what makes the field trustworthy; the signer is then compared against the on-chain `signerAddress`. On pre-0.4.0 evidence (no `runtime_data`) fall back to "first 20 bytes of `report_data` == signerAddress", searched as a substring — never treat an RTMR as the signer.
   - ⚠️ quote body offset varies by version: v4 header=48, **v5 header=54** bytes — hardcoding `quote[48:]` mis-reads report_data on v5. AS already aligns it correctly per version; just read `submods.cpu0.ear.veraison.annotated-evidence.tdx.quote.body`.
 - **tls_public_key** (if present): sha256 of the SubjectPublicKeyInfo of the app's TLS key. A client compares it against the certificate it was handed during the handshake — that is what ties the TLS endpoint to this TEE. Absent = the app has no TLS key yet (keys are derived at `start_app`).
-- **kms_keys** (if present, tapp-server ≥ 0.11.0): the keys the app took from the KMS with `GetSecretResource` this boot (a restarted tapp-server reads them back from the event log), sorted by material then address: `address`, `material` (hex, lowercase, no `0x`; `""` = the app's base key) and compressed `public_key` of the 32-byte secret used as a secp256k1 private key. This is how an app's **stable** identity (same on every node, across restarts, unlike `signer`) is tied to an attested TEE; the app must sign with the secret itself for the address to be its. Check:
+- **identities / key_commitments** (tapp-server ≥0.12.0): verify exact app namespace, canonical scheme/material/commitment, typed algorithm/encoding/derivation, public-key/address/SPKI correspondence and matching successful replayed events. Never infer an app signer from a node signer or a generic commitment. Future `evidence.extensions` proofs require their own validation against the authenticated statement; the extensions themselves are outside the quote's RD.
+- **Legacy kms_keys** (0.11.x, if present): sorted address/material/compressed-public-key declarations for generic secrets interpreted as secp256k1. New generic calls do not create them. For this legacy format check:
   - only evidence that holds up in full: AS-verified quote, its signer, fresh, event log replays, platform passes, a published **production** image (a dev image's operator has a shell in the TD, so its quote vouches for anything);
   - each entry in exactly that form, and each address its public key's;
   - one address per material across the app's nodes, a single node included (two = a node got a key elsewhere);

@@ -13,6 +13,13 @@ page:
 3. **Attestation Service host** — the CoCo-AS that `tapp-cli verify-app`
    submits quotes to (`--as-endpoint`).
 
+Apps on a tapp can use **`ResolveAppIdentity`** on its local Unix socket to
+query that node's pinned Scan without implementing a Scan client or separately
+configuring trust anchors. The RPC requires the chain, TappRegistry, and app id;
+see [APP_IDENTITY.md](APP_IDENTITY.md). It requires Scan's structured
+`/api/verify` API; it never substitutes the explorer's `/cert` pin list for a
+verification verdict.
+
 ## tappscan.0g.ai — the explorer, both networks
 
 | network | URL | chain | registry |

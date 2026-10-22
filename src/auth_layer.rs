@@ -338,7 +338,7 @@ pub struct SignerAddress(pub String);
 /// Method permission requirements
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum MethodPermission {
-    Public,        // No auth required
+    Public, // No auth required
     /// Reachable only over the Unix socket, never over TCP. No signature either — the
     /// caller is a container inside this CVM asking for key material, and it has no key
     /// to sign with; it is calling in order to obtain one.
@@ -375,8 +375,8 @@ fn classify(method_name: &str) -> Option<MethodPermission> {
         "GetEvidence" | "GetAppKey" | "GetAppInfo" | "ListApps" | "GetTaskStatus"
         | "GetServiceStatus" | "GetTappInfo" | "GetAppCsr" => MethodPermission::Public,
 
-        // Hand over key material. Socket only.
-        "GetAppSecretKey" | "GetSecretResource" | "GetAppTlsCert" => {
+        // Key material and app-facing infrastructure lookups. Socket only.
+        "GetAppSecretKey" | "GetAppSigner" | "GetSecretResource" | "GetAppTlsCert" | "ResolveAppIdentity" => {
             MethodPermission::LocalOnly
         }
 
@@ -443,7 +443,11 @@ mod tests {
                 unclassified.push(name.to_string());
             }
         }
-        assert!(seen > 20, "parsed only {} rpcs — the proto layout changed", seen);
+        assert!(
+            seen > 20,
+            "parsed only {} rpcs — the proto layout changed",
+            seen
+        );
         assert!(
             unclassified.is_empty(),
             "these RPCs fall through to the OwnerOnly default; classify them in \
@@ -641,12 +645,19 @@ mod signed_body_tests {
     /// What the inner service saw: the body bytes and the authenticated signer.
     type Seen = Arc<Mutex<Option<(Vec<u8>, Option<String>)>>>;
 
-    fn middleware() -> (AuthMiddleware<impl Service<
-        http::Request<BoxBody>,
-        Response = http::Response<BoxBody>,
-        Error = std::convert::Infallible,
-        Future = impl Send,
-    > + Clone + Send + 'static>, Seen) {
+    fn middleware() -> (
+        AuthMiddleware<
+            impl Service<
+                    http::Request<BoxBody>,
+                    Response = http::Response<BoxBody>,
+                    Error = std::convert::Infallible,
+                    Future = impl Send,
+                > + Clone
+                + Send
+                + 'static,
+        >,
+        Seen,
+    ) {
         let seen: Seen = Arc::new(Mutex::new(None));
         let record = seen.clone();
         let inner = tower::service_fn(move |req: http::Request<BoxBody>| {
@@ -680,8 +691,10 @@ mod signed_body_tests {
         if let Some(v) = version {
             b = b.header("x-signature-version", v);
         }
-        b.body(tonic::body::boxed(http_body_util::Full::new(Bytes::from(body))))
-            .unwrap()
+        b.body(tonic::body::boxed(http_body_util::Full::new(Bytes::from(
+            body,
+        ))))
+        .unwrap()
     }
 
     /// The grpc-status a refusal carries; None = the request reached the service.
@@ -692,7 +705,12 @@ mod signed_body_tests {
             .and_then(|v| v.parse().ok())
     }
 
-    fn signed_v2(key: &[u8; 32], method: &str, msg: &crate::proto::StartAppRequest, ts: i64) -> String {
+    fn signed_v2(
+        key: &[u8; 32],
+        method: &str,
+        msg: &crate::proto::StartAppRequest,
+        ts: i64,
+    ) -> String {
         let hash: [u8; 32] = sha2::Sha256::digest(msg.encode_to_vec()).into();
         personal_sign(key, &build_sign_message_v2(method, &hash, ts))
     }
@@ -709,9 +727,16 @@ mod signed_body_tests {
             .call(request("StartApp", body.clone(), &sig, ts, Some("2")))
             .await
             .unwrap();
-        assert_eq!(grpc_status(&resp), None, "the owner's request must reach the service");
+        assert_eq!(
+            grpc_status(&resp),
+            None,
+            "the owner's request must reach the service"
+        );
         let (got_body, signer) = seen.lock().unwrap().clone().expect("service was called");
-        assert_eq!(got_body, body, "the buffered body must be handed on byte for byte");
+        assert_eq!(
+            got_body, body,
+            "the buffered body must be handed on byte for byte"
+        );
         assert_eq!(signer.as_deref(), Some(address_of(&KEY).as_str()));
     }
 
@@ -725,12 +750,24 @@ mod signed_body_tests {
         let swapped = start_app("services: {web: {image: evil}}");
 
         let resp = svc
-            .call(request("StartApp", frame(&swapped.encode_to_vec()), &sig, ts, Some("2")))
+            .call(request(
+                "StartApp",
+                frame(&swapped.encode_to_vec()),
+                &sig,
+                ts,
+                Some("2"),
+            ))
             .await
             .unwrap();
         // Recovers some unrelated address, which holds no permission.
-        assert_eq!(grpc_status(&resp), Some(tonic::Code::PermissionDenied as i32));
-        assert!(seen.lock().unwrap().is_none(), "the swapped request must not reach the service");
+        assert_eq!(
+            grpc_status(&resp),
+            Some(tonic::Code::PermissionDenied as i32)
+        );
+        assert!(
+            seen.lock().unwrap().is_none(),
+            "the swapped request must not reach the service"
+        );
     }
 
     #[tokio::test]
@@ -741,10 +778,19 @@ mod signed_body_tests {
         let sig = signed_v2(&KEY, "StartApp", &msg, ts);
         let body = frame(&msg.encode_to_vec());
 
-        let first = svc.call(request("StartApp", body.clone(), &sig, ts, Some("2"))).await.unwrap();
+        let first = svc
+            .call(request("StartApp", body.clone(), &sig, ts, Some("2")))
+            .await
+            .unwrap();
         assert_eq!(grpc_status(&first), None);
-        let replay = svc.call(request("StartApp", body, &sig, ts, Some("2"))).await.unwrap();
-        assert_eq!(grpc_status(&replay), Some(tonic::Code::Unauthenticated as i32));
+        let replay = svc
+            .call(request("StartApp", body, &sig, ts, Some("2")))
+            .await
+            .unwrap();
+        assert_eq!(
+            grpc_status(&replay),
+            Some(tonic::Code::Unauthenticated as i32)
+        );
     }
 
     /// One signature has many spellings that recover to the same signer. Every one
@@ -757,15 +803,18 @@ mod signed_body_tests {
         let sig = signed_v2(&KEY, "StartApp", &msg, ts);
         let body = frame(&msg.encode_to_vec());
 
-        let first = svc.call(request("StartApp", body.clone(), &sig, ts, Some("2"))).await.unwrap();
+        let first = svc
+            .call(request("StartApp", body.clone(), &sig, ts, Some("2")))
+            .await
+            .unwrap();
         assert_eq!(grpc_status(&first), None);
 
         let hex = sig.trim_start_matches("0x");
         let v = u8::from_str_radix(&hex[128..], 16).unwrap();
         let variants = [
-            hex.to_string(),                                       // no 0x
-            format!("0x{}", hex.to_uppercase()),                   // other case
-            format!("0x{}{:02x}", &hex[..128], v - 27),            // v as 0/1
+            hex.to_string(),                            // no 0x
+            format!("0x{}", hex.to_uppercase()),        // other case
+            format!("0x{}{:02x}", &hex[..128], v - 27), // v as 0/1
         ];
         for variant in variants {
             let resp = svc
@@ -790,10 +839,19 @@ mod signed_body_tests {
         for key in [OTHER_KEY, [11u8; 32], [13u8; 32]] {
             let sig = signed_v2(&key, "StartApp", &msg, ts);
             let resp = svc
-                .call(request("StartApp", frame(&msg.encode_to_vec()), &sig, ts, Some("2")))
+                .call(request(
+                    "StartApp",
+                    frame(&msg.encode_to_vec()),
+                    &sig,
+                    ts,
+                    Some("2"),
+                ))
                 .await
                 .unwrap();
-            assert_eq!(grpc_status(&resp), Some(tonic::Code::PermissionDenied as i32));
+            assert_eq!(
+                grpc_status(&resp),
+                Some(tonic::Code::PermissionDenied as i32)
+            );
         }
         assert_eq!(svc.replay.len(), 0);
     }
@@ -809,7 +867,13 @@ mod signed_body_tests {
         for key in [OTHER_KEY, [11u8; 32], [13u8; 32]] {
             let sig = personal_sign(&key, &build_sign_message_v2("ClaimConfig", &hash, ts));
             let resp = svc
-                .call(request("ClaimConfig", frame(&msg.encode_to_vec()), &sig, ts, Some("2")))
+                .call(request(
+                    "ClaimConfig",
+                    frame(&msg.encode_to_vec()),
+                    &sig,
+                    ts,
+                    Some("2"),
+                ))
                 .await
                 .unwrap();
             // Reaches the handler, which decides whether the node is claimable.
@@ -830,13 +894,26 @@ mod signed_body_tests {
 
         let ts = now - 480;
         let sig = signed_v2(&KEY, "StartApp", &msg, ts);
-        let resp = svc.call(request("StartApp", body.clone(), &sig, ts, Some("2"))).await.unwrap();
-        assert_eq!(grpc_status(&resp), None, "8 minutes old is inside the window");
+        let resp = svc
+            .call(request("StartApp", body.clone(), &sig, ts, Some("2")))
+            .await
+            .unwrap();
+        assert_eq!(
+            grpc_status(&resp),
+            None,
+            "8 minutes old is inside the window"
+        );
 
         let ts = now - 660;
         let sig = signed_v2(&KEY, "StartApp", &msg, ts);
-        let resp = svc.call(request("StartApp", body, &sig, ts, Some("2"))).await.unwrap();
-        assert_eq!(grpc_status(&resp), Some(tonic::Code::Unauthenticated as i32));
+        let resp = svc
+            .call(request("StartApp", body, &sig, ts, Some("2")))
+            .await
+            .unwrap();
+        assert_eq!(
+            grpc_status(&resp),
+            Some(tonic::Code::Unauthenticated as i32)
+        );
     }
 
     /// The legacy message authorised the method with any body. Even a valid one
@@ -848,10 +925,19 @@ mod signed_body_tests {
         let ts = chrono::Utc::now().timestamp();
         let sig = personal_sign(&KEY, &format!("StartApp:{ts}"));
         let resp = svc
-            .call(request("StartApp", frame(&msg.encode_to_vec()), &sig, ts, None))
+            .call(request(
+                "StartApp",
+                frame(&msg.encode_to_vec()),
+                &sig,
+                ts,
+                None,
+            ))
             .await
             .unwrap();
-        assert_eq!(grpc_status(&resp), Some(tonic::Code::Unauthenticated as i32));
+        assert_eq!(
+            grpc_status(&resp),
+            Some(tonic::Code::Unauthenticated as i32)
+        );
         assert!(seen.lock().unwrap().is_none());
     }
 
@@ -862,10 +948,19 @@ mod signed_body_tests {
         let ts = chrono::Utc::now().timestamp();
         let sig = signed_v2(&OTHER_KEY, "StartApp", &msg, ts);
         let resp = svc
-            .call(request("StartApp", frame(&msg.encode_to_vec()), &sig, ts, Some("2")))
+            .call(request(
+                "StartApp",
+                frame(&msg.encode_to_vec()),
+                &sig,
+                ts,
+                Some("2"),
+            ))
             .await
             .unwrap();
-        assert_eq!(grpc_status(&resp), Some(tonic::Code::PermissionDenied as i32));
+        assert_eq!(
+            grpc_status(&resp),
+            Some(tonic::Code::PermissionDenied as i32)
+        );
     }
 
     #[test]

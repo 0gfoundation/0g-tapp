@@ -252,7 +252,8 @@ All applications run within TEE boundaries and are cryptographically measured. T
 Attestation evidence returned by `GetEvidence` commits the application's TEE-derived identity into the TDX `report_data` field. `report_data` is `sha512` of a small JSON object — `runtime_data` — that travels as a third field of the evidence alongside `quote` and `cc_eventlog`:
 
 ```json
-{"kms_keys": [{"address": "0x…", "material": "", "public_key": "0x02…"}],
+{"app_id":"my-app", "identities":[{"role":"app_signer", "…":"…"}],
+ "key_commitments":[{"commitment":"0x…", "material":"70726f7669646572", "scheme":"poseidon-bn254-4-v1"}],
  "nonce": "0x…", "signer": "0x…", "tls_public_key": "0x…"}
 ```
 
@@ -260,14 +261,17 @@ Attestation evidence returned by `GetEvidence` commits the application's TEE-der
 
 | field | meaning |
 |---|---|
-| `kms_keys` | tapp-server ≥ 0.11.0. The keys the app has taken from the KMS with `GetSecretResource` this boot (a restarted tapp-server reads them back from the event log), sorted by material and then address. Each entry is the material (hex, lowercase, no `0x`; `""` for the app's base key) and the Ethereum address and compressed public key of the 32-byte secret used as a secp256k1 private key. Normally one entry per material; two for one material mean the node got two different keys for it. This is how a verifier ties a stable address, the same on every node of the app and across restarts, to an attested TEE of the app. See [A stable identity from the KMS](#a-stable-identity-from-the-kms). |
+| `app_id` | The exact app namespace covered by this runtime data (empty for the common node identity). |
+| `identities` | tapp-server ≥0.12.0: typed `node_signer`, `app_signer`, and `tls` public keys, their algorithm, encoding, derivation and source. KMS identities reference a commitment. See [APP_IDENTITY.md](docs/APP_IDENTITY.md). |
+| `key_commitments` | Algorithm-neutral `poseidon-bn254-4-v1` commitments to fetched KMS secrets, scoped to appId and decoded material. Each must occur in this app's replayed event log. No signing curve or address is inferred from a generic secret. |
+| `kms_keys` | Legacy 0.11.x address/public-key declarations. Read for compatibility; new generic KMS calls do not create these entries. |
 | `nonce` | Caller-supplied challenge, echoed back. A quote is self-authenticating but undated, so without a challenge a cached quote is indistinguishable from a fresh one. Pass `get-evidence --nonce <hex>` (≤64 bytes, must be random). |
 | `signer` | The Ethereum address derived inside the enclave — the identity `TappRegistry` records. Verifiers match it against the registered `signerAddress` to prove a signed message and the on-chain identity come from the same app on this TEE. |
 | `tls_public_key` | sha256 of the app's TLS SubjectPublicKeyInfo, when it has one. This is what lets a client tie the certificate it was handed during a TLS handshake to a TEE running this app. |
 
 `GetEvidence` with an `app_id` answers for an app that was started this boot (running, or stopped since) and for one that is **being started**. The last is for the KMS's attested admission: before it releases an encrypted app's volume key, the KMS has the verifier check this node's evidence for the app, and the start is waiting for that key. Such evidence proves the app's signer is held in this TEE, not that the app runs — there is no `start_app` event for it yet, and reconciliation (verify-app, the scan) reads that event. A second `start-app` of an app that is being started is refused.
 
-Empty top-level fields are omitted rather than serialised as `""` or `[]`, so evidence produced before a field existed and after it are byte-identical whenever the field is unused. (A `kms_keys` entry always carries `material`, `""` included.) Two consequences for verifiers:
+`app_id`, `identities`, and `key_commitments` are explicit, including empty values. Optional legacy fields, nonce and TLS hash are omitted when unused. Two consequences for verifiers:
 
 - **A quote alone no longer names its signer** — the structure must accompany it. Nothing in the system passes a bare quote.
 - **Hash the bytes exactly as transmitted.** Never re-serialise them to check the hash.
@@ -294,6 +298,21 @@ What makes it trustworthy is the binding, not the issuer: `public_key_sha256` is
 | `kms` | `(app_id, "tls")` at the KMS cluster | yes, and identical on every node of the app | "some TEE of this app" |
 
 Certificate pinning, Certificate Transparency monitoring and ACME renewal all need a key that outlives a restart, so they need `kms`. `local` involves nothing external — no KMS, no on-chain registration — so it works from first boot, which is why it is the default; stability is what you opt into once something needs it. Set it in `config.toml` or at claim time with `claim-config --tls-key-source local|kms`.
+
+### Discovering another app through Scan
+
+Applications can call **`ResolveAppIdentity`** (server ≥0.12.0) on the local
+`/run/tapp/tapp.sock` with a `chain_id`, TappRegistry `registry_address`, and
+`app_id`. Tapp queries Scan using the live URL and TLS pin established at claim
+or by `UpdateTrustAnchors`; apps do not maintain a second copy of those anchors.
+The lookup works without KMS configuration and returns verified registered node
+signers, app TLS SPKI SHA256 pins, and explicit observation/expiry times.
+
+The interface trusts the configured Scan's verification policy. Its node signer
+is not a stable KMS service signer, and its `tee_url` is a management endpoint,
+not the business URL to connect to with the app TLS pin. See
+[`docs/APP_IDENTITY.md`](docs/APP_IDENTITY.md) for the request, response, upstream
+requirements, and service-discovery boundary.
 
 ### Measurement Design Philosophy
 
@@ -1031,7 +1050,7 @@ When `[kbs]` is configured, apps running inside the TEE can retrieve a hardware-
 
 ### Key material is served only on the Unix socket
 
-Three RPCs hand over private key material — `GetAppSecretKey`, `GetSecretResource` and `GetAppTlsCert` — and from v0.4.0 they are reachable **only over the Unix socket**. Over TCP they are refused with `PermissionDenied`, including from `localhost` and from a container using `host.docker.internal:host-gateway`.
+`GetAppSecretKey`, `GetSecretResource`, `GetAppTlsCert`, and the new `GetAppSigner` hand over private key material and are reachable **only over the Unix socket**. Over TCP they are refused with `PermissionDenied`, including from `localhost` and from a container using `host.docker.internal:host-gateway`.
 
 The check is the transport answering rather than a judgement about an address: tonic records connect-info per listener, and a TCP connection always carries a peer address while a Unix one never does. Before v0.4.0 this was an address check that accepted the Docker bridge ranges, which meant any host that could reach `:50051` could fetch any app's private key.
 
@@ -1070,11 +1089,11 @@ The returned `secret` bytes are the HKDF-derived app key from the KMS cluster, d
 
 ### Remote / TCP access
 
-The server always listens on `bind_address` (default `0.0.0.0:50051`) for remote clients — management, the on-chain `teeUrl`, `verify-app`. The Unix socket above is additional, not a replacement. Everything except the three key-material RPCs works over either.
+The server always listens on `bind_address` (default `0.0.0.0:50051`) for remote clients — management, the on-chain `teeUrl`, `verify-app`. The Unix socket above is additional, not a replacement. The four key-material RPCs and the app-facing `ResolveAppIdentity` lookup are socket-only; other methods work over either.
 
 ### Derivation material (per-caller keys)
 
-`GetSecretResourceRequest` takes an optional `material` field — hex-encoded derivation material, forwarded verbatim to the KMS `/app-key` endpoint, which binds it into the derived key alongside `app_id`. (tapp-server ≥ 0.11.0 refuses anything but hex of at most 256 bytes, and lists each key in the app's evidence; see below.) This lets an app derive many independent keys from the KMS (e.g. AgenticID derives per-agent seal keys with `material = chainId ‖ contractAddress ‖ sealId`) instead of holding one app-wide secret and deriving locally. The KMS DPRF is one-way: per-material keys expose neither each other nor the app-wide key.
+`GetSecretResourceRequest` takes an optional `material` field — hex-encoded derivation material bound by KMS into the key alongside `app_id`. tapp normalizes it to lowercase hex without `0x` and refuses more than 256 decoded bytes. tapp-server ≥0.12.0 records a commitment without interpreting the secret as a signing key. This lets an app derive independent per-agent keys (e.g. `chainId ‖ contractAddress ‖ sealId`) instead of holding one app-wide secret and deriving locally.
 
 ```bash
 grpcurl -unix -plaintext \
@@ -1088,7 +1107,21 @@ Absent/empty `material` derives purely from the `app_id` namespace — byte-iden
 
 The app's signer — the key `GetAppSecretKey` returns and the address registered on chain — is made inside the TEE and changes whenever tapp-server restarts or the VM reboots. That is right for the node's identity, but not for an app whose address is known outside: an address on a contract's allowlist, an oracle's signer, anything a counterparty has pinned. Such an app signs with a KMS key instead. `GetSecretResource` returns the same 32-byte secret for the same `app_id` and `material` on every node of the app, every time.
 
-Use the secret directly as the secp256k1 private key. With tapp-server ≥ 0.11.0:
+With tapp-server ≥0.12.0, call the socket-only `GetAppSigner(app_id)` for the stable
+application identity. It uses the fixed `70726f7669646572` (hex `provider`) material
+and interprets that secret as a secp256k1 scalar, preserving existing KMS-provider
+addresses. Its response carries the secret, compressed public key, address,
+commitment, derivation and explicit measurement result. The typed `app_signer`
+declaration and commitment are authenticated in runtime data and the replayed
+event log. Generic `GetSecretResource` returns opaque bytes and a commitment;
+TLS uses a separate P-256 declaration under material `746c73`.
+
+Commitment parameters and future proof boundaries are described in
+[APP_IDENTITY.md](docs/APP_IDENTITY.md). The node signer and on-chain node
+registration remain unchanged. Cache secrets in memory rather than repeatedly
+fetching them: each generic fetch adds an event to the log carried by verification.
+
+**Legacy tapp-server 0.11.x only** interpreted generic secrets as secp256k1 keys:
 
 - The response also carries the key the app signs as: `eth_address` (20 bytes) and `compressed_public_key` (33 bytes). They are proto `bytes`, so grpcurl shows them base64-encoded as `ethAddress` and `compressedPublicKey`; `tapp-cli -s /run/tapp/tapp.sock get-secret-resource` (tapp-cli ≥ 0.12.0) prints them in hex. An older server leaves them empty: derive them from the secret.
 - From then to the end of the boot, `GetEvidence` for the app lists the key in `runtime_data.kms_keys` (see [Trusted Execution Environment](#trusted-execution-environment)). A restarted tapp-server reads the list back from this boot's `get_secret_resource` events, which name the same address; a key is listed only once its event is written.

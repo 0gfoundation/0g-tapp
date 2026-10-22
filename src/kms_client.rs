@@ -27,7 +27,13 @@ mod tests {
 
         assert_eq!(result, vec![0xde, 0xad, 0xbe, 0xef]);
         // Plain http and no verifier: nothing about who answered was checked.
-        assert_eq!(answer, KmsAnswer { url: server.uri(), attested: false });
+        assert_eq!(
+            answer,
+            KmsAnswer {
+                url: server.uri(),
+                attested: false
+            }
+        );
     }
 
     #[tokio::test]
@@ -85,14 +91,21 @@ mod tests {
             .mount(&good_server)
             .await;
 
-        let client = KmsClient::new(vec![bad_server.uri(), good_server.uri()], &Default::default());
+        let client = KmsClient::new(
+            vec![bad_server.uri(), good_server.uri()],
+            &Default::default(),
+        );
         let (result, answer) = client
             .get_encrypted_secret("myapp", 1234567890, "pubkey_hex", "sig_hex", "")
             .await
             .unwrap();
 
         assert_eq!(result, vec![0xca, 0xfe, 0xba, 0xbe]);
-        assert_eq!(answer.url, good_server.uri(), "the node that answered, not the first tried");
+        assert_eq!(
+            answer.url,
+            good_server.uri(),
+            "the node that answered, not the first tried"
+        );
     }
 
     #[tokio::test]
@@ -174,7 +187,8 @@ mod onchain_visibility_tests {
     const VERIFIER_UNREACHABLE_DAMPED: &str = r#"{"error":"attestation required: attestation not verified (recently checked): verifier unreachable"}"#;
     /// ...and from one that does not. It turns into the real answer within the KMS's 30s
     /// damping, so it is waited on: a lasting refusal then fails fast on that answer.
-    const VERIFIER_DAMPED_BARE: &str = r#"{"error":"attestation required: attestation not verified (recently checked)"}"#;
+    const VERIFIER_DAMPED_BARE: &str =
+        r#"{"error":"attestation required: attestation not verified (recently checked)"}"#;
     /// The scan has a result stored from before it recorded the DEBUG attribute and has not
     /// re-attested the node yet (0g-tapp-verifier#16, scan/src/api.rs).
     const VERIFIER_REATTESTING: &str = r#"{"error":"attestation required: attestation not verified: the TD's DEBUG attribute is not known for this result; it needs re-attesting"}"#;
@@ -186,10 +200,21 @@ mod onchain_visibility_tests {
         assert_eq!(what(SIGNER_NOT_YET), Some("this node's signer on-chain"));
         // Attested admission (0g-kms src/verifier.rs): the verifier has not synced the
         // updateNode yet, or has not re-attested the node.
-        for lag in [VERIFIER_NOT_YET, VERIFIER_DAMPED_NOT_YET, VERIFIER_DAMPED_BARE] {
-            assert_eq!(what(lag), Some("this node's signer at the verifier"), "{lag}");
+        for lag in [
+            VERIFIER_NOT_YET,
+            VERIFIER_DAMPED_NOT_YET,
+            VERIFIER_DAMPED_BARE,
+        ] {
+            assert_eq!(
+                what(lag),
+                Some("this node's signer at the verifier"),
+                "{lag}"
+            );
         }
-        assert_eq!(what(VERIFIER_REATTESTING), Some("this node's evidence re-attested by the verifier"));
+        assert_eq!(
+            what(VERIFIER_REATTESTING),
+            Some("this node's evidence re-attested by the verifier")
+        );
         for down in [VERIFIER_UNREACHABLE, VERIFIER_UNREACHABLE_DAMPED] {
             assert_eq!(what(down), Some("a verdict from the verifier"), "{down}");
         }
@@ -287,6 +312,8 @@ mod pin_tests {
 fn pinned_client(expected: impl IntoIterator<Item = String>) -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .use_preconfigured_tls(crate::pinned_tls::client_config(expected))
+        .https_only(true)
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| anyhow!("build pinned client: {}", e))
 }
@@ -494,8 +521,7 @@ impl KmsClient {
             // Pinned to the verifier's own attested key. Without this the whole exercise
             // is circular: an attacker on this hop rewrites the very set that is supposed
             // to catch him.
-            match pinned_client(std::iter::once(p.scan_pubkey.clone()))
-            {
+            match pinned_client(std::iter::once(p.scan_pubkey.clone())) {
                 Ok(c) => match c.get(&url).send().await {
                     Ok(resp) if resp.status().is_success() => match resp.text().await {
                         Ok(body) => {
@@ -507,7 +533,9 @@ impl KmsClient {
                             }
                             p.last_refresh = Some(std::time::Instant::now());
                         }
-                        Err(e) => tracing::warn!(url = %url, error = %e, "verifier body unreadable"),
+                        Err(e) => {
+                            tracing::warn!(url = %url, error = %e, "verifier body unreadable")
+                        }
                     },
                     Ok(resp) => {
                         tracing::warn!(url = %url, status = %resp.status(), "verifier refused");
@@ -570,7 +598,10 @@ impl KmsClient {
             {
                 Ok(v) => return Ok(v),
                 Err(e) if e.downcast_ref::<NotOnChainYet>().is_some() => {
-                    let what = e.downcast_ref::<NotOnChainYet>().map(|n| n.what).unwrap_or("this app on-chain");
+                    let what = e
+                        .downcast_ref::<NotOnChainYet>()
+                        .map(|n| n.what)
+                        .unwrap_or("this app on-chain");
                     let left = deadline.saturating_duration_since(std::time::Instant::now());
                     if left.is_zero() {
                         // Say what is actually known: the KMS did not see it for the whole
@@ -641,13 +672,16 @@ impl KmsClient {
             loop {
                 match client.post(&endpoint).json(&req).send().await {
                     Ok(resp) if resp.status().is_success() => {
-                        let body: KmsResponse = resp.json().await
+                        let body: KmsResponse = resp
+                            .json()
+                            .await
                             .map_err(|e| anyhow!("KMS {} invalid response: {}", url, e))?;
                         let bytes = hex::decode(body.encrypted_secret.trim_start_matches("0x"))
                             .map_err(|e| anyhow!("KMS {} invalid hex: {}", url, e))?;
                         // Pinned only means anything over TLS: to a plain-http node the same
                         // client sends the request with no handshake to check.
-                        let tls = reqwest::Url::parse(&endpoint).is_ok_and(|u| u.scheme() == "https");
+                        let tls =
+                            reqwest::Url::parse(&endpoint).is_ok_and(|u| u.scheme() == "https");
                         let answer = KmsAnswer {
                             url: url.clone(),
                             attested: self.pins.is_some() && tls,
@@ -720,7 +754,8 @@ impl KmsClient {
                 if attempt > self.max_retries {
                     break;
                 }
-                let delay = (self.initial_delay_ms * (1u64 << (attempt - 1))).min(self.max_delay_ms);
+                let delay =
+                    (self.initial_delay_ms * (1u64 << (attempt - 1))).min(self.max_delay_ms);
                 tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
             }
         }

@@ -99,18 +99,30 @@ report_data = sha512(runtime_data)
 (base64). Definition in `tapp-common/src/report_data.rs`:
 
 ```json
-{"kms_keys":[{"address":"0x…","material":"","public_key":"0x02…"},{"address":"0x…","material":"7369676e6572","public_key":"0x03…"}],
+{"app_id":"my-app","identities":[],"key_commitments":[],
  "nonce":"0x…","signer":"0x…","tls_public_key":"0x…"}
 ```
 
 | field | meaning |
 |---|---|
-| `kms_keys` | tapp-server ≥ 0.11.0: the keys the app took from the KMS with `GetSecretResource` this boot (a restarted tapp-server reads them back from the event log), sorted by material and then address; absent if it took none. `material` is hex as the KMS reads it (lowercase, no `0x`, `""` for the app's base key); `address` and `public_key` (compressed) are those of the 32-byte secret used as a secp256k1 private key. Normally one entry per material |
+| `app_id` | ≥0.12.0: exact application namespace; empty for the common node identity |
+| `identities` | ≥0.12.0: typed node/app/TLS public keys with algorithm, encoding, source, derivation and optional KMS commitment reference |
+| `key_commitments` | ≥0.12.0: canonical Poseidon commitments to opaque KMS secrets, scoped to app id and material |
+| `kms_keys` | Legacy 0.11.x secp256k1 address/public-key declarations; new generic KMS retrievals do not populate this list |
 | `nonce` | the caller-supplied challenge (`--nonce`, ≤64 bytes), echoed back verbatim |
 | `signer` | the app's TEE-derived signer EVM address (20 bytes), i.e. the identity registered on-chain |
 | `tls_public_key` | sha256 of the app's TLS public key (SubjectPublicKeyInfo); absent if the app has never requested a TLS key |
 
-**`kms_keys` is how a stable address is tied to an attested TEE.** The KMS derives one key per
+**Current typed identities (≥0.12.0):** validate the app id, canonical
+`poseidon-bn254-4-v1` commitment and material, exact role/algorithm/derivation,
+compressed public key, and matching successful `get_secret_resource` events for
+KMS references. Derive the app signer's Ethereum address from its secp256k1 public
+key and the TLS SPKI hash from its P-256 public key; compare node/TLS legacy fields.
+The fixed commitment parameters and explicit proof extension boundary are in
+[APP_IDENTITY.md](APP_IDENTITY.md). The generic secret itself has no signing curve.
+Runtime data and the event log must both authenticate before using these fields.
+
+**Legacy 0.11.x `kms_keys` format:** the KMS derives one key per
 (app_id, material) and gives it only to signers registered on chain for the app, so the same
 material yields the same address on every node of the app and across restarts, while the
 `signer` above changes with every restart. A verifier that has checked the binding learns that
@@ -143,7 +155,7 @@ not, and should not, ask again: every request adds an event to the log.
 
 Two rules that must be remembered:
 
-1. **An empty top-level field is "absent", not `""` or `[]`.** This way, when a field is unused, the evidence bytes are byte-for-byte identical before and after the field was added. (A `kms_keys` entry always carries `material`, `""` included.)
+1. **Hash exact received bytes.** ≥0.12.0 explicitly emits `app_id`, `identities` and `key_commitments`, including empty values. Optional legacy fields are omitted when unused. Do not reconstruct a legacy or current object to calculate its hash.
 2. **The verifier hashes the bytes exactly as received and never re-serializes.**
    The `RuntimeData` struct is only for reading fields, not an encoder. The fields are written
    in sorted order, so the bytes as received are also the canonical JSON CoCo-AS computes (below).
@@ -307,7 +319,8 @@ while o + 12 <= len(log):
 | `runtime_data.signer` | = on-chain signerAddress | see above |
 | `runtime_data.nonce` | = the challenge sent with this request | only checked if `--nonce` was passed |
 | `runtime_data.tls_public_key` | = sha256 of the certificate public key obtained in the handshake | may be absent (app never requested a TLS key) |
-| `runtime_data.kms_keys` | each `address` = the address of its `public_key`; one address per material across the app's nodes; each key named by a `get_secret_resource` event of the app with `kms_attested: true` and a `kms_url` you trust | may be absent (app took no KMS key); see §② |
+| `runtime_data.identities` / `key_commitments` | exact app/role/algorithm/source/derivation, public-key/address/SPKI correspondence, canonical commitments and matching successful replayed events | ≥0.12.0; see [APP_IDENTITY.md](APP_IDENTITY.md) |
+| Legacy `runtime_data.kms_keys` | each `address` = the address of its `public_key`; one address per material across the app's nodes; each key named by a `get_secret_resource` event of the app with `kms_attested: true` and a `kms_url` you trust | 0.11.x compatibility; see §② |
 | compose / volumes / image hash | = corresponding on-chain field | see §① encoding rules |
 
 **kernel_cmdline has two reference values (new/old grub); matching either one passes:**

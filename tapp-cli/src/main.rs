@@ -2,12 +2,11 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use tapp_common::proto::{
     tapp_service_client::TappServiceClient, AddToWhitelistRequest, ClaimConfigRequest,
-    DockerLoginRequest,
-    DockerLogoutRequest, GetAppContainerStatusRequest, GetAppInfoRequest, GetAppKeyRequest,
-    GetAppLogsRequest, GetAppSecretKeyRequest, GetAppCsrRequest, GetAppTlsCertRequest, GetEvidenceRequest,
-    GetSecretResourceRequest,
-    GetServiceLogsRequest, GetServiceStatusRequest, GetTappInfoRequest, GetTaskStatusRequest,
-    ListAppsRequest, ListWhitelistRequest, MountFile, PruneImagesRequest, RemoveFromWhitelistRequest,
+    DockerLoginRequest, DockerLogoutRequest, GetAppContainerStatusRequest, GetAppCsrRequest,
+    GetAppInfoRequest, GetAppKeyRequest, GetAppLogsRequest, GetAppSecretKeyRequest,
+    GetAppTlsCertRequest, GetEvidenceRequest, GetSecretResourceRequest, GetServiceLogsRequest,
+    GetServiceStatusRequest, GetTappInfoRequest, GetTaskStatusRequest, ListAppsRequest,
+    ListWhitelistRequest, MountFile, PruneImagesRequest, RemoveFromWhitelistRequest,
     StartAppRequest, StartServiceRequest, StopAppRequest, StopServiceRequest,
     UpdateTrustAnchorsRequest, WithdrawBalanceRequest,
 };
@@ -78,8 +77,7 @@ async fn create_client(
             }))
             .await?;
         TappServiceClient::new(channel)
-    } else if server.starts_with("https://")
-        && TLS_PIN.get().map(|p| p.is_some()).unwrap_or(false)
+    } else if server.starts_with("https://") && TLS_PIN.get().map(|p| p.is_some()).unwrap_or(false)
     {
         // Pinned: the peer must hold the key whose SPKI sha256 was given. This is
         // what defeats an ACTIVE on-path attacker — --insecure below only defeats
@@ -172,7 +170,12 @@ struct Cli {
     /// pasted back. Both are checked before the command goes on. A request signature has
     /// to come back within the server's ±10 min window. --ledger or --fordefi replace the
     /// pasting.
-    #[arg(long, global = true, env = "TAPP_EXTERNAL_SIGNER", conflicts_with = "private_key")]
+    #[arg(
+        long,
+        global = true,
+        env = "TAPP_EXTERNAL_SIGNER",
+        conflicts_with = "private_key"
+    )]
     external_signer: Option<String>,
 
     /// With --external-signer: sign on a Ledger connected to this machine instead of pasting.
@@ -180,7 +183,12 @@ struct Cli {
     /// transaction, which it signs only; the transaction is checked and broadcast from here.
     /// A contract call needs Blind signing enabled in the device's Ethereum app. Built in on
     /// macOS; elsewhere build with --features ledger.
-    #[arg(long, global = true, requires = "external_signer", conflicts_with = "fordefi")]
+    #[arg(
+        long,
+        global = true,
+        requires = "external_signer",
+        conflicts_with = "fordefi"
+    )]
     ledger: bool,
 
     /// With --external-signer: sign with a Fordefi vault through the 0g-fordefi-signer
@@ -314,7 +322,11 @@ enum Commands {
         contract: Option<String>,
         /// CoCo Attestation Service gRPC endpoint (https://host:port; a bare host:port is
         /// plaintext)
-        #[arg(long, env = "TAPP_AS_ENDPOINT", default_value = "https://35.253.66.70:50004")]
+        #[arg(
+            long,
+            env = "TAPP_AS_ENDPOINT",
+            default_value = "https://35.253.66.70:50004"
+        )]
         as_endpoint: String,
 
         /// sha256 of the AS's TLS public key (`0x…`). The current value for the default AS
@@ -384,10 +396,6 @@ enum Commands {
         /// Application ID
         #[arg(short, long)]
         app_id: String,
-
-        /// Use X25519 key pair
-        #[arg(long)]
-        x25519: bool,
     },
 
     /// A certificate signing request for a name you choose, to hand to a CA.
@@ -437,10 +445,6 @@ enum Commands {
         /// Output in JSON format
         #[arg(long)]
         json: bool,
-
-        /// Use X25519 key pair
-        #[arg(long)]
-        x25519: bool,
     },
 
     /// Get secret resource from KMS (local access only)
@@ -656,7 +660,6 @@ enum Commands {
         #[arg(long)]
         signature: String,
     },
-
 
     /// Register app on-chain after starting it.
     /// Fetches compose/volume/image hashes and signerAddress from --server, registers them.
@@ -911,13 +914,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let _ = TLS_PIN.set(pin);
 
     if cli.ledger {
-        if let Err(e) = tapp_common::external_signer::use_backend(tapp_common::external_signer::Backend::Ledger) {
+        if let Err(e) =
+            tapp_common::external_signer::use_backend(tapp_common::external_signer::Backend::Ledger)
+        {
             eprintln!("✗ --ledger: {e}");
             std::process::exit(2);
         }
     }
     if cli.fordefi {
-        if let Err(e) = tapp_common::external_signer::use_backend(tapp_common::external_signer::Backend::Fordefi) {
+        if let Err(e) = tapp_common::external_signer::use_backend(
+            tapp_common::external_signer::Backend::Fordefi,
+        ) {
             eprintln!("✗ --fordefi: {e}");
             std::process::exit(2);
         }
@@ -981,8 +988,28 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Commands::GetAppInfo { app_id } => {
             get_app_info(&cli.server, app_id).await?;
         }
-        Commands::VerifyApp { app_id, rpc_url, contract, as_endpoint, as_pubkey, policy_ids, reference_values, relay } => {
-            verify_app_cmd(&cli.server, &app_id, rpc_url, contract, &as_endpoint, as_pubkey.as_deref(), &policy_ids, relay.as_deref(), reference_values.as_deref()).await?;
+        Commands::VerifyApp {
+            app_id,
+            rpc_url,
+            contract,
+            as_endpoint,
+            as_pubkey,
+            policy_ids,
+            reference_values,
+            relay,
+        } => {
+            verify_app_cmd(
+                &cli.server,
+                &app_id,
+                rpc_url,
+                contract,
+                &as_endpoint,
+                as_pubkey.as_deref(),
+                &policy_ids,
+                relay.as_deref(),
+                reference_values.as_deref(),
+            )
+            .await?;
         }
         Commands::ListApps => {
             list_apps(&cli.server).await?;
@@ -1002,10 +1029,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Commands::GetEvidence { app_id, nonce } => {
             get_evidence(&cli.server, app_id, nonce).await?;
         }
-        Commands::GetAppKey { app_id, x25519 } => {
-            get_app_key(&cli.server, app_id, x25519).await?;
+        Commands::GetAppKey { app_id } => {
+            get_app_key(&cli.server, app_id).await?;
         }
-        Commands::GetAppCsr { app_id, domain, out } => {
+        Commands::GetAppCsr {
+            app_id,
+            domain,
+            out,
+        } => {
             get_app_csr(&cli.server, app_id, domain, out).await?;
         }
         Commands::GetAppTlsCert {
@@ -1015,12 +1046,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             get_app_tls_cert(&cli.server, app_id, out_key, out_cert).await?;
         }
-        Commands::GetAppSecretKey {
-            app_id,
-            json,
-            x25519,
-        } => {
-            get_app_secret_key(&cli.server, app_id, json, x25519).await?;
+        Commands::GetAppSecretKey { app_id, json } => {
+            get_app_secret_key(&cli.server, app_id, json).await?;
         }
         Commands::GetSecretResource { app_id, material } => {
             get_secret_resource(&cli.server, app_id, material).await?;
@@ -1158,7 +1185,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             tee_url,
         } => {
             let private_key = require_private_key(&cli.private_key)?;
-            register_onchain(&cli.server, app_id, rpc_url, contract, stake_wei, private_key, tee_url.as_deref()).await?;
+            register_onchain(
+                &cli.server,
+                app_id,
+                rpc_url,
+                contract,
+                stake_wei,
+                private_key,
+                tee_url.as_deref(),
+            )
+            .await?;
         }
         Commands::UpdateOnchain {
             app_id,
@@ -1177,7 +1213,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             tee_url,
         } => {
             let private_key = require_private_key(&cli.private_key)?;
-            add_node_onchain(&cli.server, app_id, rpc_url, contract, stake_wei, private_key, signer_address, tee_url).await?;
+            add_node_onchain(
+                &cli.server,
+                app_id,
+                rpc_url,
+                contract,
+                stake_wei,
+                private_key,
+                signer_address,
+                tee_url,
+            )
+            .await?;
         }
         Commands::RemoveNodeOnchain {
             app_id,
@@ -1186,7 +1232,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             signer_address,
         } => {
             let private_key = require_private_key(&cli.private_key)?;
-            remove_node_onchain(&cli.server, app_id, rpc_url, contract, private_key, signer_address).await?;
+            remove_node_onchain(
+                &cli.server,
+                app_id,
+                rpc_url,
+                contract,
+                private_key,
+                signer_address,
+            )
+            .await?;
         }
         Commands::UpdateNodeOnchain {
             app_id,
@@ -1197,13 +1251,20 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             tee_url,
         } => {
             let private_key = require_private_key(&cli.private_key)?;
-            update_node_onchain(&cli.server, app_id, rpc_url, contract, private_key, old_signer, new_signer, tee_url).await?;
+            update_node_onchain(
+                &cli.server,
+                app_id,
+                rpc_url,
+                contract,
+                private_key,
+                old_signer,
+                new_signer,
+                tee_url,
+            )
+            .await?;
         }
 
-        Commands::Withdraw {
-            rpc_url,
-            contract,
-        } => {
+        Commands::Withdraw { rpc_url, contract } => {
             let private_key = require_private_key(&cli.private_key)?;
             withdraw_onchain(rpc_url, contract, private_key).await?;
         }
@@ -1214,7 +1275,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             invalidator,
         } => {
             let private_key = require_private_key(&cli.private_key)?;
-            authorize_invalidator_onchain(app_id, rpc_url, contract, invalidator, private_key).await?;
+            authorize_invalidator_onchain(app_id, rpc_url, contract, invalidator, private_key)
+                .await?;
         }
         Commands::RevokeInvalidatorOnchain {
             app_id,
@@ -1275,8 +1337,11 @@ fn collect_dir_files(
             let rel = path
                 .strip_prefix(base_dir)
                 .map_err(|e| format!("strip_prefix error: {}", e))?;
-            let file_source_path =
-                format!("{}/{}", source_prefix.trim_end_matches('/'), rel.to_string_lossy());
+            let file_source_path = format!(
+                "{}/{}",
+                source_prefix.trim_end_matches('/'),
+                rel.to_string_lossy()
+            );
             let content = std::fs::read(&path)
                 .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
             println!("    ✓ Found: {}", file_source_path);
@@ -1435,7 +1500,12 @@ fn signed_start_app(
     } else {
         format!("app {app_id}")
     };
-    add_signature_metadata(&mut request, private_key, "StartApp", &about(server, &subject))?;
+    add_signature_metadata(
+        &mut request,
+        private_key,
+        "StartApp",
+        &about(server, &subject),
+    )?;
     Ok(request)
 }
 
@@ -1568,7 +1638,11 @@ async fn wait_for_task(
 /// the node itself (#141), and what is recorded is what the scan will call. A node older
 /// than that listener keeps the plaintext URL. `--server` naming this machine (a socket,
 /// localhost) is refused: that address means nothing to anyone reading the chain.
-fn evidence_url_for(server: &str, explicit: Option<&str>, version: Option<&str>) -> Result<String, String> {
+fn evidence_url_for(
+    server: &str,
+    explicit: Option<&str>,
+    version: Option<&str>,
+) -> Result<String, String> {
     if let Some(u) = explicit {
         let u = u.trim().trim_end_matches('/');
         if !(u.starts_with("https://") || u.starts_with("http://")) {
@@ -1589,7 +1663,10 @@ fn evidence_url_for(server: &str, explicit: Option<&str>, version: Option<&str>)
     let host = if authority.starts_with('[') {
         authority.split_inclusive(']').next().unwrap_or(authority)
     } else {
-        authority.rsplit_once(':').map(|(h, _)| h).unwrap_or(authority)
+        authority
+            .rsplit_once(':')
+            .map(|(h, _)| h)
+            .unwrap_or(authority)
     };
     if scheme == "unix" || host == "localhost" || host.starts_with("127.") || host == "[::1]" {
         return Err(local());
@@ -1618,7 +1695,10 @@ fn serves_tls_listener(version: &str) -> bool {
 /// same host's TLS listener. `None` for anything else: a recorded URL that is not the
 /// legacy form was someone's choice, and is kept.
 fn migrate_legacy_tee_url(recorded: &str) -> Option<String> {
-    let rest = recorded.trim().trim_end_matches('/').strip_prefix("http://")?;
+    let rest = recorded
+        .trim()
+        .trim_end_matches('/')
+        .strip_prefix("http://")?;
     let host = rest.strip_suffix(":50051")?;
     (!host.is_empty() && !host.contains('/')).then(|| format!("https://{}:50052", host))
 }
@@ -1665,7 +1745,9 @@ enum AtUrl {
 async fn signer_reached_at(url: &str, app_id: &str) -> AtUrl {
     let ask = async {
         let channel = if url.starts_with("https://") {
-            tapp_common::pinned_tls::grpc_channel(url, Vec::new()).await.map_err(|_| AtUrl::NoAnswer)?
+            tapp_common::pinned_tls::grpc_channel(url, Vec::new())
+                .await
+                .map_err(|_| AtUrl::NoAnswer)?
         } else {
             tonic::transport::Endpoint::from_shared(url.to_string())
                 .map_err(|_| AtUrl::NotThisNode)?
@@ -1676,10 +1758,8 @@ async fn signer_reached_at(url: &str, app_id: &str) -> AtUrl {
         let resp = TappServiceClient::new(channel)
             .get_app_key(Request::new(GetAppKeyRequest {
                 app_id: app_id.to_owned(),
-                key_type: "ethereum".to_string(),
                 additional_data: vec![],
                 kbs_resource_uri: String::new(),
-                x25519: false,
             }))
             .await
             .map_err(|s| match s.code() {
@@ -1689,7 +1769,9 @@ async fn signer_reached_at(url: &str, app_id: &str) -> AtUrl {
             })?
             .into_inner();
         if resp.success && resp.eth_address.len() == 20 {
-            Ok(AtUrl::Signer(ethers::types::Address::from_slice(&resp.eth_address)))
+            Ok(AtUrl::Signer(ethers::types::Address::from_slice(
+                &resp.eth_address,
+            )))
         } else {
             Err(AtUrl::NotThisNode)
         }
@@ -1871,16 +1953,34 @@ async fn ensure_registered_onchain(
             let (tee_url, compose, volumes) =
                 onchain::get_node(&rpc_url, &contract, app_id, *n).await?;
             if *n == signer {
-                this_node = Some(NodeOnChain { tee_url: tee_url.clone(), compose, volumes });
+                this_node = Some(NodeOnChain {
+                    tee_url: tee_url.clone(),
+                    compose,
+                    volumes,
+                });
             }
             tee_urls.insert(*n, tee_url);
         }
-        Some(ChainApp { app_compose, app_volumes, app_images, nodes, this_node, tee_urls })
+        Some(ChainApp {
+            app_compose,
+            app_volumes,
+            app_images,
+            nodes,
+            this_node,
+            tee_urls,
+        })
     } else {
         None
     };
 
-    let steps = plan_chain_sync(chain.as_ref(), &deployed, signer, stated_old, add_node, app_id)?;
+    let steps = plan_chain_sync(
+        chain.as_ref(),
+        &deployed,
+        signer,
+        stated_old,
+        add_node,
+        app_id,
+    )?;
     if steps.is_empty() {
         println!("✓ On-chain registration already matches this deployment");
         return Ok(None);
@@ -1896,11 +1996,19 @@ async fn ensure_registered_onchain(
     // long enough for the KMS to refuse the app its volume key. So the StartApp is signed
     // before the last registry call and sent the moment that call is mined, not after another
     // round with a signer who may take minutes.
-    let last_call = steps.iter().rposition(|s| !matches!(s, SyncStep::ImagesDifferFromApp));
+    let last_call = steps
+        .iter()
+        .rposition(|s| !matches!(s, SyncStep::ImagesDifferFromApp));
     let mut start = None;
     for (i, step) in steps.into_iter().enumerate() {
         if Some(i) == last_call {
-            start = Some(signed_start_app(server, compose_file, app_id, private_key, false)?);
+            start = Some(signed_start_app(
+                server,
+                compose_file,
+                app_id,
+                private_key,
+                false,
+            )?);
         }
         match step {
             SyncStep::RegisterApp { tee_url } => {
@@ -1921,7 +2029,10 @@ async fn ensure_registered_onchain(
                 println!("  Tx Hash: 0x{:x}", tx);
             }
             SyncStep::UpdateAppCode { keep_volumes } => {
-                let before = chain.as_ref().map(|c| c.app_compose.clone()).unwrap_or_default();
+                let before = chain
+                    .as_ref()
+                    .map(|c| c.app_compose.clone())
+                    .unwrap_or_default();
                 let tx = onchain::update_app(
                     &params,
                     app_id,
@@ -1931,10 +2042,19 @@ async fn ensure_registered_onchain(
                 )
                 .await?;
                 println!("✓ App code declaration updated on-chain (single-node app: it is this node's code)");
-                println!("  Compose: 0x{} -> 0x{}", short_hex(&before), short_hex(&deployed.compose));
+                println!(
+                    "  Compose: 0x{} -> 0x{}",
+                    short_hex(&before),
+                    short_hex(&deployed.compose)
+                );
                 println!("  Tx Hash: 0x{:x}", tx);
             }
-            SyncStep::ReplaceNode { old, tee_url, compose_override, volumes_override } => {
+            SyncStep::ReplaceNode {
+                old,
+                tee_url,
+                compose_override,
+                volumes_override,
+            } => {
                 let before = chain.as_ref().and_then(|c| c.tee_urls.get(&old).cloned());
                 let tee_url = tee_url_for_replacement(
                     tee_url,
@@ -1966,7 +2086,11 @@ async fn ensure_registered_onchain(
                 }
                 println!("  Tx Hash: 0x{:x}", tx);
             }
-            SyncStep::AddNode { tee_url, compose_override, volumes_override } => {
+            SyncStep::AddNode {
+                tee_url,
+                compose_override,
+                volumes_override,
+            } => {
                 let tx = onchain::add_node(
                     &params,
                     app_id,
@@ -1982,8 +2106,15 @@ async fn ensure_registered_onchain(
                 println!("  TEE URL: {}", tee_url);
                 println!("  Tx Hash: 0x{:x}", tx);
             }
-            SyncStep::RefreshNode { tee_url, compose_override, volumes_override } => {
-                let before = chain.as_ref().and_then(|c| c.this_node.as_ref()).map(|n| n.tee_url.clone());
+            SyncStep::RefreshNode {
+                tee_url,
+                compose_override,
+                volumes_override,
+            } => {
+                let before = chain
+                    .as_ref()
+                    .and_then(|c| c.this_node.as_ref())
+                    .map(|n| n.tee_url.clone());
                 let tx = onchain::update_node(
                     &params,
                     app_id,
@@ -2058,19 +2189,31 @@ struct ChainApp {
 
 #[derive(Debug, PartialEq)]
 enum SyncStep {
-    RegisterApp { tee_url: String },
+    RegisterApp {
+        tee_url: String,
+    },
     /// The app's declaration becomes this deployment's code (single-node apps
     /// only); the app-level mount-file default is passed back unchanged.
-    UpdateAppCode { keep_volumes: Vec<u8> },
+    UpdateAppCode {
+        keep_volumes: Vec<u8>,
+    },
     ReplaceNode {
         old: ethers::types::Address,
         tee_url: String,
         compose_override: Vec<u8>,
         volumes_override: Vec<u8>,
     },
-    AddNode { tee_url: String, compose_override: Vec<u8>, volumes_override: Vec<u8> },
+    AddNode {
+        tee_url: String,
+        compose_override: Vec<u8>,
+        volumes_override: Vec<u8>,
+    },
     /// Same signer, record rewritten to what this node now runs.
-    RefreshNode { tee_url: String, compose_override: Vec<u8>, volumes_override: Vec<u8> },
+    RefreshNode {
+        tee_url: String,
+        compose_override: Vec<u8>,
+        volumes_override: Vec<u8>,
+    },
     /// Images differ from the app's list in a multi-node app. The registry keeps
     /// images per app only, so this node's cannot be recorded without changing
     /// every other node's declaration — reported, not written.
@@ -2096,7 +2239,9 @@ fn plan_chain_sync(
     app_id: &str,
 ) -> Result<Vec<SyncStep>, String> {
     let Some(chain) = chain else {
-        return Ok(vec![SyncStep::RegisterApp { tee_url: deployed.tee_url.clone()? }]);
+        return Ok(vec![SyncStep::RegisterApp {
+            tee_url: deployed.tee_url.clone()?,
+        }]);
     };
 
     enum Target<'a> {
@@ -2140,7 +2285,9 @@ fn plan_chain_sync(
     let mut app_compose = chain.app_compose.clone();
     let app_moves = single && code_differs;
     if app_moves {
-        steps.push(SyncStep::UpdateAppCode { keep_volumes: chain.app_volumes.clone() });
+        steps.push(SyncStep::UpdateAppCode {
+            keep_volumes: chain.app_volumes.clone(),
+        });
         app_compose = deployed.compose.clone();
     }
 
@@ -2190,7 +2337,12 @@ fn plan_chain_sync(
                 Some(recorded) => deployed.tee_url_over(recorded),
                 None => deployed.tee_url.clone()?,
             };
-            steps.push(SyncStep::ReplaceNode { old, tee_url, compose_override, volumes_override })
+            steps.push(SyncStep::ReplaceNode {
+                old,
+                tee_url,
+                compose_override,
+                volumes_override,
+            })
         }
         Target::Add => steps.push(SyncStep::AddNode {
             tee_url: deployed.tee_url.clone()?,
@@ -2225,7 +2377,12 @@ async fn stop_app(
         app_id: app_id.clone(),
     });
 
-    add_signature_metadata(&mut request, &private_key, "StopApp", &about(server, &format!("app {app_id}")))?;
+    add_signature_metadata(
+        &mut request,
+        &private_key,
+        "StopApp",
+        &about(server, &format!("app {app_id}")),
+    )?;
 
     let response = client.stop_app(request).await?;
     let result = response.into_inner();
@@ -2383,12 +2540,7 @@ fn print_trust_anchors(
     // KMS it takes keys from — and a wrong cluster there is silent: keys still arrive,
     // just from somewhere else.
     if a.kbs_node_urls.is_empty() {
-        println!(
-            "{}{:<w$}: none configured",
-            indent,
-            "kms",
-            w = label_width
-        );
+        println!("{}{:<w$}: none configured", indent, "kms", w = label_width);
     } else {
         println!(
             "{}{:<w$}: {}",
@@ -2402,8 +2554,7 @@ fn print_trust_anchors(
         }
         // Plaintext here means the node cannot check which KMS answered, whatever pin it
         // holds — there is no handshake to bind one to. Worth saying where it is read.
-        if a
-            .kbs_node_urls
+        if a.kbs_node_urls
             .iter()
             .any(|u| u.trim().to_ascii_lowercase().starts_with("http://"))
         {
@@ -2495,6 +2646,117 @@ fn material_label(material: &str) -> String {
 /// `unchecked` the keys taken while the node did not check the KMS against attestation, and
 /// `unrecorded` listed keys no event of the app names. Returns (warned, failed): a warning
 /// for unchecked keys, a failure for unrecorded ones.
+/// Show typed metadata without promoting unverified keys to an authenticated identity.
+fn print_typed_identity(
+    identity: &tapp_common::identity_verify::IdentityVerification,
+    unattested: Option<&str>,
+    indent: &str,
+    width: usize,
+) -> (bool, bool) {
+    if !identity.present {
+        return (false, false);
+    }
+    if let Some(error) = &identity.error {
+        println!(
+            "{}{:<width$}: ✗ invalid typed identity metadata: {}",
+            indent, "identities", error
+        );
+        return (false, true);
+    }
+    match unattested {
+        Some(reason) => println!(
+            "{}{:<width$}: ? metadata is NOT authenticated: {}",
+            indent, "identities", reason
+        ),
+        None => println!(
+            "{}{:<width$}: ✓ authenticated by this node's verified evidence",
+            indent, "identities"
+        ),
+    }
+    for key in &identity.identities {
+        println!(
+            "{}  role={} algorithm={} source={} derivation={}",
+            indent, key.role, key.algorithm, key.key_source, key.derivation
+        );
+        println!(
+            "{}    public_key={} encoding={}",
+            indent, key.public_key, key.public_key_encoding
+        );
+        if let Some(reference) = &key.key_ref {
+            println!(
+                "{}    key_ref: material={} scheme={} C={}",
+                indent, reference.material, reference.scheme, reference.commitment
+            );
+        }
+    }
+    for c in &identity.key_commitments {
+        println!(
+            "{}  commitment: material={} scheme={} C={}",
+            indent, c.material, c.scheme, c.commitment
+        );
+    }
+    if identity.unchecked > 0 {
+        println!(
+            "{}  ⚠️ {} commitment(s) lack a measured acquisition from an attested KMS connection",
+            indent, identity.unchecked
+        );
+    }
+    (identity.unchecked > 0 || unattested.is_some(), false)
+}
+
+/// Only callers whose node-level acceptance gate passed are compared. Local keys
+/// legitimately differ between nodes; shared KMS purposes must agree.
+fn typed_identity_conflicts<'a>(
+    accepted: impl IntoIterator<Item = &'a tapp_common::identity_verify::IdentityVerification>,
+) -> Vec<String> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let mut commitments: BTreeMap<(&str, &str), BTreeSet<&str>> = BTreeMap::new();
+    let mut roles: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
+    for metadata in accepted {
+        if !metadata.present || metadata.error.is_some() {
+            continue;
+        }
+        for c in &metadata.key_commitments {
+            commitments
+                .entry((&c.material, &c.scheme))
+                .or_default()
+                .insert(&c.commitment);
+        }
+        for id in &metadata.identities {
+            if id.key_source == "kms" {
+                roles
+                    .entry(&id.role)
+                    .or_default()
+                    .insert(serde_json::to_string(id).unwrap_or_default());
+            }
+        }
+    }
+    let mut conflicts = Vec::new();
+    for ((material, scheme), values) in commitments {
+        if values.len() > 1 {
+            conflicts.push(format!(
+                "material={material} scheme={scheme}: {} commitments disagree",
+                values.len()
+            ));
+        }
+    }
+    for (role, values) in roles {
+        if values.len() > 1 {
+            conflicts.push(format!(
+                "KMS role={role}: {} typed identities disagree",
+                values.len()
+            ));
+        }
+    }
+    conflicts
+}
+
+fn print_typed_identity_conflicts(conflicts: &[String]) {
+    for conflict in conflicts {
+        println!("  identities : ✗ {conflict}");
+    }
+}
+
 fn print_kms_keys(
     keys: &[tapp_common::report_data::KmsKey],
     logged_only: usize,
@@ -2624,7 +2886,10 @@ fn boot_chain_line(executables: Option<i64>, show: bool) -> Option<String> {
     }
     Some(match executables {
         Some(n) if n == EXECUTABLES_MATCHED => {
-            format!("boot-chain : ✓ (executables={}, matches policy reference)", n)
+            format!(
+                "boot-chain : ✓ (executables={}, matches policy reference)",
+                n
+            )
         }
         Some(n) => format!("boot-chain : ✗ (executables={}, no policy match)", n),
         None => "boot-chain : ? (policy set no executables claim)".to_string(),
@@ -2695,22 +2960,46 @@ async fn verify_app_cmd(
     };
     let refs = match &loaded {
         Ok(l) => {
-            println!("Reference values: {} — {} published image(s)\n", l.source, l.sets.len());
+            println!(
+                "Reference values: {} — {} published image(s)\n",
+                l.source,
+                l.sets.len()
+            );
             Some(l.sets.as_slice())
         }
         Err(e) => {
-            println!("Reference values: unavailable ({}) — the boot chain is NOT checked\n", e);
+            println!(
+                "Reference values: unavailable ({}) — the boot chain is NOT checked\n",
+                e
+            );
             None
         }
     };
 
     // Direct mode: no --contract → verify the single --server node without chain reconciliation.
     if contract.is_none() {
-        let d = tapp_common::verify::verify_node_direct(server, app_id, as_endpoint, as_pubkey, policy_ids, refs).await?;
-        println!("Verifying app: {}  (direct mode — no on-chain reconciliation)", app_id);
+        let d = tapp_common::verify::verify_node_direct(
+            server,
+            app_id,
+            as_endpoint,
+            as_pubkey,
+            policy_ids,
+            refs,
+        )
+        .await?;
+        println!(
+            "Verifying app: {}  (direct mode — no on-chain reconciliation)",
+            app_id
+        );
         println!("  server      : {}", d.server);
         println!("  signer      : {}  (attested in report_data)", d.signer);
         print_tls_binding(&d.tls_public_key, "  ", 12);
+        let (identity_warned, identity_failed) =
+            print_typed_identity(&d.identity, d.identity_unattested(), "  ", 12);
+        let identity_conflicts = typed_identity_conflicts(
+            std::iter::once(&d.identity).filter(|_| d.identity_attested()),
+        );
+        print_typed_identity_conflicts(&identity_conflicts);
         let (kms_unchecked, kms_unrecorded) = print_kms_keys(
             &d.kms_keys,
             d.kms_keys_logged_only.len(),
@@ -2730,7 +3019,10 @@ async fn verify_app_cmd(
         }
         print_boot_chain(&d.boot_chain, &d.boot_measurements, false, "  ", 12);
         if let Some(owner) = &d.claimed_owner {
-            println!("  owner       : {}  (from claim_config event; no chain comparison in direct mode)", owner);
+            println!(
+                "  owner       : {}  (from claim_config event; no chain comparison in direct mode)",
+                owner
+            );
         }
         print_trust_anchors(d.trust_anchors.as_ref(), "  ", 12);
         if !d.compose_hash.is_empty() {
@@ -2751,21 +3043,41 @@ async fn verify_app_cmd(
         print_kms_key_conflicts(&conflicts);
         let platform = d.platform();
         println!(
-            "\nBoot chain {} ; platform {}{}{}{}",
+            "\nBoot chain {} ; platform {}{}{}{}{}",
             boot_chain_summary([&d.boot_chain], false),
             platform_word(&platform),
-            if conflicts.is_empty() { "" } else { " ; kms keys disagree ❌" },
-            if kms_unchecked { " ; kms keys from an unchecked KMS ⚠️" } else { "" },
-            if as_pinned { "" } else { " ; AS unauthenticated ⚠️" }
+            if conflicts.is_empty() {
+                ""
+            } else {
+                " ; kms keys disagree ❌"
+            },
+            if kms_unchecked {
+                " ; kms keys from an unchecked KMS ⚠️"
+            } else {
+                ""
+            },
+            if as_pinned {
+                ""
+            } else {
+                " ; AS unauthenticated ⚠️"
+            },
+            if identity_conflicts.is_empty() {
+                ""
+            } else {
+                " ; typed identities disagree ❌"
+            }
         );
         println!("(direct mode shows what the node attests; register on-chain + use --contract to reconcile)");
-        let failed = !d.replay_ok
+        let failed = identity_failed
+            || !identity_conflicts.is_empty()
+            || !d.replay_ok
             || d.fresh == Some(false)
             || !conflicts.is_empty()
             || kms_unrecorded
             || matches!(d.boot_chain, refvalues::BootChain::Unknown { .. })
             || matches!(platform, tapp_common::verify::Platform::Fail(_));
-        let warned = !as_pinned
+        let warned = identity_warned
+            || !as_pinned
             || kms_unchecked
             || boot_chain_warns(&d.boot_chain)
             || matches!(platform, tapp_common::verify::Platform::Warn(_));
@@ -2773,28 +3085,46 @@ async fn verify_app_cmd(
     }
 
     // Chain mode.
-    let rpc_url = rpc_url.ok_or("chain mode requires --rpc-url (or omit --contract for direct mode)")?;
+    let rpc_url =
+        rpc_url.ok_or("chain mode requires --rpc-url (or omit --contract for direct mode)")?;
     let contract = contract.unwrap();
     let verdict = tapp_common::verify::verify_app(
-        &rpc_url, &contract, app_id, as_endpoint, as_pubkey, policy_ids, relay, refs,
+        &rpc_url,
+        &contract,
+        app_id,
+        as_endpoint,
+        as_pubkey,
+        policy_ids,
+        relay,
+        refs,
     )
     .await?;
     // On mainnet a dev image fails, as it does in the scan's verdict and so at the KMS.
-    let mainnet = tapp_common::onchain::chain_id(&rpc_url).await?
-        == tapp_common::onchain::MAINNET_CHAIN_ID;
+    let mainnet =
+        tapp_common::onchain::chain_id(&rpc_url).await? == tapp_common::onchain::MAINNET_CHAIN_ID;
 
     let yn = |b: bool| if b { "✓" } else { "✗" };
-    println!("Verifying app: {}  ({} node(s))", verdict.app_id, verdict.nodes.len());
+    println!(
+        "Verifying app: {}  ({} node(s))",
+        verdict.app_id,
+        verdict.nodes.len()
+    );
     let mut all_ok = true;
     let mut kms_unchecked = false;
+    let mut identity_warned = false;
     for n in &verdict.nodes {
         let reconciled = n.reconciled();
         all_ok &= reconciled;
         println!("\n  node {}", n.signer);
         println!("    teeUrl     : {}", n.tee_url);
         if let Some(r) = &n.relayed_by {
-            println!("    evidence   : the node did not answer here; relayed by {}", r);
-            println!("                 (transport only — everything below is checked here, and the");
+            println!(
+                "    evidence   : the node did not answer here; relayed by {}",
+                r
+            );
+            println!(
+                "                 (transport only — everything below is checked here, and the"
+            );
             println!("                 quote must echo the challenge sent for it)");
         }
         if !n.reachable {
@@ -2812,24 +3142,34 @@ async fn verify_app_cmd(
         }
         print_boot_chain(&n.boot_chain, &n.boot_measurements, mainnet, "    ", 11);
         let owner_str = match &n.owner_claim {
-            Some(Ok(_))  => "✓",
+            Some(Ok(_)) => "✓",
             Some(Err(_)) => "✗",
-            None         => "?",
+            None => "?",
         };
         println!(
             "    reconcile  : signer{} compose{} volumes{} image{} owner{}",
-            yn(n.signer_ok), yn(n.compose_ok), yn(n.volumes_ok), yn(n.image_ok), owner_str
+            yn(n.signer_ok),
+            yn(n.compose_ok),
+            yn(n.volumes_ok),
+            yn(n.image_ok),
+            owner_str
         );
         println!(
             "    fresh      : {}",
             match n.fresh {
                 Some(true) => "✓ the quote echoes the challenge sent for it",
-                Some(false) => "✗ the quote echoes a different challenge — not produced for this request",
-                None if n.relayed_by.is_some() => "✗ unproven (server predates challenges) — a relay could be replaying it",
+                Some(false) =>
+                    "✗ the quote echoes a different challenge — not produced for this request",
+                None if n.relayed_by.is_some() =>
+                    "✗ unproven (server predates challenges) — a relay could be replaying it",
                 None => "? unproven (server predates challenges)",
             }
         );
         print_tls_binding(&n.tls_public_key, "    ", 11);
+        let (warned, failed) =
+            print_typed_identity(&n.identity, n.identity_unattested(), "    ", 11);
+        identity_warned |= warned;
+        all_ok &= !failed;
         let (warned, failed) = print_kms_keys(
             &n.kms_keys,
             n.kms_keys_logged_only.len(),
@@ -2842,7 +3182,10 @@ async fn verify_app_cmd(
         kms_unchecked |= warned;
         all_ok &= !failed;
         if let Some(Err(claimed)) = &n.owner_claim {
-            println!("    owner      : ✗ claim_config says {} but on-chain owner differs", claimed);
+            println!(
+                "    owner      : ✗ claim_config says {} but on-chain owner differs",
+                claimed
+            );
             all_ok = false;
         } else if let Some(Ok(claimed)) = &n.owner_claim {
             println!("    owner      : ✓ {}", claimed);
@@ -2850,7 +3193,10 @@ async fn verify_app_cmd(
             println!("    owner      : ? no claim_config event in eventlog");
         }
         print_trust_anchors(n.trust_anchors.as_ref(), "    ", 11);
-        if n.trust_anchors.as_ref().is_some_and(|a| a.resumed_differently) {
+        if n.trust_anchors
+            .as_ref()
+            .is_some_and(|a| a.resumed_differently)
+        {
             all_ok = false;
         }
         if n.app_resumed_differently {
@@ -2873,36 +3219,74 @@ async fn verify_app_cmd(
     // fails the app, whichever node holds the odd one.
     let conflicts = verdict.kms_key_conflicts();
     print_kms_key_conflicts(&conflicts);
+    let identity_conflicts = typed_identity_conflicts(
+        verdict
+            .nodes
+            .iter()
+            .filter(|n| n.identity_attested())
+            .map(|n| &n.identity),
+    );
+    print_typed_identity_conflicts(&identity_conflicts);
+    all_ok &= identity_conflicts.is_empty();
     let reached: Vec<_> = verdict.nodes.iter().filter(|n| n.reachable).collect();
     let chains: Vec<_> = reached.iter().map(|n| &n.boot_chain).collect();
     let platforms: Vec<_> = reached.iter().map(|n| n.platform()).collect();
     let platform_summary = if platforms.is_empty() {
         "not checked (no node reached) ❌"
-    } else if platforms.iter().any(|p| matches!(p, tapp_common::verify::Platform::Fail(_))) {
+    } else if platforms
+        .iter()
+        .any(|p| matches!(p, tapp_common::verify::Platform::Fail(_)))
+    {
         "has failures ❌"
-    } else if platforms.iter().any(|p| matches!(p, tapp_common::verify::Platform::Warn(_))) {
+    } else if platforms
+        .iter()
+        .any(|p| matches!(p, tapp_common::verify::Platform::Warn(_)))
+    {
         "TCB advisories outstanding ⚠️"
     } else {
         "debug off, TCB up to date ✅"
     };
     println!(
         "\nResult: reconciliation {} ; boot chain {} ; platform {}{}{}{}",
-        if all_ok { "ALL PASS ✅" } else { "has failures ❌" },
+        if all_ok {
+            "ALL PASS ✅"
+        } else {
+            "has failures ❌"
+        },
         boot_chain_summary(chains.iter().copied(), mainnet),
         platform_summary,
-        if conflicts.is_empty() { "" } else { " ; kms keys disagree ❌" },
-        if kms_unchecked { " ; kms keys from an unchecked KMS ⚠️" } else { "" },
-        if as_pinned { "" } else { " ; AS unauthenticated ⚠️" }
+        if conflicts.is_empty() {
+            ""
+        } else {
+            " ; kms keys disagree ❌"
+        },
+        if kms_unchecked {
+            " ; kms keys from an unchecked KMS ⚠️"
+        } else {
+            ""
+        },
+        if as_pinned {
+            ""
+        } else {
+            " ; AS unauthenticated ⚠️"
+        }
     );
     let failed = !all_ok
         || !conflicts.is_empty()
-        || chains.iter().any(|c| matches!(c, refvalues::BootChain::Unknown { .. }))
+        || chains
+            .iter()
+            .any(|c| matches!(c, refvalues::BootChain::Unknown { .. }))
         || (mainnet && chains.iter().any(|c| is_dev(c)))
-        || platforms.iter().any(|p| matches!(p, tapp_common::verify::Platform::Fail(_)));
-    let warned = !as_pinned
+        || platforms
+            .iter()
+            .any(|p| matches!(p, tapp_common::verify::Platform::Fail(_)));
+    let warned = identity_warned
+        || !as_pinned
         || kms_unchecked
         || chains.iter().any(|c| boot_chain_warns(c))
-        || platforms.iter().any(|p| matches!(p, tapp_common::verify::Platform::Warn(_)));
+        || platforms
+            .iter()
+            .any(|p| matches!(p, tapp_common::verify::Platform::Warn(_)));
     std::process::exit(exit_status(failed, warned));
 }
 
@@ -2910,7 +3294,10 @@ async fn verify_app_cmd(
 /// TCB, and that the event log replays against the signed RTMRs.
 fn print_as_line(tcb_status: &str, advisories: usize, replay_ok: bool, indent: &str, width: usize) {
     if tcb_status == "-" {
-        println!("{}{:<width$}: ✗ no verdict from the AS (see note)", indent, "AS");
+        println!(
+            "{}{:<width$}: ✗ no verdict from the AS (see note)",
+            indent, "AS"
+        );
         return;
     }
     println!(
@@ -2919,7 +3306,11 @@ fn print_as_line(tcb_status: &str, advisories: usize, replay_ok: bool, indent: &
         "AS",
         tcb_status,
         advisories,
-        if replay_ok { "replays ✓" } else { "does NOT replay ✗" }
+        if replay_ok {
+            "replays ✓"
+        } else {
+            "does NOT replay ✗"
+        }
     );
 }
 
@@ -2929,7 +3320,10 @@ fn print_platform(p: &tapp_common::verify::Platform, indent: &str, width: usize)
     let label = format!("{}{:<width$}", indent, "platform");
     match p {
         Platform::Ok => println!("{}: ✓ debug off, TCB up to date", label),
-        Platform::Warn(w) => println!("{}: ⚠️ debug off, {} — an Intel advisory is outstanding", label, w),
+        Platform::Warn(w) => println!(
+            "{}: ⚠️ debug off, {} — an Intel advisory is outstanding",
+            label, w
+        ),
         Platform::Fail(f) => println!("{}: ✗ {}", label, f),
     }
 }
@@ -3013,7 +3407,10 @@ fn boot_chain_word(chain: &tapp_common::refvalues::BootChain, mainnet: bool) -> 
     use tapp_common::refvalues::BootChain;
     match chain {
         BootChain::Matched(image) if mainnet && is_dev(chain) => {
-            format!("✗ dev image {} (not accepted on mainnet)", image.trim_end_matches(".json"))
+            format!(
+                "✗ dev image {} (not accepted on mainnet)",
+                image.trim_end_matches(".json")
+            )
         }
         BootChain::Matched(image) if is_dev(chain) => {
             format!("⚠️ dev image {}", image.trim_end_matches(".json"))
@@ -3033,7 +3430,10 @@ fn boot_chain_summary<'a>(
     // "Matches a published image's boot-chain digests", deliberately not "runs a published
     // image": firmware (MRTD/RTMR0) is not compared, and an extra boot-services
     // application ahead of a published UKI would still match.
-    if chains.iter().any(|c| matches!(c, BootChain::Unknown { .. })) {
+    if chains
+        .iter()
+        .any(|c| matches!(c, BootChain::Unknown { .. }))
+    {
         "has nodes matching no published image ❌"
     } else if chains.is_empty() || chains.iter().any(|c| matches!(c, BootChain::NotChecked)) {
         "not checked ⚠️"
@@ -3115,7 +3515,12 @@ async fn get_app_container_status(
         app_id: app_id.clone(),
     });
 
-    add_signature_metadata(&mut request, &private_key, "GetAppContainerStatus", &about(server, &format!("app {app_id}")))?;
+    add_signature_metadata(
+        &mut request,
+        &private_key,
+        "GetAppContainerStatus",
+        &about(server, &format!("app {app_id}")),
+    )?;
 
     let response = client.get_app_container_status(request).await?;
     let result = response.into_inner();
@@ -3211,22 +3616,13 @@ async fn get_evidence(
     Ok(())
 }
 
-async fn get_app_key(
-    server: &str,
-    app_id: String,
-    x25519: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn get_app_key(server: &str, app_id: String) -> Result<(), Box<dyn std::error::Error>> {
     let mut client = create_client(server).await?;
 
-    // key_type is left empty: the server treats that as "ethereum", the only kind that
-    // exists. There used to be a --key-type flag here that was sent but ignored, so
-    // `--key-type rsa` printed "rsa" over ethereum key material.
     let request = Request::new(GetAppKeyRequest {
         app_id: app_id.clone(),
-        key_type: String::new(),
         additional_data: vec![],
         kbs_resource_uri: String::new(),
-        x25519,
     });
 
     let response = client.get_app_key(request).await?;
@@ -3244,13 +3640,6 @@ async fn get_app_key(
 
     if !result.eth_address.is_empty() {
         println!("  Ethereum Address: 0x{}", hex::encode(&result.eth_address));
-    }
-
-    if x25519 && !result.x25519_public_key.is_empty() {
-        println!(
-            "  X25519 Public Key: 0x{}",
-            hex::encode(&result.x25519_public_key)
-        );
     }
 
     Ok(())
@@ -3289,7 +3678,9 @@ async fn get_app_csr(
         // re-derived at every boot, so the certificate a CA issues stops matching the key
         // as soon as the node restarts, and renewing on every reboot runs into rate limits.
         println!("  ⚠️  A local key changes on every restart, so a CA-issued certificate for it");
-        println!("      is void after a reboot. Claim with --tls-key-source kms for one that lasts.");
+        println!(
+            "      is void after a reboot. Claim with --tls-key-source kms for one that lasts."
+        );
     }
     println!(
         "  The certificate this becomes will carry the key above — the same one the\n           attestation commits to, so pinning and the CA's name both hold."
@@ -3330,7 +3721,9 @@ async fn get_app_tls_cert(
     if result.key_source == "local" {
         println!("  Bound to this instance, and regenerated when it restarts — do not pin it.");
     } else {
-        println!("  Derived from KMS: stable across restarts and shared by every node of this app.");
+        println!(
+            "  Derived from KMS: stable across restarts and shared by every node of this app."
+        );
     }
     println!("  Issuer           : {}", result.issuer);
     if result.issuer == "self-signed" {
@@ -3370,21 +3763,18 @@ async fn get_app_secret_key(
     server: &str,
     app_id: String,
     json_output: bool,
-    x25519: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut client = create_client(server).await?;
 
     let request = Request::new(GetAppSecretKeyRequest {
         app_id: app_id.clone(),
-        key_type: "ethereum".to_string(),
-        x25519,
     });
 
     let response = match client.get_app_secret_key(request).await {
         Ok(resp) => resp,
         Err(e) if e.code() == tonic::Code::PermissionDenied => {
             eprintln!("✗ Permission denied: {}", e.message());
-            eprintln!("\nGetAppSecretKey can ONLY be called from localhost!");
+            eprintln!("\nGetAppSecretKey is served only on the tapp Unix socket.");
             eprintln!("Private keys will NEVER be sent over the network.");
             std::process::exit(1);
         }
@@ -3438,7 +3828,7 @@ async fn get_secret_resource(
         Ok(resp) => resp,
         Err(e) if e.code() == tonic::Code::PermissionDenied => {
             eprintln!("✗ Permission denied: {}", e.message());
-            eprintln!("\nGetSecretResource can ONLY be called from localhost!");
+            eprintln!("\nGetSecretResource is served only on the tapp Unix socket.");
             std::process::exit(1);
         }
         Err(e) => return Err(e.into()),
@@ -3454,12 +3844,10 @@ async fn get_secret_resource(
     println!("✓ Secret resource retrieved");
     println!("  App ID: {}", app_id);
     println!("  Secret (hex): 0x{}", hex::encode(&result.secret));
-    // The secret as a secp256k1 key, which the app's evidence now lists. A server before
-    // 0.11.0 sends neither.
-    if !result.eth_address.is_empty() {
-        println!("  Address: 0x{}", hex::encode(&result.eth_address));
-        println!("  Public key (compressed): 0x{}", hex::encode(&result.compressed_public_key));
-        println!("  (listed in this app's evidence for the rest of this boot, once its event is written)");
+    if !result.commitment.is_empty() {
+        println!("  Commitment scheme: {}", result.commitment_scheme);
+        println!("  Commitment: 0x{}", hex::encode(&result.commitment));
+        println!("  Recorded in evidence: {}", result.measured_in_evidence);
     }
 
     Ok(())
@@ -3480,7 +3868,12 @@ async fn start_service(
         pull_image: pull,
     });
 
-    add_signature_metadata(&mut request, &private_key, "StartService", &about(server, &format!("{service_name} of app {app_id}")))?;
+    add_signature_metadata(
+        &mut request,
+        &private_key,
+        "StartService",
+        &about(server, &format!("{service_name} of app {app_id}")),
+    )?;
 
     let response = client.start_service(request).await?;
     let result = response.into_inner();
@@ -3522,7 +3915,12 @@ async fn stop_service(
         service_name: service_name.clone(),
     });
 
-    add_signature_metadata(&mut request, &private_key, "StopService", &about(server, &format!("{service_name} of app {app_id}")))?;
+    add_signature_metadata(
+        &mut request,
+        &private_key,
+        "StopService",
+        &about(server, &format!("{service_name} of app {app_id}")),
+    )?;
 
     let response = client.stop_service(request).await?;
     let result = response.into_inner();
@@ -3564,7 +3962,12 @@ async fn update_trust_anchors(
         scan_url,
         scan_public_key,
     });
-    add_signature_metadata(&mut request, &private_key, "UpdateTrustAnchors", &about(server, ""))?;
+    add_signature_metadata(
+        &mut request,
+        &private_key,
+        "UpdateTrustAnchors",
+        &about(server, ""),
+    )?;
 
     let result = match client.update_trust_anchors(request).await {
         Ok(r) => r.into_inner(),
@@ -3654,7 +4057,12 @@ async fn claim_config(
         scan_url: scan_url.clone(),
         scan_public_key: scan_public_key.clone(),
     });
-    add_signature_metadata(&mut request, &private_key, "ClaimConfig", &about(server, ""))?;
+    add_signature_metadata(
+        &mut request,
+        &private_key,
+        "ClaimConfig",
+        &about(server, ""),
+    )?;
 
     let result = match client.claim_config(request).await {
         Ok(response) => response.into_inner(),
@@ -3728,7 +4136,12 @@ async fn add_to_whitelist(
         evm_address: address.clone(),
     });
 
-    add_signature_metadata(&mut request, &private_key, "AddToWhitelist", &about(server, address.trim()))?;
+    add_signature_metadata(
+        &mut request,
+        &private_key,
+        "AddToWhitelist",
+        &about(server, address.trim()),
+    )?;
 
     let response = client.add_to_whitelist(request).await?;
     let result = response.into_inner();
@@ -3755,7 +4168,12 @@ async fn remove_from_whitelist(
         evm_address: address.clone(),
     });
 
-    add_signature_metadata(&mut request, &private_key, "RemoveFromWhitelist", &about(server, address.trim()))?;
+    add_signature_metadata(
+        &mut request,
+        &private_key,
+        "RemoveFromWhitelist",
+        &about(server, address.trim()),
+    )?;
 
     let response = client.remove_from_whitelist(request).await?;
     let result = response.into_inner();
@@ -3779,7 +4197,12 @@ async fn list_whitelist(
 
     let mut request = Request::new(ListWhitelistRequest {});
 
-    add_signature_metadata(&mut request, &private_key, "ListWhitelist", &about(server, ""))?;
+    add_signature_metadata(
+        &mut request,
+        &private_key,
+        "ListWhitelist",
+        &about(server, ""),
+    )?;
 
     let response = client.list_whitelist(request).await?;
     let result = response.into_inner();
@@ -3816,7 +4239,12 @@ async fn docker_login(
         password,
     });
 
-    add_signature_metadata(&mut request, &private_key, "DockerLogin", &about(server, ""))?;
+    add_signature_metadata(
+        &mut request,
+        &private_key,
+        "DockerLogin",
+        &about(server, ""),
+    )?;
 
     let response = client.docker_login(request).await?;
     let result = response.into_inner();
@@ -3843,7 +4271,12 @@ async fn docker_logout(
         registry: registry.unwrap_or_default(),
     });
 
-    add_signature_metadata(&mut request, &private_key, "DockerLogout", &about(server, ""))?;
+    add_signature_metadata(
+        &mut request,
+        &private_key,
+        "DockerLogout",
+        &about(server, ""),
+    )?;
 
     let response = client.docker_logout(request).await?;
     let result = response.into_inner();
@@ -3870,7 +4303,12 @@ async fn prune_images(
 
     let mut request = Request::new(PruneImagesRequest { all });
 
-    add_signature_metadata(&mut request, &private_key, "PruneImages", &about(server, ""))?;
+    add_signature_metadata(
+        &mut request,
+        &private_key,
+        "PruneImages",
+        &about(server, ""),
+    )?;
 
     println!("Pruning Docker images... (this may take a while)");
 
@@ -4003,7 +4441,12 @@ async fn get_service_logs(
         download_full,
     });
 
-    add_signature_metadata(&mut request, &private_key, "GetServiceLogs", &about(server, ""))?;
+    add_signature_metadata(
+        &mut request,
+        &private_key,
+        "GetServiceLogs",
+        &about(server, ""),
+    )?;
 
     let response = client.get_service_logs(request).await?;
     let result = response.into_inner();
@@ -4046,7 +4489,12 @@ async fn withdraw_balance(
         "" => format!("app {app_id}"),
         to => format!("app {app_id} to {to}"),
     };
-    add_signature_metadata(&mut request, &private_key, "WithdrawBalance", &about(server, &label))?;
+    add_signature_metadata(
+        &mut request,
+        &private_key,
+        "WithdrawBalance",
+        &about(server, &label),
+    )?;
 
     let response = client.withdraw_balance(request).await?;
     let result = response.into_inner();
@@ -4142,10 +4590,8 @@ async fn fetch_signer_address(
     let key_resp = client
         .get_app_key(Request::new(GetAppKeyRequest {
             app_id: app_id.to_owned(),
-            key_type: "ethereum".to_string(),
             additional_data: vec![],
             kbs_resource_uri: String::new(),
-            x25519: false,
         }))
         .await?
         .into_inner();
@@ -4154,7 +4600,11 @@ async fn fetch_signer_address(
         return Err(format!("GetAppKey failed: {}", key_resp.message).into());
     }
     if key_resp.eth_address.len() != 20 {
-        return Err(format!("Unexpected eth_address length: {}", key_resp.eth_address.len()).into());
+        return Err(format!(
+            "Unexpected eth_address length: {}",
+            key_resp.eth_address.len()
+        )
+        .into());
     }
     Ok(ethers::types::Address::from_slice(&key_resp.eth_address))
 }
@@ -4194,8 +4644,16 @@ async fn node_override_hashes(
 ) -> Result<(Vec<u8>, Vec<u8>), Box<dyn std::error::Error>> {
     let (app_compose, app_volumes) =
         tapp_common::onchain::get_app_default_hashes(rpc_url, contract, app_id).await?;
-    let compose = if node_compose == app_compose { Vec::new() } else { node_compose };
-    let volumes = if node_volumes == app_volumes { Vec::new() } else { node_volumes };
+    let compose = if node_compose == app_compose {
+        Vec::new()
+    } else {
+        node_compose
+    };
+    let volumes = if node_volumes == app_volumes {
+        Vec::new()
+    } else {
+        node_volumes
+    };
     Ok((compose, volumes))
 }
 
@@ -4215,7 +4673,11 @@ async fn register_onchain(
     let (compose_hash, volumes_hash, image_hashes) = fetch_app_hashes(server, &app_id).await?;
     let signer_address = fetch_signer_address(server, &app_id).await?;
 
-    let params = OnchainParams { rpc_url, contract, private_key };
+    let params = OnchainParams {
+        rpc_url,
+        contract,
+        private_key,
+    };
     // compose/volumes become the app-level shared defaults; the first node inherits them.
     let tx = tapp_common::onchain::register_app(
         &params,
@@ -4251,8 +4713,19 @@ async fn update_onchain(
     // overrides are updated via update-node-onchain.
     let (compose_hash, volumes_hash, image_hashes) = fetch_app_hashes(server, &app_id).await?;
 
-    let params = OnchainParams { rpc_url, contract, private_key };
-    let tx = tapp_common::onchain::update_app(&params, &app_id, compose_hash, volumes_hash, image_hashes).await?;
+    let params = OnchainParams {
+        rpc_url,
+        contract,
+        private_key,
+    };
+    let tx = tapp_common::onchain::update_app(
+        &params,
+        &app_id,
+        compose_hash,
+        volumes_hash,
+        image_hashes,
+    )
+    .await?;
 
     println!("✓ App updated on-chain");
     println!("  App ID: {}", app_id);
@@ -4278,10 +4751,16 @@ async fn add_node_onchain(
     let (signer, tee_url) = if let Some(addr) = signer_arg {
         let parsed = Address::from_str(addr.trim_start_matches("0x"))
             .map_err(|_| format!("Invalid signer address: {}", addr))?;
-        (parsed, node_evidence_url(server, tee_url_arg.as_deref()).await?)
+        (
+            parsed,
+            node_evidence_url(server, tee_url_arg.as_deref()).await?,
+        )
     } else {
         let fetched = fetch_signer_address(server, &app_id).await?;
-        (fetched, node_evidence_url(server, tee_url_arg.as_deref()).await?)
+        (
+            fetched,
+            node_evidence_url(server, tee_url_arg.as_deref()).await?,
+        )
     };
     let tee_url = tee_url.0?;
 
@@ -4292,9 +4771,19 @@ async fn add_node_onchain(
     let (compose_hash, volumes_hash) =
         node_override_hashes(&rpc_url, &contract, &app_id, node_compose, node_volumes).await?;
 
-    let params = OnchainParams { rpc_url, contract, private_key };
+    let params = OnchainParams {
+        rpc_url,
+        contract,
+        private_key,
+    };
     let tx = tapp_common::onchain::add_node(
-        &params, &app_id, signer, &tee_url, compose_hash, volumes_hash, U256::from(stake_wei),
+        &params,
+        &app_id,
+        signer,
+        &tee_url,
+        compose_hash,
+        volumes_hash,
+        U256::from(stake_wei),
     )
     .await?;
 
@@ -4318,12 +4807,17 @@ async fn remove_node_onchain(
     use tapp_common::onchain::OnchainParams;
 
     let signer = if let Some(addr) = signer_address {
-        addr.trim_start_matches("0x").parse::<ethers::types::Address>()?
+        addr.trim_start_matches("0x")
+            .parse::<ethers::types::Address>()?
     } else {
         fetch_signer_address(server, &app_id).await?
     };
 
-    let params = OnchainParams { rpc_url, contract, private_key };
+    let params = OnchainParams {
+        rpc_url,
+        contract,
+        private_key,
+    };
     let tx = tapp_common::onchain::remove_node(&params, &app_id, signer).await?;
 
     println!("✓ Node removal initiated on-chain");
@@ -4434,14 +4928,19 @@ async fn update_node_onchain(
     let (new_signer, tee_url) = if let Some(addr) = new_signer_arg {
         let parsed = Address::from_str(addr.trim_start_matches("0x"))
             .map_err(|_| format!("Invalid new signer address: {}", addr))?;
-        (parsed, node_evidence_url(server, tee_url_arg.as_deref()).await?)
+        (
+            parsed,
+            node_evidence_url(server, tee_url_arg.as_deref()).await?,
+        )
     } else {
         let fetched = fetch_signer_address(server, &app_id).await?;
-        (fetched, node_evidence_url(server, tee_url_arg.as_deref()).await?)
+        (
+            fetched,
+            node_evidence_url(server, tee_url_arg.as_deref()).await?,
+        )
     };
     let (derived_tee_url, tls_listener) = tee_url;
     let explicit_tee_url = tee_url_arg.is_some();
-
 
     // `--server` names the node that is *taking over* — that is where the new signer is read
     // from. The one being replaced is dead by definition after a restart, so asking the same
@@ -4503,8 +5002,12 @@ async fn update_node_onchain(
     // refresh this node's compose/volumes from its server; store as a per-node override
     // only when it differs from the app-level default (else empty = inherit).
     let (node_compose, node_volumes, _image_hashes) = fetch_app_hashes(server, &app_id).await?;
-    if in_place && cur_url == tee_url && cur_compose == node_compose && cur_volumes == node_volumes {
-        println!("✓ Nothing to update: this node's record already matches (teeUrl {})", cur_url);
+    if in_place && cur_url == tee_url && cur_compose == node_compose && cur_volumes == node_volumes
+    {
+        println!(
+            "✓ Nothing to update: this node's record already matches (teeUrl {})",
+            cur_url
+        );
         return Ok(());
     }
     if cur_url != tee_url {
@@ -4513,9 +5016,19 @@ async fn update_node_onchain(
     let (compose_hash, volumes_hash) =
         node_override_hashes(&rpc_url, &contract, &app_id, node_compose, node_volumes).await?;
 
-    let params = OnchainParams { rpc_url, contract, private_key };
+    let params = OnchainParams {
+        rpc_url,
+        contract,
+        private_key,
+    };
     let tx = tapp_common::onchain::update_node(
-        &params, &app_id, old_signer_addr, new_signer, tee_url.clone(), compose_hash, volumes_hash,
+        &params,
+        &app_id,
+        old_signer_addr,
+        new_signer,
+        tee_url.clone(),
+        compose_hash,
+        volumes_hash,
     )
     .await?;
 
@@ -4536,7 +5049,11 @@ async fn withdraw_onchain(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use tapp_common::onchain::{self, OnchainParams};
 
-    let params = OnchainParams { rpc_url, contract, private_key };
+    let params = OnchainParams {
+        rpc_url,
+        contract,
+        private_key,
+    };
     let tx = onchain::withdraw(&params).await?;
 
     println!("✓ Stake withdrawn");
@@ -4559,7 +5076,11 @@ async fn authorize_invalidator_onchain(
     let invalidator_addr = Address::from_str(invalidator.trim_start_matches("0x"))
         .map_err(|_| format!("Invalid invalidator address: {}", invalidator))?;
 
-    let params = OnchainParams { rpc_url, contract, private_key };
+    let params = OnchainParams {
+        rpc_url,
+        contract,
+        private_key,
+    };
     let tx = onchain::authorize_invalidator(&params, &app_id, invalidator_addr).await?;
 
     println!("✓ Invalidator authorized");
@@ -4584,7 +5105,11 @@ async fn revoke_invalidator_onchain(
     let invalidator_addr = Address::from_str(invalidator.trim_start_matches("0x"))
         .map_err(|_| format!("Invalid invalidator address: {}", invalidator))?;
 
-    let params = OnchainParams { rpc_url, contract, private_key };
+    let params = OnchainParams {
+        rpc_url,
+        contract,
+        private_key,
+    };
     let tx = onchain::revoke_invalidator(&params, &app_id, invalidator_addr).await?;
 
     println!("✓ Invalidator revoked");
@@ -4639,10 +5164,17 @@ async fn transfer_app_ownership_onchain(
         .into());
     }
 
-    let params = OnchainParams { rpc_url, contract, private_key };
+    let params = OnchainParams {
+        rpc_url,
+        contract,
+        private_key,
+    };
     let tx = onchain::transfer_app_ownership(&params, &app_id, nominee).await?;
     if nominee == Address::zero() {
-        println!("✓ Nomination cancelled — 0x{:x} remains the owner of {}", me, app_id);
+        println!(
+            "✓ Nomination cancelled — 0x{:x} remains the owner of {}",
+            me, app_id
+        );
     } else {
         println!("✓ Nominated 0x{:x} as owner of {}", nominee, app_id);
         println!("  Owner (unchanged until accepted): 0x{:x}", me);
@@ -4675,7 +5207,11 @@ async fn accept_app_ownership_onchain(
     }
     let previous = onchain::get_app_owner(&rpc_url, &contract, &app_id).await?;
 
-    let params = OnchainParams { rpc_url, contract, private_key };
+    let params = OnchainParams {
+        rpc_url,
+        contract,
+        private_key,
+    };
     let tx = onchain::accept_app_ownership(&params, &app_id).await?;
     println!("✓ Ownership of {} transferred", app_id);
     println!("  Previous owner: 0x{:x}", previous);
@@ -4760,7 +5296,12 @@ fn add_signature_metadata<T: prost::Message>(
         loop {
             let timestamp = chrono::Utc::now().timestamp();
             let message = sign_message_for(request, method_name, timestamp, legacy);
-            match external_signer::request_signature(&address, &message, what.trim_end(), Some(timestamp + 600)) {
+            match external_signer::request_signature(
+                &address,
+                &message,
+                what.trim_end(),
+                Some(timestamp + 600),
+            ) {
                 Ok(sig) => return attach_signature(request, &hex::encode(sig), timestamp, legacy),
                 Err(e) if e.downcast_ref::<external_signer::Expired>().is_some() => {
                     eprintln!("  ✗ that signature came after its deadline; here is a new message for the same request");
@@ -4848,7 +5389,10 @@ mod tests {
     /// the node by its host.
     #[test]
     fn a_signature_request_names_the_app_and_the_node() {
-        assert_eq!(about("https://35.222.55.79:50052", "app my-app"), "app my-app on 35.222.55.79");
+        assert_eq!(
+            about("https://35.222.55.79:50052", "app my-app"),
+            "app my-app on 35.222.55.79"
+        );
         assert_eq!(about("http://127.0.0.1:50051", ""), "on 127.0.0.1");
         assert_eq!(about("/run/tapp/tapp.sock", ""), "on /run/tapp/tapp.sock");
     }
@@ -4870,7 +5414,9 @@ mod tests {
     /// one given, which is what claim-config and the on-chain commands compare against.
     #[test]
     fn an_external_signer_acts_as_the_address_given() {
-        let a: ethers::types::Address = "0x1E524e3a3Ef3Af6F62b2732015b216A8c6ce05cd".parse().unwrap();
+        let a: ethers::types::Address = "0x1E524e3a3Ef3Af6F62b2732015b216A8c6ce05cd"
+            .parse()
+            .unwrap();
         let value = tapp_common::external_signer::as_key_value(&a);
         assert_eq!(wallet_address(&value).unwrap(), a);
         // A key still derives its own address.
@@ -4919,7 +5465,10 @@ mod tests {
                 app_images: vec![img.to_vec()],
                 nodes: nodes.iter().map(|n| a(*n)).collect(),
                 this_node: None,
-                tee_urls: nodes.iter().map(|n| (a(*n), format!("https://n{}.example:50052", n))).collect(),
+                tee_urls: nodes
+                    .iter()
+                    .map(|n| (a(*n), format!("https://n{}.example:50052", n)))
+                    .collect(),
             }
         }
         fn with_this_node(mut chain: ChainApp, compose: &[u8], volumes: &[u8]) -> ChainApp {
@@ -4991,14 +5540,33 @@ mod tests {
             assert!(plan_chain_sync(Some(&chain), &d, a(1), None, false, "app").is_ok());
             // ... but a registration has nothing to keep, and says so.
             assert!(plan_chain_sync(None, &d, a(1), None, false, "app").is_err());
-            assert!(plan_chain_sync(Some(&app(b"c", b"v", b"img", &[7])), &d, a(1), None, true, "app").is_err());
+            assert!(plan_chain_sync(
+                Some(&app(b"c", b"v", b"img", &[7])),
+                &d,
+                a(1),
+                None,
+                true,
+                "app"
+            )
+            .is_err());
         }
 
         #[test]
         fn only_the_exact_legacy_form_is_migrated() {
-            assert_eq!(migrate_legacy_tee_url("http://34.1.2.3:50051").as_deref(), Some("https://34.1.2.3:50052"));
-            assert_eq!(migrate_legacy_tee_url("http://node.example:50051/").as_deref(), Some("https://node.example:50052"));
-            for kept in ["https://node.example:50052", "http://node.example:8080", "https://front.example", "http://node.example"] {
+            assert_eq!(
+                migrate_legacy_tee_url("http://34.1.2.3:50051").as_deref(),
+                Some("https://34.1.2.3:50052")
+            );
+            assert_eq!(
+                migrate_legacy_tee_url("http://node.example:50051/").as_deref(),
+                Some("https://node.example:50052")
+            );
+            for kept in [
+                "https://node.example:50052",
+                "http://node.example:8080",
+                "https://front.example",
+                "http://node.example",
+            ] {
                 assert_eq!(migrate_legacy_tee_url(kept), None, "{kept}");
             }
         }
@@ -5038,7 +5606,12 @@ mod tests {
 
         #[test]
         fn first_deploy_registers() {
-            assert_eq!(plan(None, &deployed(b"c", b"v", &[b"i"]), 1), vec![SyncStep::RegisterApp { tee_url: "https://me:50052".into() }]);
+            assert_eq!(
+                plan(None, &deployed(b"c", b"v", &[b"i"]), 1),
+                vec![SyncStep::RegisterApp {
+                    tee_url: "https://me:50052".into()
+                }]
+            );
         }
 
         #[test]
@@ -5046,7 +5619,12 @@ mod tests {
             let chain = app(b"c", b"v", b"i", &[7]);
             assert_eq!(
                 plan(Some(&chain), &deployed(b"c", b"v", &[b"i"]), 1),
-                vec![SyncStep::ReplaceNode { old: a(7), tee_url: "https://n7.example:50052".into(), compose_override: none(), volumes_override: none() }]
+                vec![SyncStep::ReplaceNode {
+                    old: a(7),
+                    tee_url: "https://n7.example:50052".into(),
+                    compose_override: none(),
+                    volumes_override: none()
+                }]
             );
         }
 
@@ -5063,7 +5641,12 @@ mod tests {
             let chain = existing(app(b"c1", b"v", b"i1", &[1]), b"c1", b"v");
             assert_eq!(
                 plan(Some(&chain), &deployed(b"c2", b"v", &[b"i2"]), 1),
-                vec![SyncStep::UpdateAppCode { keep_volumes: b"v".to_vec() }, refresh(b"", b"")]
+                vec![
+                    SyncStep::UpdateAppCode {
+                        keep_volumes: b"v".to_vec()
+                    },
+                    refresh(b"", b"")
+                ]
             );
         }
 
@@ -5072,7 +5655,12 @@ mod tests {
             let chain = existing(app(b"c", b"v", b"i1", &[1]), b"c", b"v");
             assert_eq!(
                 plan(Some(&chain), &deployed(b"c", b"v", &[b"i2"]), 1),
-                vec![SyncStep::UpdateAppCode { keep_volumes: b"v".to_vec() }, refresh(b"", b"")]
+                vec![
+                    SyncStep::UpdateAppCode {
+                        keep_volumes: b"v".to_vec()
+                    },
+                    refresh(b"", b"")
+                ]
             );
         }
 
@@ -5085,7 +5673,12 @@ mod tests {
             let chain = existing(app(b"c2", b"v", b"i", &[1]), b"c2", b"v");
             assert_eq!(
                 plan(Some(&chain), &deployed(b"c3", b"v", &[b"i"]), 1),
-                vec![SyncStep::UpdateAppCode { keep_volumes: b"v".to_vec() }, refresh(b"", b"")]
+                vec![
+                    SyncStep::UpdateAppCode {
+                        keep_volumes: b"v".to_vec()
+                    },
+                    refresh(b"", b"")
+                ]
             );
         }
 
@@ -5095,8 +5688,15 @@ mod tests {
             assert_eq!(
                 plan(Some(&chain), &deployed(b"c2", b"v", &[b"i"]), 1),
                 vec![
-                    SyncStep::UpdateAppCode { keep_volumes: b"v".to_vec() },
-                    SyncStep::ReplaceNode { old: a(7), tee_url: "https://n7.example:50052".into(), compose_override: none(), volumes_override: none() },
+                    SyncStep::UpdateAppCode {
+                        keep_volumes: b"v".to_vec()
+                    },
+                    SyncStep::ReplaceNode {
+                        old: a(7),
+                        tee_url: "https://n7.example:50052".into(),
+                        compose_override: none(),
+                        volumes_override: none()
+                    },
                 ]
             );
         }
@@ -5108,7 +5708,12 @@ mod tests {
             let chain = existing(app(b"c1", b"v", b"i", &[1]), b"pinned", b"v");
             assert_eq!(
                 plan(Some(&chain), &deployed(b"c2", b"v", &[b"i"]), 1),
-                vec![SyncStep::UpdateAppCode { keep_volumes: b"v".to_vec() }, refresh(b"", b"")]
+                vec![
+                    SyncStep::UpdateAppCode {
+                        keep_volumes: b"v".to_vec()
+                    },
+                    refresh(b"", b"")
+                ]
             );
         }
 
@@ -5185,12 +5790,22 @@ mod tests {
         fn replacing_a_node_of_several_with_new_code_records_it_on_the_new_node() {
             let chain = app(b"c1", b"v", b"i", &[7, 8]);
             let steps = plan_chain_sync(
-                Some(&chain), &deployed(b"c2", b"v", &[b"i"]), a(1), Some(a(7)), false, "app",
+                Some(&chain),
+                &deployed(b"c2", b"v", &[b"i"]),
+                a(1),
+                Some(a(7)),
+                false,
+                "app",
             )
             .unwrap();
             assert_eq!(
                 steps,
-                vec![SyncStep::ReplaceNode { old: a(7), tee_url: "https://n7.example:50052".into(), compose_override: b"c2".to_vec(), volumes_override: none() }]
+                vec![SyncStep::ReplaceNode {
+                    old: a(7),
+                    tee_url: "https://n7.example:50052".into(),
+                    compose_override: b"c2".to_vec(),
+                    volumes_override: none()
+                }]
             );
         }
 
@@ -5203,12 +5818,21 @@ mod tests {
         fn add_node_scales_out_and_never_moves_the_app_declaration() {
             let chain = app(b"c1", b"v", b"i", &[7]);
             let steps = plan_chain_sync(
-                Some(&chain), &deployed(b"c2", b"v", &[b"i"]), a(1), None, true, "app",
+                Some(&chain),
+                &deployed(b"c2", b"v", &[b"i"]),
+                a(1),
+                None,
+                true,
+                "app",
             )
             .unwrap();
             assert_eq!(
                 steps,
-                vec![SyncStep::AddNode { tee_url: "https://me:50052".into(), compose_override: b"c2".to_vec(), volumes_override: none() }]
+                vec![SyncStep::AddNode {
+                    tee_url: "https://me:50052".into(),
+                    compose_override: b"c2".to_vec(),
+                    volumes_override: none()
+                }]
             );
         }
 
@@ -5217,7 +5841,11 @@ mod tests {
             let chain = app(b"c", b"v", b"i", &[7, 8]);
             assert_eq!(
                 plan(Some(&chain), &deployed(b"c", b"v", &[b"i"]), 1),
-                vec![SyncStep::AddNode { tee_url: "https://me:50052".into(), compose_override: none(), volumes_override: none() }]
+                vec![SyncStep::AddNode {
+                    tee_url: "https://me:50052".into(),
+                    compose_override: none(),
+                    volumes_override: none()
+                }]
             );
         }
 
@@ -5225,7 +5853,12 @@ mod tests {
         fn an_old_signer_that_is_not_a_node_is_an_error() {
             let chain = app(b"c", b"v", b"i", &[7, 8]);
             assert!(plan_chain_sync(
-                Some(&chain), &deployed(b"c", b"v", &[b"i"]), a(1), Some(a(9)), false, "app",
+                Some(&chain),
+                &deployed(b"c", b"v", &[b"i"]),
+                a(1),
+                Some(a(9)),
+                false,
+                "app",
             )
             .is_err());
         }
@@ -5299,10 +5932,7 @@ mod tests {
     }
 
     fn make_compose(volumes: &[&str]) -> String {
-        let volume_lines: String = volumes
-            .iter()
-            .map(|v| format!("      - {}\n", v))
-            .collect();
+        let volume_lines: String = volumes.iter().map(|v| format!("      - {}\n", v)).collect();
         format!(
             "services:\n  app:\n    image: test\n    volumes:\n{}",
             volume_lines
@@ -5339,13 +5969,13 @@ mod tests {
     fn test_skip_named_volumes_and_absolute_paths() {
         let tmp = TempDir::new().unwrap();
         let compose_path = tmp.path().join("docker-compose.yaml");
-        let content = make_compose(&[
-            "myvolume:/data",
-            "/absolute/path:/etc/file",
-        ]);
+        let content = make_compose(&["myvolume:/data", "/absolute/path:/etc/file"]);
 
         let mounts = extract_volume_mounts(&compose_path, &content).unwrap();
-        assert!(mounts.is_empty(), "named volumes and absolute paths must be skipped");
+        assert!(
+            mounts.is_empty(),
+            "named volumes and absolute paths must be skipped"
+        );
     }
 }
 
@@ -5359,10 +5989,7 @@ mod replaced_node {
     }
 
     /// Inference, i.e. no --old-signer.
-    fn infer(
-        nodes: &[Address],
-        new_signer: Address,
-    ) -> Result<Option<Address>, String> {
+    fn infer(nodes: &[Address], new_signer: Address) -> Result<Option<Address>, String> {
         pick_replaced_node(nodes, new_signer, "app", None)
     }
 
@@ -5463,7 +6090,9 @@ mod exit_status_tests {
         assert!(boot_chain_summary([&dev], true).contains('❌'));
         assert!(boot_chain_summary([&dev], false).contains("⚠️"));
         assert!(boot_chain_word(&dev, true).starts_with('✗'));
-        assert!(!is_dev(&BootChain::Matched("uki/v0.8.0-r2/prod.json".to_string())));
+        assert!(!is_dev(&BootChain::Matched(
+            "uki/v0.8.0-r2/prod.json".to_string()
+        )));
     }
 }
 
@@ -5503,7 +6132,12 @@ mod evidence_url_tests {
             "https://front.example"
         );
         assert_eq!(
-            evidence_url_for("http://1.2.3.4:50051", Some("https://10.128.15.233:50052/"), Some("0.9.0")).unwrap(),
+            evidence_url_for(
+                "http://1.2.3.4:50051",
+                Some("https://10.128.15.233:50052/"),
+                Some("0.9.0")
+            )
+            .unwrap(),
             "https://10.128.15.233:50052"
         );
         assert!(evidence_url_for("http://1.2.3.4:50051", Some("10.0.0.1:50052"), None).is_err());
@@ -5511,9 +6145,21 @@ mod evidence_url_tests {
 
     #[test]
     fn a_server_reached_locally_needs_an_explicit_url() {
-        for local in ["http://127.0.0.1:50051", "https://localhost:50052", "/run/tapp/tapp.sock", "unix:///run/tapp/tapp.sock", "http://[::1]:50051"] {
-            assert!(evidence_url_for(local, None, Some("0.9.0")).is_err(), "{local}");
-            assert!(evidence_url_for(local, Some("https://node.example:50052"), None).is_ok(), "{local}");
+        for local in [
+            "http://127.0.0.1:50051",
+            "https://localhost:50052",
+            "/run/tapp/tapp.sock",
+            "unix:///run/tapp/tapp.sock",
+            "http://[::1]:50051",
+        ] {
+            assert!(
+                evidence_url_for(local, None, Some("0.9.0")).is_err(),
+                "{local}"
+            );
+            assert!(
+                evidence_url_for(local, Some("https://node.example:50052"), None).is_ok(),
+                "{local}"
+            );
         }
     }
 
@@ -5527,7 +6173,10 @@ mod evidence_url_tests {
         let local: Result<String, String> = Err("--server is reached locally".to_string());
 
         // This node answers: a restart. Kept, nothing to say.
-        assert_eq!(replacement_tee_url(kept.clone(), &derived, AtUrl::Signer(me), me), (Ok(kept.clone()), None));
+        assert_eq!(
+            replacement_tee_url(kept.clone(), &derived, AtUrl::Signer(me), me),
+            (Ok(kept.clone()), None)
+        );
 
         // Another signer, or an answer that is no signer: another machine. Derived, and said.
         for at in [AtUrl::Signer(other), AtUrl::NotThisNode] {
@@ -5535,13 +6184,18 @@ mod evidence_url_tests {
             assert_eq!(url, derived);
             assert!(note.unwrap().contains("another machine"), "{at:?}");
             // ...and with nothing to derive from, it refuses rather than keep the wrong URL.
-            assert!(replacement_tee_url(kept.clone(), &local, at, me).0.is_err(), "{at:?}");
+            assert!(
+                replacement_tee_url(kept.clone(), &local, at, me).0.is_err(),
+                "{at:?}"
+            );
         }
 
         // Nothing answers: kept, with the flag to pass if this is another machine.
         let (url, note) = replacement_tee_url(kept.clone(), &derived, AtUrl::NoAnswer, me);
         assert_eq!(url, Ok(kept.clone()));
-        assert!(note.unwrap().contains("--tee-url https://203.0.113.7:50052"));
+        assert!(note
+            .unwrap()
+            .contains("--tee-url https://203.0.113.7:50052"));
     }
 
     /// A replaced slot's URL that does not answer from here is kept: it may be private to the
@@ -5549,7 +6203,10 @@ mod evidence_url_tests {
     #[tokio::test]
     async fn a_replaced_url_that_does_not_answer_is_kept() {
         let kept = "https://127.0.0.1:1".to_string();
-        for derived in [Ok("https://203.0.113.7:50052".to_string()), Err("local --server".to_string())] {
+        for derived in [
+            Ok("https://203.0.113.7:50052".to_string()),
+            Err("local --server".to_string()),
+        ] {
             let got = tee_url_for_replacement(
                 kept.clone(),
                 &derived,
@@ -5560,5 +6217,72 @@ mod evidence_url_tests {
             .await;
             assert_eq!(got, Ok(kept.clone()));
         }
+    }
+}
+
+#[cfg(test)]
+mod typed_identity_tests {
+    use super::*;
+    use tapp_common::identity::{KeyIdentity, APP_SIGNER_MATERIAL};
+    use tapp_common::identity_verify::IdentityVerification;
+
+    fn metadata(secret: [u8; 32]) -> IdentityVerification {
+        let c = tapp_common::kms::commitment("fixture", APP_SIGNER_MATERIAL, &secret).unwrap();
+        IdentityVerification {
+            present: true,
+            identities: vec![KeyIdentity::app_signer(&secret, c.clone()).unwrap()],
+            key_commitments: vec![c],
+            ..Default::default()
+        }
+    }
+    #[test]
+    fn accepted_kms_identities_and_generic_commitments_must_agree() {
+        let a = metadata([1; 32]);
+        let b = metadata([2; 32]);
+        assert!(typed_identity_conflicts([&a, &a]).is_empty());
+        let conflicts = typed_identity_conflicts([&a, &b]);
+        assert!(conflicts.iter().any(|c| c.contains("commitments disagree")));
+        assert!(conflicts
+            .iter()
+            .any(|c| c.contains("typed identities disagree")));
+        let mut generic = a.clone();
+        generic.identities.clear();
+        let mut other = b;
+        other.identities.clear();
+        assert!(!typed_identity_conflicts([&generic, &other]).is_empty());
+    }
+    #[test]
+    fn local_tls_keys_may_differ_and_invalid_metadata_is_not_compared() {
+        let a = IdentityVerification {
+            present: true,
+            identities: vec![KeyIdentity::tls(&[1; 32], None).unwrap()],
+            ..Default::default()
+        };
+        let b = IdentityVerification {
+            present: true,
+            identities: vec![KeyIdentity::tls(&[2; 32], None).unwrap()],
+            ..Default::default()
+        };
+        assert!(typed_identity_conflicts([&a, &b]).is_empty());
+        let mut invalid = metadata([2; 32]);
+        invalid.error = Some("invalid metadata".into());
+        assert!(typed_identity_conflicts([&metadata([1; 32]), &invalid]).is_empty());
+    }
+    #[test]
+    fn metadata_errors_fail_and_untrusted_or_unchecked_claims_warn() {
+        let mut identity = metadata([1; 32]);
+        assert_eq!(print_typed_identity(&identity, None, "", 0), (false, false));
+        assert_eq!(
+            print_typed_identity(&identity, Some("not verified"), "", 0),
+            (true, false)
+        );
+        identity.unchecked = 1;
+        assert_eq!(print_typed_identity(&identity, None, "", 0), (true, false));
+        identity.error = Some("commitment mismatch".into());
+        assert_eq!(print_typed_identity(&identity, None, "", 0), (false, true));
+        assert_eq!(
+            print_typed_identity(&IdentityVerification::default(), None, "", 0),
+            (false, false)
+        );
     }
 }

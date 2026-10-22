@@ -128,7 +128,9 @@ fn writable_mounts_reaching(
             continue;
         };
         for vol in volumes {
-            let Some((source, read_only)) = bind_source(vol) else { continue };
+            let Some((source, read_only)) = bind_source(vol) else {
+                continue;
+            };
             if read_only || !source.starts_with('/') {
                 continue;
             }
@@ -146,7 +148,11 @@ fn writable_mounts_reaching(
 /// The host path a bind mount names and whether it is read-only, in either syntax.
 fn bind_source(vol: &serde_yaml::Value) -> Option<(&str, bool)> {
     if let Some(map) = vol.as_mapping() {
-        if map.get(serde_yaml::Value::from("type")).and_then(|t| t.as_str()) != Some("bind") {
+        if map
+            .get(serde_yaml::Value::from("type"))
+            .and_then(|t| t.as_str())
+            != Some("bind")
+        {
             return None;
         }
         let source = map.get(serde_yaml::Value::from("source"))?.as_str()?;
@@ -272,7 +278,11 @@ mod state_dir_tests {
 
     fn check(volume: &str) -> Vec<String> {
         let compose = format!("services:\n  app:\n    image: x\n    volumes:\n      - {volume}\n");
-        state_dir_exposures(&compose, Path::new("/run/tapp"), Some(Path::new("/run/tapp/tapp.sock")))
+        state_dir_exposures(
+            &compose,
+            Path::new("/run/tapp"),
+            Some(Path::new("/run/tapp/tapp.sock")),
+        )
     }
 
     /// The data disk is the apps' declared data only: an app cannot write there directly,
@@ -281,13 +291,25 @@ mod state_dir_tests {
     fn a_writable_mount_reaching_the_data_disk_is_refused() {
         let disk = Path::new("/var/lib/tapp/disk");
         let with = |volume: &str| {
-            let compose = format!("services:\n  app:\n    image: x\n    volumes:\n      - {volume}\n");
+            let compose =
+                format!("services:\n  app:\n    image: x\n    volumes:\n      - {volume}\n");
             data_disk_exposures(&compose, disk)
         };
-        for v in ["/var/lib/tapp/disk/logs:/logs", "/var/lib/tapp/disk:/disk", "/var/lib/tapp:/t", "/var/lib:/l", "/:/host"] {
+        for v in [
+            "/var/lib/tapp/disk/logs:/logs",
+            "/var/lib/tapp/disk:/disk",
+            "/var/lib/tapp:/t",
+            "/var/lib:/l",
+            "/:/host",
+        ] {
             assert_eq!(with(v).len(), 1, "{v}");
         }
-        for v in ["/var/lib/tapp/disk:/disk:ro", "./data:/data", "/data/kms:/var/lib/kms", "/var/lib/tapp/apps-x:/x"] {
+        for v in [
+            "/var/lib/tapp/disk:/disk:ro",
+            "./data:/data",
+            "/data/kms:/var/lib/kms",
+            "/var/lib/tapp/apps-x:/x",
+        ] {
             assert!(with(v).is_empty(), "{v}");
         }
     }
@@ -302,7 +324,14 @@ mod state_dir_tests {
 
     #[test]
     fn a_writable_mount_reaching_the_state_is_refused() {
-        for v in ["/run/tapp:/run/tapp", "/run/tapp/:/x", "/run:/host-run", "/:/host", "/run/tapp/claimed_owner:/o", "/run/tapp:/x:rw"] {
+        for v in [
+            "/run/tapp:/run/tapp",
+            "/run/tapp/:/x",
+            "/run:/host-run",
+            "/:/host",
+            "/run/tapp/claimed_owner:/o",
+            "/run/tapp:/x:rw",
+        ] {
             assert_eq!(check(v).len(), 1, "{v}");
         }
     }
@@ -310,7 +339,10 @@ mod state_dir_tests {
     #[test]
     fn long_syntax_is_checked_too() {
         let c = "services:\n  app:\n    image: x\n    volumes:\n      - type: bind\n        source: /run\n        target: /r\n";
-        assert_eq!(state_dir_exposures(c, Path::new("/run/tapp"), None).len(), 1);
+        assert_eq!(
+            state_dir_exposures(c, Path::new("/run/tapp"), None).len(),
+            1
+        );
         let ro = "services:\n  app:\n    image: x\n    volumes:\n      - type: bind\n        source: /run\n        target: /r\n        read_only: true\n";
         assert!(state_dir_exposures(ro, Path::new("/run/tapp"), None).is_empty());
     }
@@ -337,7 +369,10 @@ mod tests {
         let short = lint(
             "services:\n  db:\n    volumes:\n      - pgdata:/var/lib/postgresql/data\nvolumes:\n  pgdata:\n",
         );
-        assert!(short.is_empty(), "redirected volume must not be flagged: {short:?}");
+        assert!(
+            short.is_empty(),
+            "redirected volume must not be flagged: {short:?}"
+        );
 
         let long = lint(
             "services:\n  db:\n    volumes:\n      - type: volume\n        source: pgdata\n        target: /var/lib/postgresql/data\nvolumes:\n  pgdata:\n",
