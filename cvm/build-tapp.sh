@@ -20,7 +20,7 @@ TAPP_SERVER_URL="${TAPP_SERVER_URL:-https://github.com/0gfoundation/0g-tapp/rele
 BUILD_MODE="${BUILD_MODE:-canonical}"  # canonical (default): owner-agnostic image, one refval set for all owners.
                                        # custom: OWNER_ADDRESS baked in, per-owner initrd measurement + refval set.
 OWNER_ADDRESS="${OWNER_ADDRESS:-}"     # Required when BUILD_MODE=custom; ignored in canonical mode.
-KBS_URLS="${KBS_URLS:-}"             # REQUIRED: KBS node URLs for [kbs] node_urls, comma-separated and quoted, e.g. KBS_URLS='"http://host1:9091", "http://host2:9091"'
+KBS_URLS="${KBS_URLS:-}"             # custom mode only: KBS node URLs for [kbs] node_urls, comma-separated and quoted, e.g. KBS_URLS='"http://host1:9091", "http://host2:9091"'. Leave empty for canonical images (#169)
 DNS_FALLBACK="${DNS_FALLBACK:-8.8.8.8 8.8.4.4 1.1.1.1}"
 HARDEN="${HARDEN:-1}"                                   # 1=hardened (purge Tier1/2 + mask getty + replace netplan); 0=dev
 # Docker version pin. Current docker-ce (28+/29+) breaks Sysbox: Docker 28+ emits the Linux time
@@ -88,8 +88,8 @@ else
   OWNER_ADDRESS=""   # canonical mode never bakes an owner, even if accidentally set
   echo "Build mode: canonical (owner-agnostic, claim at runtime via ClaimConfig RPC)" >&2
 fi
-# KBS_URLS is optional in canonical mode (can be supplied at runtime via ClaimConfig --kbs-urls);
-# required in custom mode so the baked config is complete.
+# KBS_URLS belongs empty in canonical mode: one image serves every network, so the claimer
+# supplies it via ClaimConfig --kbs-urls (#169). Required in custom mode so the baked config is complete.
 # Normalize "empty-looking" values: a literal [] (someone meaning "none") would otherwise be
 # interpolated into node_urls = [$KBS_URLS] as the nested array [[]] — broken TOML semantics.
 [ "$KBS_URLS" = "[]" ] && KBS_URLS=""

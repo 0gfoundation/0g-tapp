@@ -159,9 +159,15 @@ tapp-cli -s <node> -k <owner-key> claim-config \
   --scan-url https://<verifier> --scan-pubkey 0x<sha256 of its TLS key>
 ```
 
-- **`--kbs-urls`** (or a baked `[kbs] node_urls` in the image): the cluster
-  members. List several — any `t` of them serve a request. CVM images usually
-  bake the production list, in which case claiming without `--kbs-urls` keeps it.
+- **`--kbs-urls`**: the cluster members, from [Deployed clusters](#deployed-clusters).
+  List several — any `t` of them serve a request. **Always pass it**: CVM images
+  bake no list, because one image serves both networks and a baked list would be
+  wrong for one of them. A node claimed without it has no KMS. Calls that need one
+  fail with `KMS not configured`, but an app in the default `encrypted` data mode
+  does **not** fail: it starts on a RAM directory instead, lost at every reboot,
+  and the warning goes only to the tapp-server log. `update-trust-anchors
+  --kbs-urls` adds the list later without a restart; an app already running on
+  RAM stays there until it is restarted.
 - **`--scan-url` / `--scan-pubkey`** — the trust anchors. KMS nodes serve
   attested self-signed TLS; the consumer verifies their identity through a
   verifier (tappscan) whose own key is pinned here. **Omitting this is the
@@ -190,8 +196,8 @@ source cannot consume itself:
    no opt-out.)
 2. **`--tls-key-source local`** in its claim — its serving key cannot come from
    itself; consumers pin the attested key via the verifier instead.
-3. Its own `[kbs]` config is irrelevant to it and a baked one should be ignored
-   or removed — the KBS URLs point at the very cluster it forms.
+3. **No `--kbs-urls`** in its claim — the KBS URLs would point at the very
+   cluster it forms.
 
 Cluster formation, membership changes, share recovery and the reasons
 `update-node-onchain` (never remove+add) is the only safe way to rotate a KMS
