@@ -63,6 +63,26 @@ Scan verifies a nonce-bound quote, and may reuse that observation within its
 60-second cooldown. Tapp also imposes a 300-second maximum. The returned deadline
 is the earlier limit; it is not a challenge issued by this application.
 
+KMS admission can observe a valid node before that app has acquired its TLS or
+app-signer keys. After publishing a new TLS/app-signer identity, tapp queues a
+best-effort `POST /api/verify` with `refresh: true`. Scan pulls its own new
+nonce-bound evidence; tapp does not upload evidence or declare verification
+complete. Ordinary generic secrets and signer cache hits do not trigger this.
+The queue merges pending hints per app/node, bounds both queues to 64 entries,
+uses one request at a time, and retries at most three times with a 95-second
+attempt timeout. Every attempt reads the current claimed Scan URL and pin.
+Returning an already measured key never waits for Scan or depends on its reply.
+
+An identity lookup that encounters a valid observation still missing app TLS
+requests one refresh before reporting it pending. Ready nodes can be returned
+while other current nodes remain pending; their registration epochs must still
+agree, and malformed evidence or transport failures are not treated as pending.
+A TLS-only app remains valid
+without an app signer; services requiring that signer must wait for it explicitly.
+If its publication hint fails, the 60-second Scan cache expiry allows another
+observation. Consumers should bound their readiness wait and start serving only
+after required identities and business authorization are ready.
+
 Scan must support `/api/health`, `/api/apps/{app_id}`, and `POST /api/verify`
 with the structured verification/status fields. Missing support, transport or
 pin failures, malformed or expired verdicts, and scope mismatches fail the RPC.

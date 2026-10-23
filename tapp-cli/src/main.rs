@@ -3009,6 +3009,11 @@ async fn verify_app_cmd(
             "  ",
             12,
         );
+        let kms_freshness_failed = d.fresh != Some(true)
+            && (!d.kms_keys.is_empty() || !d.kms_keys_logged_only.is_empty());
+        if kms_freshness_failed {
+            println!("  kms keys    : ✗ the quote does not prove this request's challenge");
+        }
         print_as_line(&d.tcb_status, d.advisories, d.replay_ok, "  ", 12);
         print_platform(&d.platform(), "  ", 12);
         if show_policy {
@@ -3074,6 +3079,7 @@ async fn verify_app_cmd(
             || d.fresh == Some(false)
             || !conflicts.is_empty()
             || kms_unrecorded
+            || kms_freshness_failed
             || matches!(d.boot_chain, refvalues::BootChain::Unknown { .. })
             || matches!(platform, tapp_common::verify::Platform::Fail(_));
         let warned = identity_warned

@@ -107,7 +107,7 @@ impl NodeVerdict {
 
     /// Why this node's KMS keys cannot be believed, or `None` when they can: the AS
     /// verified the quote, the quote names the registered signer and was made for this
-    /// request (through a relay, provably so), the event log replays, the platform passes,
+    /// request with a matching challenge, the event log replays, the platform passes,
     /// and the image is a published production one (or could not be checked). Everything
     /// but a dev image fails the node on its own; what such a node lists is neither shown
     /// as attested nor compared with the other nodes'.
@@ -121,7 +121,7 @@ impl NodeVerdict {
         if !self.signer_ok {
             return Some("the quote does not name this node's signer");
         }
-        if self.fresh == Some(false) || (self.relayed_by.is_some() && self.fresh != Some(true)) {
+        if self.fresh != Some(true) {
             return Some("the quote is not proven to be made for this request");
         }
         unattested_by(self.replay_ok, &self.platform(), &self.boot_chain)
@@ -1198,8 +1198,8 @@ impl DirectVerdict {
         if !self.quote_ok {
             return Some("the AS did not verify the quote");
         }
-        if self.fresh == Some(false) {
-            return Some("the quote was made for another request");
+        if self.fresh != Some(true) {
+            return Some("the quote is not proven to be made for this request");
         }
         unattested_by(self.replay_ok, &self.platform(), &self.boot_chain)
     }
@@ -1892,6 +1892,41 @@ mod tests {
         let a = read_report_data(&ev, &quote_with(&rd), b"chal", "");
         assert!(a.kms_keys.is_empty());
     }
+
+    #[test]
+    fn recovering_legacy_kms_keys_from_the_log_cannot_bypass_the_quote_challenge() {
+        let material = "70726f7669646572";
+        let mut runtime = crate::report_data::RuntimeData::new(&SIGNER, b"old").unwrap();
+        runtime.kms_keys = vec![key(material, 1)];
+        let (bytes, rd) = runtime.seal().unwrap();
+        let quote = quote_with(&rd);
+        let log = tcg_log(&[("get_secret_resource", &taken("a", material, 1, true))]);
+        for (evidence, challenge, accepted) in [
+            (serde_json::json!({}), b"new".as_slice(), false),
+            (serde_json::json!({"runtime_data":B64.encode(b"swapped")}), b"new".as_slice(), false),
+            (serde_json::json!({"runtime_data":B64.encode(&bytes)}), b"new".as_slice(), false),
+            (serde_json::json!({"runtime_data":B64.encode(&bytes)}), b"old".as_slice(), true),
+        ] {
+            let parsed = read_report_data(&evidence, &quote, challenge, "a");
+            let logged = kms_keys_from_log(&log, "a", &parsed.kms_keys).unwrap();
+            assert_eq!(parsed.kms_keys.len() + logged.logged_only.len(), 1);
+            // This isolates the freshness policy after successful AS/replay checks;
+            // quote_with is a parsing fixture, not a hardware-signed quote.
+            let verdict = DirectVerdict {
+                server: "https://node.example".into(), signer: parsed.signer,
+                tls_public_key: parsed.tls_public_key, identity: parsed.identity,
+                kms_keys: parsed.kms_keys, kms_keys_logged_only: logged.logged_only,
+                kms_keys_unchecked: logged.unchecked, kms_keys_unrecorded: logged.unrecorded,
+                quote_ok: true, fresh: parsed.fresh, ear_status: "affirming".into(),
+                tcb_status: "UpToDate".into(), advisories: 0, boot_executables: None,
+                boot_measurements: vec![], compose_hash: String::new(), images: vec![],
+                claimed_owner: None, trust_anchors: None, replay_ok: true,
+                boot_chain: crate::refvalues::BootChain::Matched("gcp/prod.json".into()),
+                td_debug: Some(false), note: parsed.note,
+            };
+            assert_eq!(verdict.kms_keys_attested(), accepted);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1962,6 +1997,15 @@ mod relay_tests {
     fn a_quote_made_for_another_request_never_passes() {
         assert!(!node(Some(false), false).reconciled());
         assert!(!node(Some(false), true).reconciled());
+    }
+
+    #[test]
+    fn legacy_node_diagnostics_do_not_authenticate_kms_keys_without_a_challenge() {
+        let legacy = node(None, false);
+        assert!(legacy.reconciled());
+        assert!(!legacy.kms_keys_attested());
+        assert!(node(Some(true), false).kms_keys_attested());
+        assert!(!node(Some(false), false).kms_keys_attested());
     }
 
     #[test]
