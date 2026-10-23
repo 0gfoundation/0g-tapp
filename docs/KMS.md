@@ -106,8 +106,9 @@ That makes the on-chain node list the entire authorization model:
   it for a while — and with attested admission on, so is the verifier it asks.
   tapp-server waits that out: a key request the KMS answers with "app not found
   on-chain", "not in on-chain signer list", "not registered on-chain per
-  verifier", "verifier unreachable", or the verifier's "DEBUG attribute is not
-  known … needs re-attesting" is retried for up to `[kbs.retry] onchain_wait_ms` (240s) before
+  verifier", "verifier unreachable", the exact `GetEvidence: Invalid app_id: App
+  <requested-id> not found` negative cached before StartApp, or the verifier's
+  "DEBUG attribute is not known … needs re-attesting" is retried for up to `[kbs.retry] onchain_wait_ms` (240s) before
   failing. So is the KMS's damped "(recently checked)" answer when it does not
   say why (older KMS builds), since it turns into the real answer within 30s; a
   damped answer that names a lasting reason fails at once. The KMS cannot tell

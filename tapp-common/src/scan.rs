@@ -99,12 +99,22 @@ struct VerifiedReply {
     node: Option<ResolvedNodeIdentity>,
     registered_at: u64,
     pending: bool,
+    declarations: Vec<VerifiedDeclaration>,
+}
+
+// A positive pending observation still makes authenticated claims. Keep them
+// for consistency checks without treating it as a service pin or lease source.
+struct VerifiedDeclaration {
+    app_signer: String,
+    identities: Vec<KeyIdentity>,
+    key_commitments: Vec<KeyCommitment>,
 }
 
 /// Resolve current app nodes through HTTPS authenticated by the configured scan
 /// SPKI pin. Redirects and environment proxies are disabled. Definitive negative
 /// or incomplete node verdicts can be omitted when another node is ready;
-/// transport, malformed responses and verifier faults
+/// verified declarations from incomplete nodes must still agree with all peers.
+/// Transport, malformed responses and verifier faults
 /// abort the whole resolution, even if another node verified successfully.
 pub async fn resolve_app_identity(
     scan_url: &str,
@@ -196,6 +206,7 @@ async fn resolve(client: &Client, base: &Url, scope: &Scope) -> Result<ResolvedA
         candidates.insert(signer);
     }
     let mut nodes = Vec::new();
+    let mut declarations = Vec::new();
     let mut identity_pending = false;
     let mut registered_at = None;
     let candidates: Vec<_> = candidates.into_iter().collect();
@@ -218,25 +229,41 @@ async fn resolve(client: &Client, base: &Url, scope: &Scope) -> Result<ResolvedA
                     let mut body = body;
                     body["refresh"] = Value::Bool(true);
                     let verdict = request(&client, Method::POST, url, Some(body), "node verification").await?;
-                    let refreshed = verify_reply(&verdict, &app_id, &signer, chain_id, &registry, now())?;
+                    let mut refreshed = verify_reply(&verdict, &app_id, &signer, chain_id, &registry, now())?;
                     if refreshed.registered_at != reply.registered_at {
                         return Err(ResolveError::ScopeChanged);
                     }
+                    // Refresh may complete or strip a pending schema, but it must
+                    // not erase an already verified declaration from this lookup.
+                    refreshed.declarations.extend(reply.declarations);
                     Ok(refreshed)
                 } else {
                     Ok(reply)
                 }
             });
         }
+        let mut first_error = None;
         while let Some(reply) = work.join_next().await {
-            let reply = reply.map_err(|_| ResolveError::UpstreamFault)??;
-            if registered_at.is_some_and(|epoch| epoch != reply.registered_at) {
-                return Err(ResolveError::ScopeChanged);
+            let reply = reply.map_err(|_| ResolveError::UpstreamFault).and_then(|reply| reply);
+            match reply {
+                Ok(reply) => {
+                    if registered_at.is_some_and(|epoch| epoch != reply.registered_at) {
+                        first_error.get_or_insert(ResolveError::ScopeChanged);
+                        continue;
+                    }
+                    registered_at = Some(reply.registered_at);
+                    identity_pending |= reply.pending;
+                    declarations.extend(reply.declarations);
+                    if let Some(node) = reply.node { nodes.push(node); }
+                }
+                Err(error) => { first_error.get_or_insert(error); }
             }
-            registered_at = Some(reply.registered_at);
-            identity_pending |= reply.pending;
-            if let Some(node) = reply.node { nodes.push(node); }
         }
+        // A 429 must still fail this lookup, but aborting its siblings would
+        // cancel the cold verifications Scan already accepted. Let this bounded
+        // batch publish before returning its first error; the outer deadline
+        // still bounds every lookup and no further batch is started on failure.
+        if let Some(error) = first_error { return Err(error); }
     }
     // A scan repointed to another registry while requests were in flight must
     // not combine the old candidates with the new verdicts into one identity.
@@ -250,6 +277,7 @@ async fn resolve(client: &Client, base: &Url, scope: &Scope) -> Result<ResolvedA
         if node.expires_at <= resolved_at { return Err(ResolveError::Stale("identity lease")); }
         node.expires_at = node.expires_at.min(resolved_at + ACCEPTANCE_TTL_SECS);
     }
+    check_consistency(&declarations)?;
     if nodes.is_empty() {
         return Err(if identity_pending {
             ResolveError::IdentityPending("no current node has a complete public identity yet")
@@ -257,11 +285,20 @@ async fn resolve(client: &Client, base: &Url, scope: &Scope) -> Result<ResolvedA
             ResolveError::NoVerifiedNodes
         });
     }
-    let app_signers: BTreeSet<_> = nodes.iter().filter(|n| !n.app_signer.is_empty()).map(|n| n.app_signer.as_str()).collect();
+    nodes.sort_by(|a, b| a.node_signer.cmp(&b.node_signer));
+    Ok(ResolvedAppIdentity {
+        chain_id: scope.chain_id, registry: scope.registry.clone(), app_id: scope.app_id.clone(),
+        scanned_to_block: after.scanned_to_block, resolved_at, nodes,
+        registered_at: registered_at.ok_or(ResolveError::NoVerifiedNodes)?,
+    })
+}
+
+fn check_consistency(declarations: &[VerifiedDeclaration]) -> Result<(), ResolveError> {
+    let app_signers: BTreeSet<_> = declarations.iter().filter(|n| !n.app_signer.is_empty()).map(|n| n.app_signer.as_str()).collect();
     if app_signers.len() > 1 { return Err(ResolveError::InvalidResponse("nodes disagree about app signer")); }
     let mut references = std::collections::BTreeMap::new();
     let mut kms_roles = std::collections::BTreeMap::new();
-    for node in &nodes {
+    for node in declarations {
         for reference in &node.key_commitments {
             let key = (&reference.material, &reference.scheme);
             if references.insert(key, &reference.commitment).is_some_and(|old| old != &reference.commitment) {
@@ -274,14 +311,7 @@ async fn resolve(client: &Client, base: &Url, scope: &Scope) -> Result<ResolvedA
             }
         }
     }
-    drop(references);
-    drop(kms_roles);
-    nodes.sort_by(|a, b| a.node_signer.cmp(&b.node_signer));
-    Ok(ResolvedAppIdentity {
-        chain_id: scope.chain_id, registry: scope.registry.clone(), app_id: scope.app_id.clone(),
-        scanned_to_block: after.scanned_to_block, resolved_at, nodes,
-        registered_at: registered_at.ok_or(ResolveError::NoVerifiedNodes)?,
-    })
+    Ok(())
 }
 
 async fn health(client: &Client, base: &Url, scope: &Scope) -> Result<Health, ResolveError> {
@@ -325,7 +355,7 @@ fn verify_reply(value: &Value, app_id: &str, signer: &str, chain_id: u64, regist
         if string(value, "reason")?.trim().is_empty() {
             return Err(ResolveError::InvalidResponse("negative verification has no reason"));
         }
-        return Ok(VerifiedReply { node: None, registered_at, pending: false });
+        return Ok(VerifiedReply { node: None, registered_at, pending: false, declarations: Vec::new() });
     }
     if !error.is_null() || !string(value, "reason")?.is_empty() {
         return Err(ResolveError::InvalidResponse("positive verification contains an error"));
@@ -381,7 +411,7 @@ fn verify_reply(value: &Value, app_id: &str, signer: &str, chain_id: u64, regist
             || attested.get("app_signer").is_some_and(|v| !v.is_null() && v.as_str() != Some("")) {
             return Err(ResolveError::InvalidResponse("unverified response contains typed metadata"));
         }
-        return Ok(VerifiedReply { node: None, registered_at, pending: true });
+        return Ok(VerifiedReply { node: None, registered_at, pending: true, declarations: Vec::new() });
     }
     if identities.is_empty() { return Err(ResolveError::InvalidResponse("empty typed identities")); }
     let pin = match attested.get("tls_public_key") {
@@ -427,14 +457,17 @@ fn verify_reply(value: &Value, app_id: &str, signer: &str, chain_id: u64, regist
     if attested.get("app_signer").and_then(Value::as_str).unwrap_or("") != app_signer {
         return Err(ResolveError::InvalidResponse("app signer summary mismatch"));
     }
+    let declaration = VerifiedDeclaration {
+        app_signer: app_signer.clone(), identities: identities.clone(), key_commitments: commitments.clone(),
+    };
     if !roles.contains("tls") {
         if pin.is_some() {
             return Err(ResolveError::InvalidResponse("TLS fingerprint has no typed identity"));
         }
-        return Ok(VerifiedReply { node: None, registered_at, pending: true });
+        return Ok(VerifiedReply { node: None, registered_at, pending: true, declarations: vec![declaration] });
     }
     let pin = pin.ok_or(ResolveError::InvalidResponse("app TLS SPKI hash missing"))?;
-    Ok(VerifiedReply { registered_at, pending: false, node: Some(ResolvedNodeIdentity {
+    Ok(VerifiedReply { registered_at, pending: false, declarations: vec![declaration], node: Some(ResolvedNodeIdentity {
         node_signer: signer.to_string(), tee_url: tee_url.to_string(), tls_spki_sha256: pin,
         checked_at, expires_at,
         tcb_status: tcb_status.to_string(), advisories, image_env: image_env.to_string(),
@@ -553,12 +586,14 @@ mod tests {
 
     fn verdict_for(signer: &str) -> Value {
         let mut body = verdict();
-        if signer == NODE2 {
+        if signer != NODE {
             use k256::elliptic_curve::sec1::ToEncodedPoint;
-            let mut scalar = [0u8; 32]; scalar[31] = 2;
-            let key = k256::SecretKey::from_slice(&scalar).unwrap();
-            let identity = KeyIdentity::node(key.public_key().to_encoded_point(true).as_bytes(), "app").unwrap();
-            assert_eq!(identity.ethereum_address().as_deref(), Some(NODE2));
+            let identity = (2..=5).find_map(|n| {
+                let mut scalar = [0u8; 32]; scalar[31] = n;
+                let key = k256::SecretKey::from_slice(&scalar).unwrap();
+                let identity = KeyIdentity::node(key.public_key().to_encoded_point(true).as_bytes(), "app").unwrap();
+                (identity.ethereum_address().as_deref() == Some(signer)).then_some(identity)
+            }).expect("known fixture signer");
             body["status"]["attested"]["identities"][0] = serde_json::to_value(identity).unwrap();
         }
         body["signer"] = json!(signer);
@@ -590,6 +625,32 @@ mod tests {
     }
 
     #[test]
+    fn a_verified_pending_declaration_is_checked_even_without_a_service_node() {
+        let ready = verify_reply(&verdict(), "app", NODE, 16602, REGISTRY, now()).unwrap();
+        let mut pending = verdict_for(NODE2);
+        pending["status"]["attested"]["identities"].as_array_mut().unwrap()
+            .retain(|identity| identity["role"] != "tls");
+        pending["status"]["attested"]["tls_public_key"] = Value::Null;
+        let reply = verify_reply(&pending, "app", NODE2, 16602, REGISTRY, now()).unwrap();
+        assert!(reply.pending && reply.node.is_none());
+        assert_eq!(reply.declarations.len(), 1);
+        let mut declarations = ready.declarations;
+        declarations.extend(reply.declarations);
+        check_consistency(&declarations).unwrap();
+
+        let commitment = json!(format!("0x{}", "02".repeat(32)));
+        pending["status"]["attested"]["identities"][1]["key_ref"]["commitment"] = commitment.clone();
+        pending["status"]["attested"]["key_commitments"][0]["commitment"] = commitment;
+        let reply = verify_reply(&pending, "app", NODE2, 16602, REGISTRY, now()).unwrap();
+        declarations.extend(reply.declarations);
+        assert!(matches!(check_consistency(&declarations),
+            Err(ResolveError::InvalidResponse("nodes disagree about KMS commitment"))));
+
+        pending["status"]["attested"]["fresh"] = Value::Null;
+        assert!(verify_reply(&pending, "app", NODE2, 16602, REGISTRY, now()).is_err());
+    }
+
+    #[test]
     fn url_prefix_and_app_id_are_encoded_as_segments() {
         let base = scan_base("https://scan.example/mainnet/").unwrap();
         assert_eq!(endpoint(&base,&["apps","a/b?c#d"]).as_str(),"https://scan.example/mainnet/api/apps/a%2Fb%3Fc%23d");
@@ -603,9 +664,42 @@ mod tests {
         url:String,
         pin:String,
         requests:Arc<std::sync::Mutex<Vec<Value>>>,
+        cold:Arc<ColdProgress>,
         task:tokio::task::JoinHandle<()>,
     }
     impl Drop for ScanServer { fn drop(&mut self) { self.task.abort(); } }
+
+    struct ColdProgress {
+        slots: Arc<tokio::sync::Semaphore>,
+        attempts: std::sync::atomic::AtomicUsize,
+        started: std::sync::atomic::AtomicUsize,
+        completed: std::sync::atomic::AtomicUsize,
+        cancelled: std::sync::atomic::AtomicUsize,
+        rejected: std::sync::atomic::AtomicUsize,
+        cached: std::sync::Mutex<BTreeSet<String>>,
+    }
+    impl Default for ColdProgress {
+        fn default() -> Self {
+            Self { slots:Arc::new(tokio::sync::Semaphore::new(4)), attempts:0.into(),
+                started:0.into(), completed:0.into(), cancelled:0.into(), rejected:0.into(),
+                cached:Default::default() }
+        }
+    }
+    struct ColdAttempt { progress:Arc<ColdProgress>, completed:bool }
+    impl Drop for ColdAttempt {
+        fn drop(&mut self) {
+            if !self.completed { self.progress.cancelled.fetch_add(1, std::sync::atomic::Ordering::SeqCst); }
+        }
+    }
+    fn cold_signers() -> Vec<String> {
+        use k256::elliptic_curve::sec1::ToEncodedPoint;
+        (1..=5).map(|n| {
+            let mut scalar=[0;32]; scalar[31]=n;
+            let key=k256::SecretKey::from_slice(&scalar).unwrap();
+            KeyIdentity::node(key.public_key().to_encoded_point(true).as_bytes(), "app").unwrap()
+                .ethereum_address().unwrap()
+        }).collect()
+    }
 
     async fn server(mode: &'static str) -> ScanServer {
         let _ = rustls::crypto::ring::default_provider().install_default();
@@ -619,11 +713,14 @@ mod tests {
         let url = format!("https://localhost:{}",listener.local_addr().unwrap().port());
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
         let received = requests.clone();
+        let cold = Arc::new(ColdProgress::default());
+        let progress = cold.clone();
         let task = tokio::spawn(async move {
             loop {
                 let (stream,_) = listener.accept().await.unwrap();
                 let acceptor = acceptor.clone();
                 let received = received.clone();
+                let progress = progress.clone();
                 tokio::spawn(async move {
                     let Ok(mut stream) = acceptor.accept(stream).await else { return };
                     let mut bytes = Vec::new();
@@ -651,25 +748,76 @@ mod tests {
                         (200,json!({"chain_id":if mode=="scope" {1} else {16602},"contract":REGISTRY,
                             "scanned_to_block":50,"refreshed_at":now()}),"")
                     } else if path.ends_with("/apps/app") {
-                        let signers = if mode.starts_with("multi_") { vec![NODE,NODE2] } else { vec![NODE] };
+                        let signers = if mode == "multi_cold_cap" { cold_signers() }
+                            else if mode.starts_with("multi_") { vec![NODE.into(),NODE2.into()] } else { vec![NODE.into()] };
                         (200,json!({"app_id":"app","current_signers":signers}),"")
                     } else {
                         let req: Value = serde_json::from_slice(&bytes[end..end+length]).unwrap();
                         assert_eq!(req["app_id"], "app");
                         let signer = req["signer"].as_str().unwrap();
-                        assert!(signer == NODE || (mode.starts_with("multi_") && signer == NODE2));
+                        assert!(mode == "multi_cold_cap" || signer == NODE || (mode.starts_with("multi_") && signer == NODE2));
                         received.lock().unwrap().push(req.clone());
+                        if mode == "multi_cold_cap" && !progress.cached.lock().unwrap().contains(signer) {
+                            use std::sync::atomic::Ordering::SeqCst;
+                            // Scan charges its 6/60s cold budget before trying its
+                            // four on-demand slots. These retries share one window.
+                            let permit = if progress.attempts.fetch_add(1, SeqCst) < 6 {
+                                progress.slots.clone().try_acquire_owned().ok()
+                            } else { None };
+                            let Some(_permit) = permit else {
+                                progress.rejected.fetch_add(1, SeqCst);
+                                let _ = stream.write_all(b"HTTP/1.1 429 Busy\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                                let _ = stream.shutdown().await;
+                                return;
+                            };
+                            progress.started.fetch_add(1, SeqCst);
+                            let mut attempt=ColdAttempt { progress:progress.clone(), completed:false };
+                            let mut probe=[0;1];
+                            tokio::select! {
+                                // Model a quote/AS operation whose request is
+                                // cancelled when the HTTPS peer disconnects.
+                                _ = stream.read(&mut probe) => return,
+                                _ = tokio::time::sleep(Duration::from_millis(200)) => {}
+                            }
+                            progress.cached.lock().unwrap().insert(signer.to_string());
+                            progress.completed.fetch_add(1, SeqCst);
+                            attempt.completed=true;
+                        }
                         let mut body = verdict_for(signer);
                         let pending = mode == "still_pending"
                             || (mode == "pending_tls" && req["refresh"] != true)
+                            || (mode == "pending_signer_changes" && req["refresh"] != true)
                             || mode == "multi_all_pending"
-                            || (mode.starts_with("multi_") && signer == NODE2);
+                            || (mode.starts_with("multi_") && mode != "multi_cold_cap" && signer == NODE2);
                         if pending {
                             body["status"]["attested"]["identities"].as_array_mut().unwrap()
                                 .retain(|identity| identity["role"] != "tls");
                             body["status"]["attested"]["tls_public_key"] = Value::Null;
                         }
+                        if (signer == NODE2 && mode == "multi_pending_signer_conflict")
+                            || (((signer == NODE2 && mode == "multi_pending_decl_disappears")
+                                || mode == "pending_signer_changes") && req["refresh"] != true) {
+                            let c = crate::kms::commitment("app", crate::identity::APP_SIGNER_MATERIAL, &[2;32]).unwrap();
+                            let id = KeyIdentity::app_signer(&[2;32], c.clone()).unwrap();
+                            body["status"]["attested"]["app_signer"] = json!(id.ethereum_address().unwrap());
+                            body["status"]["attested"]["identities"][1] = json!(id);
+                            body["status"]["attested"]["key_commitments"] = json!([c]);
+                        }
+                        if signer == NODE2 && mode == "multi_pending_commitment_conflict" {
+                            let commitment = json!(format!("0x{}", "02".repeat(32)));
+                            body["status"]["attested"]["identities"][1]["key_ref"]["commitment"] = commitment.clone();
+                            body["status"]["attested"]["key_commitments"][0]["commitment"] = commitment;
+                        }
+                        if signer == NODE2 && mode == "multi_pending_short_lease" {
+                            body["expires_at"] = json!(now()+10);
+                        }
                         if mode == "pending_metadata" && req["refresh"] != true {
+                            body["identities_verified"] = json!(false);
+                            body["status"]["attested"]["identities"] = json!([]);
+                            body["status"]["attested"]["key_commitments"] = json!([]);
+                            body["status"]["attested"]["app_signer"] = Value::Null;
+                        }
+                        if mode == "multi_pending_decl_disappears" && signer == NODE2 && req["refresh"] == true {
                             body["identities_verified"] = json!(false);
                             body["status"]["attested"]["identities"] = json!([]);
                             body["status"]["attested"]["key_commitments"] = json!([]);
@@ -703,7 +851,7 @@ mod tests {
                 });
             }
         });
-        ScanServer{url,pin,requests,task}
+        ScanServer{url,pin,requests,cold,task}
     }
 
     #[tokio::test]
@@ -770,6 +918,63 @@ mod tests {
         assert!(matches!(resolve_app_identity(&scan.url, &scan.pin, 16602, REGISTRY, "app").await,
             Err(ResolveError::IdentityPending(_))));
         assert_eq!(scan.requests.lock().unwrap().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn pending_verified_declarations_still_participate_in_cross_node_consistency() {
+        for (mode, problem) in [
+            ("multi_pending_signer_conflict", "nodes disagree about app signer"),
+            ("multi_pending_commitment_conflict", "nodes disagree about KMS commitment"),
+            ("multi_pending_decl_disappears", "nodes disagree about app signer"),
+        ] {
+            let scan = server(mode).await;
+            let result = resolve_app_identity(&scan.url, &scan.pin, 16602, REGISTRY, "app").await;
+            assert!(matches!(result, Err(ResolveError::InvalidResponse(error)) if error == problem),
+                "pending declaration was discarded: {mode}");
+            let requests = scan.requests.lock().unwrap();
+            assert_eq!(requests.iter().filter(|req| req["signer"] == NODE2).count(), 2);
+            assert_eq!(requests.iter().filter(|req| req["refresh"] == true).count(), 1);
+        }
+        let scan = server("pending_signer_changes").await;
+        assert!(matches!(resolve_app_identity(&scan.url, &scan.pin, 16602, REGISTRY, "app").await,
+            Err(ResolveError::InvalidResponse("nodes disagree about app signer"))), "refresh erased the first verified app signer");
+        assert_eq!(scan.requests.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn an_agreeing_pending_declaration_contributes_no_service_node_or_lease() {
+        let scan = server("multi_pending_short_lease").await;
+        let identity = resolve_app_identity(&scan.url, &scan.pin, 16602, REGISTRY, "app").await.unwrap();
+        assert_eq!(identity.nodes.len(), 1);
+        assert_eq!(identity.nodes[0].node_signer, NODE);
+        assert_eq!(identity.nodes[0].app_signer, NODE);
+        assert_eq!(identity.nodes[0].tls_spki_sha256,
+            verdict()["status"]["attested"]["tls_public_key"].as_str().unwrap().trim_start_matches("0x"));
+        assert!(identity.nodes[0].expires_at > identity.resolved_at+30);
+        let requests = scan.requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests.iter().filter(|req| req["refresh"] == true).count(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_cold_capacity_error_drains_accepted_work_before_failing_and_retry_can_progress() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let scan = server("multi_cold_cap").await;
+        assert!(matches!(resolve_app_identity(&scan.url, &scan.pin, 16602, REGISTRY, "app").await,
+            Err(ResolveError::HttpStatus { status:429, .. })), "a rate limit must not produce a descriptor");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while scan.cold.completed.load(SeqCst)+scan.cold.cancelled.load(SeqCst) < scan.cold.started.load(SeqCst) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }).await.unwrap();
+        assert_eq!(scan.cold.started.load(SeqCst), 4);
+        assert_eq!(scan.cold.rejected.load(SeqCst), 1);
+        assert_eq!(scan.cold.cancelled.load(SeqCst), 0, "one 429 cancelled every accepted cold verification");
+        assert_eq!(scan.cold.completed.load(SeqCst), 4);
+        let identity = resolve_app_identity(&scan.url, &scan.pin, 16602, REGISTRY, "app").await.unwrap();
+        assert_eq!(identity.nodes.len(), 5);
+        assert_eq!(scan.cold.started.load(SeqCst), 5);
+        assert_eq!(scan.cold.completed.load(SeqCst), 5);
     }
 
     #[tokio::test]

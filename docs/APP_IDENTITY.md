@@ -75,8 +75,10 @@ Returning an already measured key never waits for Scan or depends on its reply.
 
 An identity lookup that encounters a valid observation still missing app TLS
 requests one refresh before reporting it pending. Ready nodes can be returned
-while other current nodes remain pending; their registration epochs must still
-agree, and malformed evidence or transport failures are not treated as pending.
+while other current nodes remain pending; their registration epochs and all
+verified app-signer/KMS declarations must still agree, including declarations
+seen before the refresh. Pending observations supply no service pin or lease.
+Malformed evidence or transport failures are not treated as pending.
 A TLS-only app remains valid
 without an app signer; services requiring that signer must wait for it explicitly.
 If its publication hint fails, the 60-second Scan cache expiry allows another
@@ -89,6 +91,10 @@ pin failures, malformed or expired verdicts, and scope mismatches fail the RPC.
 There is no fallback to `/cert`, an unpinned client, or a configured default
 Scan. A definite negative verdict can exclude one node; an upstream verification
 outage fails the lookup rather than being disguised as a negative result.
+When a batch receives an error such as HTTP 429, its already started verifications
+finish before the lookup reports the first error. This lets Scan publish accepted
+cold work for a later retry; no descriptor is returned and no later batch starts.
+The resolver's 120-second total deadline still bounds that wait.
 
 ## Typed identities and extension boundary
 
