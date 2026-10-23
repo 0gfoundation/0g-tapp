@@ -625,7 +625,8 @@ tapp-cli -s https://<node>:50052 --tls-pin 0x<pin> \
   --external-signer 0x<owner address> start-app -f docker-compose.yml -a my-app
 ```
 
-(or set `TAPP_EXTERNAL_SIGNER`). Every command that would sign then stops and asks:
+(or set `TAPP_EXTERNAL_SIGNER`). Every command that would sign then stops and asks, unless
+`--ledger` or `--fordefi` (below) has the device or the vault asked instead:
 
 - **a request signature**: the CLI prints the one line of text above (`<Method>:0x<hash>:<ts>`).
   Sign it as a *message* (`personal_sign`), for example in Fordefi's message signing, and
@@ -639,7 +640,17 @@ tapp-cli -s https://<node>:50052 --tls-pin 0x<pin> \
 
 So multi-step commands such as `start-app --register-onchain` run to the end, with one
 prompt per signature and per transaction. The signer sees a hash, not the compose: what it
-approves is "this exact request", and the request is what this CLI run built.
+approves is "this exact request", and the request is what this CLI run built. Each prompt
+names what the request is for: the method, the app and the node (`StartApp app my-app on
+203.0.113.7`), or for a transaction the registry function and the app.
+
+`start-app --register-onchain` asks for the StartApp before the last registry transaction, not
+after it, and sends it the moment that transaction is mined. A StartApp that arrived minutes
+later could find that the scan had already looked for the app on the node, found nothing, and
+kept that answer for about a minute, during which the KMS refuses the app its volume key. If
+the StartApp's signature runs out of time while the transaction waits, it is asked for again
+after the transaction. Should the start still fail with `GetEvidence: … App … not found`, run
+`start-app` again without `--register-onchain` after a minute.
 
 #### With a Ledger: `--ledger`
 
@@ -664,6 +675,114 @@ Ledger support is built in on **macOS**, through the system's own USB (IOKit) wi
 else to install: install Rust and protobuf (`brew install protobuf`), then `cargo build
 --release -p tapp-cli`. The release binaries are built for Linux without it. On Linux, build
 with `--features ledger` (libusb; non-root access needs Ledger's udev rules).
+
+#### With Fordefi: `--fordefi`
+
+Add `--fordefi` (tapp-cli ≥ 0.11.0) and tapp-cli asks a Fordefi vault for each signature instead of prompting.
+It goes through the [0g-fordefi-signer](https://github.com/0gfoundation/0g-fordefi-signer)
+service:
+
+```bash
+export FORDEFI_SIGNER_URL=https://<the service>
+export FORDEFI_SIGNER_TOKEN=<this caller's token for it>
+tapp-cli --external-signer 0x<the vault address> --fordefi start-app -f docker-compose.yml -a my-app ...
+```
+
+The Fordefi API user's credentials (its access token and P-256 key) stay with the service.
+This machine holds only a token that names it to the service, which the service's operator can
+revoke on its own. `FORDEFI_SIGNER_URL` must be `https://`, with a certificate from a public CA
+(tapp-cli trusts no other). Plain `http://` is taken only to this machine, for example through an
+SSH tunnel, and never through a proxy, since the token travels on every call.
+
+What has to exist:
+
+- **The service**, with an entry for this caller in its policy file (see the service's README).
+  The service's operator makes the token with `python auth.py <name>`.
+
+  ```json
+  "tapp": {
+    "token_sha256": "<sha256 of this caller's token>",
+    "contracts": ["16661:0x54874F536301c993922Dd95097e3902e7FBfe612",
+                  "16602:0x2Ce80374318B1d7Fb3345724457a182E0ad165c9"],
+    "functions": ["registerApp(string,bytes,bytes,bytes[],address,string)",
+                  "updateApp(string,bytes,bytes,bytes[])",
+                  "addNode(string,address,string,bytes,bytes)",
+                  "updateNode(string,address,address,string,bytes,bytes)",
+                  "removeNode(string,address)", "withdraw()",
+                  "authorizeInvalidator(string,address)", "revokeInvalidator(string,address)",
+                  "acceptAppOwnership(string)"],
+    "max_value": "100000000000000000000",
+    "messages": "[A-Z][A-Za-z]+:0x[0-9a-f]{64}:[0-9]{10}"
+  }
+  ```
+
+  - `contracts`: the TappRegistry on each chain used. A call to any other contract is refused.
+  - `functions`: the registry functions tapp-cli calls, and none of the registry's admin ones.
+    `transferAppOwnership(string,address)` is left out: it hands an app, and the stake later
+    locked under it, to another address, so with it a token could move the vault's coin out a
+    call at a time. Add it only if this caller is to run `transfer-app-ownership`, and have
+    Fordefi's policy require an approver for it.
+  - `max_value`: the most stake one call may carry, in wei (here 100 OG). Without it, no stake
+    can be sent, so `registerApp` and `addNode` are refused.
+  - `max_fee` (not set here): the most gas × gas price one call may cost, default 0.1 OG.
+  - `messages`: tapp's request signatures. Without it, none can be signed. `--legacy-sign`
+    (tapp-server < 0.9.0) signs `Method:timestamp` and needs `(:0x[0-9a-f]{64})?` in place of
+    `:0x[0-9a-f]{64}`, which also admits that older, weaker form for any node.
+- **On Fordefi's side:**
+  - The service's API user.
+  - The organisation's **API Signer**, running and activated, with that API user's public key
+    registered.
+  - Fordefi's MPC is 2-of-2: one share is Fordefi's, the other is held by the API Signer.
+    Fordefi takes part once its **policy** has approved the request.
+- **The chain.** 0G mainnet is built into Fordefi. Any other chain, such as the Galileo testnet,
+  must first be added to the organisation as a custom chain (Settings > Chains > Add EVM chain).
+- **Funds.** The vault is the sender. It pays the gas of every call, and the stake of
+  `registerApp` and `addNode`, on each chain used. The stake must be at least the registry's
+  `minStakeAmount()`: 0.1 OG on mainnet and 1 OG on testnet as of October 2026.
+
+What tapp-cli does:
+
+- **A request signature** is a personal_sign request. Approvers see it noted
+  `0g-fordefi-signer: <caller>: tapp-cli: <Method> app <app> on <node>` (no app for a request
+  about the node).
+  - The CLI follows its state: `waiting for approval` is the policy; `approved` means the API
+    Signer has not signed yet.
+  - It goes on once the signature recovers to the given address.
+  - Approvers have until the server's ±10-minute window closes. After that the request is
+    aborted and a new one is made for the same request, every 10 minutes until one is signed
+    or the command is stopped.
+- **An on-chain call** is estimated here and signed without being broadcast, with the gas, the
+  gas price and the account's next nonce set here. Approvers see it noted with the registry
+  function and the app: `0g-fordefi-signer: <caller>: tapp-cli: addNode(string,address,string,bytes,bytes) app <app>`.
+  - tapp-cli checks the signed transaction: signer, chain, contract, data, value, gas, gas
+    price, and that its nonce is still the account's next.
+  - Fordefi may raise the gas limit: it added a quarter to one its simulation found within a
+    few percent of the gas used. Up to half as much again as the limit asked is taken, and the
+    output says so. It costs a little more: 0G charges at least 80% of a transaction's limit.
+  - It then broadcasts it, waits for it to be mined and checks it again: the same path as a
+    Ledger's.
+  - A call not signed within 30 minutes is aborted.
+- **Stopping the command** (Ctrl-C) leaves its Fordefi request open. Reject it in Fordefi, or it
+  can still be approved. The same holds when asking for a signature gets no answer or a server
+  error: Fordefi may have made the request anyway, and the error says which note to look for.
+
+Neither the service nor Fordefi is trusted for what comes back. A signature from another vault,
+or a transaction that differs from the one asked for in any of the fields above, stops the
+command before anything is sent. Such a transaction is still signed, though: whoever holds it
+can send it until the vault's next transaction uses its nonce. The error says when that nonce
+is already used and the transaction can no longer be sent.
+
+Fordefi keeps that transaction waiting to be pushed, and simulates the vault's later
+transactions as if it had been sent. Asking again for the same call can then fail in Fordefi's
+simulation: a second `removeNode` of an app's last node fails with `not app owner`, because the
+first one unregistered the app. When the transaction is the one wanted, send it instead:
+Fordefi's `POST /api/v1/transactions/<id>/push`, or broadcast its raw transaction.
+
+Whoever holds a token can have the vault sign whatever that caller's entry and Fordefi's policy
+let through. Within its entry, that is the owner's authority over the vault's apps: starting,
+stopping and registering them, and, if the entry lists `transferAppOwnership` (the one above does
+not), handing them to another address. So keep tokens off shared machines, and give the API user
+a policy that requires approval for anything it should not sign alone.
 
 ## On-chain Registration
 

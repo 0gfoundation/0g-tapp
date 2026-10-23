@@ -234,12 +234,21 @@ const WRITE_CALLS: &[&str] = &[
     "acceptAppOwnership(string)",
 ];
 
+/// The registry function a call makes and, when its first argument is the app id, the app:
+/// `removeNode(string,address) app my-app`. Shown to whoever signs it, as the calldata is not
+/// readable by eye.
 fn call_name(data: &[u8]) -> String {
-    WRITE_CALLS
-        .iter()
-        .find(|sig| data.len() >= 4 && data[..4] == selector(sig))
-        .map(|sig| sig.to_string())
-        .unwrap_or_else(|| "a registry call".to_string())
+    let Some(sig) = WRITE_CALLS.iter().find(|sig| data.len() >= 4 && data[..4] == selector(sig)) else {
+        return "a registry call".to_string();
+    };
+    if sig.contains("(string") {
+        if let Ok(tokens) = decode(&[ParamType::String], &data[4..]) {
+            if let Some(Token::String(app_id)) = tokens.into_iter().next() {
+                return format!("{sig} app {app_id}");
+            }
+        }
+    }
+    sig.to_string()
 }
 
 async fn send_tx(
@@ -601,6 +610,10 @@ mod external_signer_tests {
             }
         }
         assert!(seen > 10, "found only {seen} calls; the scan is broken");
+        let remove = calldata("removeNode(string,address)", vec![Token::String("my-app".into()), Token::Address(Address::zero())]);
+        assert_eq!(call_name(&remove), "removeNode(string,address) app my-app");
+        assert_eq!(call_name(&calldata("withdraw()", vec![])), "withdraw()");
+        // Only the selector: the app cannot be read, the function still is.
         assert_eq!(call_name(&selector("updateNode(string,address,address,string,bytes,bytes)")), "updateNode(string,address,address,string,bytes,bytes)");
         assert_eq!(call_name(&[0, 1, 2, 3]), "a registry call");
     }
