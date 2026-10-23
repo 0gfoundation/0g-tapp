@@ -11,7 +11,6 @@ pub struct EthKeyPair {
     pub private_key: Vec<u8>, // 32-byte private key (can be used to reconstruct SigningKey)
     pub public_key: Vec<u8>,  // 64-byte uncompressed public key (without 0x04 prefix)
     pub eth_address: Vec<u8>, // 20-byte Ethereum address
-    pub x25519_public_key: Option<Vec<u8>>, // 32-byte X25519 public key
 }
 
 /// Application key service.
@@ -34,7 +33,7 @@ pub struct AppKeyService {
 
 impl AppKeyService {
     pub fn new() -> Self {
-        let common = Self::generate_eth_keypair(true)
+        let common = Self::generate_eth_keypair()
             .expect("OS randomness must be available to generate the common signer");
         info!(
             common_signer = %format!("0x{}", hex::encode(&common.eth_address)),
@@ -52,17 +51,17 @@ impl AppKeyService {
     }
 
     /// Generate a fresh random Ethereum key pair (used only for the common signer).
-    fn generate_eth_keypair(x25519: bool) -> TappResult<EthKeyPair> {
+    fn generate_eth_keypair() -> TappResult<EthKeyPair> {
         use k256::elliptic_curve::rand_core::OsRng;
         let signing_key = SigningKey::random(&mut OsRng);
-        Self::keypair_from_signing_key(signing_key, x25519)
+        Self::keypair_from_signing_key(signing_key)
     }
 
     /// Deterministically derive an app's key pair from the common signer.
     /// Domain-separated and one-way: the app key says nothing about the common
     /// key, and distinct app_ids can never collide. The counter handles the
     /// astronomically unlikely hash-not-a-valid-scalar case.
-    fn derive_eth_keypair(&self, app_id: &str, x25519: bool) -> TappResult<EthKeyPair> {
+    fn derive_eth_keypair(&self, app_id: &str) -> TappResult<EthKeyPair> {
         for counter in 0u8..=255 {
             let mut hasher = Keccak256::new();
             hasher.update(b"tapp-app-signer-v1");
@@ -71,7 +70,7 @@ impl AppKeyService {
             hasher.update([counter]);
             let candidate = hasher.finalize();
             if let Ok(signing_key) = SigningKey::from_slice(&candidate) {
-                return Self::keypair_from_signing_key(signing_key, x25519);
+                return Self::keypair_from_signing_key(signing_key);
             }
         }
         Err(DockerError::ContainerOperationFailed {
@@ -81,7 +80,7 @@ impl AppKeyService {
         .into())
     }
 
-    fn keypair_from_signing_key(signing_key: SigningKey, x25519: bool) -> TappResult<EthKeyPair> {
+    fn keypair_from_signing_key(signing_key: SigningKey) -> TappResult<EthKeyPair> {
         let private_key = signing_key.to_bytes().to_vec();
         let verifying_key = signing_key.verifying_key();
 
@@ -95,25 +94,6 @@ impl AppKeyService {
         // Store 64-byte public key (without 0x04 prefix), consistent with verify_signature()
         let public_key = public_key_without_prefix.to_vec();
 
-        // Generate x25519 key pair if requested
-        // Compatible with eciesjs: directly use secp256k1 private key as x25519 private key
-        let x25519_public_key = if x25519 {
-            // Convert secp256k1 private key to x25519 private key
-            // eciesjs uses the same 32-byte private key for both secp256k1 and x25519
-            let mut x25519_private_bytes = [0u8; 32];
-            x25519_private_bytes.copy_from_slice(&private_key[..32]);
-
-            // Create x25519 secret from the same private key
-            let x25519_secret = x25519_dalek::StaticSecret::from(x25519_private_bytes);
-
-            // Derive x25519 public key
-            let x25519_public = x25519_dalek::PublicKey::from(&x25519_secret);
-
-            Some(x25519_public.as_bytes().to_vec())
-        } else {
-            None
-        };
-
         // Calculate Ethereum address from 64-byte public key (without prefix)
         let mut hasher = Keccak256::new();
         hasher.update(public_key_without_prefix);
@@ -124,16 +104,11 @@ impl AppKeyService {
             private_key,
             public_key,
             eth_address,
-            x25519_public_key,
         })
     }
 
     /// Get or create key for an app (in-memory mode)
-    async fn get_or_create_in_memory_key(
-        &self,
-        app_id: &str,
-        x25519: bool,
-    ) -> TappResult<EthKeyPair> {
+    async fn get_or_create_in_memory_key(&self, app_id: &str) -> TappResult<EthKeyPair> {
         // The empty app_id IS the common signer — the node's own identity,
         // available before any app exists.
         if app_id.is_empty() {
@@ -148,10 +123,9 @@ impl AppKeyService {
 
         info!(
             app_id = %app_id,
-            x25519_enabled = x25519,
             "Deriving app key from the common signer"
         );
-        let key_pair = self.derive_eth_keypair(app_id, x25519)?;
+        let key_pair = self.derive_eth_keypair(app_id)?;
 
         // Cache it (derivation is deterministic; the cache is an optimization)
         keys.insert(app_id.to_string(), key_pair.clone());
@@ -181,21 +155,14 @@ impl AppKeyService {
     }
 
     /// Get public key for an app
-    pub async fn get_public_key(
-        &self,
-        app_id: &str,
-    ) -> TappResult<(Vec<u8>, Vec<u8>, Option<Vec<u8>>)> {
+    pub async fn get_public_key(&self, app_id: &str) -> TappResult<(Vec<u8>, Vec<u8>)> {
         if app_id.is_empty() {
             let c = &self.common;
-            return Ok((c.eth_address.clone(), c.public_key.clone(), c.x25519_public_key.clone()));
+            return Ok((c.eth_address.clone(), c.public_key.clone()));
         }
         let keys = self.app_keys.lock().await;
         if let Some(key_pair) = keys.get(app_id) {
-            Ok((
-                key_pair.eth_address.clone(),
-                key_pair.public_key.clone(),
-                key_pair.x25519_public_key.clone(),
-            ))
+            Ok((key_pair.eth_address.clone(), key_pair.public_key.clone()))
         } else {
             Err(DockerError::ServiceNotFound {
                 service_name: format!("Key for app_id: {}", app_id),
@@ -204,34 +171,10 @@ impl AppKeyService {
         }
     }
 
-    /// Get app key pair (always in-memory)
-    pub async fn get_app_key(
-        &self,
-        app_id: &str,
-        key_type: &str,
-        x25519: bool,
-    ) -> TappResult<EthKeyPair> {
-        info!(app_id = %app_id, key_type = %key_type, "Processing app key request");
-
-        match key_type {
-            "ethereum" => {
-                let key_pair = self.get_or_create_in_memory_key(app_id, x25519).await?;
-                info!(
-                    app_id = %app_id,
-                    eth_address = format!("0x{}", hex::encode(&key_pair.eth_address)),
-                    "Returning in-memory key"
-                );
-                Ok(key_pair)
-            }
-            _ => {
-                warn!(key_type = %key_type, "Unsupported key type");
-                Err(DockerError::ContainerOperationFailed {
-                    operation: "get_app_key".to_string(),
-                    reason: format!("Unsupported key type: {}", key_type),
-                }
-                .into())
-            }
-        }
+    /// Fixed node identity API. Other purposes obtain generic KMS bytes under
+    /// dedicated materials; no curve-switch parameter is accepted here.
+    pub async fn get_app_key(&self, app_id: &str) -> TappResult<EthKeyPair> {
+        self.get_or_create_in_memory_key(app_id).await
     }
 }
 
@@ -359,7 +302,10 @@ mod tests {
         let mut one = [0u8; 32];
         one[31] = 1;
         let (address, public_key) = eth_identity_of_secret(&one).unwrap();
-        assert_eq!(hex::encode(address), "7e5f4552091a69125d5dfcb7b8c2659029395bdf");
+        assert_eq!(
+            hex::encode(address),
+            "7e5f4552091a69125d5dfcb7b8c2659029395bdf"
+        );
         assert_eq!(
             hex::encode(public_key),
             "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
@@ -375,10 +321,20 @@ mod tests {
 
     #[test]
     fn bytes_that_are_no_private_key_have_no_identity() {
-        let order =
-            hex::decode("fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141").unwrap();
-        for not_a_key in [vec![0u8; 32], order, vec![1u8; 31], vec![1u8; 33], Vec::new()] {
-            assert!(eth_identity_of_secret(&not_a_key).is_none(), "{}", hex::encode(&not_a_key));
+        let order = hex::decode("fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141")
+            .unwrap();
+        for not_a_key in [
+            vec![0u8; 32],
+            order,
+            vec![1u8; 31],
+            vec![1u8; 33],
+            Vec::new(),
+        ] {
+            assert!(
+                eth_identity_of_secret(&not_a_key).is_none(),
+                "{}",
+                hex::encode(&not_a_key)
+            );
         }
         assert!(eth_address_of_public_key(b"not a point").is_none());
     }
@@ -386,7 +342,7 @@ mod tests {
     #[test]
     fn test_sign_and_verify() {
         // Generate a test key pair
-        let key_pair = AppKeyService::generate_eth_keypair(true).unwrap();
+        let key_pair = AppKeyService::generate_eth_keypair().unwrap();
 
         // Test message
         let message = b"Hello, TAPP!";

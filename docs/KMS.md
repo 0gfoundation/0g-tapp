@@ -106,8 +106,9 @@ That makes the on-chain node list the entire authorization model:
   it for a while — and with attested admission on, so is the verifier it asks.
   tapp-server waits that out: a key request the KMS answers with "app not found
   on-chain", "not in on-chain signer list", "not registered on-chain per
-  verifier", "verifier unreachable", or the verifier's "DEBUG attribute is not
-  known … needs re-attesting" is retried for up to `[kbs.retry] onchain_wait_ms` (240s) before
+  verifier", "verifier unreachable", the exact `GetEvidence: Invalid app_id: App
+  <requested-id> not found` negative cached before StartApp, or the verifier's
+  "DEBUG attribute is not known … needs re-attesting" is retried for up to `[kbs.retry] onchain_wait_ms` (240s) before
   failing. So is the KMS's damped "(recently checked)" answer when it does not
   say why (older KMS builds), since it turns into the real answer within 30s; a
   damped answer that names a lasting reason fails at once. The KMS cannot tell
@@ -132,6 +133,7 @@ namespaces in use:
 |---|---|---|
 | `""` (empty) | apps, via `get-secret-resource` on the socket | the app's base secret, free-form use |
 | `746c73` (`"tls"`) | tapp-server, `tls-key-source = kms` | the app's stable TLS key (same cert across boots — what lets Let's Encrypt issuance survive; see [APP_TLS.md](APP_TLS.md)) |
+| `70726f7669646572` (`"provider"`) | tapp-server, `GetAppSigner` | stable secp256k1 application signer; compatible with existing sandbox KMS provider addresses |
 | `666465` (`"fde"`) | tapp-server, encrypted data volumes | the LUKS passphrase of the app's `data/` volume (see the README's data-modes section) |
 
 Not in this table: `scratch` volume keys and everything `local` — those derive
@@ -139,15 +141,15 @@ from the node's own signer precisely because they must **not** survive a boot.
 The empty app_id (the node's common signer) is refused by `get-secret-resource`;
 node-scoped material is not servable to app containers.
 
-Whatever material is asked for with `GetSecretResource` (tapp-server ≥ 0.11.0: hex of
-at most 256 bytes), the app's evidence lists, for the rest of the boot, the address and
-public key of the secret read as a secp256k1 key: `runtime_data.kms_keys` names the
-material and that key. An app that signs with the secret therefore has an address that
-stays the same across boots and nodes, and that a verifier can tie to an attested TEE of
-the app, as given by the KMS node that answered (recorded with whether the connection to
-it was checked, in the key's `get_secret_resource` event). Take each key
-once per boot: every request adds an event to the event log that all verification
-carries. See [A stable identity from the KMS](../README.md#a-stable-identity-from-the-kms).
+From tapp-server 0.12.0, fetched KMS secrets are opaque 32-byte values. tapp records
+the fixed `poseidon-bn254-4-v1` commitment in the SHA384 event log and in
+`runtime_data.key_commitments`; it never infers a signing curve from a generic
+secret. Dedicated app-signer and TLS paths additionally publish typed public keys
+in `runtime_data.identities`, referencing the same commitment format. The old
+0.11.x `kms_keys` address declarations remain readable for compatibility.
+Take each generic key once per boot: every request adds an event carried by
+verification. See [APP_IDENTITY.md](APP_IDENTITY.md) and
+[A stable identity from the KMS](../README.md#a-stable-identity-from-the-kms).
 
 ## Configuring a node to consume the KMS
 

@@ -254,9 +254,9 @@ mod tests {
 
     // A fixed, valid P-256 scalar — stands in for whatever KMS derives.
     const SECRET: [u8; 32] = [
-        0x4c, 0x0b, 0x1f, 0x6d, 0x2a, 0x91, 0x33, 0x7e, 0x58, 0xc4, 0x0d, 0xa2, 0x66, 0x19,
-        0xfb, 0x87, 0x35, 0x92, 0xee, 0x41, 0x7a, 0x0c, 0xb3, 0x5d, 0x28, 0x6f, 0x94, 0x11,
-        0xd7, 0x03, 0x8a, 0x56,
+        0x4c, 0x0b, 0x1f, 0x6d, 0x2a, 0x91, 0x33, 0x7e, 0x58, 0xc4, 0x0d, 0xa2, 0x66, 0x19, 0xfb,
+        0x87, 0x35, 0x92, 0xee, 0x41, 0x7a, 0x0c, 0xb3, 0x5d, 0x28, 0x6f, 0x94, 0x11, 0xd7, 0x03,
+        0x8a, 0x56,
     ];
 
     #[tokio::test]
@@ -305,7 +305,10 @@ mod tests {
             .join("");
         let der = base64::decode(b64.trim()).unwrap();
         let text = String::from_utf8_lossy(&der);
-        assert!(text.contains("api.example.com"), "name missing from request");
+        assert!(
+            text.contains("api.example.com"),
+            "name missing from request"
+        );
         assert!(
             !text.contains("tapp.0g.ai"),
             "the built-in name leaked into a request asked for another"
@@ -329,7 +332,14 @@ mod tests {
 
     #[test]
     fn a_domain_that_is_not_one_is_refused_rather_than_encoded() {
-        for bad in ["", ".leading", "trailing.", "a..b", "has space", "semi;colon"] {
+        for bad in [
+            "",
+            ".leading",
+            "trailing.",
+            "a..b",
+            "has space",
+            "semi;colon",
+        ] {
             assert!(
                 signing_request(&[7u8; 32], bad).is_err(),
                 "accepted {:?}",
@@ -340,13 +350,22 @@ mod tests {
 
     #[tokio::test]
     async fn the_name_is_derived_from_the_app_id_not_supplied_by_the_caller() {
-        assert_eq!(dns_name("0g-sandbox-provider"), "0g-sandbox-provider.tapp.0g.ai");
+        assert_eq!(
+            dns_name("0g-sandbox-provider"),
+            "0g-sandbox-provider.tapp.0g.ai"
+        );
     }
 
     #[tokio::test]
     async fn a_secret_that_is_not_a_valid_key_is_refused_rather_than_reduced() {
-        assert!(build("demo", &[0u8; 32], "local", None).await.is_err(), "zero is not a scalar");
-        assert!(build("demo", &[0u8; 16], "local", None).await.is_err(), "wrong length");
+        assert!(
+            build("demo", &[0u8; 32], "local", None).await.is_err(),
+            "zero is not a scalar"
+        );
+        assert!(
+            build("demo", &[0u8; 16], "local", None).await.is_err(),
+            "wrong length"
+        );
     }
 }
 

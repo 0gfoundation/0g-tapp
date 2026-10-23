@@ -8,6 +8,46 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[tokio::test]
+    async fn a_key_request_recovers_after_the_pre_start_negative_expires() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        let server = MockServer::start().await;
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let observed = attempts.clone();
+        Mock::given(method("POST"))
+            .and(path("/app-key"))
+            .respond_with(move |_: &wiremock::Request| {
+                if observed.fetch_add(1, Ordering::SeqCst) == 0 {
+                    ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                        "error": "attestation required: attestation not verified (recently checked): GetEvidence: Invalid app_id: App fresh-app not found"
+                    }))
+                } else {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "encrypted_secret": "cafe"
+                    }))
+                }
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+        let retry = crate::config::RetryConfig {
+            max_retries: 0,
+            onchain_wait_ms: 10_000,
+            ..Default::default()
+        };
+        let client = KmsClient::new(vec![server.uri()], &retry);
+        let (secret, _) = client
+            .get_encrypted_secret("fresh-app", 1, "pubkey", "signature", "")
+            .await
+            .unwrap();
+        assert_eq!(secret, vec![0xca, 0xfe]);
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
     async fn test_success_single_node() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -27,7 +67,13 @@ mod tests {
 
         assert_eq!(result, vec![0xde, 0xad, 0xbe, 0xef]);
         // Plain http and no verifier: nothing about who answered was checked.
-        assert_eq!(answer, KmsAnswer { url: server.uri(), attested: false });
+        assert_eq!(
+            answer,
+            KmsAnswer {
+                url: server.uri(),
+                attested: false
+            }
+        );
     }
 
     #[tokio::test]
@@ -85,14 +131,21 @@ mod tests {
             .mount(&good_server)
             .await;
 
-        let client = KmsClient::new(vec![bad_server.uri(), good_server.uri()], &Default::default());
+        let client = KmsClient::new(
+            vec![bad_server.uri(), good_server.uri()],
+            &Default::default(),
+        );
         let (result, answer) = client
             .get_encrypted_secret("myapp", 1234567890, "pubkey_hex", "sig_hex", "")
             .await
             .unwrap();
 
         assert_eq!(result, vec![0xca, 0xfe, 0xba, 0xbe]);
-        assert_eq!(answer.url, good_server.uri(), "the node that answered, not the first tried");
+        assert_eq!(
+            answer.url,
+            good_server.uri(),
+            "the node that answered, not the first tried"
+        );
     }
 
     #[tokio::test]
@@ -150,6 +203,38 @@ struct KmsResponse {
 mod onchain_visibility_tests {
     use super::*;
 
+    #[test]
+    fn a_pre_start_scan_negative_is_transient_for_the_requested_app_only() {
+        // Scan can pull evidence after registration but before StartApp. Its
+        // cached negative is repeated by KMS after the app is already starting.
+        for prefix in [
+            "attestation required: attestation not verified: ",
+            "attestation required: attestation not verified (recently checked): ",
+        ] {
+            let body = serde_json::json!({
+                "error": format!("{prefix}GetEvidence: Invalid app_id: App fresh-app not found")
+            })
+            .to_string();
+            assert_eq!(
+                not_onchain_yet(&body, "fresh-app").map(|n| n.what),
+                Some("this app's evidence at the verifier"),
+                "{body}"
+            );
+            assert!(not_onchain_yet(&body, "another-app").is_none());
+            for reason in [
+                "GetEvidence: Invalid app_id: App fresh-app not found or not running",
+                "GetEvidence: TEE not supported on this platform",
+                "the TD runs with DEBUG: its host can read and write its memory",
+            ] {
+                let refused = serde_json::json!({"error": format!("{prefix}{reason}")}).to_string();
+                assert!(
+                    not_onchain_yet(&refused, "fresh-app").is_none(),
+                    "{refused}"
+                );
+            }
+        }
+    }
+
     /// The 404 body the KMS serves for an app it cannot see on-chain yet, verbatim from a
     /// testnet node (`https://136.83.14.240:9443`) during a `start-app --register-onchain`
     /// whose registration had landed on chain seconds earlier.
@@ -174,22 +259,34 @@ mod onchain_visibility_tests {
     const VERIFIER_UNREACHABLE_DAMPED: &str = r#"{"error":"attestation required: attestation not verified (recently checked): verifier unreachable"}"#;
     /// ...and from one that does not. It turns into the real answer within the KMS's 30s
     /// damping, so it is waited on: a lasting refusal then fails fast on that answer.
-    const VERIFIER_DAMPED_BARE: &str = r#"{"error":"attestation required: attestation not verified (recently checked)"}"#;
+    const VERIFIER_DAMPED_BARE: &str =
+        r#"{"error":"attestation required: attestation not verified (recently checked)"}"#;
     /// The scan has a result stored from before it recorded the DEBUG attribute and has not
     /// re-attested the node yet (0g-tapp-verifier#16, scan/src/api.rs).
     const VERIFIER_REATTESTING: &str = r#"{"error":"attestation required: attestation not verified: the TD's DEBUG attribute is not known for this result; it needs re-attesting"}"#;
 
     #[test]
     fn the_transient_answers_are_recognised_and_other_4xx_are_not() {
-        let what = |body| not_onchain_yet(body).map(|n| n.what);
+        let what = |body| not_onchain_yet(body, "r2-probe").map(|n| n.what);
         assert_eq!(what(APP_NOT_YET), Some("this app on-chain"));
         assert_eq!(what(SIGNER_NOT_YET), Some("this node's signer on-chain"));
         // Attested admission (0g-kms src/verifier.rs): the verifier has not synced the
         // updateNode yet, or has not re-attested the node.
-        for lag in [VERIFIER_NOT_YET, VERIFIER_DAMPED_NOT_YET, VERIFIER_DAMPED_BARE] {
-            assert_eq!(what(lag), Some("this node's signer at the verifier"), "{lag}");
+        for lag in [
+            VERIFIER_NOT_YET,
+            VERIFIER_DAMPED_NOT_YET,
+            VERIFIER_DAMPED_BARE,
+        ] {
+            assert_eq!(
+                what(lag),
+                Some("this node's signer at the verifier"),
+                "{lag}"
+            );
         }
-        assert_eq!(what(VERIFIER_REATTESTING), Some("this node's evidence re-attested by the verifier"));
+        assert_eq!(
+            what(VERIFIER_REATTESTING),
+            Some("this node's evidence re-attested by the verifier")
+        );
         for down in [VERIFIER_UNREACHABLE, VERIFIER_UNREACHABLE_DAMPED] {
             assert_eq!(what(down), Some("a verdict from the verifier"), "{down}");
         }
@@ -207,7 +304,10 @@ mod onchain_visibility_tests {
             r#"{"error":"bad request: missing field"}"#,
             "",
         ] {
-            assert!(not_onchain_yet(fails_fast).is_none(), "{fails_fast}");
+            assert!(
+                not_onchain_yet(fails_fast, "r2-probe").is_none(),
+                "{fails_fast}"
+            );
         }
     }
 
@@ -287,6 +387,10 @@ mod pin_tests {
 fn pinned_client(expected: impl IntoIterator<Item = String>) -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .use_preconfigured_tls(crate::pinned_tls::client_config(expected))
+        .https_only(true)
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(90))
         .build()
         .map_err(|e| anyhow!("build pinned client: {}", e))
 }
@@ -413,18 +517,37 @@ struct NotOnChainYet {
 ///   verifier holds a result from before it recorded that attribute (0g-tapp-verifier#16);
 /// - `attestation not verified (recently checked)` with no reason after it — the damped repeat
 ///   of an older KMS, which turns into the real answer within its 30s damping;
+/// - `GetEvidence: Invalid app_id: App <requested-id> not found`, first or damped —
+///   Scan fetched before StartApp and still holds its pre-start negative;
 /// - `verifier unreachable`, first or damped — the scan could not answer, which since
 ///   0g-tapp-verifier#16 includes a failed registry read on its side. The KMS still refuses
 ///   until the scan verifies, so waiting admits nothing.
 ///
 /// Every other "attestation required" reason (a DEBUG TD, an unpublished or dev image), and a
 /// damped repeat that names one, is final and fails fast.
-fn not_onchain_yet(body: &str) -> Option<NotOnChainYet> {
+fn not_onchain_yet(body: &str, app_id: &str) -> Option<NotOnChainYet> {
     const DAMPED: &str = "attestation not verified (recently checked)";
     let damped_bare = body
         .find(DAMPED)
         .is_some_and(|i| !body[i + DAMPED.len()..].starts_with(':'));
-    let what = if body.contains("app not found on-chain") {
+    // This exact node refusal can have been cached before StartApp. Retry only
+    // the requested app's missing-evidence result, never arbitrary node failures.
+    let pre_start_negative = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_owned))
+        .is_some_and(|error| {
+            [
+                "attestation required: attestation not verified: ",
+                "attestation required: attestation not verified (recently checked): ",
+            ]
+            .iter()
+            .any(|prefix| {
+                error == format!("{prefix}GetEvidence: Invalid app_id: App {app_id} not found")
+            })
+        });
+    let what = if pre_start_negative {
+        "this app's evidence at the verifier"
+    } else if body.contains("app not found on-chain") {
         "this app on-chain"
     } else if body.contains("not in on-chain signer list") {
         "this node's signer on-chain"
@@ -444,7 +567,11 @@ impl KmsClient {
     pub fn new(node_urls: Vec<String>, retry: &crate::config::RetryConfig) -> Self {
         Self {
             node_urls,
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(5))
+                .timeout(std::time::Duration::from_secs(90))
+                .build()
+                .expect("KMS HTTP client configuration is valid"),
             max_retries: retry.max_retries,
             initial_delay_ms: retry.initial_delay_ms,
             max_delay_ms: retry.max_delay_ms,
@@ -494,8 +621,7 @@ impl KmsClient {
             // Pinned to the verifier's own attested key. Without this the whole exercise
             // is circular: an attacker on this hop rewrites the very set that is supposed
             // to catch him.
-            match pinned_client(std::iter::once(p.scan_pubkey.clone()))
-            {
+            match pinned_client(std::iter::once(p.scan_pubkey.clone())) {
                 Ok(c) => match c.get(&url).send().await {
                     Ok(resp) if resp.status().is_success() => match resp.text().await {
                         Ok(body) => {
@@ -507,7 +633,9 @@ impl KmsClient {
                             }
                             p.last_refresh = Some(std::time::Instant::now());
                         }
-                        Err(e) => tracing::warn!(url = %url, error = %e, "verifier body unreadable"),
+                        Err(e) => {
+                            tracing::warn!(url = %url, error = %e, "verifier body unreadable")
+                        }
                     },
                     Ok(resp) => {
                         tracing::warn!(url = %url, status = %resp.status(), "verifier refused");
@@ -570,7 +698,10 @@ impl KmsClient {
             {
                 Ok(v) => return Ok(v),
                 Err(e) if e.downcast_ref::<NotOnChainYet>().is_some() => {
-                    let what = e.downcast_ref::<NotOnChainYet>().map(|n| n.what).unwrap_or("this app on-chain");
+                    let what = e
+                        .downcast_ref::<NotOnChainYet>()
+                        .map(|n| n.what)
+                        .unwrap_or("this app on-chain");
                     let left = deadline.saturating_duration_since(std::time::Instant::now());
                     if left.is_zero() {
                         // Say what is actually known: the KMS did not see it for the whole
@@ -641,13 +772,16 @@ impl KmsClient {
             loop {
                 match client.post(&endpoint).json(&req).send().await {
                     Ok(resp) if resp.status().is_success() => {
-                        let body: KmsResponse = resp.json().await
+                        let body: KmsResponse = resp
+                            .json()
+                            .await
                             .map_err(|e| anyhow!("KMS {} invalid response: {}", url, e))?;
                         let bytes = hex::decode(body.encrypted_secret.trim_start_matches("0x"))
                             .map_err(|e| anyhow!("KMS {} invalid hex: {}", url, e))?;
                         // Pinned only means anything over TLS: to a plain-http node the same
                         // client sends the request with no handshake to check.
-                        let tls = reqwest::Url::parse(&endpoint).is_ok_and(|u| u.scheme() == "https");
+                        let tls =
+                            reqwest::Url::parse(&endpoint).is_ok_and(|u| u.scheme() == "https");
                         let answer = KmsAnswer {
                             url: url.clone(),
                             attested: self.pins.is_some() && tls,
@@ -665,7 +799,7 @@ impl KmsClient {
                         // registered. Signalled up to the caller, which waits and retries the
                         // whole request -- retrying this node would be pointless, since every
                         // node reads the same chain and will answer the same way.
-                        if let Some(not_yet) = not_onchain_yet(&body) {
+                        if let Some(not_yet) = not_onchain_yet(&body, app_id) {
                             tracing::warn!(url = %url, "{}", not_yet);
                             return Err(not_yet.into());
                         }
@@ -720,7 +854,8 @@ impl KmsClient {
                 if attempt > self.max_retries {
                     break;
                 }
-                let delay = (self.initial_delay_ms * (1u64 << (attempt - 1))).min(self.max_delay_ms);
+                let delay =
+                    (self.initial_delay_ms * (1u64 << (attempt - 1))).min(self.max_delay_ms);
                 tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
             }
         }

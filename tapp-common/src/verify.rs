@@ -35,6 +35,7 @@ pub struct NodeVerdict {
     /// during a handshake learns the peer holds a key attested inside this TEE — which is
     /// the whole of layer-1 verification, and needs no CA.
     pub tls_public_key: String,
+    pub identity: crate::identity_verify::IdentityVerification,
     /// The KMS keys the app took on this node, as runtime_data lists them. Believe them
     /// only when [`NodeVerdict::kms_keys_attested`] holds; see
     /// [`AppVerdict::kms_key_conflicts`] for the check across nodes.
@@ -106,7 +107,7 @@ impl NodeVerdict {
 
     /// Why this node's KMS keys cannot be believed, or `None` when they can: the AS
     /// verified the quote, the quote names the registered signer and was made for this
-    /// request (through a relay, provably so), the event log replays, the platform passes,
+    /// request with a matching challenge, the event log replays, the platform passes,
     /// and the image is a published production one (or could not be checked). Everything
     /// but a dev image fails the node on its own; what such a node lists is neither shown
     /// as attested nor compared with the other nodes'.
@@ -120,7 +121,7 @@ impl NodeVerdict {
         if !self.signer_ok {
             return Some("the quote does not name this node's signer");
         }
-        if self.fresh == Some(false) || (self.relayed_by.is_some() && self.fresh != Some(true)) {
+        if self.fresh != Some(true) {
             return Some("the quote is not proven to be made for this request");
         }
         unattested_by(self.replay_ok, &self.platform(), &self.boot_chain)
@@ -129,6 +130,20 @@ impl NodeVerdict {
     pub fn kms_keys_attested(&self) -> bool {
         self.kms_keys_unattested().is_none()
     }
+
+    pub fn identity_unattested(&self) -> Option<&'static str> {
+        if !self.identity.present { return Some("no typed identity metadata"); }
+        if self.identity.error.is_some() { return Some("typed identity metadata is invalid"); }
+        if self.fresh != Some(true) { return Some("typed identities require a matching quote challenge"); }
+        if let Some(reason) = self.kms_keys_unattested() { return Some(reason); }
+        if matches!(self.boot_chain, crate::refvalues::BootChain::NotChecked) {
+            return Some("boot reference values were not checked");
+        }
+        if !self.reconciled() { return Some("app workload measurements do not reconcile with the registry"); }
+        None
+    }
+
+    pub fn identity_attested(&self) -> bool { self.identity_unattested().is_none() }
 }
 
 /// The checks [`NodeVerdict::kms_keys_unattested`] and the direct-mode one share.
@@ -289,6 +304,7 @@ struct Attested {
     /// sha256 of the app's TLS public key, `0x…`, empty when the app has no TLS key yet.
     /// A client compares this against the key it was handed during a handshake.
     tls_public_key: String,
+    identity: crate::identity_verify::IdentityVerification,
     /// The KMS keys listed, those in the form tapp-server writes (`read_kms_keys`).
     kms_keys: Vec<crate::report_data::KmsKey>,
     /// `None` when no challenge was sent or the server predates the field, so a caller
@@ -297,6 +313,16 @@ struct Attested {
     /// False means the old signer-only `report_data`, which carries no challenge at all.
     structured: bool,
     note: String,
+}
+
+// Keep new metadata errors independent from the legacy signer parser.
+#[derive(serde::Deserialize)]
+struct LegacyRuntimeIdentity {
+    signer: String,
+    #[serde(default)]
+    tls_public_key: String,
+    #[serde(default)]
+    nonce: String,
 }
 
 impl Attested {
@@ -316,10 +342,11 @@ impl Attested {
 ///   the challenge came back is the only way to tell a fresh quote from a replayed one.
 /// - **Without it**, `report_data` is the bare 20-byte address. Take the leading 20
 ///   bytes — that is where every server that produced this format put it.
-fn read_report_data(evidence: &serde_json::Value, quote_b64: &str, nonce: &[u8]) -> Attested {
+fn read_report_data(evidence: &serde_json::Value, quote_b64: &str, nonce: &[u8], app_id: &str) -> Attested {
     let mut a = Attested {
         signer: String::new(),
         tls_public_key: String::new(),
+        identity: Default::default(),
         kms_keys: Vec::new(),
         fresh: None,
         structured: false,
@@ -334,7 +361,7 @@ fn read_report_data(evidence: &serde_json::Value, quote_b64: &str, nonce: &[u8])
         }
     };
 
-    let Some(rdata_b64) = evidence[crate::report_data::EVIDENCE_FIELD].as_str() else {
+    let Some(runtime_data) = evidence.get(crate::report_data::EVIDENCE_FIELD) else {
         a.signer = format!("0x{}", hex::encode(&rd[..20]));
         if !nonce.is_empty() {
             a.note = "server predates the challenge field, freshness unproven; ".to_string();
@@ -342,6 +369,10 @@ fn read_report_data(evidence: &serde_json::Value, quote_b64: &str, nonce: &[u8])
         return a;
     };
     a.structured = true;
+    let Some(rdata_b64) = runtime_data.as_str() else {
+        a.note = "runtime_data is present but is not a base64 string; ".into();
+        return a;
+    };
 
     let bytes = match B64.decode(rdata_b64) {
         Ok(b) => b,
@@ -354,7 +385,7 @@ fn read_report_data(evidence: &serde_json::Value, quote_b64: &str, nonce: &[u8])
         a.note = "runtime_data does not hash to the quote's report_data; ".to_string();
         return a;
     }
-    let parsed: crate::report_data::RuntimeData = match serde_json::from_slice(&bytes) {
+    let parsed: LegacyRuntimeIdentity = match serde_json::from_slice(&bytes) {
         Ok(p) => p,
         Err(e) => {
             a.note = format!("runtime_data parse: {}; ", e);
@@ -364,6 +395,7 @@ fn read_report_data(evidence: &serde_json::Value, quote_b64: &str, nonce: &[u8])
 
     a.signer = parsed.signer;
     a.tls_public_key = parsed.tls_public_key;
+    a.identity = crate::identity_verify::IdentityVerification::read(&bytes, app_id, &a.signer, &a.tls_public_key);
     if !nonce.is_empty() {
         let echoed = crate::report_data::strip_hex(&parsed.nonce)
             .eq_ignore_ascii_case(&hex::encode(nonce));
@@ -544,7 +576,7 @@ fn eventlog_claim_config_owner(cc_eventlog_b64: &str) -> Result<Option<String>> 
 ///
 /// (The TCG walk here is a fourth copy of the same loop. Left duplicated rather than
 /// refactoring three working parsers as a side effect of adding a feature.)
-fn eventlog_tapp_events(cc_eventlog_b64: &str, operation: &str) -> Result<Vec<serde_json::Value>> {
+pub(crate) fn eventlog_tapp_events(cc_eventlog_b64: &str, operation: &str) -> Result<Vec<serde_json::Value>> {
     Ok(eventlog_tapp_events_of(cc_eventlog_b64, &[operation])?
         .into_iter()
         .map(|(_, v)| v)
@@ -1123,6 +1155,7 @@ pub struct DirectVerdict {
     pub signer: String, // from quote report_data (0x…), as attested (not reconciled)
     /// sha256 of the attested TLS public key, `0x…`. Empty when the app has no TLS key.
     pub tls_public_key: String,
+    pub identity: crate::identity_verify::IdentityVerification,
     /// The KMS keys the app took on this node, as runtime_data lists them. Believe them
     /// only when [`DirectVerdict::kms_keys_attested`] holds.
     pub kms_keys: Vec<crate::report_data::KmsKey>,
@@ -1165,8 +1198,8 @@ impl DirectVerdict {
         if !self.quote_ok {
             return Some("the AS did not verify the quote");
         }
-        if self.fresh == Some(false) {
-            return Some("the quote was made for another request");
+        if self.fresh != Some(true) {
+            return Some("the quote is not proven to be made for this request");
         }
         unattested_by(self.replay_ok, &self.platform(), &self.boot_chain)
     }
@@ -1174,6 +1207,19 @@ impl DirectVerdict {
     pub fn kms_keys_attested(&self) -> bool {
         self.kms_keys_unattested().is_none()
     }
+
+    pub fn identity_unattested(&self) -> Option<&'static str> {
+        if !self.identity.present { return Some("no typed identity metadata"); }
+        if self.identity.error.is_some() { return Some("typed identity metadata is invalid"); }
+        if self.fresh != Some(true) { return Some("typed identities require a matching quote challenge"); }
+        if let Some(reason) = self.kms_keys_unattested() { return Some(reason); }
+        if matches!(self.boot_chain, crate::refvalues::BootChain::NotChecked) {
+            return Some("boot reference values were not checked");
+        }
+        None
+    }
+
+    pub fn identity_attested(&self) -> bool { self.identity_unattested().is_none() }
 
     /// One node can disagree with itself too: two keys for one material.
     pub fn kms_key_conflicts(&self) -> Vec<KmsKeyConflict> {
@@ -1199,6 +1245,7 @@ pub async fn verify_node_direct(
         server: server.to_string(),
         signer: String::new(),
         tls_public_key: String::new(),
+        identity: Default::default(),
         kms_keys: Vec::new(),
         kms_keys_logged_only: Vec::new(),
         kms_keys_unchecked: 0,
@@ -1228,10 +1275,11 @@ pub async fn verify_node_direct(
 
     // There is no on-chain signer to compare against here — the whole point of this path
     // is that the app may not be registered — so report what the node attested.
-    let attested = read_report_data(&j, quote_b64, &nonce);
+    let attested = read_report_data(&j, quote_b64, &nonce, app_id);
     v.signer = attested.signer.clone();
     v.tls_public_key = attested.tls_public_key.clone();
     v.kms_keys = attested.kms_keys.clone();
+    v.identity = attested.identity.clone();
     v.fresh = attested.fresh;
     v.note = attested.note.clone();
 
@@ -1254,6 +1302,7 @@ pub async fn verify_node_direct(
     // no key's provenance is known.
     v.kms_keys_unchecked = v.kms_keys.len();
     if v.replay_ok {
+        v.identity.reconcile_log(cc_b64, app_id);
         if let Some(log) = kms_keys_from_log(cc_b64, app_id, &v.kms_keys) {
             v.kms_keys_logged_only = log.logged_only;
             v.kms_keys_unchecked = log.unchecked;
@@ -1323,6 +1372,7 @@ pub async fn verify_app(
             signer_ok: false,
             quote_ok: false,
             tls_public_key: String::new(),
+            identity: Default::default(),
             kms_keys: Vec::new(),
             kms_keys_logged_only: Vec::new(),
             kms_keys_unchecked: 0,
@@ -1392,10 +1442,11 @@ pub async fn verify_app(
         let cc_b64 = j["cc_eventlog"].as_str().unwrap_or("");
 
         // ④a signer binding: the quote names the signer the chain registered
-        let attested = read_report_data(&j, quote_b64, &nonce);
+        let attested = read_report_data(&j, quote_b64, &nonce, app_id);
         v.signer_ok = attested.is(signer.as_bytes());
         v.tls_public_key = attested.tls_public_key.clone();
         v.kms_keys = attested.kms_keys.clone();
+        v.identity = attested.identity.clone();
         v.fresh = attested.fresh;
         v.note = attested.note.clone();
 
@@ -1425,6 +1476,7 @@ pub async fn verify_app(
         // then no key's provenance is known.
         v.kms_keys_unchecked = v.kms_keys.len();
         if v.replay_ok {
+            v.identity.reconcile_log(cc_b64, app_id);
             if let Some(log) = kms_keys_from_log(cc_b64, app_id, &v.kms_keys) {
                 v.kms_keys_logged_only = log.logged_only;
                 v.kms_keys_unchecked = log.unchecked;
@@ -1709,9 +1761,36 @@ mod tests {
     }
 
     #[test]
+    fn new_metadata_is_parsed_only_after_hash_binding_and_does_not_block_legacy_signer() {
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "signer":format!("0x{}",hex::encode(SIGNER)),"app_id":42,
+            "identities":"invalid","key_commitments":[]
+        })).unwrap();
+        let evidence = serde_json::json!({"runtime_data":B64.encode(&bytes)});
+        let bound = quote_with(&crate::report_data::report_data_of(&bytes));
+        let read = read_report_data(&evidence,&bound,&[],"sandbox");
+        assert!(read.is(&SIGNER));
+        assert!(read.identity.present && read.identity.error.is_some());
+        let other = quote_with(&crate::report_data::report_data_of(b"other"));
+        let read = read_report_data(&evidence,&other,&[],"sandbox");
+        assert!(!read.identity.present && read.identity.identities.is_empty());
+        assert!(read.signer.is_empty());
+    }
+
+    #[test]
+    fn a_malformed_runtime_field_does_not_downgrade_to_legacy_report_data() {
+        for runtime in [serde_json::json!(null),serde_json::json!({}),serde_json::json!(42)] {
+            let quote=quote_with(&legacy_report_data(&SIGNER));
+            let read=read_report_data(&serde_json::json!({"runtime_data":runtime}),&quote,&[],"sandbox");
+            assert!(read.signer.is_empty() && !read.identity.present);
+            assert!(read.structured);
+        }
+    }
+
+    #[test]
     fn a_server_that_predates_runtime_data_still_has_its_signer_read() {
         let quote = quote_with(&legacy_report_data(&SIGNER));
-        let a = read_report_data(&serde_json::json!({}), &quote, &[]);
+        let a = read_report_data(&serde_json::json!({}), &quote, &[], "");
         assert!(a.is(&SIGNER));
         assert!(!a.structured);
         assert_eq!(a.fresh, None);
@@ -1721,7 +1800,7 @@ mod tests {
     #[test]
     fn sending_a_challenge_to_an_old_server_says_so_instead_of_failing_the_signer() {
         let quote = quote_with(&legacy_report_data(&SIGNER));
-        let a = read_report_data(&serde_json::json!({}), &quote, b"chal");
+        let a = read_report_data(&serde_json::json!({}), &quote, b"chal", "");
         assert!(a.is(&SIGNER), "the signer binding still holds");
         assert_eq!(a.fresh, None, "not a failure — the server cannot answer it");
         assert!(a.note.contains("predates"), "got {}", a.note);
@@ -1732,7 +1811,7 @@ mod tests {
         let rdata = crate::report_data::RuntimeData::new(&SIGNER, b"chal").unwrap();
         let (bytes, rd) = rdata.seal().unwrap();
         let ev = serde_json::json!({ crate::report_data::EVIDENCE_FIELD: B64.encode(&bytes) });
-        let a = read_report_data(&ev, &quote_with(&rd), b"chal");
+        let a = read_report_data(&ev, &quote_with(&rd), b"chal", "");
         assert!(a.is(&SIGNER));
         assert!(a.structured);
         assert_eq!(a.fresh, Some(true));
@@ -1745,7 +1824,7 @@ mod tests {
         let rdata = crate::report_data::RuntimeData::new(&SIGNER, b"theirs").unwrap();
         let (bytes, rd) = rdata.seal().unwrap();
         let ev = serde_json::json!({ crate::report_data::EVIDENCE_FIELD: B64.encode(&bytes) });
-        let a = read_report_data(&ev, &quote_with(&rd), b"mine");
+        let a = read_report_data(&ev, &quote_with(&rd), b"mine", "");
         assert!(a.is(&SIGNER));
         assert_eq!(a.fresh, Some(false));
         assert!(a.note.contains("not echoed"), "got {}", a.note);
@@ -1764,7 +1843,7 @@ mod tests {
             .seal()
             .unwrap();
         let ev = serde_json::json!({ crate::report_data::EVIDENCE_FIELD: B64.encode(&other) });
-        let a = read_report_data(&ev, &quote_with(&rd), b"chal");
+        let a = read_report_data(&ev, &quote_with(&rd), b"chal", "");
         assert!(!a.is(&SIGNER));
         assert!(!a.is(&[0x22; 20]), "the swapped signer must not be believed either");
         assert!(a.note.contains("does not hash"), "got {}", a.note);
@@ -1782,7 +1861,7 @@ mod tests {
         rdata.kms_keys = vec![kms_key("", 1), kms_key("7369676e6572", 2)];
         let (bytes, rd) = rdata.seal().unwrap();
         let ev = serde_json::json!({ crate::report_data::EVIDENCE_FIELD: B64.encode(&bytes) });
-        let a = read_report_data(&ev, &quote_with(&rd), b"chal");
+        let a = read_report_data(&ev, &quote_with(&rd), b"chal", "");
         assert!(a.is(&SIGNER));
         assert_eq!(a.kms_keys, rdata.kms_keys);
         assert!(a.note.is_empty(), "got {}", a.note);
@@ -1796,7 +1875,7 @@ mod tests {
         rdata.kms_keys = vec![kms_key("", 1), bad];
         let (bytes, rd) = rdata.seal().unwrap();
         let ev = serde_json::json!({ crate::report_data::EVIDENCE_FIELD: B64.encode(&bytes) });
-        let a = read_report_data(&ev, &quote_with(&rd), b"mine");
+        let a = read_report_data(&ev, &quote_with(&rd), b"mine", "");
         assert_eq!(a.kms_keys, vec![kms_key("", 1)]);
         // Said alongside the challenge finding, not instead of it.
         assert!(a.note.contains("not echoed"), "got {}", a.note);
@@ -1810,8 +1889,43 @@ mod tests {
         forged.kms_keys = vec![kms_key("", 1)];
         let (bytes, _) = forged.seal().unwrap();
         let ev = serde_json::json!({ crate::report_data::EVIDENCE_FIELD: B64.encode(&bytes) });
-        let a = read_report_data(&ev, &quote_with(&rd), b"chal");
+        let a = read_report_data(&ev, &quote_with(&rd), b"chal", "");
         assert!(a.kms_keys.is_empty());
+    }
+
+    #[test]
+    fn recovering_legacy_kms_keys_from_the_log_cannot_bypass_the_quote_challenge() {
+        let material = "70726f7669646572";
+        let mut runtime = crate::report_data::RuntimeData::new(&SIGNER, b"old").unwrap();
+        runtime.kms_keys = vec![key(material, 1)];
+        let (bytes, rd) = runtime.seal().unwrap();
+        let quote = quote_with(&rd);
+        let log = tcg_log(&[("get_secret_resource", &taken("a", material, 1, true))]);
+        for (evidence, challenge, accepted) in [
+            (serde_json::json!({}), b"new".as_slice(), false),
+            (serde_json::json!({"runtime_data":B64.encode(b"swapped")}), b"new".as_slice(), false),
+            (serde_json::json!({"runtime_data":B64.encode(&bytes)}), b"new".as_slice(), false),
+            (serde_json::json!({"runtime_data":B64.encode(&bytes)}), b"old".as_slice(), true),
+        ] {
+            let parsed = read_report_data(&evidence, &quote, challenge, "a");
+            let logged = kms_keys_from_log(&log, "a", &parsed.kms_keys).unwrap();
+            assert_eq!(parsed.kms_keys.len() + logged.logged_only.len(), 1);
+            // This isolates the freshness policy after successful AS/replay checks;
+            // quote_with is a parsing fixture, not a hardware-signed quote.
+            let verdict = DirectVerdict {
+                server: "https://node.example".into(), signer: parsed.signer,
+                tls_public_key: parsed.tls_public_key, identity: parsed.identity,
+                kms_keys: parsed.kms_keys, kms_keys_logged_only: logged.logged_only,
+                kms_keys_unchecked: logged.unchecked, kms_keys_unrecorded: logged.unrecorded,
+                quote_ok: true, fresh: parsed.fresh, ear_status: "affirming".into(),
+                tcb_status: "UpToDate".into(), advisories: 0, boot_executables: None,
+                boot_measurements: vec![], compose_hash: String::new(), images: vec![],
+                claimed_owner: None, trust_anchors: None, replay_ok: true,
+                boot_chain: crate::refvalues::BootChain::Matched("gcp/prod.json".into()),
+                td_debug: Some(false), note: parsed.note,
+            };
+            assert_eq!(verdict.kms_keys_attested(), accepted);
+        }
     }
 }
 
@@ -1830,6 +1944,7 @@ mod relay_tests {
             signer_ok: true,
             quote_ok: true,
             tls_public_key: String::new(),
+            identity: Default::default(),
             kms_keys: Vec::new(),
             kms_keys_logged_only: Vec::new(),
             kms_keys_unchecked: 0,
@@ -1882,6 +1997,35 @@ mod relay_tests {
     fn a_quote_made_for_another_request_never_passes() {
         assert!(!node(Some(false), false).reconciled());
         assert!(!node(Some(false), true).reconciled());
+    }
+
+    #[test]
+    fn legacy_node_diagnostics_do_not_authenticate_kms_keys_without_a_challenge() {
+        let legacy = node(None, false);
+        assert!(legacy.reconciled());
+        assert!(!legacy.kms_keys_attested());
+        assert!(node(Some(true), false).kms_keys_attested());
+        assert!(!node(Some(false), false).kms_keys_attested());
+    }
+
+    #[test]
+    fn typed_identity_authentication_requires_the_full_trust_gate() {
+        let mut n=node(Some(true),false);
+        n.identity.present=true;
+        n.boot_chain=crate::refvalues::BootChain::Matched("prod/gcp/v1.json".into());
+        assert!(n.identity_attested());
+        n.quote_ok=false; assert!(!n.identity_attested()); n.quote_ok=true;
+        n.signer_ok=false; assert!(!n.identity_attested()); n.signer_ok=true;
+        n.fresh=None; assert!(!n.identity_attested()); n.fresh=Some(true);
+        n.replay_ok=false; assert!(!n.identity_attested()); n.replay_ok=true;
+        n.compose_ok=false; assert!(!n.identity_attested()); n.compose_ok=true;
+        n.image_ok=false; assert!(!n.identity_attested()); n.image_ok=true;
+        n.td_debug=Some(true); assert!(!n.identity_attested()); n.td_debug=Some(false);
+        n.boot_chain=crate::refvalues::BootChain::NotChecked; assert!(!n.identity_attested());
+        n.boot_chain=crate::refvalues::BootChain::Matched("gcp/dev.json".into()); assert!(!n.identity_attested());
+        n.boot_chain=crate::refvalues::BootChain::Matched("gcp/prod.json".into());
+        n.identity.unchecked=1; assert!(n.identity_attested()); // provenance is a visible warning
+        n.identity.error=Some("bad commitment".into()); assert!(!n.identity_attested());
     }
 
     fn holding(signer: &str, keys: &[(&str, u8)]) -> NodeVerdict {

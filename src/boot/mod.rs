@@ -61,9 +61,12 @@ fn attach_runtime_data(evidence: Vec<u8>, runtime_data: &[u8]) -> Vec<u8> {
     };
     obj.insert(
         crate::report_data::EVIDENCE_FIELD.to_string(),
-        serde_json::Value::String(
-            base64::engine::general_purpose::STANDARD.encode(runtime_data),
-        ),
+        serde_json::Value::String(base64::engine::general_purpose::STANDARD.encode(runtime_data)),
+    );
+    // Reserved envelope extension point. No proof is generated or claimed here.
+    obj.insert(
+        crate::report_data::EXTENSIONS_FIELD.to_string(),
+        serde_json::json!(crate::report_data::EvidenceExtensions::default()),
     );
     match serde_json::to_vec(&parsed) {
         Ok(v) => v,
@@ -137,7 +140,10 @@ impl<'a> Starting<'a> {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(app_id.to_string());
-        fresh.then(|| Self { set, app_id: app_id.to_string() })
+        fresh.then(|| Self {
+            set,
+            app_id: app_id.to_string(),
+        })
     }
 }
 
@@ -164,7 +170,10 @@ fn load_apps(path: &Path) -> std::io::Result<Option<Vec<AppInfo>>> {
 fn save_apps(path: &Path, apps: &HashMap<String, AppInfo>) -> std::io::Result<()> {
     let mut list: Vec<&AppInfo> = apps.values().collect();
     list.sort_by(|a, b| a.app_id.cmp(&b.app_id));
-    crate::utils::write_state_file(path, &serde_json::to_vec(&list).map_err(std::io::Error::other)?)
+    crate::utils::write_state_file(
+        path,
+        &serde_json::to_vec(&list).map_err(std::io::Error::other)?,
+    )
 }
 
 impl BootService {
@@ -231,7 +240,10 @@ enable_eventlog = true
                 // Fail closed, as for the claim: serving evidence for, and stopping, apps
                 // read back from tmpfs without measuring them is the gap this closes.
                 if let Err(e) = measurement_service
-                    .extend_measurement(crate::measurement_service::OPERATION_NAME_APPS_RESUMED, &data)
+                    .extend_measurement(
+                        crate::measurement_service::OPERATION_NAME_APPS_RESUMED,
+                        &data,
+                    )
                     .await
                 {
                     error!(error = %e, "Failed to measure the resumed apps; refusing to run on them unmeasured");
@@ -241,7 +253,10 @@ enable_eventlog = true
                     ))
                     .into());
                 }
-                info!(apps = list.len(), "Resumed the apps started earlier this boot");
+                info!(
+                    apps = list.len(),
+                    "Resumed the apps started earlier this boot"
+                );
                 apps = list.into_iter().map(|a| (a.app_id.clone(), a)).collect();
             }
             Some(Ok(_)) | None => {}
@@ -409,31 +424,35 @@ enable_eventlog = true
         // files are staged and containers start. Strict on failure: starting the
         // app on the wrong storage would be a silent downgrade the owner cannot see.
         let provisioned = match data_plan {
-            DataPlan::Encrypted(key_fut) => async {
-                let key = key_fut.await.map_err(|e| {
-                    TappError::from(DockerError::ContainerOperationFailed {
-                        operation: "fde_volume_key".to_string(),
-                        reason: format!(
-                            "KMS refused the volume key: {e} — the app's data volume \
+            DataPlan::Encrypted(key_fut) => {
+                async {
+                    let key = key_fut.await.map_err(|e| {
+                        TappError::from(DockerError::ContainerOperationFailed {
+                            operation: "fde_volume_key".to_string(),
+                            reason: format!(
+                                "KMS refused the volume key: {e} — the app's data volume \
                              cannot be opened. Is this node registered on-chain for \
                              the app (start-app --register-onchain)? Apps that must \
                              start without the KMS can declare x-tapp.data: plain|ram|scratch."
-                        ),
-                    })
-                })?;
-                volume::ensure_mounted(&app_id, &key).await
+                            ),
+                        })
+                    })?;
+                    volume::ensure_mounted(&app_id, &key).await
+                }
+                .await
             }
-            .await,
-            DataPlan::Scratch(key_fut) => async {
-                let key = key_fut.await.map_err(|e| {
-                    TappError::from(DockerError::ContainerOperationFailed {
-                        operation: "scratch_volume_key".to_string(),
-                        reason: format!("failed to derive the scratch key: {e}"),
-                    })
-                })?;
-                volume::ensure_scratch(&app_id, &key).await
+            DataPlan::Scratch(key_fut) => {
+                async {
+                    let key = key_fut.await.map_err(|e| {
+                        TappError::from(DockerError::ContainerOperationFailed {
+                            operation: "scratch_volume_key".to_string(),
+                            reason: format!("failed to derive the scratch key: {e}"),
+                        })
+                    })?;
+                    volume::ensure_scratch(&app_id, &key).await
+                }
+                .await
             }
-            .await,
             DataPlan::Plain => volume::ensure_plain(&app_id).await,
             DataPlan::Ram => volume::ensure_ram(&app_id).await,
             DataPlan::RamDowngraded => {
@@ -447,7 +466,9 @@ enable_eventlog = true
         };
         if let Err(e) = provisioned {
             tracing::error!(app_id = %app_id, error = %e, "Failed to provision app data directory");
-            self.task_manager.mark_failed(&task_id, format!("{e}")).await;
+            self.task_manager
+                .mark_failed(&task_id, format!("{e}"))
+                .await;
             return;
         }
 
@@ -592,7 +613,11 @@ enable_eventlog = true
                 self.task_manager
                     .mark_completed(
                         &task_id,
-                        TaskSuccessResult { app_id, deployer, ..Default::default() },
+                        TaskSuccessResult {
+                            app_id,
+                            deployer,
+                            ..Default::default()
+                        },
                     )
                     .await;
             }
@@ -785,6 +810,8 @@ enable_eventlog = true
         signer_eth_address: &[u8],
         tls_public_key: Option<String>,
         kms_keys: Vec<crate::report_data::KmsKey>,
+        identities: Vec<crate::identity::KeyIdentity>,
+        key_commitments: Vec<crate::identity::KeyCommitment>,
     ) -> TappResult<GetEvidenceResponse> {
         // Get app_id from request. EMPTY IS VALID: it asks for the node's own
         // evidence — the common signer plus the :50052 TLS key hash — which is
@@ -827,6 +854,9 @@ enable_eventlog = true
         // signer. See tapp_common::report_data.
         let mut runtime_data =
             crate::report_data::RuntimeData::new(signer_eth_address, &request.nonce)?;
+        runtime_data.app_id = app_id.clone();
+        runtime_data.identities = identities;
+        runtime_data.key_commitments = key_commitments;
         runtime_data.tls_public_key = tls_public_key.unwrap_or_default();
         runtime_data.kms_keys = kms_keys;
         let (runtime_data_bytes, report_data) = runtime_data.seal()?;
@@ -1440,6 +1470,26 @@ enable_eventlog = true
 mod tests {
     use super::*;
 
+    #[test]
+    fn evidence_reserves_an_empty_extension_namespace_outside_the_runtime_hash() {
+        use base64::Engine;
+        let rd = b"{\"signer\":\"fixture\"}";
+        let original = br#"{"quote":"unchanged","cc_eventlog":"unchanged","extensions":{"unverified_proof":"discard"}}"#.to_vec();
+        let out: serde_json::Value =
+            serde_json::from_slice(&attach_runtime_data(original, rd)).unwrap();
+        assert_eq!(out["quote"], "unchanged");
+        assert_eq!(
+            out[crate::report_data::EXTENSIONS_FIELD],
+            serde_json::json!({})
+        );
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(out[crate::report_data::EVIDENCE_FIELD].as_str().unwrap())
+                .unwrap(),
+            rd
+        );
+    }
+
     fn app(id: &str) -> AppInfo {
         AppInfo {
             app_id: id.to_string(),
@@ -1479,12 +1529,21 @@ mod tests {
             .collect();
         save_apps(&path, &apps).unwrap();
         let back = load_apps(&path).unwrap().unwrap();
-        assert_eq!(back.iter().map(|a| a.app_id.as_str()).collect::<Vec<_>>(), ["a", "b"]);
-        assert_eq!(back[0].compose_content.image_hash, apps["a"].compose_content.image_hash);
+        assert_eq!(
+            back.iter().map(|a| a.app_id.as_str()).collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+        assert_eq!(
+            back[0].compose_content.image_hash,
+            apps["a"].compose_content.image_hash
+        );
         // Nothing left behind from the write, and only root can read the apps' compose.
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
         use std::os::unix::fs::PermissionsExt;
-        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     /// A verifier compares an apps_resumed entry with the start_app event's fields, so the
@@ -1505,7 +1564,13 @@ mod tests {
         })
         .unwrap();
         let resumed = a.measured();
-        for k in ["app_id", "deployer", "compose_hash", "volumes_hash", "image_hash"] {
+        for k in [
+            "app_id",
+            "deployer",
+            "compose_hash",
+            "volumes_hash",
+            "image_hash",
+        ] {
             assert_eq!(resumed[k], start[k], "{k}");
         }
     }
