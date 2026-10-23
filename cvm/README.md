@@ -112,17 +112,18 @@ See `cryptpilot-gcp-boot-fix.md` §0.1 for details.
 ## One-shot build
 ```bash
 export LIBGUESTFS_BACKEND=direct
-KBS_URLS='"http://<kbs-host-1>:9091", "http://<kbs-host-2>:9091"' \
 ./build-tapp.sh <bare-ubuntu-24.04.qcow2> tapp.qcow2
 # One image for every platform. CLOUD (gcp|ali) is only needed for an opt-in Stage C publish
 # (PUBLISH_AS=…); leave it alone to build a qcow2 you can publish later, or boot yourself.
 ```
-- **Required**:
-  - `KBS_URLS` — KBS node URLs for `[kbs] node_urls`, comma-separated and quoted as shown.
 - **Build mode**: `BUILD_MODE=canonical` (default) builds an owner-agnostic image — the tapp
   boots unclaimed and owner/config are claimed at runtime via `tapp-cli claim-config`
   (measured event). `BUILD_MODE=custom` requires `OWNER_ADDRESS=0x…` and bakes it into
   `config.toml` `[server.permission]` (per-owner reference values, legacy).
+- **No KMS list in canonical images.** One image serves every network, so a baked list would be
+  wrong for one of them; the claimer passes `--kbs-urls` (#169). `KBS_URLS` (KBS node URLs for
+  `[kbs] node_urls`, comma-separated and quoted, e.g. `'"http://host1:9091", "http://host2:9091"'`)
+  is required in custom mode only.
 - tapp-server is downloaded by default from GitHub v0.1.0 (includes the guest-components `8d71a3b4` fix, RTMR OK); if you have it locally, set `TAPP_SERVER_BIN=<path>`.
 - Storage / Sysbox knobs: `DATA_ROOT` (docker data-root, default `/data/docker`, on the runtime volume), `CONTAINERD_ROOT` (default `/data/containerd`), `DOCKER_VERSION` (default `5:27.5.1-…noble`; empty = repo default), `ENABLE_SYSBOX` / `SYSBOX_VERSION` (default `0.7.0`).
 - Publish (Stage C, opt-in): `PUBLISH_AS=<gcp-image-name>` publishes the built image to GCP after the build (see [Publish to GCP](#publish-to-gcp-stage-c)); `GCS_BUCKET` / `GCP_PROJECT` / `GUEST_OS_FEATURES` pass through.
@@ -166,7 +167,7 @@ The cryptpilot rootfs writable overlay is **RAM-backed (zram) and ephemeral** �
 ## Multi-tenant container isolation — Sysbox (issue #21, opt-in)
 For hostile-multi-tenant workloads (e.g. 0g-sandbox), build with `ENABLE_SYSBOX=1` to install [Sysbox](https://github.com/nestybox/sysbox) and register `sysbox-runc` as a dockerd runtime, so in-container `root` is user-namespace-remapped (a kernel CVE in a sandbox is no longer host-equivalent):
 ```bash
-ENABLE_SYSBOX=1 KBS_URLS='...' ./build-tapp.sh base.qcow2 gcp-tapp.qcow2
+ENABLE_SYSBOX=1 ./build-tapp.sh base.qcow2 gcp-tapp.qcow2
 ```
 - Only the runtime registration is gated behind `ENABLE_SYSBOX`; the runtime volume above is there regardless. Sysbox's own data store is on it too: `sysbox-mgr --data-root` → **`/data/sysbox`** (it holds inner-container images).
 - **Docker is pinned to 27.5.1** (`DOCKER_VERSION`). Docker 28+/29+ emit the Linux *time namespace* in the OCI spec, which `sysbox-runc` rejects (`namespace ... does not exist`); Nestybox supports Docker 20.10–27.x only.
@@ -195,7 +196,7 @@ gcloud auth login            # gcloud + gsutil must be authenticated with write 
 ```
 Defaults `GCS_BUCKET=gs://tapp-image`, `GCP_PROJECT=g-devops`, `GUEST_OS_FEATURES=UEFI_COMPATIBLE,GVNIC,SEV_CAPABLE,TDX_CAPABLE` (all overridable). It refuses to clobber an existing image name (delete it, or publish under a new name). Or fold it into the build as an opt-in final stage:
 ```bash
-PUBLISH_AS=og-tdx-dev ENABLE_SYSBOX=1 KBS_URLS='...' ./build-tapp.sh base.qcow2 og-tdx-dev.qcow2
+PUBLISH_AS=og-tdx-dev ENABLE_SYSBOX=1 ./build-tapp.sh base.qcow2 og-tdx-dev.qcow2
 ```
 Create a confidential instance from the published image with `--image=<name> --image-project=g-devops --confidential-compute-type=TDX`.
 

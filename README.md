@@ -447,8 +447,9 @@ claims it:
 ```bash
 tapp-cli -s http://<tapp>:50051 -k 0x<your-key> claim-config
 
-# Or claim and configure in one call — KMS cluster and TLS key source are
-# optional here if already present in config.toml:
+# Or claim and configure in one call. CVM images bake no KMS cluster (one image
+# serves both networks), so a node whose apps use the KMS needs --kbs-urls here
+# or via update-trust-anchors later:
 tapp-cli -s http://<tapp>:50051 -k 0x<your-key> claim-config \
   --kbs-urls "https://kms-1:9443,https://kms-2:9443" \
   --tls-key-source kms \

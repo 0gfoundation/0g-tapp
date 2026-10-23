@@ -20,7 +20,9 @@
 # `cloud` is NOT a dimension any more — it only chooses where Stage C publishes to. The image is
 # identical on every platform (one HWE generic kernel; dev access via dev_ssh_pubkey rather than a
 # per-cloud agent), so its measurements, reference values and AS policy id carry no cloud.
-# KBS/KMS is fixed (vars.TAPP_KBS_URLS), not per-build.
+# Canonical images bake no KMS list (#169): one image serves every network, so any baked list
+# would be wrong for one of them. The claimer passes --kbs-urls. Only custom mode (one owner per
+# image) bakes vars.TAPP_KBS_URLS.
 #
 # TWO versions, do not conflate them (docs/VERSIONING.md → CVM image):
 #   version    tapp-server release tag. Used ONLY to fetch the binary.
@@ -157,7 +159,7 @@ jobs:
       # Actions script-injection shape, and this is the only input a human pastes arbitrary text
       # into. Every other input in that step already comes through env.
       DEV_SSH_PUBKEY_INPUT: ${{ inputs.dev_ssh_pubkey }}
-      KBS_URLS: ${{ vars.TAPP_KBS_URLS }}                       # required (no safe default)
+      KBS_URLS: ${{ inputs.build_mode == 'custom' && vars.TAPP_KBS_URLS || '' }}   # canonical: never baked (#169)
       GCP_PROJECT: ${{ vars.GCP_PROJECT || 'g-devops' }}
       GCS_BUCKET: ${{ vars.GCS_BUCKET || 'gs://tapp-image' }}
       # Ali publish (CLOUD=ali): the al8 build runner is itself an Ali ECS instance, so aliyun/ossutil
@@ -190,6 +192,10 @@ jobs:
             # a silently-defaulted owner baked into a measured image is how mistakes ship).
             if ! printf '%s' "$OWNER" | grep -qE '^0[xX][0-9a-fA-F]{40}$'; then
               echo "error: build_mode=custom requires owner as a full 0x-prefixed 40-hex address; got '${OWNER:-<empty>}'." >&2
+              FAIL=1
+            fi
+            if [ -z "$KBS_URLS" ]; then
+              echo "error: build_mode=custom bakes vars.TAPP_KBS_URLS, which is not set." >&2
               FAIL=1
             fi
           fi
@@ -321,7 +327,7 @@ jobs:
       - name: Stage A+B — build the image
         run: |
           cd cvm
-          # BUILD_MODE and KBS_URLS are inherited from the job env (empty KBS_URLS is fine
+          # BUILD_MODE and KBS_URLS are inherited from the job env (KBS_URLS is always empty
           # in canonical mode — supplied at runtime via ClaimConfig --kbs-urls).
           # custom mode: map the workflow's OWNER to build-tapp.sh's OWNER_ADDRESS.
           # NOTE: no $VAR expansion inside the assignment-prefix list — bash decides what is
