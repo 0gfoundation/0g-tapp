@@ -182,9 +182,17 @@ tapp-cli -s http://<node>:50051 get-app-csr \
   --app-id my-app --domain api.example.com --out my.csr
 ```
 
-**The app does not have to exist yet.** The key is derived from the app id, so a signing request
-can be obtained — and a certificate issued — before anything is deployed. That ordering is what
-makes this workable: the certificate is ready before the container that needs it starts.
+Claim the node and choose its intended `--tls-key-source` before requesting a CSR. Do not
+derive a CSR under the unclaimed default and then change the source: TLS identities are cached,
+and claiming does not rotate an identity already derived in this process.
+
+**With `local`, the app does not have to exist yet.** The key is derived from the app id, so a
+signing request can be obtained — and a certificate issued — before anything is deployed.
+With `kms`, the application container can still start later, but its node must first be
+registered for the app and able to supply evidence accepted by the KMS (and the configured
+Scan when attested admission is enabled); the KMS cluster must also be reachable. Prepare that
+registration and evidence before requesting the CSR. The certificate can then be ready before
+the container that needs it starts.
 
 Take `my.csr` to any ACME client in CSR mode. With [lego](https://github.com/go-acme/lego):
 

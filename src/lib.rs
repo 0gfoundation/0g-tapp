@@ -22,6 +22,7 @@ pub use tapp_common::pinned_tls;
 pub mod permission;
 pub mod service_monitor;
 pub mod signature_auth;
+mod signer_cache;
 pub mod task_manager;
 pub mod tls_cert;
 pub mod utils;
@@ -228,7 +229,7 @@ pub struct TappServiceImpl {
     pub kms_keys: Arc<Mutex<report_data::KmsKeyLog>>,
     pub key_metadata: Arc<Mutex<identity::MetadataLog>>,
     // Only the dedicated stable app signer is cached, not arbitrary app secrets.
-    app_signers: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+    app_signers: signer_cache::SignerCache,
     identity_refresh: identity_refresh::IdentityRefresh,
 }
 
@@ -847,7 +848,7 @@ impl TappServiceImpl {
             tls_identities: Arc::new(Mutex::new(HashMap::new())),
             kms_keys: Arc::new(Mutex::new(kms_keys)),
             key_metadata: Arc::new(Mutex::new(key_metadata)),
-            app_signers: Arc::new(Mutex::new(HashMap::new())),
+            app_signers: signer_cache::SignerCache::default(),
             identity_refresh,
             boot_service,
             app_key_service,
@@ -1289,42 +1290,44 @@ impl TappService for TappServiceImpl {
         if req.app_id.is_empty() {
             return Err(Status::invalid_argument("app_id must not be empty"));
         }
-        let mut cache = self.app_signers.lock().await;
-        let secret = if let Some(secret) = cache.get(&req.app_id) {
-            secret.clone()
-        } else {
-            let (secret, answer) = self
-                .kms_derive(&req.app_id, identity::APP_SIGNER_MATERIAL)
-                .await?;
-            let c =
-                tapp_common::kms::commitment(&req.app_id, identity::APP_SIGNER_MATERIAL, &secret)
-                    .map_err(|e| Status::internal(e.to_string()))?;
-            let id =
-                identity::KeyIdentity::app_signer(&secret, c.clone()).map_err(Status::internal)?;
-            let already_measured =
-                self.key_metadata
-                    .lock()
-                    .await
-                    .contains(&req.app_id, &c, Some(&id));
-            if !already_measured
-                && !self
-                    .measure_secret_resource(
-                        &req.app_id,
-                        identity::APP_SIGNER_MATERIAL,
-                        true,
-                        Some(&c),
-                        Some(&id),
-                        Some(&answer),
-                    )
-                    .await
-            {
-                return Err(Status::unavailable(
-                    "cannot measure the KMS app signing identity",
-                ));
-            }
-            cache.insert(req.app_id.clone(), secret.clone());
-            secret
-        };
+        let secret = self
+            .app_signers
+            .get_or_try_init(&req.app_id, || async {
+                let (secret, answer) = self
+                    .kms_derive(&req.app_id, identity::APP_SIGNER_MATERIAL)
+                    .await?;
+                let c = tapp_common::kms::commitment(
+                    &req.app_id,
+                    identity::APP_SIGNER_MATERIAL,
+                    &secret,
+                )
+                .map_err(|e| Status::internal(e.to_string()))?;
+                let id = identity::KeyIdentity::app_signer(&secret, c.clone())
+                    .map_err(Status::internal)?;
+                let already_measured =
+                    self.key_metadata
+                        .lock()
+                        .await
+                        .contains(&req.app_id, &c, Some(&id));
+                if !already_measured
+                    && !self
+                        .measure_secret_resource(
+                            &req.app_id,
+                            identity::APP_SIGNER_MATERIAL,
+                            true,
+                            Some(&c),
+                            Some(&id),
+                            Some(&answer),
+                        )
+                        .await
+                {
+                    return Err(Status::unavailable(
+                        "cannot measure the KMS app signing identity",
+                    ));
+                }
+                Ok::<_, Status>(secret)
+            })
+            .await?;
         let c = tapp_common::kms::commitment(&req.app_id, identity::APP_SIGNER_MATERIAL, &secret)
             .map_err(|e| Status::internal(e.to_string()))?;
         let id = identity::KeyIdentity::app_signer(&secret, c.clone()).map_err(Status::internal)?;
@@ -2164,7 +2167,7 @@ impl TappService for TappServiceImpl {
                 &scan_url,
                 &scan_public_key,
             )));
-            self.app_signers.lock().await.clear();
+            self.app_signers.clear().await;
         }
 
         // Persist so a process restart within this boot cannot reopen the claim.
@@ -2290,7 +2293,7 @@ impl TappService for TappServiceImpl {
                 &resulting.scan_url,
                 &resulting.scan_public_key,
             )));
-            self.app_signers.lock().await.clear();
+            self.app_signers.clear().await;
         }
 
         info!(

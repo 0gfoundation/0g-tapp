@@ -314,6 +314,8 @@ fn pinned_client(expected: impl IntoIterator<Item = String>) -> Result<reqwest::
         .use_preconfigured_tls(crate::pinned_tls::client_config(expected))
         .https_only(true)
         .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(90))
         .build()
         .map_err(|e| anyhow!("build pinned client: {}", e))
 }
@@ -471,7 +473,11 @@ impl KmsClient {
     pub fn new(node_urls: Vec<String>, retry: &crate::config::RetryConfig) -> Self {
         Self {
             node_urls,
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(5))
+                .timeout(std::time::Duration::from_secs(90))
+                .build()
+                .expect("KMS HTTP client configuration is valid"),
             max_retries: retry.max_retries,
             initial_delay_ms: retry.initial_delay_ms,
             max_delay_ms: retry.max_delay_ms,
