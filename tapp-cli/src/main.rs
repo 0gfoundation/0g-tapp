@@ -298,6 +298,10 @@ enum Commands {
     /// --reference-values); the AS is relied on for the quote, TCB and event-log replay.
     /// A node whose port is closed to you is reached through its registry's scan relay —
     /// transport only, everything is still checked here.
+    /// Each node's KMS keys (the keys the app took with GetSecretResource this boot) are
+    /// listed when its evidence verified, and a material with more than one key attested
+    /// fails the run. Keys taken while the node did not check the KMS against attestation
+    /// make it end with a warning.
     VerifyApp {
         /// Application ID
         #[arg(long)]
@@ -2398,7 +2402,11 @@ fn print_trust_anchors(
         }
         // Plaintext here means the node cannot check which KMS answered, whatever pin it
         // holds — there is no handshake to bind one to. Worth saying where it is read.
-        if a.kbs_node_urls.iter().any(|u| u.starts_with("http://")) {
+        if a
+            .kbs_node_urls
+            .iter()
+            .any(|u| u.trim().to_ascii_lowercase().starts_with("http://"))
+        {
             println!(
                 "{}{}⚠️  plaintext — KMS node identity cannot be checked on those",
                 indent, pad
@@ -2468,6 +2476,145 @@ fn print_tls_binding(tls_public_key: &str, indent: &str, label_width: usize) {
         indent, pad
     );
     println!("{}{}  | openssl dgst -sha256", indent, pad);
+}
+
+/// What `material` is called in output: the empty one is the app's base key.
+fn material_label(material: &str) -> String {
+    if material.is_empty() {
+        "\"\" (the app's base key)".to_string()
+    } else {
+        material.to_string()
+    }
+}
+
+/// The KMS keys a node lists for the app, one line each: the address an app signing with
+/// the key signs as, and the material it took the key under. Shown only when the node's
+/// evidence can be believed about them; otherwise one line says why not.
+///
+/// `logged_only` counts keys the event log names that runtime_data does not list,
+/// `unchecked` the keys taken while the node did not check the KMS against attestation, and
+/// `unrecorded` listed keys no event of the app names. Returns (warned, failed): a warning
+/// for unchecked keys, a failure for unrecorded ones.
+fn print_kms_keys(
+    keys: &[tapp_common::report_data::KmsKey],
+    logged_only: usize,
+    unattested: Option<&str>,
+    unchecked: usize,
+    unrecorded: usize,
+    indent: &str,
+    label_width: usize,
+) -> (bool, bool) {
+    // An app that takes a key per user or per agent can hold thousands. All of them are in
+    // the evidence, and get-evidence prints runtime_data whole.
+    const SHOWN: usize = 20;
+    let total = keys.len() + logged_only;
+    if total == 0 {
+        return (false, false);
+    }
+    let pad = " ".repeat(label_width + 2);
+    if let Some(why) = unattested {
+        println!(
+            "{}{:<w$}: {} not shown — {}",
+            indent,
+            "kms keys",
+            total,
+            why,
+            w = label_width
+        );
+        return (false, false);
+    }
+    for k in keys.iter().take(SHOWN) {
+        println!(
+            "{}{:<w$}: {}  material {}",
+            indent,
+            "kms key",
+            k.address,
+            material_label(&k.material),
+            w = label_width
+        );
+    }
+    if keys.len() > SHOWN {
+        println!(
+            "{}{}… and {} more; get-evidence prints them all",
+            indent,
+            pad,
+            keys.len() - SHOWN
+        );
+    }
+    if logged_only > 0 {
+        println!(
+            "{}{}+ {} more taken this boot that only the event log names",
+            indent, pad, logged_only
+        );
+    }
+    // tapp-server lists a key only once its event is written, and runtime_data names no app:
+    // a listed key no event of this app names is another app's.
+    let failed = unrecorded > 0;
+    if failed {
+        println!(
+            "{}{}✗ {} of these named by no get_secret_resource event of this app: another \
+             app's keys",
+            indent, pad, unrecorded
+        );
+    }
+    // A key is only what the KMS that answered gave it. Each event records whether the
+    // connection to that KMS was checked against attestation; which cluster it was is the
+    // owner's setting either way.
+    if unchecked > 0 {
+        println!(
+            "{}{}⚠️ {} of these taken while this node did not check the KMS against attestation \
+             (no verifier, or a KMS node reached over plain http): they could have been \
+             substituted",
+            indent, pad, unchecked
+        );
+        (true, failed)
+    } else {
+        println!(
+            "{}{}taken over connections checked against attestation; which KMS cluster that \
+             was is the owner's setting (see the event log, and verifier and kms)",
+            indent, pad
+        );
+        (false, failed)
+    }
+}
+
+/// The materials with more than one key attested, capped: an app with a key per user, one
+/// of whose nodes uses another cluster, disagrees on all of them.
+fn print_kms_key_conflicts(conflicts: &[tapp_common::verify::KmsKeyConflict]) {
+    const MATERIALS_SHOWN: usize = 10;
+    const ADDRESSES_SHOWN: usize = 5;
+    for c in conflicts.iter().take(MATERIALS_SHOWN) {
+        println!(
+            "\n  ✗ kms keys : more than one key is attested for material {}",
+            material_label(&c.material)
+        );
+        for (address, signers) in c.addresses.iter().take(ADDRESSES_SHOWN) {
+            println!(
+                "               {}  on node{} {}",
+                address,
+                if signers.len() == 1 { "" } else { "s" },
+                signers.join(", ")
+            );
+        }
+        if c.addresses.len() > ADDRESSES_SHOWN {
+            println!(
+                "               … and {} more addresses",
+                c.addresses.len() - ADDRESSES_SHOWN
+            );
+        }
+    }
+    if conflicts.len() > MATERIALS_SHOWN {
+        println!(
+            "\n  ✗ kms keys : … and {} more materials",
+            conflicts.len() - MATERIALS_SHOWN
+        );
+    }
+    if !conflicts.is_empty() {
+        println!(
+            "               The KMS derives one key per app and material: a node holding another \
+             got it from somewhere else, such as another KMS cluster or a substituted answer."
+        );
+    }
 }
 
 fn boot_chain_line(executables: Option<i64>, show: bool) -> Option<String> {
@@ -2564,6 +2711,15 @@ async fn verify_app_cmd(
         println!("  server      : {}", d.server);
         println!("  signer      : {}  (attested in report_data)", d.signer);
         print_tls_binding(&d.tls_public_key, "  ", 12);
+        let (kms_unchecked, kms_unrecorded) = print_kms_keys(
+            &d.kms_keys,
+            d.kms_keys_logged_only.len(),
+            d.kms_keys_unattested(),
+            d.kms_keys_unchecked,
+            d.kms_keys_unrecorded,
+            "  ",
+            12,
+        );
         print_as_line(&d.tcb_status, d.advisories, d.replay_ok, "  ", 12);
         print_platform(&d.platform(), "  ", 12);
         if show_policy {
@@ -2586,18 +2742,31 @@ async fn verify_app_cmd(
         if !d.note.is_empty() {
             println!("  note        : {}", d.note);
         }
+        // A quote made for some other request proves nothing about this one, in this mode as
+        // in chain mode.
+        if d.fresh == Some(false) {
+            println!("  fresh       : ✗ the quote echoes a different challenge — not produced for this request");
+        }
+        let conflicts = d.kms_key_conflicts();
+        print_kms_key_conflicts(&conflicts);
         let platform = d.platform();
         println!(
-            "\nBoot chain {} ; platform {}{}",
+            "\nBoot chain {} ; platform {}{}{}{}",
             boot_chain_summary([&d.boot_chain], false),
             platform_word(&platform),
+            if conflicts.is_empty() { "" } else { " ; kms keys disagree ❌" },
+            if kms_unchecked { " ; kms keys from an unchecked KMS ⚠️" } else { "" },
             if as_pinned { "" } else { " ; AS unauthenticated ⚠️" }
         );
         println!("(direct mode shows what the node attests; register on-chain + use --contract to reconcile)");
         let failed = !d.replay_ok
+            || d.fresh == Some(false)
+            || !conflicts.is_empty()
+            || kms_unrecorded
             || matches!(d.boot_chain, refvalues::BootChain::Unknown { .. })
             || matches!(platform, tapp_common::verify::Platform::Fail(_));
         let warned = !as_pinned
+            || kms_unchecked
             || boot_chain_warns(&d.boot_chain)
             || matches!(platform, tapp_common::verify::Platform::Warn(_));
         std::process::exit(exit_status(failed, warned));
@@ -2617,6 +2786,7 @@ async fn verify_app_cmd(
     let yn = |b: bool| if b { "✓" } else { "✗" };
     println!("Verifying app: {}  ({} node(s))", verdict.app_id, verdict.nodes.len());
     let mut all_ok = true;
+    let mut kms_unchecked = false;
     for n in &verdict.nodes {
         let reconciled = n.reconciled();
         all_ok &= reconciled;
@@ -2660,6 +2830,17 @@ async fn verify_app_cmd(
             }
         );
         print_tls_binding(&n.tls_public_key, "    ", 11);
+        let (warned, failed) = print_kms_keys(
+            &n.kms_keys,
+            n.kms_keys_logged_only.len(),
+            n.kms_keys_unattested(),
+            n.kms_keys_unchecked,
+            n.kms_keys_unrecorded,
+            "    ",
+            11,
+        );
+        kms_unchecked |= warned;
+        all_ok &= !failed;
         if let Some(Err(claimed)) = &n.owner_claim {
             println!("    owner      : ✗ claim_config says {} but on-chain owner differs", claimed);
             all_ok = false;
@@ -2688,6 +2869,10 @@ async fn verify_app_cmd(
             platform_word(&n.platform())
         );
     }
+    // One key per app and material is the KMS's whole promise, so a material with two keys
+    // fails the app, whichever node holds the odd one.
+    let conflicts = verdict.kms_key_conflicts();
+    print_kms_key_conflicts(&conflicts);
     let reached: Vec<_> = verdict.nodes.iter().filter(|n| n.reachable).collect();
     let chains: Vec<_> = reached.iter().map(|n| &n.boot_chain).collect();
     let platforms: Vec<_> = reached.iter().map(|n| n.platform()).collect();
@@ -2701,17 +2886,21 @@ async fn verify_app_cmd(
         "debug off, TCB up to date ✅"
     };
     println!(
-        "\nResult: reconciliation {} ; boot chain {} ; platform {}{}",
+        "\nResult: reconciliation {} ; boot chain {} ; platform {}{}{}{}",
         if all_ok { "ALL PASS ✅" } else { "has failures ❌" },
         boot_chain_summary(chains.iter().copied(), mainnet),
         platform_summary,
+        if conflicts.is_empty() { "" } else { " ; kms keys disagree ❌" },
+        if kms_unchecked { " ; kms keys from an unchecked KMS ⚠️" } else { "" },
         if as_pinned { "" } else { " ; AS unauthenticated ⚠️" }
     );
     let failed = !all_ok
+        || !conflicts.is_empty()
         || chains.iter().any(|c| matches!(c, refvalues::BootChain::Unknown { .. }))
         || (mainnet && chains.iter().any(|c| is_dev(c)))
         || platforms.iter().any(|p| matches!(p, tapp_common::verify::Platform::Fail(_)));
     let warned = !as_pinned
+        || kms_unchecked
         || chains.iter().any(|c| boot_chain_warns(c))
         || platforms.iter().any(|p| matches!(p, tapp_common::verify::Platform::Warn(_)));
     std::process::exit(exit_status(failed, warned));
@@ -2959,7 +3148,10 @@ async fn get_evidence(
     app_id: String,
     nonce_hex: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut client = create_client(server).await?;
+    // A busy node's evidence passes tonic's default 4 MiB; accept what verify-app does.
+    let mut client = create_client(server)
+        .await?
+        .max_decoding_message_size(tapp_common::verify::MAX_EVIDENCE_LEN);
 
     let nonce = match nonce_hex.as_deref() {
         Some(h) => hex::decode(h.trim_start_matches("0x"))
@@ -3262,6 +3454,13 @@ async fn get_secret_resource(
     println!("✓ Secret resource retrieved");
     println!("  App ID: {}", app_id);
     println!("  Secret (hex): 0x{}", hex::encode(&result.secret));
+    // The secret as a secp256k1 key, which the app's evidence now lists. A server before
+    // 0.11.0 sends neither.
+    if !result.eth_address.is_empty() {
+        println!("  Address: 0x{}", hex::encode(&result.eth_address));
+        println!("  Public key (compressed): 0x{}", hex::encode(&result.compressed_public_key));
+        println!("  (listed in this app's evidence for the rest of this boot, once its event is written)");
+    }
 
     Ok(())
 }

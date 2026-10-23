@@ -3,7 +3,8 @@
 tapp node verifier. The only input is an app_id; everything else is automatic:
 read the chain, fetch evidence, verify the quote at the AS, compare the boot chain with
 the published reference values, reconcile the evidence with the chain. The same logic as
-`tapp-cli verify-app` (tapp-common/src/verify.rs, refvalues.rs).
+`tapp-cli verify-app` (tapp-common/src/verify.rs, refvalues.rs), less the checks listed at
+the end: where those apply, this script can pass a node verify-app fails or warns about.
 
 Requires: cast (foundry), tapp-cli, grpcurl, and attestation.proto alongside this file.
 Usage: python3 verify_app.py <app_id>
@@ -22,7 +23,15 @@ boot chain is compared HERE against the published reference values
 
 A node whose port is closed to you is reached through its registry's scan relay (RELAY
 overrides it). Transport only: the evidence is checked exactly the same way, and the
-quote must echo the random challenge sent for it."""
+quote must echo the random challenge sent for it.
+
+Each node's KMS keys (runtime_data.kms_keys, the keys the app took with GetSecretResource)
+are listed when its evidence can be believed, and a material with more than one key attested
+fails the app. Left out here, and done by tapp-cli verify-app: the owner check (claim_config
+against the on-chain owner) and printing the node's KMS settings; and for KMS keys,
+re-deriving each address from its public key, reading keys only the event log names,
+failing keys no event of the app names, and warning about keys whose event says the KMS was
+not checked against attestation."""
 import sys, os, json, base64, struct, subprocess, re, binascii, hashlib, secrets
 import atexit, shlex, shutil, tempfile
 import urllib.parse, urllib.request, urllib.error
@@ -200,6 +209,41 @@ except Exception as e:
     REF_SETS = None
     print(f"reference values: unavailable ({e}) — the boot chain is NOT checked\n")
 
+def kms_entries(value):
+    """The runtime_data.kms_keys entries in the one form tapp-server writes, and how many
+    others there were. Matching that form also makes them safe to compare as strings and to
+    print. tapp-cli additionally re-derives each address from its public key; this does not."""
+    if not isinstance(value, list):
+        return [], 0 if value is None else 1
+    def ok(e):
+        return (isinstance(e, dict)
+                and isinstance(e.get("material"), str)
+                and re.fullmatch(r"(?:[0-9a-f]{2}){0,256}", e["material"]) is not None
+                and isinstance(e.get("address"), str)
+                and re.fullmatch(r"0x[0-9a-f]{40}", e["address"]) is not None
+                and isinstance(e.get("public_key"), str)
+                and re.fullmatch(r"0x0[23][0-9a-f]{64}", e["public_key"]) is not None)
+    good = [e for e in value if ok(e)]
+    return good, len(value) - len(good)
+
+def show_kms_keys(keys, dropped, why_not):
+    if dropped:
+        print(f"     note: {dropped} kms_keys entr{'y' if dropped == 1 else 'ies'} not in the "
+              "form tapp-server writes, ignored")
+    if not keys:
+        return
+    if why_not:
+        print(f"     kms keys: {len(keys)} not shown — {why_not}")
+        return
+    for k in keys[:20]:
+        label = k["material"] or "\"\" (the app's base key)"
+        print(f"     kms key: {k['address']}  material {label}")
+    if len(keys) > 20:
+        print(f"              … and {len(keys) - 20} more")
+    # A key is what the KMS that answered gave it, and which KMS that is is the owner's
+    # setting. tapp-cli verify-app reads from each key's event whether that KMS was checked.
+    print("              whether the KMS that gave them was checked: see tapp-cli verify-app")
+
 # ───────── 1. read the registration off the chain ─────────
 print("## 1. chain")
 # On mainnet a dev image fails, as it does in the scan's verdict and so at the KMS.
@@ -225,6 +269,7 @@ if not nodes:
 all_ok = True
 boot_all = None
 warned = not AS_AUTH
+kms_seen = {}   # material -> {address: [node signers]}, for the check across nodes
 for signer in nodes:
     print(f"\n## node {signer}")
     # getNode returns this node's EFFECTIVE compose/volumes: its own per-node override if
@@ -348,7 +393,7 @@ for signer in nodes:
     #          evidence. Check that equality FIRST and only then read the fields out of it —
     #          the other order means trusting JSON the quote does not cover.
     # Older:   no runtime_data field, and report_data's first 20 bytes are the signer.
-    fresh = tls_pubkey = None
+    fresh = tls_pubkey = kms_raw = None
     rd_b64 = j.get("runtime_data")
     if rd_b64:
         rd_bytes = base64.b64decode(rd_b64)        # bytes as received: never loads-then-dumps
@@ -358,6 +403,7 @@ for signer in nodes:
         sig_ok = bound and rd.get("signer", "").lower() == signer.lower()
         fresh = bound and rd.get("nonce", "").lower() == "0x" + nonce.hex()
         tls_pubkey = rd.get("tls_public_key") if bound else None
+        kms_raw = rd.get("kms_keys") if sig_ok else None
         if not bound:
             print("  4. WARNING report_data != sha512(runtime_data): binding does not hold, "
                   "every field in it is untrustworthy")
@@ -366,6 +412,25 @@ for signer in nodes:
         sig_ok = bool(as_report_data) and signer.lower()[2:] in as_report_data.lower()
         print("  4. note: no runtime_data in evidence, node predates v0.4.0 — verifying the "
               "signer with the old report_data reading")
+    # The keys the app took with GetSecretResource, each the address an app signing with the
+    # secret signs as. Believed only from evidence that holds up in full: the AS verified the
+    # quote, it names this node's signer and was made for this request (through a relay,
+    # provably), the event log replays, the platform passes, and the image is a published
+    # production one or unchecked (a dev image's operator has a shell in the TD). Counted
+    # before any reconcile failure below, as tapp-cli counts them.
+    kms_keys, kms_dropped = kms_entries(kms_raw)
+    kms_why_not = ("the AS did not verify the quote" if not tm else
+                   "the quote does not name this node's signer" if not sig_ok else
+                   "the quote is not proven to be made for this request"
+                   if fresh is False or (relayed and fresh is not True) else
+                   "the event log does not replay" if not replay_ok else
+                   "the platform fails" if not platform_ok else
+                   "the image is not a published one" if boot_ok is False else
+                   "a dev image, whose operator has a shell in the TD" if dev else None)
+    kms_believed = kms_why_not is None
+    if kms_believed:
+        for k in kms_keys:
+            kms_seen.setdefault(k["material"], {}).setdefault(k["address"], []).append(signer)
     # cc_eventlog -> last successful start_app whose compose matches the chain
     log = base64.b64decode(j["cc_eventlog"]); o = 8 + 20
     ds, = struct.unpack_from('<I', log, o); o += 4 + ds
@@ -397,6 +462,7 @@ for signer in nodes:
                         last = d
     if not last:
         print("  4. FAIL: no successful start_app whose compose matches the chain")
+        show_kms_keys(kms_keys, kms_dropped, kms_why_not)
         all_ok = False; continue
     ev_vol = b"".join(k.encode() + b":" + bytes.fromhex(v) + b"\n"
                       for k, v in sorted(last["volumes_hash"].items()))
@@ -419,6 +485,7 @@ for signer in nodes:
         print( "              openssl s_client -connect HOST:PORT </dev/null 2>/dev/null \\")
         print( "                | openssl x509 -pubkey -noout | openssl pkey -pubin -outform der \\")
         print( "                | openssl dgst -sha256")
+    show_kms_keys(kms_keys, kms_dropped, kms_why_not)
 
     # A challenge that was not echoed means this quote was not produced for this request,
     # which is as hard a failure as a measurement that does not reconcile. Through a relay
@@ -433,7 +500,21 @@ for signer in nodes:
     boot_all = boot_node if boot_all is None else (boot_all and boot_node if boot_node is not None else boot_all)
     print(f"  => reconcile {'PASS' if node_ok else 'FAIL'} ; boot chain {boot} ; platform {platform}")
 
+# The KMS derives one key per app and material, so every node that took a material must name
+# the same address for it. A node holding another got it from somewhere else: another KMS
+# cluster, or an answer substituted on the way. Which node is the odd one is not knowable here.
+conflicts = [(m, h) for m, h in sorted(kms_seen.items()) if len(h) > 1]
+kms_ok = not conflicts
+for material, holders in conflicts[:10]:
+    label = material if material else "\"\" (the app's base key)"
+    print(f"\n  FAIL kms keys: more than one key is attested for material {label}")
+    for address, signers in sorted(holders.items()):
+        print(f"       {address}  on {', '.join(signers)}")
+if len(conflicts) > 10:
+    print(f"\n  FAIL kms keys: … and {len(conflicts) - 10} more materials")
+
 print(f"\n### verdict: reconcile {'PASS on every node' if all_ok else 'FAILED on at least one node'}"
       f" ; boot chain {'not checked' if boot_all is None else 'every node matches a published image' if boot_all else 'FAILED'}"
+      + ("" if kms_ok else " ; kms keys disagree")
       + ("" if AS_AUTH else " ; AS unauthenticated"))
-sys.exit(1 if not all_ok or boot_all is False else 2 if warned else 0)
+sys.exit(1 if not all_ok or not kms_ok or boot_all is False else 2 if warned else 0)

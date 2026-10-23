@@ -194,6 +194,63 @@ pub struct TappServiceImpl {
     /// Per-app TLS identity, derived on first use. Same lifetime as the app key cache:
     /// the key itself is deterministic, so a restart re-derives the identical one.
     pub tls_identities: Arc<Mutex<HashMap<String, Arc<tls_cert::TlsIdentity>>>>,
+    /// The KMS keys each app has taken through `GetSecretResource` this boot, which
+    /// `GetEvidence` lists (`report_data::RuntimeData::kms_keys`). Read back from the event
+    /// log at startup (`kms_keys_of_this_boot`), then filled only by GetSecretResource, by
+    /// whatever holds the socket and names the app. GetEvidence is unauthenticated, and
+    /// reading this is all it does, so it never reaches the KMS.
+    pub kms_keys: Arc<Mutex<report_data::KmsKeyLog>>,
+}
+
+/// The KMS keys this boot's earlier tapp-server processes handed out, read back from the
+/// `get_secret_resource` events they measured.
+///
+/// So the evidence lists every key taken this boot, not just this process's, and an app
+/// need not ask again after a restart: asking again only adds another event to the log,
+/// which every verification then carries. Best effort: a node that cannot read its own
+/// event log lists only what it hands out from now on, and says so. Verifiers read the log
+/// themselves and still see the rest.
+async fn kms_keys_of_this_boot(
+    measurement_service: &measurement_service::MeasurementService,
+) -> report_data::KmsKeyLog {
+    let mut log = report_data::KmsKeyLog::default();
+    // The event log comes with evidence; the report_data asked for is beside the point.
+    // Bounded: this runs before anything listens, and a stalled quote service must not hold
+    // the node down. Missing the earlier keys costs less than not starting.
+    let read = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        measurement_service.get_evidence(&[0u8; 64]),
+    )
+    .await;
+    let evidence = match read {
+        Ok(Ok(e)) => e,
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "cannot read this boot's event log; KMS keys taken before this process are not listed");
+            return log;
+        }
+        Err(_) => {
+            tracing::warn!("reading this boot's event log took over 30s; KMS keys taken before this process are not listed");
+            return log;
+        }
+    };
+    let cc_eventlog = serde_json::from_slice::<serde_json::Value>(&evidence)
+        .ok()
+        .and_then(|j| j["cc_eventlog"].as_str().map(String::from));
+    let Some(cc_eventlog) = cc_eventlog else {
+        tracing::warn!("the evidence carries no event log; KMS keys taken before this process are not listed");
+        return log;
+    };
+    match verify::eventlog_kms_keys(&cc_eventlog) {
+        Ok(keys) => {
+            let count = keys.len();
+            for logged in keys {
+                log.record(&logged.app_id, logged.key);
+            }
+            info!(count, "KMS keys taken earlier this boot read back from the event log");
+        }
+        Err(e) => tracing::warn!(error = %e, "cannot parse this boot's event log; KMS keys taken before this process are not listed"),
+    }
+    log
 }
 
 /// Fetch a KMS-derived secret for `app_id` under the `material` namespace.
@@ -208,7 +265,7 @@ async fn kms_derive_with(
     app_key_service: &app_key::AppKeyService,
     app_id: &str,
     material: &str,
-) -> Result<Vec<u8>, Status> {
+) -> Result<(Vec<u8>, kms_client::KmsAnswer), Status> {
     // The client is taken out of the lock, not used under it: a fetch can now wait minutes
     // for the KMS to see a registration, and a held read guard would block every claim and
     // trust-anchor update behind it (tokio's RwLock is write-preferring), and with them every
@@ -256,14 +313,15 @@ async fn kms_derive_with(
     // Call KMS cluster → get ECIES-encrypted app key. `material` is opaque
     // derivation material forwarded verbatim (empty = omitted, derives
     // purely from the app_id namespace as before) — see issue #33.
-    let encrypted = kms
+    let (encrypted, answer) = kms
         .get_encrypted_secret(app_id, timestamp, &pubkey_hex, &signature_hex, material)
         .await
         .map_err(|e| Status::unavailable(format!("KMS request failed: {}", e)))?;
 
     // Decrypt with our private key
-    ecies::decrypt(&private_key, &encrypted)
-        .map_err(|e| Status::internal(format!("Failed to decrypt KMS secret: {}", e)))
+    let secret = ecies::decrypt(&private_key, &encrypted)
+        .map_err(|e| Status::internal(format!("Failed to decrypt KMS secret: {}", e)))?;
+    Ok((secret, answer))
 }
 
 impl TappServiceImpl {
@@ -279,7 +337,11 @@ impl TappServiceImpl {
     }
 
     /// See [`kms_derive_with`].
-    async fn kms_derive(&self, app_id: &str, material: &str) -> Result<Vec<u8>, Status> {
+    async fn kms_derive(
+        &self,
+        app_id: &str,
+        material: &str,
+    ) -> Result<(Vec<u8>, kms_client::KmsAnswer), Status> {
         kms_derive_with(&self.kms_client, &self.app_key_service, app_id, material).await
     }
 
@@ -350,7 +412,7 @@ impl TappServiceImpl {
                 tls_cert::derive_from_signer(&signer_key)
             }
             config::TlsKeySource::Kms => {
-                let secret = self
+                let (secret, answer) = self
                     .kms_derive(app_id, tls_cert::KMS_MATERIAL)
                     .await
                     .map_err(|e| {
@@ -362,7 +424,8 @@ impl TappServiceImpl {
                 // Taking a derived secret is a measured event wherever it happens, so a key
                 // pulled for TLS shows up in the runtime log exactly like one pulled by the
                 // app itself. The local path has nothing to measure — no secret moved.
-                self.measure_secret_resource(app_id, tls_cert::KMS_MATERIAL, true)
+                let _ = self
+                    .measure_secret_resource(app_id, tls_cert::KMS_MATERIAL, true, None, Some(&answer))
                     .await;
                 secret
             }
@@ -410,6 +473,12 @@ impl TappServiceImpl {
             .map(|id| format!("0x{}", id.public_key_sha256))
     }
 
+    /// The KMS keys `app_id` has taken this boot (read back from the event log at startup),
+    /// in material and then address order, for `report_data`.
+    async fn kms_keys_for_evidence(&self, app_id: &str) -> Vec<report_data::KmsKey> {
+        self.kms_keys.lock().await.of(app_id)
+    }
+
     /// Record that a KMS-derived secret left this node, into RTMR3.
     ///
     /// Without this, a derived key can be pulled by any container on the box and nothing
@@ -418,10 +487,24 @@ impl TappServiceImpl {
     /// not. It is what makes "re-acquiring a key leaves a trace" true rather than assumed.
     ///
     /// `material` is recorded because it names the derivation namespace, which is the part
-    /// that says *which* secret was taken. Failure to measure never fails the request: the
-    /// caller already holds the secret by this point, so refusing to answer would hide the
-    /// event rather than prevent it.
-    async fn measure_secret_resource(&self, app_id: &str, material: &str, success: bool) {
+    /// that says *which* secret was taken. `key`, when the app took the secret through
+    /// `GetSecretResource`, adds the address and public key that secret is as a private key:
+    /// the same entry `GetEvidence` lists, and what a restarted process reads the list back
+    /// from. `answer` adds the KMS node that answered and whether the connection to it was
+    /// checked against attestation, as the client that made the request knew it: the
+    /// settings may have changed while the request was under way. Failure to measure never
+    /// fails the request: the caller already holds the secret by this point, so refusing to
+    /// answer would hide the event rather than prevent it.
+    ///
+    /// Returns whether the event was written.
+    async fn measure_secret_resource(
+        &self,
+        app_id: &str,
+        material: &str,
+        success: bool,
+        key: Option<&report_data::KmsKey>,
+        answer: Option<&kms_client::KmsAnswer>,
+    ) -> bool {
         // Best-effort: an app fetching a secret before its measurements are known is
         // unusual but must still be recorded, so missing app_info leaves empty hashes
         // rather than skipping the event.
@@ -458,15 +541,19 @@ impl TappServiceImpl {
             Ok(serde_json::Value::Object(o)) => o,
             _ => {
                 tracing::error!("failed to serialise get_secret_resource measurement");
-                return;
+                return false;
             }
         };
         payload.insert(
             "material".to_string(),
             serde_json::Value::String(material.to_string()),
         );
+        payload.extend(report_data::kms_event_fields(
+            key,
+            answer.map(|a| (a.url.as_str(), a.attested)),
+        ));
 
-        if let Err(e) = self
+        match self
             .measurement_service
             .extend_measurement(
                 measurement_service::OPERATION_NAME_GET_SECRET_RESOURCE,
@@ -474,7 +561,11 @@ impl TappServiceImpl {
             )
             .await
         {
-            tracing::error!("Failed to extend measurement for get_secret_resource: {}", e);
+            Ok(()) => true,
+            Err(e) => {
+                tracing::error!("Failed to extend measurement for get_secret_resource: {}", e);
+                false
+            }
         }
     }
 
@@ -601,10 +692,13 @@ impl TappServiceImpl {
         }
         let claimed_runtime_config = Arc::new(tokio::sync::RwLock::new(runtime));
 
+        let kms_keys = kms_keys_of_this_boot(&measurement_service).await;
+
         info!("All TAPP service components initialized successfully");
 
         Ok(Self {
             tls_identities: Arc::new(Mutex::new(HashMap::new())),
+            kms_keys: Arc::new(Mutex::new(kms_keys)),
             boot_service,
             app_key_service,
             kms_client,
@@ -710,9 +804,11 @@ impl TappService for TappServiceImpl {
         // an unauthenticated caller drive KMS traffic, and would also mint a key for an
         // app that never asked for one.
         let tls_public_key = self.tls_public_key_for_evidence(&req.app_id).await;
+        // Likewise only the KMS keys the app has already taken: listed, never fetched here.
+        let kms_keys = self.kms_keys_for_evidence(&req.app_id).await;
         let evidence = self
             .boot_service
-            .get_evidence(req, &key_pair.eth_address, tls_public_key)
+            .get_evidence(req, &key_pair.eth_address, tls_public_key, kms_keys)
             .await?;
         Ok(Response::new(evidence))
     }
@@ -774,6 +870,7 @@ impl TappService for TappServiceImpl {
                         boot::DataPlan::Encrypted(Box::pin(async move {
                             kms_derive_with(&kms, &keys, &id, boot::volume::FDE_MATERIAL)
                                 .await
+                                .map(|(secret, _)| secret)
                                 .map_err(|e| e.message().to_string())
                         }))
                     } else {
@@ -2404,16 +2501,47 @@ impl TappService for TappServiceImpl {
             ));
         }
 
-        let secret = self.kms_derive(app_id, &req.material).await?;
+        // Refused here rather than by the KMS: the material goes into this app's evidence and
+        // into an event, so its form and size are ours to bound, not the KMS parser's.
+        report_data::check_material(&req.material).map_err(Status::invalid_argument)?;
 
-        self.measure_secret_resource(app_id, &req.material, true).await;
+        let (secret, answer) = self.kms_derive(app_id, &req.material).await?;
 
-        info!(app_id = %app_id, "GetSecretResource succeeded");
+        // The secret as a private key, which is what an app that signs with it is known by.
+        let key = report_data::KmsKey::of_secret(&req.material, &secret);
+        if key.is_none() {
+            tracing::warn!(
+                app_id = %app_id,
+                "the KMS secret is not a valid secp256k1 private key; it is not listed in evidence"
+            );
+        }
 
+        // Listed only once its event is written, so evidence never names a key the event log
+        // does not. A failed write leaves the key unlisted until the app asks again; the app
+        // has its secret either way.
+        let measured = self
+            .measure_secret_resource(app_id, &req.material, true, key.as_ref(), Some(&answer))
+            .await;
+        if let (Some(k), true) = (&key, measured) {
+            self.kms_keys.lock().await.record(app_id, k.clone());
+        }
+
+        info!(
+            app_id = %app_id,
+            address = key.as_ref().map(|k| k.address.as_str()).unwrap_or("-"),
+            "GetSecretResource succeeded"
+        );
+
+        let bytes_of = |hex_str: &str| hex::decode(report_data::strip_hex(hex_str)).unwrap_or_default();
         Ok(Response::new(GetSecretResourceResponse {
             success: true,
             message: format!("Secret resource retrieved for app {}", app_id),
             secret,
+            eth_address: key.as_ref().map(|k| bytes_of(&k.address)).unwrap_or_default(),
+            compressed_public_key: key
+                .as_ref()
+                .map(|k| bytes_of(&k.public_key))
+                .unwrap_or_default(),
         }))
     }
 }

@@ -27,11 +27,30 @@ pub struct NodeVerdict {
     pub tcb_status: String,
     pub advisories: usize,
     pub signer_ok: bool,  // report_data binds the on-chain signer
+    /// The AS verified the quote: its signature chain leads to Intel. Until then nothing
+    /// in the evidence is anything more than a claim.
+    pub quote_ok: bool,
     /// sha256 of the TLS public key the quote vouches for, `0x…`. Empty when the app has
     /// no TLS key. A client that compares this against the certificate it was served
     /// during a handshake learns the peer holds a key attested inside this TEE — which is
     /// the whole of layer-1 verification, and needs no CA.
     pub tls_public_key: String,
+    /// The KMS keys the app took on this node, as runtime_data lists them. Believe them
+    /// only when [`NodeVerdict::kms_keys_attested`] holds; see
+    /// [`AppVerdict::kms_key_conflicts`] for the check across nodes.
+    pub kms_keys: Vec<crate::report_data::KmsKey>,
+    /// Keys the event log says the app took this boot that runtime_data does not list: a
+    /// tapp-server that could not read the log back when it started. Compared like the
+    /// listed ones. Empty unless the event log replays.
+    pub kms_keys_logged_only: Vec<crate::report_data::KmsKey>,
+    /// How many of the keys (listed or logged only) have no `get_secret_resource` event
+    /// saying the KMS answered over a connection checked against attestation: taken with
+    /// no verifier, or from a node reached over plain http. Their address could have been
+    /// substituted.
+    pub kms_keys_unchecked: usize,
+    /// Listed keys that no event of this app names: another app's keys, which fails the
+    /// node. See `KeysInLog::unrecorded`.
+    pub kms_keys_unrecorded: usize,
     pub compose_ok: bool, // start_app compose == node effective compose
     pub volumes_ok: bool,
     pub image_ok: bool,
@@ -84,11 +103,177 @@ impl NodeVerdict {
             && (self.relayed_by.is_none() || self.fresh == Some(true))
             && !self.app_resumed_differently
     }
+
+    /// Why this node's KMS keys cannot be believed, or `None` when they can: the AS
+    /// verified the quote, the quote names the registered signer and was made for this
+    /// request (through a relay, provably so), the event log replays, the platform passes,
+    /// and the image is a published production one (or could not be checked). Everything
+    /// but a dev image fails the node on its own; what such a node lists is neither shown
+    /// as attested nor compared with the other nodes'.
+    ///
+    /// Believable is not the same as trustworthy: the keys are what the KMS cluster this
+    /// node trusted gave it, and that is the owner's setting (`kms_keys_unchecked`).
+    pub fn kms_keys_unattested(&self) -> Option<&'static str> {
+        if !self.quote_ok {
+            return Some("the AS did not verify the quote");
+        }
+        if !self.signer_ok {
+            return Some("the quote does not name this node's signer");
+        }
+        if self.fresh == Some(false) || (self.relayed_by.is_some() && self.fresh != Some(true)) {
+            return Some("the quote is not proven to be made for this request");
+        }
+        unattested_by(self.replay_ok, &self.platform(), &self.boot_chain)
+    }
+
+    pub fn kms_keys_attested(&self) -> bool {
+        self.kms_keys_unattested().is_none()
+    }
+}
+
+/// The checks [`NodeVerdict::kms_keys_unattested`] and the direct-mode one share.
+fn unattested_by(
+    replay_ok: bool,
+    platform: &Platform,
+    boot_chain: &crate::refvalues::BootChain,
+) -> Option<&'static str> {
+    if !replay_ok {
+        return Some("the event log does not replay");
+    }
+    if matches!(platform, Platform::Fail(_)) {
+        return Some("the platform fails (DEBUG on, or a revoked TCB)");
+    }
+    match boot_chain {
+        crate::refvalues::BootChain::Unknown { .. } => Some("the image is not a published one"),
+        // Its operator has a shell in the TD, so the quote vouches for anything.
+        crate::refvalues::BootChain::Matched(label) if crate::refvalues::is_dev_image(label) => {
+            Some("a dev image, whose operator has a shell in the TD")
+        }
+        _ => None,
+    }
+}
+
+/// The materials for which more than one key is attested among `holders`: each node's
+/// signer and the keys it can be believed about.
+///
+/// The KMS derives one key per (app_id, material), so every node that took a material
+/// must name the same address for it, and a node names at most one. Two addresses mean a
+/// node got a key from somewhere else: another KMS cluster, or an answer substituted on
+/// the way. Which one is the odd one out the evidence cannot say.
+pub fn kms_key_conflicts<'a>(
+    holders: impl IntoIterator<Item = (&'a str, Vec<&'a crate::report_data::KmsKey>)>,
+) -> Vec<KmsKeyConflict> {
+    let mut by_material: std::collections::BTreeMap<&str, std::collections::BTreeMap<&str, Vec<String>>> =
+        Default::default();
+    for (signer, keys) in holders {
+        // Entries are in the one form tapp-server writes (read_kms_keys and
+        // eventlog_kms_keys drop the rest), so plain string comparison is exact.
+        for k in keys {
+            let signers = by_material
+                .entry(k.material.as_str())
+                .or_default()
+                .entry(k.address.as_str())
+                .or_default();
+            if !signers.iter().any(|s| s == signer) {
+                signers.push(signer.to_string());
+            }
+        }
+    }
+    by_material
+        .into_iter()
+        .filter(|(_, addresses)| addresses.len() > 1)
+        .map(|(material, addresses)| KmsKeyConflict {
+            material: material.to_string(),
+            addresses: addresses
+                .into_iter()
+                .map(|(address, signers)| (address.to_string(), signers))
+                .collect(),
+        })
+        .collect()
+}
+
+/// What a node's event log says about the keys its runtime_data lists, for `app_id`.
+struct KeysInLog {
+    /// Keys only the log names.
+    logged_only: Vec<crate::report_data::KmsKey>,
+    /// Of all the keys, those whose events never say the KMS was checked against
+    /// attestation.
+    unchecked: usize,
+    /// Listed keys that no event of this app names. tapp-server lists a key only once its
+    /// event is written, so in evidence whose log replays this cannot happen honestly:
+    /// runtime_data carries no app_id, and such a key is another app's.
+    unrecorded: usize,
+}
+
+/// `None` when the log cannot be read.
+fn kms_keys_from_log(
+    cc_eventlog_b64: &str,
+    app_id: &str,
+    listed: &[crate::report_data::KmsKey],
+) -> Option<KeysInLog> {
+    let logged: HashMap<(String, String), LoggedKmsKey> = eventlog_kms_keys(cc_eventlog_b64)
+        .ok()?
+        .into_iter()
+        .filter(|l| l.app_id == app_id)
+        .map(|l| ((l.key.material.clone(), l.key.address.clone()), l))
+        .collect();
+    let checked = |k: &crate::report_data::KmsKey| {
+        logged
+            .get(&(k.material.clone(), k.address.clone()))
+            .is_some_and(|l| l.checked)
+    };
+    let listed_set: HashSet<(&str, &str)> =
+        listed.iter().map(|k| (k.material.as_str(), k.address.as_str())).collect();
+    let mut logged_only: Vec<_> = logged
+        .values()
+        .filter(|l| !listed_set.contains(&(l.key.material.as_str(), l.key.address.as_str())))
+        .map(|l| l.key.clone())
+        .collect();
+    logged_only.sort_by(|a, b| (&a.material, &a.address).cmp(&(&b.material, &b.address)));
+    let in_log = |k: &crate::report_data::KmsKey| {
+        logged.contains_key(&(k.material.clone(), k.address.clone()))
+    };
+    let unrecorded = listed.iter().filter(|k| !in_log(k)).count();
+    let unchecked = listed
+        .iter()
+        .chain(logged_only.iter())
+        .filter(|k| in_log(k) && !checked(k))
+        .count();
+    Some(KeysInLog {
+        logged_only,
+        unchecked,
+        unrecorded,
+    })
 }
 
 pub struct AppVerdict {
     pub app_id: String,
     pub nodes: Vec<NodeVerdict>,
+}
+
+/// A material for which the nodes of an app attest more than one key.
+#[derive(Debug, PartialEq, Eq)]
+pub struct KmsKeyConflict {
+    pub material: String,
+    /// Each address attested for the material, with the signers of the nodes attesting it.
+    pub addresses: Vec<(String, Vec<String>)>,
+}
+
+impl AppVerdict {
+    /// The materials for which more than one key is attested across this app's nodes (see
+    /// [`kms_key_conflicts`]): a finding about the app rather than about a node.
+    ///
+    /// Only nodes whose keys are attested count ([`NodeVerdict::kms_keys_attested`]), with
+    /// what runtime_data lists and what only the event log names. The others fail on their
+    /// own (or run a dev image), and nothing they say about their keys can be believed.
+    pub fn kms_key_conflicts(&self) -> Vec<KmsKeyConflict> {
+        kms_key_conflicts(self.nodes.iter().filter(|n| n.kms_keys_attested()).map(|n| {
+            (
+                n.signer.as_str(),
+                n.kms_keys.iter().chain(&n.kms_keys_logged_only).collect(),
+            )
+        }))
+    }
 }
 
 struct StartAppMeasure {
@@ -104,6 +289,8 @@ struct Attested {
     /// sha256 of the app's TLS public key, `0x…`, empty when the app has no TLS key yet.
     /// A client compares this against the key it was handed during a handshake.
     tls_public_key: String,
+    /// The KMS keys listed, those in the form tapp-server writes (`read_kms_keys`).
+    kms_keys: Vec<crate::report_data::KmsKey>,
     /// `None` when no challenge was sent or the server predates the field, so a caller
     /// that does not care about freshness is never reported as failing.
     fresh: Option<bool>,
@@ -133,6 +320,7 @@ fn read_report_data(evidence: &serde_json::Value, quote_b64: &str, nonce: &[u8])
     let mut a = Attested {
         signer: String::new(),
         tls_public_key: String::new(),
+        kms_keys: Vec::new(),
         fresh: None,
         structured: false,
         note: String::new(),
@@ -185,6 +373,16 @@ fn read_report_data(evidence: &serde_json::Value, quote_b64: &str, nonce: &[u8])
                 "challenge not echoed — this evidence was not produced for this request; "
                     .to_string();
         }
+    }
+    let read = crate::report_data::read_kms_keys(&bytes);
+    a.kms_keys = read.keys;
+    if read.dropped > 0 {
+        a.note.push_str(&format!(
+            "{} kms_keys entr{} ignored ({}); ",
+            read.dropped,
+            if read.dropped == 1 { "y" } else { "ies" },
+            read.reasons.join("; ")
+        ));
     }
     a
 }
@@ -485,6 +683,57 @@ fn eventlog_app_resumed_differently(cc_eventlog_b64: &str, app_id: &str) -> Resu
     Ok(differs)
 }
 
+/// A KMS key the event log says was taken this boot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoggedKmsKey {
+    pub app_id: String,
+    pub key: crate::report_data::KmsKey,
+    /// At least one of its `get_secret_resource` events says the KMS answered over a
+    /// connection checked against attestation (`kms_attested`): TLS to a node holding a key
+    /// the verifier attests. Recorded by the client that made the request, so a change of
+    /// settings while it was under way cannot make an unchecked answer look checked.
+    pub checked: bool,
+}
+
+/// Every KMS key the `get_secret_resource` events of this boot name, once per app and key,
+/// in app, material and address order. Events from before tapp-server 0.11.0 name no key
+/// and are skipped, as is anything not in the form tapp-server writes.
+///
+/// tapp-server reads this back when it starts, so that `runtime_data.kms_keys` covers the
+/// whole boot. A verifier reads it to tell, for each key, whether the KMS that gave it was
+/// checked against attestation.
+pub fn eventlog_kms_keys(cc_eventlog_b64: &str) -> Result<Vec<LoggedKmsKey>> {
+    let events = eventlog_tapp_events(cc_eventlog_b64, "get_secret_resource")?;
+    let mut out: std::collections::BTreeMap<(String, String, String), LoggedKmsKey> =
+        Default::default();
+    for v in &events {
+        let (Some(app_id), Some(address), Some(material), Some(public_key)) = (
+            v["app_id"].as_str(),
+            v["address"].as_str(),
+            v["material"].as_str(),
+            v["public_key"].as_str(),
+        ) else {
+            continue;
+        };
+        let key = crate::report_data::KmsKey {
+            address: address.to_string(),
+            material: crate::report_data::normalize_material(material),
+            public_key: public_key.to_string(),
+        };
+        if key.problem().is_some() {
+            continue;
+        }
+        out.entry((app_id.to_string(), key.material.clone(), key.address.clone()))
+            .or_insert_with(|| LoggedKmsKey {
+                app_id: app_id.to_string(),
+                key,
+                checked: false,
+            })
+            .checked |= v["kms_attested"].as_bool() == Some(true);
+    }
+    Ok(out.into_values().collect())
+}
+
 /// The anchors in force, read from the newest event that sets them.
 ///
 /// `update_trust_anchors` events carry the resulting state in full, so the newest one is
@@ -683,15 +932,21 @@ async fn verify_with_as(
     raw_evidence: &[u8],
     policy_ids: &[String],
 ) -> Result<AsVerdict> {
-    let mut client = connect_as(as_endpoint, as_pubkey).await?;
+    // The request carries the whole evidence and the token the whole parsed event log, so
+    // both directions get the evidence limit (the scan sets the same). The AS's own server
+    // limit is its own: on default settings it refuses a request past 4 MiB.
+    let mut client = connect_as(as_endpoint, as_pubkey)
+        .await?
+        .max_decoding_message_size(MAX_EVIDENCE_LEN)
+        .max_encoding_message_size(MAX_EVIDENCE_LEN);
     let req = AttestationRequest {
         verification_requests: vec![IndividualAttestationRequest {
             tee: "tdx".to_string(),
             evidence: B64URL.encode(raw_evidence),
-            // Left unset deliberately. report_data is now sha512 of the runtime_data we
-            // could hand over here, which would make the AS check the binding for us — but
-            // only if its hash choice matches ours, and that is unconfirmed. Until then we
-            // check it ourselves in read_report_data, which loses nothing.
+            // Left unset deliberately: read_report_data checks the binding itself, which
+            // loses nothing. Handing the AS our runtime_data as structured runtime data with
+            // "sha512" named would have it check too (its default is sha384, and raw runtime
+            // data it compares unhashed); the bytes are the canonical JSON it hashes.
             runtime_data: None,
             init_data: None,
             runtime_data_hash_algorithm: String::new(),
@@ -747,6 +1002,9 @@ fn fresh_nonce() -> Vec<u8> {
 /// for minutes.
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 
+/// Largest evidence accepted from a node, the scan's own limit. Shared with `get-evidence`.
+pub const MAX_EVIDENCE_LEN: usize = 64 * 1024 * 1024;
+
 /// Where a fetch failed: before the node answered (worth trying the relay) or after
 /// (the node itself said no, and a relay would only repeat it).
 enum FetchError {
@@ -780,7 +1038,9 @@ async fn fetch_evidence(tee_url: &str, app_id: &str, nonce: &[u8]) -> Result<Vec
         }
     };
     let mut client = match tokio::time::timeout(CONNECT_TIMEOUT, connect).await {
-        Ok(Ok(c)) => c,
+        // Evidence grows with the event log and with every KMS key an app takes; tonic's
+        // default 4 MiB would refuse a busy node's. The scan allows the same 64 MiB.
+        Ok(Ok(c)) => c.max_decoding_message_size(MAX_EVIDENCE_LEN),
         Ok(Err(e)) => return Err(FetchError::Unreachable(e)),
         Err(_) => {
             return Err(FetchError::Unreachable(anyhow!(
@@ -863,6 +1123,19 @@ pub struct DirectVerdict {
     pub signer: String, // from quote report_data (0x…), as attested (not reconciled)
     /// sha256 of the attested TLS public key, `0x…`. Empty when the app has no TLS key.
     pub tls_public_key: String,
+    /// The KMS keys the app took on this node, as runtime_data lists them. Believe them
+    /// only when [`DirectVerdict::kms_keys_attested`] holds.
+    pub kms_keys: Vec<crate::report_data::KmsKey>,
+    /// See NodeVerdict.
+    pub kms_keys_logged_only: Vec<crate::report_data::KmsKey>,
+    /// See NodeVerdict.
+    pub kms_keys_unchecked: usize,
+    /// See NodeVerdict.
+    pub kms_keys_unrecorded: usize,
+    /// The AS verified the quote. See NodeVerdict.
+    pub quote_ok: bool,
+    /// Whether the quote echoed the challenge sent for it. See NodeVerdict.
+    pub fresh: Option<bool>,
     pub ear_status: String,
     pub tcb_status: String,
     pub advisories: usize,
@@ -885,6 +1158,33 @@ impl DirectVerdict {
     pub fn platform(&self) -> Platform {
         platform(&self.tcb_status, self.td_debug)
     }
+
+    /// [`NodeVerdict::kms_keys_unattested`] without the signer, which direct mode has no
+    /// registration to compare against, and without a relay.
+    pub fn kms_keys_unattested(&self) -> Option<&'static str> {
+        if !self.quote_ok {
+            return Some("the AS did not verify the quote");
+        }
+        if self.fresh == Some(false) {
+            return Some("the quote was made for another request");
+        }
+        unattested_by(self.replay_ok, &self.platform(), &self.boot_chain)
+    }
+
+    pub fn kms_keys_attested(&self) -> bool {
+        self.kms_keys_unattested().is_none()
+    }
+
+    /// One node can disagree with itself too: two keys for one material.
+    pub fn kms_key_conflicts(&self) -> Vec<KmsKeyConflict> {
+        if !self.kms_keys_attested() {
+            return Vec::new();
+        }
+        kms_key_conflicts([(
+            self.signer.as_str(),
+            self.kms_keys.iter().chain(&self.kms_keys_logged_only).collect(),
+        )])
+    }
 }
 
 pub async fn verify_node_direct(
@@ -899,6 +1199,12 @@ pub async fn verify_node_direct(
         server: server.to_string(),
         signer: String::new(),
         tls_public_key: String::new(),
+        kms_keys: Vec::new(),
+        kms_keys_logged_only: Vec::new(),
+        kms_keys_unchecked: 0,
+        kms_keys_unrecorded: 0,
+        quote_ok: false,
+        fresh: None,
         ear_status: "-".to_string(),
         tcb_status: "-".to_string(),
         advisories: 0,
@@ -925,10 +1231,13 @@ pub async fn verify_node_direct(
     let attested = read_report_data(&j, quote_b64, &nonce);
     v.signer = attested.signer.clone();
     v.tls_public_key = attested.tls_public_key.clone();
+    v.kms_keys = attested.kms_keys.clone();
+    v.fresh = attested.fresh;
     v.note = attested.note.clone();
 
     match verify_with_as(as_endpoint, as_pubkey, &raw, policy_ids).await {
         Ok(av) => {
+            v.quote_ok = true;
             v.ear_status = av.ear_status;
             v.tcb_status = av.tcb_status;
             v.advisories = av.advisories;
@@ -939,6 +1248,17 @@ pub async fn verify_node_direct(
             v.td_debug = av.td_debug;
         }
         Err(e) => v.note = format!("{}AS: {}", v.note, e),
+    }
+
+    // What the event log says about each key, once the log is known to replay. Until then
+    // no key's provenance is known.
+    v.kms_keys_unchecked = v.kms_keys.len();
+    if v.replay_ok {
+        if let Some(log) = kms_keys_from_log(cc_b64, app_id, &v.kms_keys) {
+            v.kms_keys_logged_only = log.logged_only;
+            v.kms_keys_unchecked = log.unchecked;
+            v.kms_keys_unrecorded = log.unrecorded;
+        }
     }
 
     if let Ok(Some(m)) = latest_successful_start(cc_b64, app_id) {
@@ -1001,7 +1321,12 @@ pub async fn verify_app(
             tcb_status: "-".to_string(),
             advisories: 0,
             signer_ok: false,
+            quote_ok: false,
             tls_public_key: String::new(),
+            kms_keys: Vec::new(),
+            kms_keys_logged_only: Vec::new(),
+            kms_keys_unchecked: 0,
+            kms_keys_unrecorded: 0,
             compose_ok: false,
             volumes_ok: false,
             image_ok: false,
@@ -1070,12 +1395,14 @@ pub async fn verify_app(
         let attested = read_report_data(&j, quote_b64, &nonce);
         v.signer_ok = attested.is(signer.as_bytes());
         v.tls_public_key = attested.tls_public_key.clone();
+        v.kms_keys = attested.kms_keys.clone();
         v.fresh = attested.fresh;
         v.note = attested.note.clone();
 
         // ③ AS quote verification
         match verify_with_as(as_endpoint, as_pubkey, &raw, policy_ids).await {
             Ok(av) => {
+                v.quote_ok = true;
                 v.ear_status = av.ear_status;
                 v.tcb_status = av.tcb_status;
                 v.advisories = av.advisories;
@@ -1092,6 +1419,17 @@ pub async fn verify_app(
                 }
             }
             Err(e) => v.note = format!("{}AS: {}", v.note, e),
+        }
+
+        // What the event log says about each key, once the log is known to replay. Until
+        // then no key's provenance is known.
+        v.kms_keys_unchecked = v.kms_keys.len();
+        if v.replay_ok {
+            if let Some(log) = kms_keys_from_log(cc_b64, app_id, &v.kms_keys) {
+                v.kms_keys_logged_only = log.logged_only;
+                v.kms_keys_unchecked = log.unchecked;
+                v.kms_keys_unrecorded = log.unrecorded;
+            }
         }
 
         // ④b reconcile compose/volumes/image vs chain
@@ -1207,6 +1545,92 @@ mod tests {
     #[test]
     fn a_node_with_no_config_events_reports_no_anchors() {
         assert_eq!(eventlog_trust_anchors(&tcg_log(&[])).unwrap(), None);
+    }
+
+    /// A `get_secret_resource` event as tapp-server ≥ 0.11.0 measures it, built with the
+    /// same field builder the server uses. `attested` is what the KMS client reported.
+    fn taken(app_id: &str, material: &str, last: u8, attested: bool) -> String {
+        let mut event = serde_json::json!({
+            "app_id": app_id, "operation": "get_secret_resource", "result": "success",
+            "material": material,
+        });
+        let fields = crate::report_data::kms_event_fields(
+            Some(&key(material, last)),
+            Some(("https://kms-1:9443", attested)),
+        );
+        event.as_object_mut().unwrap().extend(fields);
+        event.to_string()
+    }
+
+    fn key(material: &str, last: u8) -> crate::report_data::KmsKey {
+        let mut secret = [0u8; 32];
+        secret[31] = last;
+        crate::report_data::KmsKey::of_secret(material, &secret).unwrap()
+    }
+
+    #[test]
+    fn each_logged_key_is_judged_by_what_its_own_events_say() {
+        let log = tcg_log(&[
+            // Settings events say nothing about a key: the event of the key itself does.
+            ("update_trust_anchors", &anchors_event("https://scan.a", &["https://kms-1:9443"])),
+            ("get_secret_resource", &taken("a", "01", 1, false)),
+            ("get_secret_resource", &taken("a", "0x02", 2, true)),
+            // Unchecked, then checked: the same key, now known to be the cluster's.
+            ("get_secret_resource", &taken("a", "03", 3, false)),
+            ("get_secret_resource", &taken("a", "03", 3, true)),
+            // And the reverse.
+            ("get_secret_resource", &taken("a", "04", 4, true)),
+            ("get_secret_resource", &taken("a", "04", 4, false)),
+            ("get_secret_resource", &taken("b", "05", 5, true)),
+            // Before 0.11.0 an event names no key; the TLS key never does.
+            ("get_secret_resource", r#"{"app_id":"a","material":"746c73","kms_attested":true}"#),
+        ]);
+        let logged = eventlog_kms_keys(&log).unwrap();
+        let checked_of = |app: &str, m: &str| {
+            logged.iter().find(|l| l.app_id == app && l.key.material == m).map(|l| l.checked)
+        };
+        assert_eq!(checked_of("a", "01"), Some(false));
+        assert_eq!(checked_of("a", "02"), Some(true), "0x02 is read as the KMS reads it");
+        assert_eq!(checked_of("a", "03"), Some(true));
+        assert_eq!(checked_of("a", "04"), Some(true));
+        assert_eq!(checked_of("b", "05"), Some(true));
+        assert_eq!(logged.len(), 5);
+    }
+
+    #[test]
+    fn the_log_adds_what_runtime_data_does_not_list_and_counts_the_rest() {
+        let log = tcg_log(&[
+            ("get_secret_resource", &taken("a", "01", 1, true)),
+            ("get_secret_resource", &taken("a", "02", 2, false)),
+            ("get_secret_resource", &taken("b", "03", 3, true)),
+        ]);
+        // 02 is not listed (a restart that could not read the log back); 03 is app b's key,
+        // listed under a; 09 no event names at all.
+        let listed = vec![key("01", 1), key("03", 3), key("09", 9)];
+        let log = kms_keys_from_log(&log, "a", &listed).unwrap();
+        assert_eq!(log.logged_only, vec![key("02", 2)]);
+        assert_eq!(log.unchecked, 1, "02, taken from an unchecked KMS");
+        assert_eq!(log.unrecorded, 2, "03 and 09, which no event of app a names");
+    }
+
+    #[test]
+    fn a_dev_image_proves_no_keys() {
+        let dev = crate::refvalues::BootChain::Matched("gcp/uki/v0.8.0/dev.json".into());
+        let prod = crate::refvalues::BootChain::Matched("gcp/uki/v0.8.0/prod.json".into());
+        assert!(unattested_by(true, &Platform::Ok, &dev).is_some());
+        assert_eq!(unattested_by(true, &Platform::Ok, &prod), None);
+        // Reference values unavailable: nothing to tell, so not held against the node.
+        assert_eq!(unattested_by(true, &Platform::Ok, &crate::refvalues::BootChain::NotChecked), None);
+        assert!(unattested_by(false, &Platform::Ok, &prod).is_some(), "a log that does not replay");
+    }
+
+    #[test]
+    fn one_key_listed_and_logged_is_not_counted_twice() {
+        let conflicts = kms_key_conflicts([("0x01", vec![&key("ab", 1), &key("ab", 1)])]);
+        assert!(conflicts.is_empty());
+        let conflicts = kms_key_conflicts([("0x01", vec![&key("ab", 1), &key("ab", 2)])]);
+        assert_eq!(conflicts.len(), 1);
+        assert!(conflicts[0].addresses.iter().all(|(_, s)| s == &vec!["0x01".to_string()]));
     }
 
     #[test]
@@ -1345,6 +1769,50 @@ mod tests {
         assert!(!a.is(&[0x22; 20]), "the swapped signer must not be believed either");
         assert!(a.note.contains("does not hash"), "got {}", a.note);
     }
+
+    fn kms_key(material: &str, last: u8) -> crate::report_data::KmsKey {
+        let mut secret = [0u8; 32];
+        secret[31] = last;
+        crate::report_data::KmsKey::of_secret(material, &secret).unwrap()
+    }
+
+    #[test]
+    fn the_kms_keys_a_quote_vouches_for_are_read_back() {
+        let mut rdata = crate::report_data::RuntimeData::new(&SIGNER, b"chal").unwrap();
+        rdata.kms_keys = vec![kms_key("", 1), kms_key("7369676e6572", 2)];
+        let (bytes, rd) = rdata.seal().unwrap();
+        let ev = serde_json::json!({ crate::report_data::EVIDENCE_FIELD: B64.encode(&bytes) });
+        let a = read_report_data(&ev, &quote_with(&rd), b"chal");
+        assert!(a.is(&SIGNER));
+        assert_eq!(a.kms_keys, rdata.kms_keys);
+        assert!(a.note.is_empty(), "got {}", a.note);
+    }
+
+    #[test]
+    fn a_kms_key_whose_address_is_not_its_public_keys_is_dropped_and_said() {
+        let mut bad = kms_key("ab", 1);
+        bad.address = kms_key("ab", 2).address;
+        let mut rdata = crate::report_data::RuntimeData::new(&SIGNER, b"theirs").unwrap();
+        rdata.kms_keys = vec![kms_key("", 1), bad];
+        let (bytes, rd) = rdata.seal().unwrap();
+        let ev = serde_json::json!({ crate::report_data::EVIDENCE_FIELD: B64.encode(&bytes) });
+        let a = read_report_data(&ev, &quote_with(&rd), b"mine");
+        assert_eq!(a.kms_keys, vec![kms_key("", 1)]);
+        // Said alongside the challenge finding, not instead of it.
+        assert!(a.note.contains("not echoed"), "got {}", a.note);
+        assert!(a.note.contains("\"ab\""), "got {}", a.note);
+    }
+
+    #[test]
+    fn kms_keys_in_runtime_data_that_does_not_hash_are_not_believed() {
+        let (_, rd) = crate::report_data::RuntimeData::new(&SIGNER, b"chal").unwrap().seal().unwrap();
+        let mut forged = crate::report_data::RuntimeData::new(&SIGNER, b"chal").unwrap();
+        forged.kms_keys = vec![kms_key("", 1)];
+        let (bytes, _) = forged.seal().unwrap();
+        let ev = serde_json::json!({ crate::report_data::EVIDENCE_FIELD: B64.encode(&bytes) });
+        let a = read_report_data(&ev, &quote_with(&rd), b"chal");
+        assert!(a.kms_keys.is_empty());
+    }
 }
 
 #[cfg(test)]
@@ -1360,7 +1828,12 @@ mod relay_tests {
             tcb_status: "UpToDate".into(),
             advisories: 0,
             signer_ok: true,
+            quote_ok: true,
             tls_public_key: String::new(),
+            kms_keys: Vec::new(),
+            kms_keys_logged_only: Vec::new(),
+            kms_keys_unchecked: 0,
+            kms_keys_unrecorded: 0,
             compose_ok: true,
             volumes_ok: true,
             image_ok: true,
@@ -1409,6 +1882,102 @@ mod relay_tests {
     fn a_quote_made_for_another_request_never_passes() {
         assert!(!node(Some(false), false).reconciled());
         assert!(!node(Some(false), true).reconciled());
+    }
+
+    fn holding(signer: &str, keys: &[(&str, u8)]) -> NodeVerdict {
+        let mut n = node(Some(true), false);
+        n.signer = signer.into();
+        n.kms_keys = keys
+            .iter()
+            .map(|(material, last)| {
+                let mut secret = [0u8; 32];
+                secret[31] = *last;
+                crate::report_data::KmsKey::of_secret(material, &secret).unwrap()
+            })
+            .collect();
+        n
+    }
+
+    #[test]
+    fn nodes_that_took_the_same_keys_agree() {
+        let app = AppVerdict {
+            app_id: "a".into(),
+            nodes: vec![
+                holding("0x01", &[("", 1), ("ab", 2)]),
+                // A node that has not taken a material yet is not a disagreement.
+                holding("0x02", &[("", 1)]),
+            ],
+        };
+        assert!(app.kms_key_conflicts().is_empty());
+    }
+
+    #[test]
+    fn two_keys_for_one_material_are_a_conflict_naming_both() {
+        let app = AppVerdict {
+            app_id: "a".into(),
+            nodes: vec![
+                holding("0x01", &[("", 1), ("ab", 2)]),
+                holding("0x02", &[("", 1), ("ab", 3)]),
+                holding("0x03", &[("ab", 2)]),
+            ],
+        };
+        let conflicts = app.kms_key_conflicts();
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].material, "ab");
+        let signers: Vec<_> = conflicts[0].addresses.iter().map(|(_, s)| s.clone()).collect();
+        assert!(signers.contains(&vec!["0x01".to_string(), "0x03".to_string()]), "{signers:?}");
+        assert!(signers.contains(&vec!["0x02".to_string()]), "{signers:?}");
+    }
+
+    #[test]
+    fn a_node_whose_runtime_data_names_another_signer_does_not_count() {
+        let mut stranger = holding("0x02", &[("ab", 3)]);
+        stranger.signer_ok = false;
+        let app = AppVerdict {
+            app_id: "a".into(),
+            nodes: vec![holding("0x01", &[("ab", 2)]), stranger],
+        };
+        assert!(app.kms_key_conflicts().is_empty());
+    }
+
+    #[test]
+    fn keys_from_evidence_that_did_not_verify_are_not_compared() {
+        // Each of these nodes fails on its own; none may make the healthy one look like
+        // it disagrees. A fabricated quote can name the registered signer and any key, so
+        // signer_ok alone is not enough.
+        let unverified: [fn(&mut NodeVerdict); 5] = [
+            |n| n.quote_ok = false,
+            |n| n.fresh = Some(false),
+            |n| {
+                n.fresh = None;
+                n.relayed_by = Some("https://tappscan.0g.ai".into());
+            },
+            |n| n.td_debug = Some(true),
+            |n| n.boot_chain = crate::refvalues::BootChain::Unknown { closest: None },
+        ];
+        for break_it in unverified {
+            let mut odd = holding("0x02", &[("ab", 3)]);
+            break_it(&mut odd);
+            assert!(!odd.kms_keys_attested());
+            let app = AppVerdict {
+                app_id: "a".into(),
+                nodes: vec![holding("0x01", &[("ab", 2)]), odd],
+            };
+            assert!(app.kms_key_conflicts().is_empty());
+        }
+        assert!(holding("0x01", &[]).kms_keys_attested());
+    }
+
+    #[test]
+    fn one_node_with_two_keys_for_a_material_is_a_conflict() {
+        // What a node lists after its KMS cluster was changed while it ran.
+        let app = AppVerdict {
+            app_id: "a".into(),
+            nodes: vec![holding("0x01", &[("ab", 2), ("ab", 3)])],
+        };
+        let conflicts = app.kms_key_conflicts();
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].addresses.len(), 2);
     }
 
     #[test]

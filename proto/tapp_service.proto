@@ -741,10 +741,12 @@ message ContainerStatus {
 // GetSecretResource Messages
 message GetSecretResourceRequest {
   string app_id = 1;
-  // Optional hex-encoded derivation material, opaque to tapp — forwarded
-  // verbatim to KMS /app-key, which binds it into the derived key alongside
-  // app_id (e.g. AgenticID: chainId || contractAddress || sealId).
-  // Absent/empty derives purely from the app_id namespace, as before.
+  // Optional hex-encoded derivation material, forwarded verbatim to KMS
+  // /app-key, which binds it into the derived key alongside app_id (e.g.
+  // AgenticID: chainId || contractAddress || sealId). Absent/empty derives
+  // purely from the app_id namespace, as before. From tapp-server 0.11.0 it is
+  // refused (INVALID_ARGUMENT) unless it is hex (digits in either case, with an
+  // optional 0x) of at most 256 bytes: it is written into the app's evidence.
   string material = 2;
 }
 
@@ -752,6 +754,21 @@ message GetSecretResourceResponse {
   bool success = 1;
   string message = 2;
   bytes secret = 3;  // plaintext KMS-derived app key
+
+  // The secret read as a secp256k1 private key: its Ethereum address (20 bytes) and its
+  // compressed public key (33 bytes; GetAppKey's public_key is 64 bytes uncompressed). An
+  // app that signs with the secret itself signs as this address. Once this call's
+  // get_secret_resource event is written, and to the end of the boot, GetEvidence for the
+  // app lists the key in runtime_data.kms_keys (a restarted tapp-server reads it back from
+  // the event log), which is how a verifier learns that the address is held by an attested
+  // TEE of the app. Ask once per boot: every call adds an event to the event log, which all
+  // of the node's evidence carries.
+  //
+  // Empty from a tapp-server older than 0.11.0, which neither sets nor lists them: derive
+  // them from `secret` instead. Also empty in the (~2^-128) case that the secret is not a
+  // valid private key, which is then not listed either.
+  bytes eth_address = 4;
+  bytes compressed_public_key = 5;
 }
 
 // ClaimConfig Messages
