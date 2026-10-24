@@ -823,6 +823,11 @@ it confirms are the containers started (so a node whose volume key comes from th
 KMS is on the node list when it asks). Safe to re-run; it writes nothing when the
 chain already matches.
 
+With tapp-server ≥0.12.1, the measure-only preflight does not derive TLS keys or
+contact the KMS. Its task ID and measurements can therefore be returned before
+the app is registered, including on nodes using KMS-backed TLS. TLS derivation
+is attempted on the subsequent real start and when the app requests a certificate.
+
 **Each node's record says what that node runs.** A deployment rewrites only this
 node's compose and mount files — stored as the node's own override where they
 differ from the app's default — and never another node's. So every node can be

@@ -1,7 +1,7 @@
 ---
 name: 0g-tapp-cli
 description: Use this skill when the user wants to deploy, manage, or troubleshoot applications on a 0G Tapp (Trusted Application Platform) server using tapp-cli. Covers start/stop apps, on-chain registration, registry login, check task status, view logs, and manage docker compose deployments across multiple remote TEE servers.
-version: 1.25.0
+version: 1.25.1
 author: 0G Labs
 tags: [0g, tapp, tee, docker, deployment, cli, onchain]
 ---
@@ -73,6 +73,8 @@ tapp-cli -s <server> -k 0x<key> start-app -f <compose> --app-id <id> \
   #   Signer-keyed apps (0g-sandbox vouchers): restart with --add-node, settle, then remove the old node
   #   (a one-node app would otherwise treat the new signer as a replacement).
   #   Requires a server with measure_only support; older servers → CLI aborts ("Server did not return measurements").
+  #   Server ≥0.12.1 skips TLS/KMS derivation during measure-only, so preflight can
+  #   return measurements before registration even when TLS uses KMS.
 tapp-cli -s <server> -k 0x<key> get-task-status --task-id <task-id>
 tapp-cli -s <server> -k 0x<key> stop-app --app-id <id>
 tapp-cli -s <server> -k 0x<key> stop-service  --app-id <id> --service-name <svc>  # flag is --service-name

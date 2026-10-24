@@ -23,6 +23,7 @@ pub mod permission;
 pub mod service_monitor;
 pub mod signature_auth;
 mod signer_cache;
+mod start_identity;
 pub mod task_manager;
 pub mod tls_cert;
 pub mod utils;
@@ -986,6 +987,7 @@ impl TappService for TappServiceImpl {
         let signer = auth_layer::get_signer_address(&request);
         let req_inner = request.into_inner();
         let app_id = req_inner.app_id.clone();
+        let measure_only = req_inner.measure_only;
 
         // Get deployer address (signer EVM address)
         // If no signer (auth disabled), use a default placeholder
@@ -1104,25 +1106,18 @@ impl TappService for TappServiceImpl {
             .start_app(req_inner, deployer.clone(), data_plan)
             .await?;
 
-        // Derive the app's TLS identity now rather than waiting for it to be asked for.
+        // Derive TLS only for a real start. A measurement preflight must return its
+        // task ID before registration: KMS admission cannot succeed before the CLI
+        // uses those measurements to register the app on chain.
         //
-        // The rule is one sentence — the key exists as soon as the app runs — and it holds
-        // for both key sources, which matters: a verifier reading "no TLS key" out of
-        // evidence must not have to wonder whether it means "none" or "not fetched yet".
-        //
-        // Waiting is not an unlucky race but the normal case. Deployment goes start → register
-        // on chain → the app fetches its certificate, and a registry event is exactly what
-        // makes tappscan re-verify — so it would fetch evidence in the gap, record "no TLS
-        // key", and keep saying so until its hourly backstop.
-        //
-        // Doing it here rather than in GetEvidence keeps it behind the owner's signature.
-        // GetEvidence is unauthenticated, and deriving there would let anyone drive KMS
-        // traffic, and mint keys for apps that never wanted one.
-        //
-        // Best effort: a KMS-sourced key needs the app registered on chain and the cluster
-        // reachable, neither of which is true on a first deploy. Failing here would fail a
-        // start that has already succeeded, so it is logged and the lazy path picks it up.
-        if let Err(e) = self.tls_identity(&app_id).await {
+        // Keep the existing eager, best-effort TLS derivation for a real start. It
+        // publishes the public identity for evidence before the certificate is requested.
+        // This stays behind the owner's signature; GetEvidence never drives KMS traffic.
+        // A standalone start can still precede registration, so failure is logged and
+        // the certificate request retries lazily rather than failing an existing task.
+        if let Some(Err(e)) =
+            start_identity::app_tls_after_start(measure_only, || self.tls_identity(&app_id)).await
+        {
             info!(
                 app_id = %app_id,
                 error = %e,
