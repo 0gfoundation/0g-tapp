@@ -834,7 +834,7 @@ message GetSecretResourceRequest {
   // Optional hex-encoded derivation material, forwarded verbatim to KMS
   // /app-key, which binds it into the derived key alongside app_id (e.g.
   // AgenticID: chainId || contractAddress || sealId). Absent/empty derives
-  // purely from the app_id namespace, as before. From tapp-server 0.11.0 it is
+  // purely from the app_id namespace, as before. From tapp-server 0.11.1 it is
   // refused (INVALID_ARGUMENT) unless it is hex (digits in either case, with an
   // optional 0x) of at most 256 bytes: it is written into the app's evidence.
   string material = 2;

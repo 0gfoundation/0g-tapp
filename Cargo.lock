@@ -5920,7 +5920,7 @@ checksum = "55937e1799185b12863d447f42597ed69d9928686b8d88a1df17376a097d8369"
 
 [[package]]
 name = "tapp-cli"
-version = "0.13.0"
+version = "0.11.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -5985,7 +5985,7 @@ dependencies = [
 
 [[package]]
 name = "tapp-server"
-version = "0.12.1"
+version = "0.11.1"
 dependencies = [
  "anyhow",
  "async-recursion",

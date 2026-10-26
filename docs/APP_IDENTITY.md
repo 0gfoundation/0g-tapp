@@ -1,6 +1,6 @@
 # App identity lookup through the local tapp
 
-`ResolveAppIdentity` (tapp-server ≥0.12.0) lets an application query the Scan
+`ResolveAppIdentity` (tapp-server ≥0.11.1) lets an application query the Scan
 already trusted by its host tapp. The application mounts `/run/tapp/tapp.sock`
 as described in [KMS.md](KMS.md); it does not configure a second Scan URL or pin.
 

@@ -141,12 +141,12 @@ from the node's own signer precisely because they must **not** survive a boot.
 The empty app_id (the node's common signer) is refused by `get-secret-resource`;
 node-scoped material is not servable to app containers.
 
-From tapp-server 0.12.0, fetched KMS secrets are opaque 32-byte values. tapp records
+From tapp-server 0.11.1, fetched KMS secrets are opaque 32-byte values. tapp records
 the fixed `poseidon-bn254-4-v1` commitment in the SHA384 event log and in
 `runtime_data.key_commitments`; it never infers a signing curve from a generic
 secret. Dedicated app-signer and TLS paths additionally publish typed public keys
 in `runtime_data.identities`, referencing the same commitment format. The old
-0.11.x `kms_keys` address declarations remain readable for compatibility.
+`kms_keys` address declarations remain readable for compatibility.
 Take each generic key once per boot: every request adds an event carried by
 verification. See [APP_IDENTITY.md](APP_IDENTITY.md) and
 [A stable identity from the KMS](../README.md#a-stable-identity-from-the-kms).

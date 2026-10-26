@@ -262,9 +262,9 @@ Attestation evidence returned by `GetEvidence` commits the application's TEE-der
 | field | meaning |
 |---|---|
 | `app_id` | The exact app namespace covered by this runtime data (empty for the common node identity). |
-| `identities` | tapp-server ≥0.12.0: typed `node_signer`, `app_signer`, and `tls` public keys, their algorithm, encoding, derivation and source. KMS identities reference a commitment. See [APP_IDENTITY.md](docs/APP_IDENTITY.md). |
+| `identities` | tapp-server ≥0.11.1: typed `node_signer`, `app_signer`, and `tls` public keys, their algorithm, encoding, derivation and source. KMS identities reference a commitment. See [APP_IDENTITY.md](docs/APP_IDENTITY.md). |
 | `key_commitments` | Algorithm-neutral `poseidon-bn254-4-v1` commitments to fetched KMS secrets, scoped to appId and decoded material. Each must occur in this app's replayed event log. No signing curve or address is inferred from a generic secret. |
-| `kms_keys` | Legacy 0.11.x address/public-key declarations. Read for compatibility; new generic KMS calls do not create these entries. |
+| `kms_keys` | Legacy address/public-key declarations. Read for compatibility; new generic KMS calls do not create these entries. |
 | `nonce` | Caller-supplied challenge, echoed back. A quote is self-authenticating but undated, so without a challenge a cached quote is indistinguishable from a fresh one. Pass `get-evidence --nonce <hex>` (≤64 bytes, must be random). |
 | `signer` | The Ethereum address derived inside the enclave — the identity `TappRegistry` records. Verifiers match it against the registered `signerAddress` to prove a signed message and the on-chain identity come from the same app on this TEE. |
 | `tls_public_key` | sha256 of the app's TLS SubjectPublicKeyInfo, when it has one. This is what lets a client tie the certificate it was handed during a TLS handshake to a TEE running this app. |
@@ -301,7 +301,7 @@ Certificate pinning, Certificate Transparency monitoring and ACME renewal all ne
 
 ### Discovering another app through Scan
 
-Applications can call **`ResolveAppIdentity`** (server ≥0.12.0) on the local
+Applications can call **`ResolveAppIdentity`** (server ≥0.11.1) on the local
 `/run/tapp/tapp.sock` with a `chain_id`, TappRegistry `registry_address`, and
 `app_id`. Tapp queries Scan using the live URL and TLS pin established at claim
 or by `UpdateTrustAnchors`; apps do not maintain a second copy of those anchors.
@@ -823,7 +823,7 @@ it confirms are the containers started (so a node whose volume key comes from th
 KMS is on the node list when it asks). Safe to re-run; it writes nothing when the
 chain already matches.
 
-With tapp-server ≥0.12.1, the measure-only preflight does not derive TLS keys or
+With tapp-server ≥0.11.1, the measure-only preflight does not derive TLS keys or
 contact the KMS. Its task ID and measurements can therefore be returned before
 the app is registered, including on nodes using KMS-backed TLS. TLS derivation
 is attempted on the subsequent real start and when the app requests a certificate.
@@ -947,8 +947,9 @@ comparing it against a live endpoint — that comparison is what ties a TLS conn
 node just verified. The line is absent when the app has never asked for a key, which is not a
 failure.
 
-With tapp-cli ≥ 0.12.0, both modes also print a `kms key : <address>  material <hex>` line
-for each key the app took with `GetSecretResource` on that node this boot (the first 20;
+With tapp-cli ≥ 0.11.1, both modes also verify legacy `runtime_data.kms_keys` snapshots.
+For that schema they print a `kms key : <address>  material <hex>` line for each
+legacy key declaration on that node this boot (the first 20;
 `get-evidence` prints them all), but only when the node's evidence can be believed: the AS
 verified the quote; it was made for this request; in chain mode it names the node's signer;
 the event log replays; the platform passes (DEBUG off, TCB not revoked); and the image is a
@@ -1099,7 +1100,7 @@ The server always listens on `bind_address` (default `0.0.0.0:50051`) for remote
 
 ### Derivation material (per-caller keys)
 
-`GetSecretResourceRequest` takes an optional `material` field — hex-encoded derivation material bound by KMS into the key alongside `app_id`. tapp normalizes it to lowercase hex without `0x` and refuses more than 256 decoded bytes. tapp-server ≥0.12.0 records a commitment without interpreting the secret as a signing key. This lets an app derive independent per-agent keys (e.g. `chainId ‖ contractAddress ‖ sealId`) instead of holding one app-wide secret and deriving locally.
+`GetSecretResourceRequest` takes an optional `material` field — hex-encoded derivation material bound by KMS into the key alongside `app_id`. tapp normalizes it to lowercase hex without `0x` and refuses more than 256 decoded bytes. tapp-server ≥0.11.1 records a commitment without interpreting the secret as a signing key. This lets an app derive independent per-agent keys (e.g. `chainId ‖ contractAddress ‖ sealId`) instead of holding one app-wide secret and deriving locally.
 
 ```bash
 grpcurl -unix -plaintext \
@@ -1113,7 +1114,7 @@ Absent/empty `material` derives purely from the `app_id` namespace — byte-iden
 
 The app's signer — the key `GetAppSecretKey` returns and the address registered on chain — is made inside the TEE and changes whenever tapp-server restarts or the VM reboots. That is right for the node's identity, but not for an app whose address is known outside: an address on a contract's allowlist, an oracle's signer, anything a counterparty has pinned. Such an app signs with a KMS key instead. `GetSecretResource` returns the same 32-byte secret for the same `app_id` and `material` on every node of the app, every time.
 
-With tapp-server ≥0.12.0, call the socket-only `GetAppSigner(app_id)` for the stable
+With tapp-server ≥0.11.1, call the socket-only `GetAppSigner(app_id)` for the stable
 application identity. It uses the fixed `70726f7669646572` (hex `provider`) material
 and interprets that secret as a secp256k1 scalar, preserving existing KMS-provider
 addresses. Its response carries the secret, compressed public key, address,
@@ -1127,9 +1128,9 @@ Commitment parameters and future proof boundaries are described in
 registration remain unchanged. Cache secrets in memory rather than repeatedly
 fetching them: each generic fetch adds an event to the log carried by verification.
 
-**Legacy tapp-server 0.11.x only** interpreted generic secrets as secp256k1 keys:
+**Legacy implementations that emitted `kms_keys`** interpreted generic secrets as secp256k1 keys:
 
-- The response also carries the key the app signs as: `eth_address` (20 bytes) and `compressed_public_key` (33 bytes). They are proto `bytes`, so grpcurl shows them base64-encoded as `ethAddress` and `compressedPublicKey`; `tapp-cli -s /run/tapp/tapp.sock get-secret-resource` (tapp-cli ≥ 0.12.0) prints them in hex. An older server leaves them empty: derive them from the secret.
+- Those legacy responses carried `eth_address` (20 bytes) and `compressed_public_key` (33 bytes), shown by grpcurl as base64-encoded `ethAddress` and `compressedPublicKey`. Legacy CLI snapshots printed them in hex. These fields are now reserved; current generic secrets carry a commitment rather than an inferred signing identity.
 - From then to the end of the boot, `GetEvidence` for the app lists the key in `runtime_data.kms_keys` (see [Trusted Execution Environment](#trusted-execution-environment)). A restarted tapp-server reads the list back from this boot's `get_secret_resource` events, which name the same address; a key is listed only once its event is written.
 - **Ask once per boot.** Every request adds an event (about 1 KB) to the event log, and every verification carries the whole log: an AS on default settings refuses a request past 4 MiB, at which point the node fails verification, and with attested admission on, the KMS. Keep the key in memory instead of asking again.
 - A verifier that checks the evidence learns that this TEE, registered on chain for the app, holds the key. `verify-app` lists each node's keys and fails the run when more than one key is attested for a material.
