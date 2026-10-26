@@ -34,8 +34,8 @@ failing keys no event of the app names, and warning about keys whose event says 
 not checked against attestation.
 
 This script preserves legacy node/KMS verification only. It does not validate or
-authorize the >=0.12.0 identities/key_commitments schema or future evidence.extensions.
-Use tapp-cli >=0.13.0 or Scan's identities_verified result for typed app/TLS identity
+authorize the >=0.11.1 identities/key_commitments schema or future evidence.extensions.
+Use tapp-cli >=0.11.1 or Scan's identities_verified result for typed app/TLS identity
 discovery; absence of legacy kms_keys is not proof that no KMS key was acquired."""
 import sys, os, json, base64, struct, subprocess, re, binascii, hashlib, secrets
 import atexit, shlex, shutil, tempfile

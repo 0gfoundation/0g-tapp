@@ -89,6 +89,15 @@ a new tag, or accept that the released binary keeps the old behaviour until the 
 Only the binaries share a release. The contract and the CVM image are versioned and shipped
 separately — see below.
 
+### Consolidated v0.11.1 release batch
+
+The upcoming `v0.11.1` release consolidates the app-identity and measurement-preflight
+changes into **tapp-server 0.11.1 and tapp-cli 0.11.1**. Both manifests and their lockfile
+entries use those versions. This release-batch choice supersedes the provisional
+0.12.x/0.13.x feature thresholds in the development documentation; it does not alter
+runtime compatibility checks. The existing `v0.11.0` release and `v0.12.0-rc.1` tag,
+artifacts and boot reference values remain unchanged.
+
 ### tapp-common (rare)
 
 tapp-common is an internal dependency, not a standalone release artifact. Bump its version only on breaking API changes that affect downstream crates. Both tapp-cli and tapp-server pin it via path dependency, so a tapp-common bump requires rebuilding dependents.

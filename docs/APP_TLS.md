@@ -153,6 +153,10 @@ A `kms` key additionally requires the app registered on chain and the cluster re
 shortly after a fresh registration the cluster may answer `401` until its own view of the chain
 catches up ([0g-kms#11](https://github.com/0gfoundation/0g-kms/issues/11)).
 
+The measure-only preflight used by `start-app --register-onchain` does not derive
+TLS keys (tapp-server ≥0.11.1). It returns measurements so the CLI can register the
+app before the real start attempts KMS-backed TLS derivation.
+
 > **`local` is not merely the default for some services — it is the only option.** Deriving a
 > `kms` key means reaching the KMS cluster over the network. Any service that the cluster
 > itself depends on, and the cluster's own nodes, therefore cannot use `kms`: they would need

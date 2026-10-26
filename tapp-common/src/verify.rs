@@ -728,8 +728,8 @@ pub struct LoggedKmsKey {
 }
 
 /// Every KMS key the `get_secret_resource` events of this boot name, once per app and key,
-/// in app, material and address order. Events from before tapp-server 0.11.0 name no key
-/// and are skipped, as is anything not in the form tapp-server writes.
+/// in app, material and address order. Older events without a key declaration
+/// are skipped, as is anything not in the legacy format tapp-server wrote.
 ///
 /// tapp-server reads this back when it starts, so that `runtime_data.kms_keys` covers the
 /// whole boot. A verifier reads it to tell, for each key, whether the KMS that gave it was
@@ -1599,7 +1599,7 @@ mod tests {
         assert_eq!(eventlog_trust_anchors(&tcg_log(&[])).unwrap(), None);
     }
 
-    /// A `get_secret_resource` event as tapp-server ≥ 0.11.0 measures it, built with the
+    /// A legacy `get_secret_resource` event with a key declaration, built with the
     /// same field builder the server uses. `attested` is what the KMS client reported.
     fn taken(app_id: &str, material: &str, last: u8, attested: bool) -> String {
         let mut event = serde_json::json!({
@@ -1634,7 +1634,7 @@ mod tests {
             ("get_secret_resource", &taken("a", "04", 4, true)),
             ("get_secret_resource", &taken("a", "04", 4, false)),
             ("get_secret_resource", &taken("b", "05", 5, true)),
-            // Before 0.11.0 an event names no key; the TLS key never does.
+            // This legacy TLS fixture has no address/public-key declaration.
             ("get_secret_resource", r#"{"app_id":"a","material":"746c73","kms_attested":true}"#),
         ]);
         let logged = eventlog_kms_keys(&log).unwrap();
