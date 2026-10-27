@@ -6,6 +6,10 @@ import "../src/TappRegistry.sol";
 import "../src/proxy/UpgradeableBeacon.sol";
 
 /// @notice Upgrade TappRegistry: deploy new implementation and point beacon at it.
+///         Only for chains where the broadcasting key itself owns the beacon (local /
+///         dev). On testnet and mainnet the owner is a wallet or the timelock: use
+///         `go run ./cmd/upgrade/ --network <net>`, which deploys with any key and
+///         prints the switch for the owner to sign.
 ///
 ///         Required env vars:
 ///           BEACON_ADDRESS  — UpgradeableBeacon address

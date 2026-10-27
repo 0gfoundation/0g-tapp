@@ -179,9 +179,9 @@ echo "$request_json" | jq '.'
 echo "--------------------------------------"
 echo ""
 
-# Sign message with private key
+# Sign the exact request: method, sha256 of its protobuf encoding, timestamp
 echo "Generating signature..."
-SIGN_OUTPUT=$(python3 "$sign_script" "StopService" "$PRIVATE_KEY" 2>&1)
+SIGN_OUTPUT=$(printf "%s" "$request_json" | python3 "$sign_script" "StopService" "$PRIVATE_KEY" - 2>&1)
 if [ $? -ne 0 ]; then
   echo "Error generating signature: $SIGN_OUTPUT"
   exit 1
@@ -202,6 +202,7 @@ set +e  # Don't exit on error
 response=$(printf "%s" "$request_json" | tr -d '\n' | grpcurl -plaintext \
     -H "x-signature: $SIGNATURE" \
     -H "x-timestamp: $TIMESTAMP" \
+    -H "x-signature-version: 2" \
     -import-path "$SCRIPT_DIR/../proto" \
     -proto tapp_service.proto \
     -d @ \

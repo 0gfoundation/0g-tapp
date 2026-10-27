@@ -7,6 +7,7 @@ import {TappRegistry} from "../src/TappRegistry.sol";
 import {UpgradeableBeacon} from "../src/proxy/UpgradeableBeacon.sol";
 import {BeaconProxy} from "../src/proxy/BeaconProxy.sol";
 import {TappRegistryV1} from "./fixtures/TappRegistryV1.sol";
+import {TappRegistryV010} from "./fixtures/TappRegistryV010.sol";
 
 contract TappRegistryTest is Test {
     TappRegistry public registry;
@@ -65,7 +66,7 @@ contract TappRegistryTest is Test {
     // ─── version ────────────────────────────────────────────────────────────
 
     function test_Version_ReturnsImplementationVersion() public view {
-        assertEq(registry.version(), "0.1.0");
+        assertEq(registry.version(), "0.2.0");
     }
 
     // ─── registerApp ──────────────────────────────────────────────────────────
@@ -954,5 +955,197 @@ contract TappRegistryTest is Test {
             assertGt(curr, prev);
             prev = curr;
         }
+    }
+
+    // ─── app ownership transfer ───────────────────────────────────────────────
+
+    address buyer = makeAddr("buyer");
+
+    function _transferTo(address to) internal {
+        vm.prank(owner);
+        registry.transferAppOwnership(APP_ID, to);
+        vm.prank(to);
+        registry.acceptAppOwnership(APP_ID);
+    }
+
+    function test_TransferAppOwnership_NominationChangesNothingUntilAccepted() public {
+        _register();
+        vm.expectEmit(true, true, true, true);
+        emit TappRegistry.AppOwnershipTransferStarted(APP_ID, owner, buyer);
+        vm.prank(owner);
+        registry.transferAppOwnership(APP_ID, buyer);
+
+        assertEq(registry.getAppInfo(APP_ID).owner, owner);
+        assertEq(registry.pendingAppOwner(APP_ID), buyer);
+        // The nominee holds no authority yet.
+        vm.prank(buyer);
+        vm.expectRevert("not app owner");
+        registry.removeNode(APP_ID, node1);
+    }
+
+    function test_TransferAppOwnership_OnlyOwnerCanNominate() public {
+        _register();
+        vm.prank(hacker);
+        vm.expectRevert("not app owner");
+        registry.transferAppOwnership(APP_ID, hacker);
+    }
+
+    function test_TransferAppOwnership_Revert_NominatingSelf() public {
+        _register();
+        vm.prank(owner);
+        vm.expectRevert("already owner");
+        registry.transferAppOwnership(APP_ID, owner);
+    }
+
+    function test_AcceptAppOwnership_OnlyTheNominee() public {
+        _register();
+        vm.prank(owner);
+        registry.transferAppOwnership(APP_ID, buyer);
+        vm.prank(hacker);
+        vm.expectRevert("not pending owner");
+        registry.acceptAppOwnership(APP_ID);
+        // Nor with nothing pending at all.
+        vm.prank(hacker);
+        vm.expectRevert("not pending owner");
+        registry.acceptAppOwnership("no-such-app");
+    }
+
+    function test_AcceptAppOwnership_MovesAuthorityAndKeepsAcks() public {
+        _register();
+        vm.prank(user);
+        registry.acknowledgeApp(APP_ID);
+        uint256 ackBefore = registry.getAckVersion(APP_ID);
+
+        vm.prank(owner);
+        registry.transferAppOwnership(APP_ID, buyer);
+        vm.expectEmit(true, true, true, true);
+        emit TappRegistry.AppOwnershipTransferred(APP_ID, owner, buyer);
+        vm.prank(buyer);
+        registry.acceptAppOwnership(APP_ID);
+
+        assertEq(registry.getAppInfo(APP_ID).owner, buyer);
+        assertEq(registry.pendingAppOwner(APP_ID), address(0));
+        // No code changed, so existing acknowledgements stand.
+        assertEq(registry.getAckVersion(APP_ID), ackBefore);
+        assertTrue(registry.isAcknowledged(user, APP_ID));
+
+        // New owner manages; old owner cannot.
+        vm.deal(buyer, 10 ether);
+        vm.prank(buyer);
+        registry.addNode{value: MIN_STAKE}(APP_ID, node2, TEE_URL_2, hex"", hex"");
+        vm.prank(owner);
+        vm.expectRevert("not app owner");
+        registry.removeNode(APP_ID, node2);
+        // A consumed nomination cannot be replayed.
+        vm.prank(buyer);
+        vm.expectRevert("not pending owner");
+        registry.acceptAppOwnership(APP_ID);
+    }
+
+    function test_TransferAppOwnership_LiveStakeTravelsLockedStakeStays() public {
+        _registerTwo();
+        // Locked to the OLD owner before the transfer: stays theirs.
+        vm.prank(owner);
+        registry.removeNode(APP_ID, node2);
+        _transferTo(buyer);
+        // A live node removed AFTER the transfer refunds the NEW owner.
+        vm.prank(buyer);
+        registry.removeNode(APP_ID, node1);
+
+        assertEq(registry.getLockedBalance(owner).length, 1);
+        assertEq(registry.getLockedBalance(buyer).length, 1);
+        assertEq(registry.getLockedBalance(buyer)[0].amount, MIN_STAKE);
+
+        vm.warp(block.timestamp + LOCK_PERIOD + 1);
+        uint256 ownerBal = owner.balance;
+        uint256 buyerBal = buyer.balance;
+        vm.prank(owner);
+        registry.withdraw();
+        vm.prank(buyer);
+        registry.withdraw();
+        assertEq(owner.balance - ownerBal, MIN_STAKE);
+        assertEq(buyer.balance - buyerBal, MIN_STAKE);
+    }
+
+    function test_TransferAppOwnership_RenominateReplacesAndZeroCancels() public {
+        _register();
+        vm.prank(owner);
+        registry.transferAppOwnership(APP_ID, hacker);
+        vm.prank(owner);
+        registry.transferAppOwnership(APP_ID, buyer);
+        vm.prank(hacker);
+        vm.expectRevert("not pending owner");
+        registry.acceptAppOwnership(APP_ID);
+
+        vm.prank(owner);
+        registry.transferAppOwnership(APP_ID, address(0));
+        assertEq(registry.pendingAppOwner(APP_ID), address(0));
+        vm.prank(buyer);
+        vm.expectRevert("not pending owner");
+        registry.acceptAppOwnership(APP_ID);
+    }
+
+    /// The nomination must die with the app: otherwise, once the id is free and
+    /// someone else registers it, a stale nominee could accept THEIR app.
+    function test_TransferAppOwnership_NominationDoesNotSurviveUnregister() public {
+        _register();
+        vm.prank(owner);
+        registry.transferAppOwnership(APP_ID, buyer);
+        vm.prank(owner);
+        registry.removeNode(APP_ID, node1); // last node → app unregistered
+        assertEq(registry.pendingAppOwner(APP_ID), address(0));
+
+        // Someone else registers the same id.
+        vm.prank(user);
+        registry.registerApp{value: MIN_STAKE}(APP_ID, COMPOSE_HASH, VOLUMES_HASH, imageHashes, node2, TEE_URL_2);
+        vm.prank(buyer);
+        vm.expectRevert("not pending owner");
+        registry.acceptAppOwnership(APP_ID);
+        assertEq(registry.getAppInfo(APP_ID).owner, user);
+    }
+
+    /// The live proxies run 0.1.0. Upgrading them must keep every byte of state and
+    /// start with no transfer pending (the new slot comes out of __gap, zeroed).
+    function test_Upgrade_From010_PreservesStateAndStartsWithNothingPending() public {
+        TappRegistryV010 implOld = new TappRegistryV010();
+        UpgradeableBeacon beacon = new UpgradeableBeacon(address(implOld), address(this));
+        BeaconProxy proxy = new BeaconProxy(
+            address(beacon), abi.encodeCall(TappRegistryV010.initialize, (MIN_STAKE, LOCK_PERIOD))
+        );
+        TappRegistryV010 oldReg = TappRegistryV010(payable(address(proxy)));
+
+        vm.prank(owner);
+        oldReg.registerApp{value: MIN_STAKE}(APP_ID, COMPOSE_HASH, VOLUMES_HASH, imageHashes, node1, TEE_URL_1);
+        vm.prank(owner);
+        oldReg.addNode{value: MIN_STAKE}(APP_ID, node2, TEE_URL_2, NODE_COMPOSE_OVERRIDE, hex"");
+        vm.prank(owner);
+        oldReg.removeNode(APP_ID, node2); // a locked balance to carry across
+        vm.prank(user);
+        oldReg.acknowledgeApp(APP_ID);
+        vm.prank(owner);
+        oldReg.authorizeInvalidator(APP_ID, hacker);
+        uint256 ack = oldReg.getAckVersion(APP_ID);
+
+        beacon.upgradeTo(address(new TappRegistry()));
+        TappRegistry reg = TappRegistry(payable(address(proxy)));
+
+        assertEq(reg.version(), "0.2.0");
+        assertEq(reg.admin(), address(this));
+        assertEq(reg.minStakeAmount(), MIN_STAKE);
+        assertEq(reg.lockPeriod(), LOCK_PERIOD);
+        assertEq(reg.getAppInfo(APP_ID).owner, owner);
+        assertEq(reg.getNodeList(APP_ID).length, 1);
+        assertEq(reg.getNode(APP_ID, node1).teeUrl, TEE_URL_1);
+        assertEq(reg.getLockedBalance(owner).length, 1);
+        assertEq(reg.getAckVersion(APP_ID), ack);
+        assertTrue(reg.isAcknowledged(user, APP_ID));
+        assertEq(reg.pendingAppOwner(APP_ID), address(0));
+
+        // And the new path works on the upgraded proxy.
+        vm.prank(owner);
+        reg.transferAppOwnership(APP_ID, buyer);
+        vm.prank(buyer);
+        reg.acceptAppOwnership(APP_ID);
+        assertEq(reg.getAppInfo(APP_ID).owner, buyer);
     }
 }

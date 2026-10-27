@@ -1,38 +1,42 @@
 // Shared modules re-exported from tapp-common (no TEE/Docker deps)
 pub use tapp_common::app_key;
-pub use tapp_common::onchain;
+pub use tapp_common::as_proto;
 pub use tapp_common::error;
+pub use tapp_common::identity;
+pub use tapp_common::onchain;
+pub use tapp_common::proto;
 pub use tapp_common::report_data;
 pub use tapp_common::verify;
-pub use tapp_common::proto;
-pub use tapp_common::as_proto;
 
 // Server-only modules
 pub mod auth_layer;
 pub mod balance_withdrawal;
-pub mod kms_client;
 pub mod boot;
 pub mod config;
+mod identity_refresh;
+mod identity_snapshot;
+pub mod kms_client;
 pub mod measurement_service;
 pub mod nonce_manager;
 pub use tapp_common::pinned_tls;
 pub mod permission;
 pub mod service_monitor;
 pub mod signature_auth;
+mod signer_cache;
+mod start_identity;
 pub mod task_manager;
 pub mod tls_cert;
 pub mod utils;
 
 pub use boot::BootService;
 pub use config::TappConfig;
-pub use tapp_common::error::{TappError, TappResult};
 use std::collections::HashMap;
 use std::sync::Arc;
+pub use tapp_common::error::{TappError, TappResult};
 pub use task_manager::TaskStatus;
 use tokio::sync::Mutex;
 use tonic::{Request, Response, Status};
 use tracing::{debug, error, info};
-
 
 // // Re-export common types
 pub use proto::{
@@ -41,16 +45,33 @@ pub use proto::{
     *,
 };
 
+fn require_local<T>(request: &Request<T>, method: &str) -> Result<(), Status> {
+    if request
+        .extensions()
+        .get::<tonic::transport::server::UdsConnectInfo>()
+        .is_none()
+    {
+        return Err(Status::permission_denied(format!(
+            "{method} is served only on the tapp Unix socket"
+        )));
+    }
+    Ok(())
+}
+
 /// Version information
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const NAME: &str = env!("CARGO_PKG_NAME");
 
-/// Runtime configuration set via ClaimConfig (owner/chain/kbs).
+/// Runtime configuration set via ClaimConfig (owner/kbs/TLS/scan).
 /// Separate from the static TappConfig so get-tapp-info can show live values.
-#[derive(Debug, Clone, Default)]
+///
+/// Persisted beside the claimed owner (see [`ClaimedRuntimeConfig::save`]): the owner
+/// alone surviving a process restart left the node owned but with its trust anchor, KMS
+/// cluster and TLS key source back at config.toml's values — while this boot's event log
+/// still recorded the claimed ones.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct ClaimedRuntimeConfig {
-    pub chain_rpc_url: String,
-    pub chain_contract_address: String,
     pub kbs_node_urls: Vec<String>,
     /// Empty means "not claimed" — fall back to config.toml, which is the pre-baked mode.
     pub tls_key_source: String,
@@ -64,6 +85,40 @@ pub struct ClaimedRuntimeConfig {
     /// checked", and callers must not conflate them.
     pub scan_url: String,
     pub scan_public_key: String,
+}
+
+impl ClaimedRuntimeConfig {
+    /// Where the claimed config of this boot lives: next to the claimed owner, so on the
+    /// same tmpfs with the same lifetime — a VM reboot clears both, together with the RTMRs
+    /// that recorded them.
+    pub fn state_path(config: &TappConfig) -> Option<std::path::PathBuf> {
+        let permission = config.server.permission.as_ref()?;
+        Some(
+            permission
+                .owner_state_path
+                .with_file_name("claimed_config.json"),
+        )
+    }
+
+    /// Written whole and renamed into place (see `utils::write_state_file`).
+    pub fn save(&self, path: &std::path::Path) -> std::io::Result<()> {
+        utils::write_state_file(
+            path,
+            &serde_json::to_vec(self).map_err(std::io::Error::other)?,
+        )
+    }
+
+    /// `Ok(None)` when nothing was claimed this boot (or by a tapp-server that did not
+    /// persist it).
+    pub fn load(path: &std::path::Path) -> std::io::Result<Option<Self>> {
+        match std::fs::read(path) {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .map(Some)
+                .map_err(std::io::Error::other),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
 }
 
 /// Reject anything that is not a usable (url, pin) pair, or accept "both empty" as
@@ -103,6 +158,17 @@ fn validate_scan_anchor(url: &str, pin: &str) -> Result<Option<(String, String)>
         url.to_string(),
         format!("0x{}", hex_part.to_lowercase()),
     )))
+}
+
+/// Retry settings for every KMS client this process builds — at startup, on a claim, on a
+/// trust-anchor update, on resume — so the same cluster behaves the same whichever path
+/// built the client.
+fn kbs_retry(config: &TappConfig) -> config::RetryConfig {
+    config
+        .kbs
+        .as_ref()
+        .map(|k| k.retry.clone())
+        .unwrap_or_default()
 }
 
 /// The KMS app id whose attested keys are the ones to accept.
@@ -146,7 +212,7 @@ pub struct TappServiceImpl {
     pub app_key_service: Arc<app_key::AppKeyService>,
     /// KMS client, wrapped in RwLock so ClaimConfig can initialize it at runtime
     /// if kbs_node_urls were not baked into config.toml (dynamic mode).
-    pub kms_client: Arc<tokio::sync::RwLock<Option<kms_client::KmsClient>>>,
+    pub kms_client: Arc<tokio::sync::RwLock<Option<Arc<kms_client::KmsClient>>>>,
     pub nonce_manager: nonce_manager::NonceManager,
     pub logs_service: service_monitor::logs::LogsService,
     pub permission_manager: Option<Arc<permission::PermissionManager>>,
@@ -156,6 +222,79 @@ pub struct TappServiceImpl {
     /// Per-app TLS identity, derived on first use. Same lifetime as the app key cache:
     /// the key itself is deterministic, so a restart re-derives the identical one.
     pub tls_identities: Arc<Mutex<HashMap<String, Arc<tls_cert::TlsIdentity>>>>,
+    /// The KMS keys each app has taken through `GetSecretResource` this boot, which
+    /// `GetEvidence` lists (`report_data::RuntimeData::kms_keys`). Read back from the event
+    /// log at startup (`kms_keys_of_this_boot`), then filled only by GetSecretResource, by
+    /// whatever holds the socket and names the app. GetEvidence is unauthenticated, and
+    /// reading this is all it does, so it never reaches the KMS.
+    pub kms_keys: Arc<Mutex<report_data::KmsKeyLog>>,
+    pub key_metadata: Arc<Mutex<identity::MetadataLog>>,
+    // Only the dedicated stable app signer is cached, not arbitrary app secrets.
+    app_signers: signer_cache::SignerCache,
+    identity_refresh: identity_refresh::IdentityRefresh,
+}
+
+/// The KMS keys this boot's earlier tapp-server processes handed out, read back from the
+/// `get_secret_resource` events they measured.
+///
+/// So the evidence lists every key taken this boot, not just this process's, and an app
+/// need not ask again after a restart: asking again only adds another event to the log,
+/// which every verification then carries. Best effort: a node that cannot read its own
+/// event log lists only what it hands out from now on, and says so. Verifiers read the log
+/// themselves and still see the rest.
+async fn kms_keys_of_this_boot(
+    measurement_service: &measurement_service::MeasurementService,
+) -> (report_data::KmsKeyLog, identity::MetadataLog) {
+    let mut log = report_data::KmsKeyLog::default();
+    let mut metadata = identity::MetadataLog::default();
+    // The event log comes with evidence; the report_data asked for is beside the point.
+    // Bounded: this runs before anything listens, and a stalled quote service must not hold
+    // the node down. Missing the earlier keys costs less than not starting.
+    let read = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        measurement_service.get_evidence(&[0u8; 64]),
+    )
+    .await;
+    let evidence = match read {
+        Ok(Ok(e)) => e,
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "cannot read this boot's event log; KMS keys taken before this process are not listed");
+            return (log, metadata);
+        }
+        Err(_) => {
+            tracing::warn!("reading this boot's event log took over 30s; KMS keys taken before this process are not listed");
+            return (log, metadata);
+        }
+    };
+    let cc_eventlog = serde_json::from_slice::<serde_json::Value>(&evidence)
+        .ok()
+        .and_then(|j| j["cc_eventlog"].as_str().map(String::from));
+    let Some(cc_eventlog) = cc_eventlog else {
+        tracing::warn!(
+            "the evidence carries no event log; KMS keys taken before this process are not listed"
+        );
+        return (log, metadata);
+    };
+    match identity::MetadataLog::restore(&cc_eventlog) {
+        Ok(restored) => metadata = restored,
+        Err(e) => tracing::warn!(error = %e, "cannot restore this boot's typed key metadata"),
+    }
+    match verify::eventlog_kms_keys(&cc_eventlog) {
+        Ok(keys) => {
+            let count = keys.len();
+            for logged in keys {
+                log.record(&logged.app_id, logged.key);
+            }
+            info!(
+                count,
+                "KMS keys taken earlier this boot read back from the event log"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "cannot parse this boot's event log; KMS keys taken before this process are not listed")
+        }
+    }
+    (log, metadata)
 }
 
 /// Fetch a KMS-derived secret for `app_id` under the `material` namespace.
@@ -166,13 +305,17 @@ pub struct TappServiceImpl {
 /// volume path runs it inside the spawned start task, which holds clones of these
 /// two handles rather than `&self`.
 async fn kms_derive_with(
-    kms_client: &tokio::sync::RwLock<Option<kms_client::KmsClient>>,
+    kms_client: &tokio::sync::RwLock<Option<Arc<kms_client::KmsClient>>>,
     app_key_service: &app_key::AppKeyService,
     app_id: &str,
     material: &str,
-) -> Result<Vec<u8>, Status> {
-    let kms_guard = kms_client.read().await;
-    let kms = kms_guard.as_ref().ok_or_else(|| {
+) -> Result<(Vec<u8>, kms_client::KmsAnswer), Status> {
+    // The client is taken out of the lock, not used under it: a fetch can now wait minutes
+    // for the KMS to see a registration, and a held read guard would block every claim and
+    // trust-anchor update behind it (tokio's RwLock is write-preferring), and with them every
+    // other KMS call on the node.
+    let kms = kms_client.read().await.clone();
+    let kms = kms.as_deref().ok_or_else(|| {
         Status::failed_precondition(
             "KMS not configured — set [kbs] node_urls in config.toml or call claim-config \
              with --kbs-urls",
@@ -184,7 +327,7 @@ async fn kms_derive_with(
     // exactly what happens when an app asks for its TLS certificate before anything
     // else has touched its key.
     app_key_service
-        .get_app_key(app_id, "ethereum", false)
+        .get_app_key(app_id)
         .await
         .map_err(|e| Status::internal(format!("Failed to create app key: {}", e)))?;
 
@@ -194,7 +337,7 @@ async fn kms_derive_with(
         .await
         .map_err(|e| Status::internal(format!("Failed to get app key: {}", e)))?;
 
-    let (_, secp256k1_pubkey_64, _) = app_key_service
+    let (_, secp256k1_pubkey_64) = app_key_service
         .get_public_key(app_id)
         .await
         .map_err(|e| Status::internal(format!("Failed to get app public key: {}", e)))?;
@@ -214,19 +357,156 @@ async fn kms_derive_with(
     // Call KMS cluster → get ECIES-encrypted app key. `material` is opaque
     // derivation material forwarded verbatim (empty = omitted, derives
     // purely from the app_id namespace as before) — see issue #33.
-    let encrypted = kms
+    let (encrypted, answer) = kms
         .get_encrypted_secret(app_id, timestamp, &pubkey_hex, &signature_hex, material)
         .await
         .map_err(|e| Status::unavailable(format!("KMS request failed: {}", e)))?;
 
     // Decrypt with our private key
-    ecies::decrypt(&private_key, &encrypted)
-        .map_err(|e| Status::internal(format!("Failed to decrypt KMS secret: {}", e)))
+    let secret = ecies::decrypt(&private_key, &encrypted)
+        .map_err(|e| Status::internal(format!("Failed to decrypt KMS secret: {}", e)))?;
+    Ok((secret, answer))
+}
+
+/// Append a SHA-384 measured KMS acquisition, then publish only its public metadata.
+/// A failed append publishes nothing; callers must not release or use the secret.
+#[derive(Default)]
+struct SecretMeasurement {
+    recorded: bool,
+    identity_changed: bool,
+}
+
+async fn measure_secret_resource_with(
+    measurement_service: &measurement_service::MeasurementService,
+    boot_service: &BootService,
+    key_metadata: &Mutex<identity::MetadataLog>,
+    app_id: &str,
+    material: &str,
+    success: bool,
+    key_commitment: Option<&identity::KeyCommitment>,
+    key_identity: Option<&identity::KeyIdentity>,
+    answer: Option<&kms_client::KmsAnswer>,
+) -> SecretMeasurement {
+    // Best-effort: an app fetching a secret before its measurements are known is
+    // unusual but must still be recorded, so missing app_info leaves empty hashes
+    // rather than skipping the event.
+    let info = boot_service.get_app_info(app_id).await.ok().flatten();
+    let m = boot::AppMeasurement {
+        app_id: app_id.to_string(),
+        operation: measurement_service::OPERATION_NAME_GET_SECRET_RESOURCE.to_string(),
+        result: String::new(),
+        error: None,
+        compose_hash: info
+            .as_ref()
+            .map(|i| i.compose_content.hash.clone())
+            .unwrap_or_default(),
+        volumes_hash: info
+            .as_ref()
+            .map(|i| i.mount_files.hash.clone())
+            .unwrap_or_default(),
+        image_hash: info
+            .as_ref()
+            .map(|i| i.compose_content.image_hash.clone())
+            .unwrap_or_default(),
+        deployer: info.as_ref().map(|i| i.owner.clone()).unwrap_or_default(),
+        timestamp: utils::current_timestamp(),
+    };
+    let m = if success {
+        m.with_success()
+    } else {
+        m.with_failure("KMS request or decryption failed".to_string())
+    };
+
+    // `material` has no field on AppMeasurement, so it is added to the serialised
+    // object rather than changing a struct every other measured operation shares.
+    let mut payload = match serde_json::to_value(&m) {
+        Ok(serde_json::Value::Object(o)) => o,
+        _ => {
+            tracing::error!("failed to serialise get_secret_resource measurement");
+            return SecretMeasurement::default();
+        }
+    };
+    payload.insert(
+        "material".to_string(),
+        serde_json::Value::String(material.to_string()),
+    );
+    payload.extend(report_data::kms_event_fields(
+        None,
+        answer.map(|a| (a.url.as_str(), a.attested)),
+    ));
+    if let Some(c) = key_commitment {
+        payload.insert("key_commitment".into(), serde_json::json!(c));
+    }
+    if let Some(id) = key_identity {
+        payload.insert("identity".into(), serde_json::json!(id));
+    }
+
+    match measurement_service
+        .extend_measurement(
+            measurement_service::OPERATION_NAME_GET_SECRET_RESOURCE,
+            &serde_json::Value::Object(payload).to_string(),
+        )
+        .await
+    {
+        Ok(()) => {
+            let mut identity_changed = false;
+            if let Some(c) = key_commitment {
+                let mut metadata = key_metadata.lock().await;
+                identity_changed =
+                    identity_snapshot::publish_measured(&mut metadata, app_id, c, key_identity);
+            }
+            SecretMeasurement {
+                recorded: true,
+                identity_changed,
+            }
+        }
+        Err(e) => {
+            tracing::error!(
+                "Failed to extend measurement for get_secret_resource: {}",
+                e
+            );
+            SecretMeasurement::default()
+        }
+    }
 }
 
 impl TappServiceImpl {
+    /// A publication hint, never a prerequisite for releasing an already measured key.
+    /// GetEvidence only reads metadata, so Scan can call it while this request returns.
+    async fn notify_identity_change(&self, app_id: &str) {
+        if app_id.is_empty() {
+            return; // The management TLS key is not an application's public identity.
+        }
+        match self.app_key_service.get_app_key(app_id).await {
+            Ok(node) => {
+                self.identity_refresh.enqueue(
+                    app_id.to_string(),
+                    format!("0x{}", hex::encode(node.eth_address)),
+                );
+            }
+            Err(_) => {
+                tracing::warn!("Cannot enqueue Scan identity refresh without the local node signer")
+            }
+        }
+    }
+
+    /// Best effort, like the owner's: failing it costs the next process restart its
+    /// claimed config, which get-tapp-info then shows, not the claim itself.
+    async fn persist_claimed_config(&self) {
+        let Some(path) = ClaimedRuntimeConfig::state_path(&self.config) else {
+            return;
+        };
+        if let Err(e) = self.claimed_runtime_config.read().await.save(&path) {
+            tracing::warn!(error = %e, path = %path.display(), "Failed to persist claimed config");
+        }
+    }
+
     /// See [`kms_derive_with`].
-    async fn kms_derive(&self, app_id: &str, material: &str) -> Result<Vec<u8>, Status> {
+    async fn kms_derive(
+        &self,
+        app_id: &str,
+        material: &str,
+    ) -> Result<(Vec<u8>, kms_client::KmsAnswer), Status> {
         kms_derive_with(&self.kms_client, &self.app_key_service, app_id, material).await
     }
 
@@ -268,7 +548,7 @@ impl TappServiceImpl {
         &self,
         app_id: &str,
     ) -> Result<(config::TlsKeySource, Vec<u8>), Status> {
-        // Claimed value wins over the pre-baked one, same as chain and KBS config.
+        // Claimed value wins over the pre-baked one, same as the KBS config.
         let source = match self
             .claimed_runtime_config
             .read()
@@ -286,7 +566,7 @@ impl TappServiceImpl {
                 // reads the cache, so an app asking for a certificate as its first action
                 // would otherwise find nothing.
                 self.app_key_service
-                    .get_app_key(app_id, "ethereum", false)
+                    .get_app_key(app_id)
                     .await
                     .map_err(|e| Status::internal(format!("Failed to create app key: {}", e)))?;
                 let signer_key = self
@@ -294,10 +574,20 @@ impl TappServiceImpl {
                     .get_private_key(app_id)
                     .await
                     .map_err(|e| Status::internal(format!("Failed to get app key: {}", e)))?;
-                tls_cert::derive_from_signer(&signer_key)
+                let secret = tls_cert::derive_from_signer(&signer_key);
+                let metadata =
+                    identity::KeyIdentity::tls(&secret, None).map_err(Status::internal)?;
+                let changed = {
+                    let mut log = self.key_metadata.lock().await;
+                    identity_snapshot::publish_local(&mut log, app_id, metadata)
+                };
+                if changed {
+                    self.notify_identity_change(app_id).await;
+                }
+                secret
             }
             config::TlsKeySource::Kms => {
-                let secret = self
+                let (secret, answer) = self
                     .kms_derive(app_id, tls_cert::KMS_MATERIAL)
                     .await
                     .map_err(|e| {
@@ -309,8 +599,23 @@ impl TappServiceImpl {
                 // Taking a derived secret is a measured event wherever it happens, so a key
                 // pulled for TLS shows up in the runtime log exactly like one pulled by the
                 // app itself. The local path has nothing to measure — no secret moved.
-                self.measure_secret_resource(app_id, tls_cert::KMS_MATERIAL, true)
-                    .await;
+                let c = tapp_common::kms::commitment(app_id, tls_cert::KMS_MATERIAL, &secret)
+                    .map_err(|e| Status::internal(e.to_string()))?;
+                let id = identity::KeyIdentity::tls(&secret, Some(c.clone()))
+                    .map_err(Status::internal)?;
+                if !self
+                    .measure_secret_resource(
+                        app_id,
+                        tls_cert::KMS_MATERIAL,
+                        true,
+                        Some(&c),
+                        Some(&id),
+                        Some(&answer),
+                    )
+                    .await
+                {
+                    return Err(Status::unavailable("cannot measure the KMS TLS identity"));
+                }
                 secret
             }
         };
@@ -332,6 +637,10 @@ impl TappServiceImpl {
             .await
             .map_err(|e| Status::internal(format!("common signer: {}", e)))?;
         let secret = tls_cert::derive_from_signer(&common_key);
+        self.key_metadata.lock().await.record_identity(
+            "",
+            identity::KeyIdentity::tls(&secret, None).map_err(Status::internal)?,
+        );
         let id = Arc::new(
             tls_cert::build("", &secret, "local", None)
                 .await
@@ -344,85 +653,40 @@ impl TappServiceImpl {
         Ok(id)
     }
 
-    /// The TLS public key hash to put in `report_data`, if one has been derived.
-    ///
-    /// Absent means no TLS key exists yet for this app — not that one is being withheld.
-    /// The two are distinguishable in practice: an endpoint serving TLS whose evidence
-    /// names no key fails the comparison a verifier makes.
-    async fn tls_public_key_for_evidence(&self, app_id: &str) -> Option<String> {
-        self.tls_identities
-            .lock()
-            .await
-            .get(app_id)
-            .map(|id| format!("0x{}", id.public_key_sha256))
+    /// The KMS keys `app_id` has taken this boot (read back from the event log at startup),
+    /// in material and then address order, for `report_data`.
+    async fn kms_keys_for_evidence(&self, app_id: &str) -> Vec<report_data::KmsKey> {
+        self.kms_keys.lock().await.of(app_id)
     }
 
-    /// Record that a KMS-derived secret left this node, into RTMR3.
-    ///
-    /// Without this, a derived key can be pulled by any container on the box and nothing
-    /// in the attestation says it happened — `get_app_secret_key` has always been measured,
-    /// but this path, which is how a key derived from the KMS namespace is obtained, was
-    /// not. It is what makes "re-acquiring a key leaves a trace" true rather than assumed.
-    ///
-    /// `material` is recorded because it names the derivation namespace, which is the part
-    /// that says *which* secret was taken. Failure to measure never fails the request: the
-    /// caller already holds the secret by this point, so refusing to answer would hide the
-    /// event rather than prevent it.
-    async fn measure_secret_resource(&self, app_id: &str, material: &str, success: bool) {
-        // Best-effort: an app fetching a secret before its measurements are known is
-        // unusual but must still be recorded, so missing app_info leaves empty hashes
-        // rather than skipping the event.
-        let info = self.boot_service.get_app_info(app_id).await.ok().flatten();
-        let m = boot::AppMeasurement {
-            app_id: app_id.to_string(),
-            operation: measurement_service::OPERATION_NAME_GET_SECRET_RESOURCE.to_string(),
-            result: String::new(),
-            error: None,
-            compose_hash: info
-                .as_ref()
-                .map(|i| i.compose_content.hash.clone())
-                .unwrap_or_default(),
-            volumes_hash: info
-                .as_ref()
-                .map(|i| i.mount_files.hash.clone())
-                .unwrap_or_default(),
-            image_hash: info
-                .as_ref()
-                .map(|i| i.compose_content.image_hash.clone())
-                .unwrap_or_default(),
-            deployer: info.as_ref().map(|i| i.owner.clone()).unwrap_or_default(),
-            timestamp: utils::current_timestamp(),
-        };
-        let m = if success {
-            m.with_success()
-        } else {
-            m.with_failure("KMS request or decryption failed".to_string())
-        };
-
-        // `material` has no field on AppMeasurement, so it is added to the serialised
-        // object rather than changing a struct every other measured operation shares.
-        let mut payload = match serde_json::to_value(&m) {
-            Ok(serde_json::Value::Object(o)) => o,
-            _ => {
-                tracing::error!("failed to serialise get_secret_resource measurement");
-                return;
-            }
-        };
-        payload.insert(
-            "material".to_string(),
-            serde_json::Value::String(material.to_string()),
-        );
-
-        if let Err(e) = self
-            .measurement_service
-            .extend_measurement(
-                measurement_service::OPERATION_NAME_GET_SECRET_RESOURCE,
-                &serde_json::Value::Object(payload).to_string(),
-            )
-            .await
-        {
-            tracing::error!("Failed to extend measurement for get_secret_resource: {}", e);
+    /// Measure algorithm-neutral commitment metadata before any secret is released.
+    /// Optional typed identity metadata is computed from the dedicated purpose's key.
+    /// Returns false on measurement failure, and publishes no metadata in that case.
+    async fn measure_secret_resource(
+        &self,
+        app_id: &str,
+        material: &str,
+        success: bool,
+        key_commitment: Option<&identity::KeyCommitment>,
+        key_identity: Option<&identity::KeyIdentity>,
+        answer: Option<&kms_client::KmsAnswer>,
+    ) -> bool {
+        let outcome = measure_secret_resource_with(
+            self.measurement_service.as_ref(),
+            self.boot_service.as_ref(),
+            self.key_metadata.as_ref(),
+            app_id,
+            material,
+            success,
+            key_commitment,
+            key_identity,
+            answer,
+        )
+        .await;
+        if outcome.identity_changed {
+            self.notify_identity_change(app_id).await;
         }
+        outcome.recorded
     }
 
     pub async fn new(
@@ -436,8 +700,14 @@ impl TappServiceImpl {
         let task_manager = Arc::new(task_manager::TaskManager::new());
 
         // Initialize BootService with measurement_service and task_manager
-        let boot_service =
-            Arc::new(BootService::new(measurement_service.clone(), task_manager).await?);
+        let boot_service = Arc::new(
+            BootService::new(
+                measurement_service.clone(),
+                task_manager,
+                BootService::state_path(&config),
+            )
+            .await?,
+        );
 
         // Initialize AppKeyService (always in-memory, independent of KBS).
         // Arc because volume-key derivation runs inside the spawned start task,
@@ -455,26 +725,132 @@ impl TappServiceImpl {
         // Wrapped in Arc<RwLock> so ClaimConfig can (re-)initialize it at runtime
         // when kbs_node_urls are provided dynamically instead of baked in config.
         let kms_client = Arc::new(tokio::sync::RwLock::new(config.kbs.as_ref().map(|kbs| {
-            info!(nodes = kbs.node_urls.len(), "Initializing KMS client from KBS config");
-            kms_client::KmsClient::new(kbs.node_urls.clone(), &kbs.retry)
+            info!(
+                nodes = kbs.node_urls.len(),
+                "Initializing KMS client from KBS config"
+            );
+            Arc::new(kms_client::KmsClient::new(
+                kbs.node_urls.clone(),
+                &kbs.retry,
+            ))
         })));
 
         // Initialize runtime config from static config (pre-baked values visible immediately)
-        let claimed_runtime_config = Arc::new(tokio::sync::RwLock::new(ClaimedRuntimeConfig {
-            chain_rpc_url: config.chain.as_ref().map(|c| c.rpc_url.clone()).unwrap_or_default(),
-            chain_contract_address: config.chain.as_ref().map(|c| c.contract_address.clone()).unwrap_or_default(),
-            kbs_node_urls: config.kbs.as_ref().map(|k| k.node_urls.clone()).unwrap_or_default(),
+        let mut runtime = ClaimedRuntimeConfig {
+            kbs_node_urls: config
+                .kbs
+                .as_ref()
+                .map(|k| k.node_urls.clone())
+                .unwrap_or_default(),
             tls_key_source: config.server.tls_key_source.as_str().to_string(),
             // No static counterpart on purpose: these are claimed, never baked into the
             // image. See ClaimedRuntimeConfig.
             scan_url: String::new(),
             scan_public_key: String::new(),
-        }));
+        };
+
+        // A process restart within this boot resumes the claimed config, and the KMS
+        // client built from it, exactly as the claim left them — and measures what it took
+        // over (claim_resumed, below).
+        // What `claim_resumed` records about the config: true when it was taken over,
+        // "absent" when there was none to take over (a tapp-server that persisted only the
+        // owner ran before this one), "unreadable" when the file is there but damaged — the
+        // case a verifier should not mistake for the benign one.
+        let mut config_resumed = serde_json::json!("absent");
+        match ClaimedRuntimeConfig::state_path(&config).map(|p| ClaimedRuntimeConfig::load(&p)) {
+            Some(Ok(Some(claimed))) => {
+                config_resumed = serde_json::json!(true);
+                info!(
+                    kbs_nodes = claimed.kbs_node_urls.len(),
+                    tls_key_source = %claimed.tls_key_source,
+                    scan_url = %claimed.scan_url,
+                    "Resumed the config claimed earlier this boot"
+                );
+                if !claimed.kbs_node_urls.is_empty() {
+                    *kms_client.write().await = Some(Arc::new(kms_client_with_anchor(
+                        claimed.kbs_node_urls.clone(),
+                        &kbs_retry(&config),
+                        &claimed.scan_url,
+                        &claimed.scan_public_key,
+                    )));
+                }
+                runtime = claimed;
+            }
+            Some(Ok(None)) | None => {}
+            // Starting on config.toml's values is not a silent downgrade: without the
+            // claimed anchor the KMS client refuses unverified nodes, and get-tapp-info
+            // shows what is in force. Refusing to start would leave the node unmanageable
+            // until a reboot.
+            Some(Err(e)) => {
+                config_resumed = serde_json::json!("unreadable");
+                error!(
+                    error = %e,
+                    "Could not read the config claimed earlier this boot; running with config.toml \
+                     values. Re-apply the trust anchors with update-trust-anchors."
+                )
+            }
+        }
+        // Measure what was taken over: the owner and config read back from tmpfs are
+        // otherwise only as trustworthy as that directory. One event, after both are known.
+        if let Some(pm) = permission_manager.as_ref().filter(|pm| pm.was_resumed()) {
+            let data = serde_json::json!({
+                "operation": measurement_service::OPERATION_NAME_CLAIM_RESUMED,
+                "owner": pm.owner_address().await,
+                "kbs_node_urls": runtime.kbs_node_urls,
+                "tls_key_source": runtime.tls_key_source,
+                "scan_url": runtime.scan_url,
+                "scan_public_key": runtime.scan_public_key,
+                // Not true: these are config.toml's values, not carried over — which is
+                // not "changed". See config_resumed above for the two ways that happens.
+                "config_resumed": config_resumed,
+                "timestamp": utils::current_timestamp()
+            })
+            .to_string();
+            // Fail closed: running on state read back from tmpfs without measuring it is
+            // the gap this event exists to close. Exiting lets the supervisor retry.
+            if let Err(e) = measurement_service
+                .extend_measurement(measurement_service::OPERATION_NAME_CLAIM_RESUMED, &data)
+                .await
+            {
+                error!(error = %e, "Failed to measure the resumed claim; refusing to run on it unmeasured");
+                return Err(std::io::Error::other(format!(
+                    "could not measure the resumed claim: {}",
+                    e
+                ))
+                .into());
+            }
+        }
+        let claimed_runtime_config = Arc::new(tokio::sync::RwLock::new(runtime));
+
+        let (kms_keys, key_metadata) = kms_keys_of_this_boot(&measurement_service).await;
+        let identity_refresh = {
+            let live = claimed_runtime_config.clone();
+            identity_refresh::IdentityRefresh::start(Arc::new(move |target| {
+                let live = live.clone();
+                Box::pin(async move {
+                    // Read the pair together on every attempt, outside all key/cache locks.
+                    let (url, pin) = {
+                        let current = live.read().await;
+                        (current.scan_url.clone(), current.scan_public_key.clone())
+                    };
+                    if url.is_empty() || pin.is_empty() {
+                        return Err("Scan anchors are not configured".into());
+                    }
+                    tapp_common::scan::refresh_node(&url, &pin, &target.app_id, &target.node_signer)
+                        .await
+                        .map_err(|e| e.to_string())
+                })
+            }))
+        };
 
         info!("All TAPP service components initialized successfully");
 
         Ok(Self {
             tls_identities: Arc::new(Mutex::new(HashMap::new())),
+            kms_keys: Arc::new(Mutex::new(kms_keys)),
+            key_metadata: Arc::new(Mutex::new(key_metadata)),
+            app_signers: signer_cache::SignerCache::default(),
+            identity_refresh,
             boot_service,
             app_key_service,
             kms_client,
@@ -492,7 +868,7 @@ impl TappServiceImpl {
 /// awaiting the ClaimConfig RPC). Sources, in order of resolution:
 ///
 /// - config `owner_address` (legacy baked-in mode) — measured as a
-///   `claim_config` event the first time it takes effect in a boot (chain/kbs
+///   `claim_config` event the first time it takes effect in a boot (kbs
 ///   values from the same config are included in the measurement data);
 /// - the owner persisted by a previous tapp-server process of the SAME boot
 ///   (restored silently: its claim_config event is already in this boot's
@@ -504,12 +880,9 @@ pub async fn establish_owner_at_startup(
     pm: &Arc<permission::PermissionManager>,
     measurement_service: &Arc<measurement_service::MeasurementService>,
     config_owner: Option<&str>,
-    chain_rpc_url: &str,
-    chain_contract_address: &str,
     kbs_node_urls: &[String],
 ) -> Result<Option<String>, String> {
-    let config_owner =
-        config_owner.map(permission::PermissionManager::normalize_address);
+    let config_owner = config_owner.map(permission::PermissionManager::normalize_address);
     let persisted = pm.load_persisted_owner();
 
     let (owner, needs_measurement) = match (config_owner, persisted) {
@@ -520,10 +893,14 @@ pub async fn establish_owner_at_startup(
                     c, p
                 ));
             }
+            pm.mark_resumed();
             (Some(c), false) // measured earlier this boot
         }
         (Some(c), None) => (Some(c), true),
-        (None, Some(p)) => (Some(p), false),
+        (None, Some(p)) => {
+            pm.mark_resumed();
+            (Some(p), false)
+        }
         (None, None) => (None, false),
     };
 
@@ -534,8 +911,6 @@ pub async fn establish_owner_at_startup(
             let measurement_data = serde_json::json!({
                 "operation": measurement_service::OPERATION_NAME_CLAIM_CONFIG,
                 "owner": owner,
-                "chain_rpc_url": chain_rpc_url,
-                "chain_contract_address": chain_contract_address,
                 "kbs_node_urls": kbs_node_urls,
                 "timestamp": utils::current_timestamp()
             })
@@ -570,19 +945,33 @@ impl TappService for TappServiceImpl {
         info!("Calling GetEvidence");
         debug!("Request: {:?}", request);
         let req = request.into_inner();
-        // Use the app signer (TEE-derived ethereum address) as report_data so the
+        // Use this app's node signer (TEE-derived address) in runtime data so the
         // attestation binds to the on-chain registered signer.
-        let key_pair = self
-            .app_key_service
-            .get_app_key(&req.app_id, "ethereum", false)
-            .await?;
-        // Reported only if a TLS key has already been derived. Deriving one here would let
-        // an unauthenticated caller drive KMS traffic, and would also mint a key for an
-        // app that never asked for one.
-        let tls_public_key = self.tls_public_key_for_evidence(&req.app_id).await;
+        let key_pair = self.app_key_service.get_app_key(&req.app_id).await?;
+        // Likewise only the KMS keys the app has already taken: listed, never fetched here.
+        let kms_keys = self.kms_keys_for_evidence(&req.app_id).await;
+        // The legacy TLS pin and typed TLS identity must come from one metadata snapshot.
+        // Otherwise a concurrent first TLS acquisition can mix an absent old pin with a
+        // newly published identity. This read never derives a key or calls the KMS.
+        let (mut identities, commitments) = self.key_metadata.lock().await.of(&req.app_id);
+        let tls_public_key = identity_snapshot::tls_hash(&identities);
+        identities.push(
+            identity::KeyIdentity::node(&key_pair.public_key, &req.app_id)
+                .map_err(Status::internal)?,
+        );
+        identities.sort_by(|a, b| {
+            (&a.role, &a.algorithm, &a.public_key).cmp(&(&b.role, &b.algorithm, &b.public_key))
+        });
         let evidence = self
             .boot_service
-            .get_evidence(req, &key_pair.eth_address, tls_public_key)
+            .get_evidence(
+                req,
+                &key_pair.eth_address,
+                tls_public_key,
+                kms_keys,
+                identities,
+                commitments,
+            )
             .await?;
         Ok(Response::new(evidence))
     }
@@ -598,6 +987,7 @@ impl TappService for TappServiceImpl {
         let signer = auth_layer::get_signer_address(&request);
         let req_inner = request.into_inner();
         let app_id = req_inner.app_id.clone();
+        let measure_only = req_inner.measure_only;
 
         // Get deployer address (signer EVM address)
         // If no signer (auth disabled), use a default placeholder
@@ -612,6 +1002,36 @@ impl TappService for TappServiceImpl {
         // before a task exists.
         let mode = boot::volume::data_mode(&req_inner.compose_content)
             .map_err(Status::invalid_argument)?;
+        if let Some(state_file) = self
+            .config
+            .server
+            .permission
+            .as_ref()
+            .map(|p| &p.owner_state_path)
+        {
+            let state_dir = state_file.parent().unwrap_or(state_file);
+            let socket = self
+                .config
+                .server
+                .unix_socket_path
+                .as_deref()
+                .map(std::path::Path::new);
+            let exposures = boot::compose_lint::state_dir_exposures(
+                &req_inner.compose_content,
+                state_dir,
+                socket,
+            );
+            if !exposures.is_empty() {
+                return Err(Status::invalid_argument(exposures.join("; ")));
+            }
+        }
+        let disk_exposures = boot::compose_lint::data_disk_exposures(
+            &req_inner.compose_content,
+            std::path::Path::new(boot::volume::DATA_DISK),
+        );
+        if !disk_exposures.is_empty() {
+            return Err(Status::invalid_argument(disk_exposures.join("; ")));
+        }
         let data_plan = if req_inner.measure_only {
             // Measure-only returns before any data directory is provisioned.
             boot::DataPlan::Ram
@@ -622,10 +1042,37 @@ impl TappService for TappServiceImpl {
                         let kms = self.kms_client.clone();
                         let keys = self.app_key_service.clone();
                         let id = app_id.clone();
+                        let measurements = self.measurement_service.clone();
+                        let boot = self.boot_service.clone();
+                        let metadata = self.key_metadata.clone();
                         boot::DataPlan::Encrypted(Box::pin(async move {
-                            kms_derive_with(&kms, &keys, &id, boot::volume::FDE_MATERIAL)
-                                .await
-                                .map_err(|e| e.message().to_string())
+                            let (secret, answer) =
+                                kms_derive_with(&kms, &keys, &id, boot::volume::FDE_MATERIAL)
+                                    .await
+                                    .map_err(|e| e.message().to_string())?;
+                            let c = tapp_common::kms::commitment(
+                                &id,
+                                boot::volume::FDE_MATERIAL,
+                                &secret,
+                            )
+                            .map_err(|e| e.to_string())?;
+                            if !measure_secret_resource_with(
+                                measurements.as_ref(),
+                                boot.as_ref(),
+                                metadata.as_ref(),
+                                &id,
+                                &c.material,
+                                true,
+                                Some(&c),
+                                None,
+                                Some(&answer),
+                            )
+                            .await
+                            .recorded
+                            {
+                                return Err("cannot measure the KMS encrypted-volume key".into());
+                            }
+                            Ok(secret)
                         }))
                     } else {
                         boot::DataPlan::RamDowngraded
@@ -639,7 +1086,7 @@ impl TappService for TappServiceImpl {
                     boot::DataPlan::Scratch(Box::pin(async move {
                         // Create-if-missing, then derive: the signer is local (TEE),
                         // so scratch needs no KMS and dies with the signer — per boot.
-                        keys.get_app_key(&id, "ethereum", false)
+                        keys.get_app_key(&id)
                             .await
                             .map_err(|e| format!("create app key: {e}"))?;
                         let signer_key = keys
@@ -659,25 +1106,18 @@ impl TappService for TappServiceImpl {
             .start_app(req_inner, deployer.clone(), data_plan)
             .await?;
 
-        // Derive the app's TLS identity now rather than waiting for it to be asked for.
+        // Derive TLS only for a real start. A measurement preflight must return its
+        // task ID before registration: KMS admission cannot succeed before the CLI
+        // uses those measurements to register the app on chain.
         //
-        // The rule is one sentence — the key exists as soon as the app runs — and it holds
-        // for both key sources, which matters: a verifier reading "no TLS key" out of
-        // evidence must not have to wonder whether it means "none" or "not fetched yet".
-        //
-        // Waiting is not an unlucky race but the normal case. Deployment goes start → register
-        // on chain → the app fetches its certificate, and a registry event is exactly what
-        // makes tappscan re-verify — so it would fetch evidence in the gap, record "no TLS
-        // key", and keep saying so until its hourly backstop.
-        //
-        // Doing it here rather than in GetEvidence keeps it behind the owner's signature.
-        // GetEvidence is unauthenticated, and deriving there would let anyone drive KMS
-        // traffic, and mint keys for apps that never wanted one.
-        //
-        // Best effort: a KMS-sourced key needs the app registered on chain and the cluster
-        // reachable, neither of which is true on a first deploy. Failing here would fail a
-        // start that has already succeeded, so it is logged and the lazy path picks it up.
-        if let Err(e) = self.tls_identity(&app_id).await {
+        // Keep the existing eager, best-effort TLS derivation for a real start. It
+        // publishes the public identity for evidence before the certificate is requested.
+        // This stays behind the owner's signature; GetEvidence never drives KMS traffic.
+        // A standalone start can still precede registration, so failure is logged and
+        // the certificate request retries lazily rather than failing an existing task.
+        if let Some(Err(e)) =
+            start_identity::app_tls_after_start(measure_only, || self.tls_identity(&app_id)).await
+        {
             info!(
                 app_id = %app_id,
                 error = %e,
@@ -822,31 +1262,88 @@ impl TappService for TappServiceImpl {
         debug!("Request: {:?}", request);
         let req = request.into_inner();
 
-        // Empty means "ethereum", the only kind that exists. Anything else is refused
-        // rather than quietly answered with ethereum material: the field was accepted and
-        // discarded for a long time, so a caller asking for "rsa" got an ethereum key and
-        // no indication that its request had not been honoured.
-        let key_type = if req.key_type.is_empty() {
-            "ethereum"
-        } else {
-            &req.key_type
-        };
-
         // Create-if-missing (same as GetEvidence): allows fetching the signer
         // address BEFORE the app starts, e.g. for on-chain pre-registration.
         // The key lives in this process's memory, so the app gets the same key
         // when it actually starts.
-        let key_pair = self
-            .app_key_service
-            .get_app_key(&req.app_id, key_type, req.x25519)
-            .await?;
+        let key_pair = self.app_key_service.get_app_key(&req.app_id).await?;
         Ok(Response::new(GetAppKeyResponse {
             success: true,
             message: format!("Public key for app {}", req.app_id),
             eth_address: key_pair.eth_address,
             public_key: key_pair.public_key,
-            x25519_public_key: key_pair.x25519_public_key.unwrap_or_default(),
             key_source: "in-memory".to_string(),
+        }))
+    }
+
+    async fn get_app_signer(
+        &self,
+        request: Request<GetAppSignerRequest>,
+    ) -> Result<Response<GetAppSignerResponse>, Status> {
+        require_local(&request, "GetAppSigner")?;
+        let req = request.into_inner();
+        if req.app_id.is_empty() {
+            return Err(Status::invalid_argument("app_id must not be empty"));
+        }
+        let secret = self
+            .app_signers
+            .get_or_try_init(&req.app_id, || async {
+                let (secret, answer) = self
+                    .kms_derive(&req.app_id, identity::APP_SIGNER_MATERIAL)
+                    .await?;
+                let c = tapp_common::kms::commitment(
+                    &req.app_id,
+                    identity::APP_SIGNER_MATERIAL,
+                    &secret,
+                )
+                .map_err(|e| Status::internal(e.to_string()))?;
+                let id = identity::KeyIdentity::app_signer(&secret, c.clone())
+                    .map_err(Status::internal)?;
+                let already_measured =
+                    self.key_metadata
+                        .lock()
+                        .await
+                        .contains(&req.app_id, &c, Some(&id));
+                if !already_measured
+                    && !self
+                        .measure_secret_resource(
+                            &req.app_id,
+                            identity::APP_SIGNER_MATERIAL,
+                            true,
+                            Some(&c),
+                            Some(&id),
+                            Some(&answer),
+                        )
+                        .await
+                {
+                    return Err(Status::unavailable(
+                        "cannot measure the KMS app signing identity",
+                    ));
+                }
+                Ok::<_, Status>(secret)
+            })
+            .await?;
+        let c = tapp_common::kms::commitment(&req.app_id, identity::APP_SIGNER_MATERIAL, &secret)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let id = identity::KeyIdentity::app_signer(&secret, c.clone()).map_err(Status::internal)?;
+        Ok(Response::new(GetAppSignerResponse {
+            success: true,
+            message: "KMS app signing identity retrieved".into(),
+            secret,
+            public_key: hex::decode(&id.public_key[2..])
+                .map_err(|_| Status::internal("invalid app signing identity"))?,
+            eth_address: hex::decode(
+                id.ethereum_address()
+                    .ok_or_else(|| Status::internal("invalid app signing address"))?
+                    .trim_start_matches("0x"),
+            )
+            .map_err(|_| Status::internal("invalid app signing address"))?,
+            key_source: "kms".into(),
+            derivation: identity::RAW_SCALAR.into(),
+            commitment_scheme: c.scheme,
+            commitment: hex::decode(&c.commitment[2..])
+                .map_err(|_| Status::internal("invalid commitment encoding"))?,
+            measured_in_evidence: true,
         }))
     }
 
@@ -854,6 +1351,7 @@ impl TappService for TappServiceImpl {
         &self,
         request: Request<GetAppTlsCertRequest>,
     ) -> Result<Response<GetAppTlsCertResponse>, Status> {
+        require_local(&request, "GetAppTlsCert")?;
         info!("Calling GetAppTlsCert");
 
         // Reachability is the control and AuthLayer enforces it: this method is served
@@ -895,6 +1393,7 @@ impl TappService for TappServiceImpl {
         &self,
         request: Request<GetAppSecretKeyRequest>,
     ) -> Result<Response<GetAppSecretKeyResponse>, Status> {
+        require_local(&request, "GetAppSecretKey")?;
         info!("Calling GetAppSecretKey");
         debug!("Request: {:?}", request);
         // Reachability is the control and AuthLayer enforces it: this method is served
@@ -905,11 +1404,6 @@ impl TappService for TappServiceImpl {
         // Get signer address from signature (handled by AuthLayer)
         // let signer = auth_layer::get_signer_address(&request);
         let req = request.into_inner();
-        let mut key_type = "ethereum".to_string();
-        if !req.key_type.is_empty() {
-            key_type = req.key_type;
-        }
-
         // // SECURITY: Check app ownership
         // if let Some(pm) = &self.permission_manager {
         //     if let Some(signer_addr) = &signer {
@@ -971,10 +1465,7 @@ impl TappService for TappServiceImpl {
         // Try to get the key
         let result = async {
             // Get public key and address for response
-            let key_response = self
-                .app_key_service
-                .get_app_key(&req.app_id, &key_type, req.x25519)
-                .await?;
+            let key_response = self.app_key_service.get_app_key(&req.app_id).await?;
 
             // Get private key
             // let private_key = self.app_key_service.get_private_key(&req.app_id).await?;
@@ -1025,7 +1516,6 @@ impl TappService for TappServiceImpl {
                     private_key: key_response.private_key,
                     public_key: key_response.public_key,
                     eth_address: key_response.eth_address,
-                    x25519_public_key: key_response.x25519_public_key.unwrap_or_default(),
                 }))
             }
             Err(e) => {
@@ -1180,18 +1670,27 @@ impl TappService for TappServiceImpl {
         let live_kbs_urls = if !runtime.kbs_node_urls.is_empty() {
             runtime.kbs_node_urls.clone()
         } else {
-            self.config.kbs.as_ref().map(|k| k.node_urls.clone()).unwrap_or_default()
+            self.config
+                .kbs
+                .as_ref()
+                .map(|k| k.node_urls.clone())
+                .unwrap_or_default()
         };
         let kbs_enabled = !live_kbs_urls.is_empty();
         let kbs_config = if kbs_enabled {
-            let (timeout, cert, retry) = self.config.kbs.as_ref().map(|kbs| {
-                let r = RetryConfigInfo {
-                    max_retries: kbs.retry.max_retries as i32,
-                    initial_delay_ms: kbs.retry.initial_delay_ms as i32,
-                    max_delay_ms: kbs.retry.max_delay_ms as i32,
-                };
-                (kbs.timeout_seconds as i32, kbs.cert_path.is_some(), Some(r))
-            }).unwrap_or((30, false, None));
+            let (timeout, cert, retry) = self
+                .config
+                .kbs
+                .as_ref()
+                .map(|kbs| {
+                    let r = RetryConfigInfo {
+                        max_retries: kbs.retry.max_retries as i32,
+                        initial_delay_ms: kbs.retry.initial_delay_ms as i32,
+                        max_delay_ms: kbs.retry.max_delay_ms as i32,
+                    };
+                    (kbs.timeout_seconds as i32, kbs.cert_path.is_some(), Some(r))
+                })
+                .unwrap_or((30, false, None));
             Some(KbsConfigInfo {
                 node_urls: live_kbs_urls,
                 timeout_seconds: timeout,
@@ -1202,30 +1701,10 @@ impl TappService for TappServiceImpl {
             None
         };
 
-        // Chain: prefer runtime (from claim), fall back to static config
-        let live_chain_rpc = if !runtime.chain_rpc_url.is_empty() {
-            runtime.chain_rpc_url.clone()
-        } else {
-            self.config.chain.as_ref().map(|c| c.rpc_url.clone()).unwrap_or_default()
-        };
-        let live_chain_contract = if !runtime.chain_contract_address.is_empty() {
-            runtime.chain_contract_address.clone()
-        } else {
-            self.config.chain.as_ref().map(|c| c.contract_address.clone()).unwrap_or_default()
-        };
         // Trust anchors have no config.toml fallback by design — see ClaimedRuntimeConfig.
         let scan_url = runtime.scan_url.clone();
         let scan_public_key = runtime.scan_public_key.clone();
         drop(runtime);
-
-        let chain_config = if !live_chain_rpc.is_empty() || !live_chain_contract.is_empty() {
-            Some(ChainConfigInfo {
-                rpc_url: live_chain_rpc,
-                contract_address: live_chain_contract,
-            })
-        } else {
-            None
-        };
 
         // Build complete config info
         let config_info = TappConfigInfo {
@@ -1234,7 +1713,6 @@ impl TappService for TappServiceImpl {
             boot: Some(boot_config),
             kbs: kbs_config,
             kbs_enabled,
-            chain: chain_config,
             scan_url: scan_url.clone(),
             scan_public_key: scan_public_key.clone(),
         };
@@ -1244,6 +1722,141 @@ impl TappService for TappServiceImpl {
             message: "TAPP configuration retrieved successfully".to_string(),
             config: Some(config_info),
             version: VERSION.to_string(),
+        }))
+    }
+
+    async fn resolve_app_identity(
+        &self,
+        request: Request<ResolveAppIdentityRequest>,
+    ) -> Result<Response<ResolveAppIdentityResponse>, Status> {
+        // Also enforce the transport here: disabling owner/signature auth must
+        // not expose an application-facing network lookup on the public listener.
+        if request
+            .extensions()
+            .get::<tonic::transport::server::UdsConnectInfo>()
+            .is_none()
+        {
+            return Err(Status::permission_denied(
+                "ResolveAppIdentity is served only on the tapp Unix socket",
+            ));
+        }
+        let req = request.into_inner();
+        if req.chain_id == 0 || req.app_id.trim().is_empty() {
+            return Err(Status::invalid_argument(
+                "chain_id and app_id must be specified",
+            ));
+        }
+        if !req
+            .registry_address
+            .parse::<ethers::types::Address>()
+            .is_ok_and(|registry| registry != ethers::types::Address::zero())
+        {
+            return Err(Status::invalid_argument(
+                "registry_address must be a nonzero Ethereum address",
+            ));
+        }
+
+        // Take URL and pin under one lock, then release it before network I/O.
+        // This does not use kms_client: Scan lookups work without a KMS cluster.
+        let (scan_url, scan_public_key) = {
+            let live = self.claimed_runtime_config.read().await;
+            (live.scan_url.clone(), live.scan_public_key.clone())
+        };
+        if scan_url.is_empty() || scan_public_key.is_empty() {
+            return Err(Status::failed_precondition(
+                "Scan trust anchors are not configured; set scan_url and scan_public_key at claim or with UpdateTrustAnchors",
+            ));
+        }
+        let identity = tapp_common::scan::resolve_app_identity(
+            &scan_url,
+            &scan_public_key,
+            req.chain_id,
+            &req.registry_address,
+            &req.app_id,
+        )
+        .await
+        .map_err(|e| {
+            use tapp_common::scan::ResolveError;
+            let message = format!("Scan identity lookup failed: {e}");
+            match e {
+                ResolveError::ScopeChanged => Status::aborted(message),
+                ResolveError::ScopeMismatch
+                | ResolveError::Stale(_)
+                | ResolveError::InvalidConfig(_) => Status::failed_precondition(message),
+                ResolveError::NoVerifiedNodes => Status::not_found(message),
+                ResolveError::IdentityPending(_) => Status::unavailable(message),
+                ResolveError::Timeout => Status::deadline_exceeded(message),
+                ResolveError::InvalidResponse(_) | ResolveError::ResponseTooLarge => {
+                    Status::data_loss(message)
+                }
+                _ => Status::unavailable(message),
+            }
+        })?;
+
+        // Do not deliver a lookup through an anchor that was replaced while it
+        // was in flight. The caller can retry against the new live configuration.
+        {
+            let live = self.claimed_runtime_config.read().await;
+            if live.scan_url != scan_url || live.scan_public_key != scan_public_key {
+                return Err(Status::aborted(
+                    "Scan trust anchors changed during lookup; retry",
+                ));
+            }
+        }
+
+        Ok(Response::new(ResolveAppIdentityResponse {
+            success: true,
+            message: "App identities verified by the configured Scan".into(),
+            chain_id: identity.chain_id,
+            registry_address: identity.registry,
+            app_id: identity.app_id,
+            nodes: identity
+                .nodes
+                .into_iter()
+                .map(|node| ResolvedAppNodeIdentity {
+                    node_signer: node.node_signer,
+                    tee_url: node.tee_url,
+                    tls_spki_sha256: format!("0x{}", node.tls_spki_sha256),
+                    checked_at: node.checked_at,
+                    expires_at: node.expires_at,
+                    tcb_status: node.tcb_status,
+                    advisories: node.advisories,
+                    image_env: node.image_env,
+                    app_signer: node.app_signer,
+                    kms_unchecked: node.kms_unchecked,
+                    key_commitments: node
+                        .key_commitments
+                        .into_iter()
+                        .map(|reference| ResolvedKeyCommitment {
+                            commitment: reference.commitment,
+                            material: reference.material,
+                            scheme: reference.scheme,
+                        })
+                        .collect(),
+                    identities: node
+                        .identities
+                        .into_iter()
+                        .map(|key| ResolvedKeyIdentity {
+                            algorithm: key.algorithm,
+                            derivation: key.derivation,
+                            key_ref: key.key_ref.map(|reference| ResolvedKeyCommitment {
+                                commitment: reference.commitment,
+                                material: reference.material,
+                                scheme: reference.scheme,
+                            }),
+                            key_source: key.key_source,
+                            public_key: key.public_key,
+                            public_key_encoding: key.public_key_encoding,
+                            role: key.role,
+                        })
+                        .collect(),
+                })
+                .collect(),
+            scan_url,
+            scan_public_key,
+            scanned_to_block: identity.scanned_to_block,
+            resolved_at: identity.resolved_at,
+            registered_at: identity.registered_at,
         }))
     }
 
@@ -1480,7 +2093,7 @@ impl TappService for TappServiceImpl {
         let (scan_url, scan_public_key) = scan.unwrap_or_default();
 
         // Extend runtime measurement — includes the full config so verifiers
-        // see owner + chain + kbs in one event. On failure the claim is rolled
+        // see owner + kbs + TLS + scan anchor in one event. On failure the claim is rolled
         // back so the tapp stays claimable.
         // The cluster the node will actually use, not just what this request named: the KMS
         // client is only replaced when the request supplies urls, so a claim that supplies
@@ -1501,8 +2114,6 @@ impl TappService for TappServiceImpl {
         let measurement_data = serde_json::json!({
             "operation": measurement_service::OPERATION_NAME_CLAIM_CONFIG,
             "owner": owner,
-            "chain_rpc_url": req.chain_rpc_url,
-            "chain_contract_address": req.chain_contract_address,
             "kbs_node_urls": effective_kbs,
             "tls_key_source": tls_key_source.as_str(),
             "scan_url": scan_url,
@@ -1528,8 +2139,6 @@ impl TappService for TappServiceImpl {
 
         // Store runtime config so get-tapp-info can show live values.
         *self.claimed_runtime_config.write().await = ClaimedRuntimeConfig {
-            chain_rpc_url: req.chain_rpc_url.clone(),
-            chain_contract_address: req.chain_contract_address.clone(),
             kbs_node_urls: effective_kbs.clone(),
             tls_key_source: tls_key_source.as_str().to_string(),
             scan_url: scan_url.clone(),
@@ -1547,22 +2156,23 @@ impl TappService for TappServiceImpl {
                 anchored = !scan_url.is_empty(),
                 "Initializing KMS client from ClaimConfig"
             );
-            *self.kms_client.write().await = Some(kms_client_with_anchor(
+            *self.kms_client.write().await = Some(Arc::new(kms_client_with_anchor(
                 effective_kbs.clone(),
-                &Default::default(),
+                &kbs_retry(&self.config),
                 &scan_url,
                 &scan_public_key,
-            ));
+            )));
+            self.app_signers.clear().await;
         }
 
         // Persist so a process restart within this boot cannot reopen the claim.
         if let Err(e) = pm.persist_owner().await {
             tracing::warn!(error = %e, "Failed to persist claimed owner");
         }
+        self.persist_claimed_config().await;
 
         info!(
             owner = %owner,
-            chain_contract = %req.chain_contract_address,
             kbs_nodes = req.kbs_node_urls.len(),
             event = "CONFIG_CLAIMED",
             "Tapp config claimed and measurement extended"
@@ -1622,8 +2232,6 @@ impl TappService for TappServiceImpl {
                     .unwrap_or_default()
             };
             ClaimedRuntimeConfig {
-                chain_rpc_url: current.chain_rpc_url.clone(),
-                chain_contract_address: current.chain_contract_address.clone(),
                 tls_key_source: current.tls_key_source.clone(),
                 kbs_node_urls,
                 scan_url,
@@ -1661,6 +2269,7 @@ impl TappService for TappServiceImpl {
 
         let kbs_changed = !req.kbs_node_urls.is_empty();
         *self.claimed_runtime_config.write().await = resulting.clone();
+        self.persist_claimed_config().await;
 
         // Replace the KMS client so the new cluster takes effect on the next request
         // rather than at the next restart.
@@ -1673,12 +2282,13 @@ impl TappService for TappServiceImpl {
                 scan = %resulting.scan_url,
                 "Replacing KMS client from UpdateTrustAnchors"
             );
-            *self.kms_client.write().await = Some(kms_client_with_anchor(
+            *self.kms_client.write().await = Some(Arc::new(kms_client_with_anchor(
                 resulting.kbs_node_urls.clone(),
-                &Default::default(),
+                &kbs_retry(&self.config),
                 &resulting.scan_url,
                 &resulting.scan_public_key,
-            ));
+            )));
+            self.app_signers.clear().await;
         }
 
         info!(
@@ -2262,6 +2872,7 @@ impl TappService for TappServiceImpl {
         &self,
         request: Request<GetSecretResourceRequest>,
     ) -> Result<Response<GetSecretResourceResponse>, Status> {
+        require_local(&request, "GetSecretResource")?;
         info!("Calling GetSecretResource");
 
         // Reachability is the control and AuthLayer enforces it: this method is served
@@ -2281,16 +2892,30 @@ impl TappService for TappServiceImpl {
             ));
         }
 
-        let secret = self.kms_derive(app_id, &req.material).await?;
+        // Refused here rather than by the KMS: the material goes into this app's evidence and
+        // into an event, so its form and size are ours to bound, not the KMS parser's.
+        report_data::check_material(&req.material).map_err(Status::invalid_argument)?;
 
-        self.measure_secret_resource(app_id, &req.material, true).await;
+        let (secret, answer) = self.kms_derive(app_id, &req.material).await?;
 
-        info!(app_id = %app_id, "GetSecretResource succeeded");
-
+        let c = tapp_common::kms::commitment(app_id, &req.material, &secret)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let measured = self
+            .measure_secret_resource(app_id, &c.material, true, Some(&c), None, Some(&answer))
+            .await;
+        if !measured {
+            return Err(Status::unavailable(
+                "cannot measure the KMS secret acquisition",
+            ));
+        }
         Ok(Response::new(GetSecretResourceResponse {
             success: true,
-            message: format!("Secret resource retrieved for app {}", app_id),
+            message: "KMS secret retrieved".into(),
             secret,
+            commitment_scheme: c.scheme,
+            commitment: hex::decode(&c.commitment[2..])
+                .map_err(|_| Status::internal("invalid commitment encoding"))?,
+            measured_in_evidence: measured,
         }))
     }
 }
@@ -2473,12 +3098,18 @@ mod tests {
         let upper = format!("0X{}", PIN[2..].to_uppercase());
         let bare = &PIN[2..];
         let expected = Some(("https://scan.example".to_string(), PIN.to_string()));
-        assert_eq!(validate_scan_anchor("https://scan.example", bare), Ok(expected.clone()));
+        assert_eq!(
+            validate_scan_anchor("https://scan.example", bare),
+            Ok(expected.clone())
+        );
         // A "0X" prefix is not stripped by strip_prefix("0x"), so it lands in the hex part
         // and is rejected on length — documented here so the behaviour is deliberate.
         assert!(validate_scan_anchor("https://scan.example", &upper).is_err());
         assert_eq!(
-            validate_scan_anchor("https://scan.example", &PIN.to_uppercase().replace("0X", "0x")),
+            validate_scan_anchor(
+                "https://scan.example",
+                &PIN.to_uppercase().replace("0X", "0x")
+            ),
             Ok(expected)
         );
     }
@@ -2558,5 +3189,109 @@ mod tests {
         assert_eq!(padded.len(), 10);
         assert_eq!(&padded[0..5], b"hello");
         assert_eq!(&padded[5..], &[0u8; 5]);
+    }
+}
+
+#[cfg(test)]
+mod claimed_config_persistence {
+    use super::*;
+
+    fn claimed() -> ClaimedRuntimeConfig {
+        ClaimedRuntimeConfig {
+            kbs_node_urls: vec!["https://kms-1:9443".into(), "https://kms-2:9443".into()],
+            tls_key_source: "kms".into(),
+            scan_url: "https://scan.example".into(),
+            scan_public_key: format!("0x{}", "ab".repeat(32)),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_restart_reads_back_exactly_what_was_claimed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("claimed_config.json");
+        claimed().save(&path).unwrap();
+
+        let back = ClaimedRuntimeConfig::load(&path).unwrap().unwrap();
+        assert_eq!(back.kbs_node_urls, claimed().kbs_node_urls);
+        assert_eq!(back.tls_key_source, "kms");
+        assert_eq!(back.scan_url, claimed().scan_url);
+        assert_eq!(back.scan_public_key, claimed().scan_public_key);
+        // Nothing but the file itself is left behind.
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn overlapping_saves_never_leave_a_torn_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("claimed_config.json");
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let mut c = claimed();
+                    c.scan_url = format!("https://scan-{i}.example");
+                    for _ in 0..50 {
+                        c.save(&path).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let back = ClaimedRuntimeConfig::load(&path).unwrap().unwrap();
+        assert!(back.scan_url.starts_with("https://scan-"));
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn nothing_claimed_this_boot_is_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            ClaimedRuntimeConfig::load(&dir.path().join("claimed_config.json"))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_file_from_another_version_still_loads() {
+        // A binary upgrade within the boot is a process restart too: fields it does not
+        // know are ignored, fields it misses take their defaults.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("claimed_config.json");
+        std::fs::write(
+            &path,
+            r#"{"retired_field":"x","scan_url":"https://scan.example","tls_key_source":"kms"}"#,
+        )
+        .unwrap();
+        let back = ClaimedRuntimeConfig::load(&path).unwrap().unwrap();
+        assert_eq!(back.scan_url, "https://scan.example");
+        assert_eq!(back.tls_key_source, "kms");
+        assert!(back.kbs_node_urls.is_empty());
+    }
+
+    #[test]
+    fn a_damaged_file_is_reported_not_taken_as_nothing_claimed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("claimed_config.json");
+        std::fs::write(&path, b"{\"scan_url\":").unwrap();
+        assert!(ClaimedRuntimeConfig::load(&path).is_err());
+    }
+
+    #[test]
+    fn it_lives_beside_the_claimed_owner() {
+        // Same directory as the owner, so the same tmpfs and the same lifetime: a reboot
+        // must clear the config together with the owner and the RTMRs that recorded both.
+        let config: TappConfig = toml::from_str(
+            "[server.permission]\nenabled = true\nowner_state_path = \"/run/tapp/claimed_owner\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            ClaimedRuntimeConfig::state_path(&config).unwrap(),
+            std::path::PathBuf::from("/run/tapp/claimed_config.json")
+        );
+        assert!(ClaimedRuntimeConfig::state_path(&TappConfig::default()).is_none());
     }
 }

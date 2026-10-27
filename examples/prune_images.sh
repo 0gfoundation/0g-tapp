@@ -281,9 +281,22 @@ echo "All: $ALL"
 echo "========================================"
 echo ""
 
+
+echo "Generating JSON request..."
+
+# Build request JSON
+request_json=$(jq -n \
+--argjson all "$ALL" \
+'{
+    all: $all,
+}')
+
+echo "Sending PruneImages request with signature authentication..."
+echo ""
+
 # Generate signature using shared sign_message.py
 echo "Generating signature..."
-SIGN_OUTPUT=$(python3 "$sign_script" "PruneImages" "$PRIVATE_KEY" 2>&1)
+SIGN_OUTPUT=$(printf "%s" "$request_json" | python3 "$sign_script" "PruneImages" "$PRIVATE_KEY" - 2>&1)
 if [ $? -ne 0 ]; then
   echo "Error generating signature: $SIGN_OUTPUT"
   exit 1
@@ -299,24 +312,13 @@ echo "Timestamp: $TIMESTAMP"
 echo "========================================"
 echo ""
 
-echo "Generating JSON request..."
-
-# Build request JSON
-request_json=$(jq -n \
---argjson all "$ALL" \
-'{
-    all: $all,
-}')
-
-echo "Sending PruneImages request with signature authentication..."
-echo ""
-
 # Send request with signature headers and capture both stdout and stderr
 set +e  # Don't exit on error
 response=$(printf "%s" "$request_json" | tr -d '\n' | \
   grpcurl -plaintext \
     -H "x-signature: $SIGNATURE" \
     -H "x-timestamp: $TIMESTAMP" \
+    -H "x-signature-version: 2" \
     -import-path "$SCRIPT_DIR/../proto" \
     -proto tapp_service.proto \
     -d @ \

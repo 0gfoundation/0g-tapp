@@ -1,6 +1,6 @@
 [package]
 name = "tapp-common"
-version = "0.1.0"
+version = "0.2.0"
 edition.workspace = true
 description = "Shared library for tapp-cli and tapp-server: proto types, onchain, app_key, verify, error"
 license.workspace = true
@@ -17,16 +17,21 @@ tower = "0.4"
 http = "1.0"
 
 # Async runtime (Mutex etc.)
-tokio = { version = "1.0", features = ["sync", "net"] }
+tokio = { version = "1.0", features = ["sync", "net", "time", "rt-multi-thread"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde_json = { version = "1.0", features = ["raw_value"] }
 serde_yaml = "0.9"
 base64 = "0.22"
 
 # Cryptography
 sha2 = "0.10"
+# Frozen circomlib-compatible BN254 Poseidon parameters (t=5, RF=8, RP=60).
+light-poseidon = "=0.4.0"
+ark-bn254 = "=0.5.0"
+ark-ff = "=0.5.0"
+p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
 # Replace certificate-authority validation with attested-key pinning — the peers are
 # TEEs presenting self-signed certificates. See pinned_tls.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
@@ -38,9 +43,12 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring"]
 sha3 = "0.10"
 hex = "0.4"
 k256 = { version = "0.13", features = ["ecdsa", "std"] }
-x25519-dalek = { version = "2.0", features = ["static_secrets"] }
 # Challenges for evidence freshness — must be random, never a counter or a clock.
 rand = "0.8.5"
+# Evidence relayed by a scan, for nodes whose port is closed to the caller.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# Where fetched reference values are cached, per commit.
+dirs = "5.0"
 
 # Logging (used by app_key, onchain, verify)
 tracing = "0.1"
@@ -57,3 +65,13 @@ chrono = { version = "0.4", features = ["serde"] }
 
 [build-dependencies]
 tonic-build = "0.12"
+
+[dev-dependencies]
+rcgen = { version = "0.13", default-features = false, features = ["ring"] }
+tokio = { version = "1.0", features = ["macros", "io-util"] }
+tempfile = "3.23.0"
+
+[features]
+# Drive a Ledger for --external-signer (tapp-cli --ledger). macOS uses its own IOKit; Linux
+# builds libusb in (non-root access needs Ledger's udev rules).
+ledger = ["ethers/ledger"]

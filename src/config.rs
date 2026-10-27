@@ -49,8 +49,6 @@ pub struct TappConfig {
     pub server: ServerConfig,
     #[serde(default)]
     pub kbs: Option<KbsConfig>,
-    #[serde(default)]
-    pub chain: Option<ChainConfig>,
 }
 
 impl TappConfig {
@@ -220,15 +218,6 @@ pub struct PermissionConfig {
     pub owner_state_path: PathBuf,
 }
 
-/// On-chain configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChainConfig {
-    /// Ethereum-compatible RPC URL
-    pub rpc_url: String,
-    /// TappRegistry contract address
-    pub contract_address: String,
-}
-
 /// KBS configuration — points to the KMS cluster for app secret retrieval.
 /// in-memory key generation is always active regardless of this config.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -262,6 +251,22 @@ pub struct RetryConfig {
     /// Maximum retry delay in milliseconds
     #[serde(default = "default_max_delay")]
     pub max_delay_ms: u64,
+
+    /// How long to keep retrying while the KMS reports an app, or this node's signer in it,
+    /// as absent from the chain.
+    ///
+    /// A different kind of wait from the three fields above, which cover a node being down or
+    /// erroring and are measured in seconds. This one waits out the KMS's view of the chain:
+    /// cached ~30s, behind an RPC that has been seen to lag far longer (one registration became
+    /// visible after 219s). An app registered, or a node replaced, moments ago is genuinely
+    /// on-chain and genuinely invisible to the KMS, and `start-app --register-onchain` lands
+    /// inside exactly that window.
+    ///
+    /// Bounded above by the KMS's timestamp tolerance (300s): the request is signed once and
+    /// retried with that signature, so a wait past the tolerance would end in an expired
+    /// signature instead of the answer it was waiting for.
+    #[serde(default = "default_onchain_wait")]
+    pub onchain_wait_ms: u64,
 }
 
 // Default value functions
@@ -299,6 +304,7 @@ fn default_kbs_retry() -> RetryConfig {
         max_retries: 2,
         initial_delay_ms: 200,
         max_delay_ms: 2000,
+        onchain_wait_ms: default_onchain_wait(),
     }
 }
 
@@ -312,6 +318,10 @@ fn default_initial_delay() -> u64 {
 
 fn default_max_delay() -> u64 {
     30000
+}
+
+fn default_onchain_wait() -> u64 {
+    240_000
 }
 
 fn default_docker_socket() -> String {
@@ -375,6 +385,7 @@ impl Default for RetryConfig {
             max_retries: default_max_retries(),
             initial_delay_ms: default_initial_delay(),
             max_delay_ms: default_max_delay(),
+            onchain_wait_ms: default_onchain_wait(),
         }
     }
 }
@@ -440,5 +451,29 @@ mod socket_mode {
         for bad in ["rw-rw----", "0o", "", "0899", "abc"] {
             assert!(parse(bad).is_err(), "accepted {:?}", bad);
         }
+    }
+}
+
+#[cfg(test)]
+mod retired_sections {
+    use super::*;
+
+    #[test]
+    fn a_config_with_the_retired_chain_table_still_loads() {
+        // Hand-written and older configs carry [chain]. A node must not refuse to boot
+        // over a section that no longer means anything — it would turn an upgrade into
+        // an outage for no gain.
+        let config: TappConfig = toml::from_str(
+            r#"
+[chain]
+rpc_url = "https://evmrpc-testnet.0g.ai"
+contract_address = "0x2Ce80374318B1d7Fb3345724457a182E0ad165c9"
+
+[kbs]
+node_urls = ["http://kms-1:9091"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.kbs.unwrap().node_urls, vec!["http://kms-1:9091"]);
     }
 }

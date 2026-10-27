@@ -16,11 +16,11 @@ pub type VolumeKeyFut =
 /// How this start provides the app's `./data`, resolved by the RPC layer from
 /// the compose's declared `x-tapp.data` mode plus what the node can actually do.
 pub enum DataPlan {
-    /// LUKS on /data, key from the KMS (mode `encrypted` on a KMS node).
+    /// LUKS on the data disk, key from the KMS (mode `encrypted` on a KMS node).
     Encrypted(VolumeKeyFut),
-    /// Plain persistent directory on /data (mode `plain`).
+    /// Plain persistent directory on the data disk (mode `plain`).
     Plain,
-    /// LUKS on /data keyed from the app signer, wiped when unopenable (mode `scratch`).
+    /// LUKS on the data disk keyed from the app signer, wiped when unopenable (mode `scratch`).
     Scratch(VolumeKeyFut),
     /// Plain directory on the RAM rootfs (mode `ram`).
     Ram,
@@ -33,8 +33,8 @@ use crate::error::{DockerError, TappError, TappResult};
 use crate::measurement_service::MeasurementService;
 use crate::proto::{GetEvidenceRequest, GetEvidenceResponse, StartAppRequest, StartAppResponse};
 use crate::task_manager::{Task, TaskManager, TaskSuccessResult};
-use std::collections::HashMap;
-use std::path::Path;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
@@ -61,9 +61,12 @@ fn attach_runtime_data(evidence: Vec<u8>, runtime_data: &[u8]) -> Vec<u8> {
     };
     obj.insert(
         crate::report_data::EVIDENCE_FIELD.to_string(),
-        serde_json::Value::String(
-            base64::engine::general_purpose::STANDARD.encode(runtime_data),
-        ),
+        serde_json::Value::String(base64::engine::general_purpose::STANDARD.encode(runtime_data)),
+    );
+    // Reserved envelope extension point. No proof is generated or claimed here.
+    obj.insert(
+        crate::report_data::EXTENSIONS_FIELD.to_string(),
+        serde_json::json!(crate::report_data::EvidenceExtensions::default()),
     );
     match serde_json::to_vec(&parsed) {
         Ok(v) => v,
@@ -74,20 +77,20 @@ fn attach_runtime_data(evidence: Vec<u8>, runtime_data: &[u8]) -> Vec<u8> {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct AppComposeContent {
     pub hash: String,
     pub content: String,
     pub image_hash: std::collections::BTreeMap<String, String>, // Map: service_name -> image
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct AppMountFiles {
     pub hash: std::collections::BTreeMap<String, String>, // Map: file_name -> hash
     pub content: String,
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct AppInfo {
     pub app_id: String,
     pub owner: String,
@@ -95,10 +98,82 @@ pub struct AppInfo {
     pub mount_files: AppMountFiles,
 }
 
+impl AppInfo {
+    /// What `apps_resumed` records for this app: the fields of its start_app event, so a
+    /// verifier can compare the two directly.
+    fn measured(&self) -> serde_json::Value {
+        serde_json::json!({
+            "app_id": self.app_id,
+            "deployer": self.owner,
+            "compose_hash": self.compose_content.hash,
+            "volumes_hash": self.mount_files.hash,
+            "image_hash": self.compose_content.image_hash,
+        })
+    }
+}
+
 pub struct BootService {
     app_info: Mutex<HashMap<String, AppInfo>>,
+    /// Apps whose start task is under way. GetEvidence answers for them: with the KMS's
+    /// attested admission on, the KMS releases an encrypted app's volume key only after the
+    /// verifier has checked the node's evidence for that app, and the start is waiting for
+    /// that key. A second start of an app in here is refused.
+    starting: std::sync::Mutex<HashSet<String>>,
+    /// Where `app_info` is kept so that a tapp-server process restarted within this boot
+    /// still knows its running apps: evidence, stop-app and the owner checks all depend on
+    /// it. Beside the claimed owner, on tmpfs. `None`: memory only.
+    state_path: Option<PathBuf>,
     measurement_service: Arc<MeasurementService>,
     task_manager: Arc<TaskManager>,
+}
+
+/// Holds an app's place in `BootService::starting` for the length of its start task.
+struct Starting<'a> {
+    set: &'a std::sync::Mutex<HashSet<String>>,
+    app_id: String,
+}
+
+impl<'a> Starting<'a> {
+    /// `None` when a start of this app is already under way.
+    fn claim(set: &'a std::sync::Mutex<HashSet<String>>, app_id: &str) -> Option<Self> {
+        let fresh = set
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(app_id.to_string());
+        fresh.then(|| Self {
+            set,
+            app_id: app_id.to_string(),
+        })
+    }
+}
+
+impl Drop for Starting<'_> {
+    fn drop(&mut self) {
+        self.set
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.app_id);
+    }
+}
+
+/// The apps file: `Ok(None)` when there is none (nothing started this boot, or memory only).
+fn load_apps(path: &Path) -> std::io::Result<Option<Vec<AppInfo>>> {
+    match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(std::io::Error::other),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+fn save_apps(path: &Path, apps: &HashMap<String, AppInfo>) -> std::io::Result<()> {
+    let mut list: Vec<&AppInfo> = apps.values().collect();
+    list.sort_by(|a, b| a.app_id.cmp(&b.app_id));
+    crate::utils::write_state_file(
+        path,
+        &serde_json::to_vec(&list).map_err(std::io::Error::other)?,
+    )
 }
 
 impl BootService {
@@ -138,16 +213,78 @@ enable_eventlog = true
         Ok(())
     }
 
-    /// Create new Docker Compose service
+    /// Where the apps of this boot are kept: beside the claimed owner, so on the same tmpfs
+    /// with the same lifetime — a VM reboot clears it, together with the RTMRs that
+    /// recorded the starts and the containers it describes.
+    pub fn state_path(config: &crate::config::TappConfig) -> Option<PathBuf> {
+        let permission = config.server.permission.as_ref()?;
+        Some(permission.owner_state_path.with_file_name("apps.json"))
+    }
+
+    /// Create new Docker Compose service. A process restart within this boot takes over the
+    /// apps the previous process recorded, and measures what it took over (`apps_resumed`).
     pub async fn new(
         measurement_service: Arc<MeasurementService>,
         task_manager: Arc<TaskManager>,
+        state_path: Option<PathBuf>,
     ) -> TappResult<Self> {
+        let mut apps = HashMap::new();
+        match state_path.as_deref().map(load_apps) {
+            Some(Ok(Some(list))) if !list.is_empty() => {
+                let data = serde_json::json!({
+                    "operation": crate::measurement_service::OPERATION_NAME_APPS_RESUMED,
+                    "apps": list.iter().map(AppInfo::measured).collect::<Vec<_>>(),
+                    "timestamp": crate::utils::current_timestamp(),
+                })
+                .to_string();
+                // Fail closed, as for the claim: serving evidence for, and stopping, apps
+                // read back from tmpfs without measuring them is the gap this closes.
+                if let Err(e) = measurement_service
+                    .extend_measurement(
+                        crate::measurement_service::OPERATION_NAME_APPS_RESUMED,
+                        &data,
+                    )
+                    .await
+                {
+                    error!(error = %e, "Failed to measure the resumed apps; refusing to run on them unmeasured");
+                    return Err(std::io::Error::other(format!(
+                        "could not measure the resumed apps: {}",
+                        e
+                    ))
+                    .into());
+                }
+                info!(
+                    apps = list.len(),
+                    "Resumed the apps started earlier this boot"
+                );
+                apps = list.into_iter().map(|a| (a.app_id.clone(), a)).collect();
+            }
+            Some(Ok(_)) | None => {}
+            // Not fatal: the containers keep running, and stop/start still work from the
+            // CLI once the apps are started again. Evidence for them is what is lost.
+            Some(Err(e)) => error!(
+                error = %e,
+                "Could not read the apps started earlier this boot; they are unknown to this \
+                 process (no evidence, no stop-app) until started again"
+            ),
+        }
         Ok(Self {
-            app_info: Mutex::new(HashMap::new()),
+            app_info: Mutex::new(apps),
+            starting: Default::default(),
+            state_path,
             measurement_service,
             task_manager,
         })
+    }
+
+    /// Keep the state file in step with `app_info`. Called with the lock held, so writes
+    /// land in the order the changes were made.
+    fn persist(&self, apps: &HashMap<String, AppInfo>) {
+        if let Some(path) = &self.state_path {
+            if let Err(e) = save_apps(path, apps) {
+                error!(error = %e, path = %path.display(), "Failed to record the apps of this boot; a tapp-server restart would forget them");
+            }
+        }
     }
 
     /// Internal method to handle the actual app start logic
@@ -159,6 +296,22 @@ enable_eventlog = true
         data_plan: DataPlan,
     ) {
         let app_id = request.app_id.clone();
+
+        // Claimed first, then the running check: a start that finishes in between has put
+        // its app into app_info before it lets go of its claim, so it is seen either way.
+        let _starting = if request.measure_only {
+            None
+        } else {
+            match Starting::claim(&self.starting, &app_id) {
+                Some(claim) => Some(claim),
+                None => {
+                    self.task_manager
+                        .mark_failed(&task_id, format!("App {} is already being started", app_id))
+                        .await;
+                    return;
+                }
+            }
+        };
 
         // Check if app already exists
         {
@@ -271,31 +424,35 @@ enable_eventlog = true
         // files are staged and containers start. Strict on failure: starting the
         // app on the wrong storage would be a silent downgrade the owner cannot see.
         let provisioned = match data_plan {
-            DataPlan::Encrypted(key_fut) => async {
-                let key = key_fut.await.map_err(|e| {
-                    TappError::from(DockerError::ContainerOperationFailed {
-                        operation: "fde_volume_key".to_string(),
-                        reason: format!(
-                            "KMS refused the volume key: {e} — the app's data volume \
+            DataPlan::Encrypted(key_fut) => {
+                async {
+                    let key = key_fut.await.map_err(|e| {
+                        TappError::from(DockerError::ContainerOperationFailed {
+                            operation: "fde_volume_key".to_string(),
+                            reason: format!(
+                                "KMS refused the volume key: {e} — the app's data volume \
                              cannot be opened. Is this node registered on-chain for \
                              the app (start-app --register-onchain)? Apps that must \
                              start without the KMS can declare x-tapp.data: plain|ram|scratch."
-                        ),
-                    })
-                })?;
-                volume::ensure_mounted(&app_id, &key).await
+                            ),
+                        })
+                    })?;
+                    volume::ensure_mounted(&app_id, &key).await
+                }
+                .await
             }
-            .await,
-            DataPlan::Scratch(key_fut) => async {
-                let key = key_fut.await.map_err(|e| {
-                    TappError::from(DockerError::ContainerOperationFailed {
-                        operation: "scratch_volume_key".to_string(),
-                        reason: format!("failed to derive the scratch key: {e}"),
-                    })
-                })?;
-                volume::ensure_scratch(&app_id, &key).await
+            DataPlan::Scratch(key_fut) => {
+                async {
+                    let key = key_fut.await.map_err(|e| {
+                        TappError::from(DockerError::ContainerOperationFailed {
+                            operation: "scratch_volume_key".to_string(),
+                            reason: format!("failed to derive the scratch key: {e}"),
+                        })
+                    })?;
+                    volume::ensure_scratch(&app_id, &key).await
+                }
+                .await
             }
-            .await,
             DataPlan::Plain => volume::ensure_plain(&app_id).await,
             DataPlan::Ram => volume::ensure_ram(&app_id).await,
             DataPlan::RamDowngraded => {
@@ -309,7 +466,9 @@ enable_eventlog = true
         };
         if let Err(e) = provisioned {
             tracing::error!(app_id = %app_id, error = %e, "Failed to provision app data directory");
-            self.task_manager.mark_failed(&task_id, format!("{e}")).await;
+            self.task_manager
+                .mark_failed(&task_id, format!("{e}"))
+                .await;
             return;
         }
 
@@ -444,13 +603,21 @@ enable_eventlog = true
                     },
                 };
 
-                self.app_info.lock().await.insert(app_id.clone(), app_info);
+                // Measured above, recorded here: never the other way round (see stop_app).
+                let mut apps = self.app_info.lock().await;
+                apps.insert(app_id.clone(), app_info);
+                self.persist(&apps);
+                drop(apps);
 
                 // Mark task as completed
                 self.task_manager
                     .mark_completed(
                         &task_id,
-                        TaskSuccessResult { app_id, deployer, ..Default::default() },
+                        TaskSuccessResult {
+                            app_id,
+                            deployer,
+                            ..Default::default()
+                        },
                     )
                     .await;
             }
@@ -642,15 +809,27 @@ enable_eventlog = true
         request: GetEvidenceRequest,
         signer_eth_address: &[u8],
         tls_public_key: Option<String>,
+        kms_keys: Vec<crate::report_data::KmsKey>,
+        identities: Vec<crate::identity::KeyIdentity>,
+        key_commitments: Vec<crate::identity::KeyCommitment>,
     ) -> TappResult<GetEvidenceResponse> {
         // Get app_id from request. EMPTY IS VALID: it asks for the node's own
         // evidence — the common signer plus the :50052 TLS key hash — which is
         // what exists before any app does, and what a client pins the management
-        // channel against. Only a non-empty app_id must name a deployed app.
+        // channel against. Only a non-empty app_id must name a deployed app, or one
+        // being started: the KMS's attested admission checks this evidence before it
+        // releases the volume key that start is waiting for. Such evidence proves the
+        // app's signer is held in this TEE, not that the app runs — there is no
+        // start_app event for it yet, which is what a reconciliation reads.
         let app_id = request.app_id;
         if !app_id.is_empty() {
             let app_info_lock = self.app_info.lock().await;
-            if !app_info_lock.contains_key(&app_id) {
+            let starting = self
+                .starting
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(&app_id);
+            if !app_info_lock.contains_key(&app_id) && !starting {
                 return Err(TappError::InvalidParameter {
                     field: "app_id".to_string(),
                     reason: format!("App {} not found", app_id),
@@ -675,13 +854,18 @@ enable_eventlog = true
         // signer. See tapp_common::report_data.
         let mut runtime_data =
             crate::report_data::RuntimeData::new(signer_eth_address, &request.nonce)?;
+        runtime_data.app_id = app_id.clone();
+        runtime_data.identities = identities;
+        runtime_data.key_commitments = key_commitments;
         runtime_data.tls_public_key = tls_public_key.unwrap_or_default();
+        runtime_data.kms_keys = kms_keys;
         let (runtime_data_bytes, report_data) = runtime_data.seal()?;
 
         info!(
             app_id = %app_id,
             signer = %runtime_data.signer,
             nonce_len = request.nonce.len(),
+            kms_keys = runtime_data.kms_keys.len(),
             report_data = %hex::encode(&report_data),
             "Generating evidence"
         );
@@ -802,7 +986,7 @@ enable_eventlog = true
                 // <app_dir>/data must detach first or the removal hits EBUSY —
                 // only the mount point is released; the LUKS mapping (and the
                 // key in the kernel) stays open, and the volume's data lives in
-                // the image file on /data, untouched. The next start remounts.
+                // the image file on the data disk, untouched. The next start remounts.
                 volume::unmount(app_id).await?;
                 let app_dir = DockerComposeManager::get_app_dir(app_id);
                 if app_dir.exists() {
@@ -843,6 +1027,11 @@ enable_eventlog = true
             .await
         {
             tracing::error!("Failed to extend measurement for stop operation: {}", e);
+        }
+        // Recorded only now, after measuring: a process stopped in between then leaves the
+        // state before the stop, which a verifier accepts, not one it never measured.
+        if result.is_ok() {
+            self.persist(&*self.app_info.lock().await);
         }
 
         result
@@ -1272,8 +1461,117 @@ enable_eventlog = true
                 e
             );
         }
+        // After measuring, as in stop_app.
+        self.persist(&*self.app_info.lock().await);
     }
 }
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use super::*;
+
+    #[test]
+    fn evidence_reserves_an_empty_extension_namespace_outside_the_runtime_hash() {
+        use base64::Engine;
+        let rd = b"{\"signer\":\"fixture\"}";
+        let original = br#"{"quote":"unchanged","cc_eventlog":"unchanged","extensions":{"unverified_proof":"discard"}}"#.to_vec();
+        let out: serde_json::Value =
+            serde_json::from_slice(&attach_runtime_data(original, rd)).unwrap();
+        assert_eq!(out["quote"], "unchanged");
+        assert_eq!(
+            out[crate::report_data::EXTENSIONS_FIELD],
+            serde_json::json!({})
+        );
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(out[crate::report_data::EVIDENCE_FIELD].as_str().unwrap())
+                .unwrap(),
+            rd
+        );
+    }
+
+    fn app(id: &str) -> AppInfo {
+        AppInfo {
+            app_id: id.to_string(),
+            owner: "0xa".to_string(),
+            compose_content: AppComposeContent {
+                hash: "c1".to_string(),
+                content: "services: {}".to_string(),
+                image_hash: [("web".to_string(), "sha256:1".to_string())].into(),
+            },
+            mount_files: AppMountFiles {
+                hash: [("a.conf".to_string(), "01".to_string())].into(),
+                content: String::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn a_second_start_of_an_app_is_refused_while_the_first_runs() {
+        let set = std::sync::Mutex::new(HashSet::new());
+        let first = Starting::claim(&set, "app").unwrap();
+        assert!(Starting::claim(&set, "app").is_none());
+        assert!(Starting::claim(&set, "other").is_some());
+        drop(first);
+        assert!(Starting::claim(&set, "app").is_some());
+        assert!(set.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_apps_of_this_boot_are_read_back_as_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("apps.json");
+        assert!(load_apps(&path).unwrap().is_none());
+
+        let apps: HashMap<_, _> = [("a", app("a")), ("b", app("b"))]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect();
+        save_apps(&path, &apps).unwrap();
+        let back = load_apps(&path).unwrap().unwrap();
+        assert_eq!(
+            back.iter().map(|a| a.app_id.as_str()).collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+        assert_eq!(
+            back[0].compose_content.image_hash,
+            apps["a"].compose_content.image_hash
+        );
+        // Nothing left behind from the write, and only root can read the apps' compose.
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    /// A verifier compares an apps_resumed entry with the start_app event's fields, so the
+    /// two must serialise the same way, or every genuine resume would read as a forged one.
+    #[test]
+    fn a_resumed_app_is_recorded_in_the_shape_of_its_start() {
+        let a = app("a");
+        let start = serde_json::to_value(AppMeasurement {
+            app_id: a.app_id.clone(),
+            operation: "start_app".to_string(),
+            result: "success".to_string(),
+            error: None,
+            compose_hash: a.compose_content.hash.clone(),
+            volumes_hash: a.mount_files.hash.clone(),
+            image_hash: a.compose_content.image_hash.clone(),
+            deployer: a.owner.clone(),
+            timestamp: 1,
+        })
+        .unwrap();
+        let resumed = a.measured();
+        for k in [
+            "app_id",
+            "deployer",
+            "compose_hash",
+            "volumes_hash",
+            "image_hash",
+        ] {
+            assert_eq!(resumed[k], start[k], "{k}");
+        }
+    }
+}
