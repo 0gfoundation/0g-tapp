@@ -71,7 +71,9 @@ impl DockerComposeManager {
             let host_path = base_path.join(relative);
 
             // Ensure the resolved path stays within base_path (prevent directory traversal)
-            let canonical_base = base_path.canonicalize().unwrap_or_else(|_| base_path.clone());
+            let canonical_base = base_path
+                .canonicalize()
+                .unwrap_or_else(|_| base_path.clone());
             let canonical_host = host_path
                 .parent()
                 .and_then(|p| p.canonicalize().ok())
@@ -316,11 +318,11 @@ impl DockerComposeManager {
         // is mounted by the time deploy runs but not during measure-only pulls.
         for name in super::compose_override::redirectable_volumes(compose_content) {
             let dir = base_path.join("data/volumes").join(&name);
-            fs::create_dir_all(&dir).await.map_err(|e| {
-                DockerError::VolumeMeasurementFailed {
+            fs::create_dir_all(&dir)
+                .await
+                .map_err(|e| DockerError::VolumeMeasurementFailed {
                     path: format!("Failed to create volume dir {}: {e}", dir.display()),
-                }
-            })?;
+                })?;
         }
 
         // 3. start compose with real-time output. No explicit -f: compose then

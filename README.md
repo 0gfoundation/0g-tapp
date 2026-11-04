@@ -58,15 +58,17 @@ Create a new ECS instance with the following specifications:
 - **Instance Type**: `ecs.gn8v-tee.4xlarge`
 - **Image**: Select the imported confidential image
 
-Attach a data disk as well: `/data` holds the app volumes, the container stores and the logs,
+Attach a data disk as well: it holds what must persist — the app volumes, and nothing else —
 and `tapp-server` does not start without it (the root filesystem is a RAM overlay, so writing
-there would be lost on reboot). The node provisions a single blank attached disk by itself.
+there would be lost on reboot). The node mounts it at `/var/lib/tapp/disk` and provisions a single
+blank attached disk by itself. `/data` is not that disk: it is the node's runtime volume, encrypted
+with a key made at every boot and empty after every reboot, where the container storage lives.
 
 Ephemeral cloud scratch disks are excluded, so a GPU machine type — where the cloud attaches
 local SSDs that cannot be declined — still provisions its one attached data disk by itself.
 
 On a host with **more than one** spare disk, which is normal on bare metal, the node cannot tell
-which one is meant to be `/data` and refuses to guess rather than risk formatting the wrong disk.
+which one is meant to be the data disk and refuses to guess rather than risk formatting the wrong disk.
 **Label the intended disk before attaching it**, on any machine with a shell:
 
 ```bash
@@ -139,8 +141,8 @@ What the compose file writes decides what protects it:
 | named volume (plainly declared) | auto-redirected into the encrypted volume | ✅ | ✅ |
 | `./data/...` bind mount | encrypted volume, explicit path | ✅ | ✅ |
 | other `./...` relative paths | RAM rootfs — fine for configs, wrong for state | – (never on disk) | ❌ |
-| absolute paths | host disk, plaintext (warned) | ❌ | ✅ |
-| `external:` / custom-driver volumes | wherever the user configured (warned) | ❌ | depends |
+| absolute `/data/...` paths | the runtime volume (warned) | ✅ per-boot key | ❌ emptied at every boot |
+| anonymous volumes, `external:` / custom-driver volumes, the container's own filesystem | docker's storage on the runtime volume (warned) | ✅ per-boot key | ❌ |
 
 The first row is the important one: the standard compose idiom
 (`pgdata:/var/lib/postgresql/data` plus a top-level `volumes: pgdata:`) is
@@ -151,7 +153,12 @@ your own override file disables the redirect (loudly).
 
 `start-app` returns any lint findings (data placed where the volume cannot
 protect it, `docker.sock` mounts, `privileged`) and the CLI prints them; the
-app still starts. On a KMS-configured node the start **fails** when the volume
+app still starts. One kind of mount is **refused** outright: a writable bind
+mount reaching tapp-server's own state in `/run/tapp` — the directory itself,
+anything above it (`/run`, `/`, `/var/run`), or a file in it other than the
+socket. That is where the claimed owner, the trust anchors, the apps started this
+boot and the scratch key live, read back on a process restart. Mount
+`/run/tapp/tapp.sock` alone, or the directory read-only. On a KMS-configured node the start **fails** when the volume
 key cannot be fetched — an app never silently runs on a plaintext directory.
 The usual cause is ordering: the node must be registered on-chain for the app
 first, which `start-app --register-onchain` handles.
@@ -245,21 +252,31 @@ All applications run within TEE boundaries and are cryptographically measured. T
 Attestation evidence returned by `GetEvidence` commits the application's TEE-derived identity into the TDX `report_data` field. `report_data` is `sha512` of a small JSON object — `runtime_data` — that travels as a third field of the evidence alongside `quote` and `cc_eventlog`:
 
 ```json
-{"nonce": "0x…", "signer": "0x…", "tls_public_key": "0x…"}
+{"app_id":"my-app", "identities":[{"role":"app_signer", "…":"…"}],
+ "key_commitments":[{"commitment":"0x…", "material":"70726f7669646572", "scheme":"poseidon-bn254-4-v1"}],
+ "nonce": "0x…", "signer": "0x…", "tls_public_key": "0x…"}
 ```
+
+(Spaced out here for reading; the bytes themselves have no whitespace.)
 
 | field | meaning |
 |---|---|
+| `app_id` | The exact app namespace covered by this runtime data (empty for the common node identity). |
+| `identities` | tapp-server ≥0.11.1: typed `node_signer`, `app_signer`, and `tls` public keys, their algorithm, encoding, derivation and source. KMS identities reference a commitment. See [APP_IDENTITY.md](docs/APP_IDENTITY.md). |
+| `key_commitments` | Algorithm-neutral `poseidon-bn254-4-v1` commitments to fetched KMS secrets, scoped to appId and decoded material. Each must occur in this app's replayed event log. No signing curve or address is inferred from a generic secret. |
+| `kms_keys` | Legacy address/public-key declarations. Read for compatibility; new generic KMS calls do not create these entries. |
 | `nonce` | Caller-supplied challenge, echoed back. A quote is self-authenticating but undated, so without a challenge a cached quote is indistinguishable from a fresh one. Pass `get-evidence --nonce <hex>` (≤64 bytes, must be random). |
 | `signer` | The Ethereum address derived inside the enclave — the identity `TappRegistry` records. Verifiers match it against the registered `signerAddress` to prove a signed message and the on-chain identity come from the same app on this TEE. |
 | `tls_public_key` | sha256 of the app's TLS SubjectPublicKeyInfo, when it has one. This is what lets a client tie the certificate it was handed during a TLS handshake to a TEE running this app. |
 
-Empty fields are omitted rather than serialised as `""`, so evidence produced before a field existed and after it are byte-identical whenever the field is unused. Two consequences for verifiers:
+`GetEvidence` with an `app_id` answers for an app that was started this boot (running, or stopped since) and for one that is **being started**. The last is for the KMS's attested admission: before it releases an encrypted app's volume key, the KMS has the verifier check this node's evidence for the app, and the start is waiting for that key. Such evidence proves the app's signer is held in this TEE, not that the app runs — there is no `start_app` event for it yet, and reconciliation (verify-app, the scan) reads that event. A second `start-app` of an app that is being started is refused.
+
+`app_id`, `identities`, and `key_commitments` are explicit, including empty values. Optional legacy fields, nonce and TLS hash are omitted when unused. Two consequences for verifiers:
 
 - **A quote alone no longer names its signer** — the structure must accompany it. Nothing in the system passes a bare quote.
-- **Hash the bytes exactly as transmitted.** Never re-serialise: there is then no canonical form for the two sides to agree on and drift apart over.
+- **Hash the bytes exactly as transmitted.** Never re-serialise them to check the hash.
 
-`sha512` is not arbitrary — `report_data` is 64 bytes and `sha512` fills it exactly, which is also what CoCo-AS expects when handed `runtime_data` and asked to check the binding itself.
+`sha512` is not arbitrary — `report_data` is 64 bytes and `sha512` fills it exactly. To have CoCo-AS check the binding itself, hand it the object as `structured_runtime_data` with `sha512` named (its default is sha384, and `raw_runtime_data` it compares unhashed). The AS re-serialises a structured object as canonical JSON (sorted keys, no whitespace) before hashing, and tapp-server writes the fields in that order, so the hash matches.
 
 Evidence from servers before v0.4.0 has no `runtime_data` field and a `report_data` whose first 20 bytes are the signer, zero-padded. Both readings are supported (`tapp-common/src/report_data.rs`, `tapp-common/src/verify.rs`); a missing field is reported as such rather than as a signer mismatch.
 
@@ -281,6 +298,21 @@ What makes it trustworthy is the binding, not the issuer: `public_key_sha256` is
 | `kms` | `(app_id, "tls")` at the KMS cluster | yes, and identical on every node of the app | "some TEE of this app" |
 
 Certificate pinning, Certificate Transparency monitoring and ACME renewal all need a key that outlives a restart, so they need `kms`. `local` involves nothing external — no KMS, no on-chain registration — so it works from first boot, which is why it is the default; stability is what you opt into once something needs it. Set it in `config.toml` or at claim time with `claim-config --tls-key-source local|kms`.
+
+### Discovering another app through Scan
+
+Applications can call **`ResolveAppIdentity`** (server ≥0.11.1) on the local
+`/run/tapp/tapp.sock` with a `chain_id`, TappRegistry `registry_address`, and
+`app_id`. Tapp queries Scan using the live URL and TLS pin established at claim
+or by `UpdateTrustAnchors`; apps do not maintain a second copy of those anchors.
+The lookup works without KMS configuration and returns verified registered node
+signers, app TLS SPKI SHA256 pins, and explicit observation/expiry times.
+
+The interface trusts the configured Scan's verification policy. Its node signer
+is not a stable KMS service signer, and its `tee_url` is a management endpoint,
+not the business URL to connect to with the app TLS pin. See
+[`docs/APP_IDENTITY.md`](docs/APP_IDENTITY.md) for the request, response, upstream
+requirements, and service-discovery boundary.
 
 ### Measurement Design Philosophy
 
@@ -384,7 +416,7 @@ unix_socket_mode = "0660"
 
 # Where app TLS private keys come from: "local" (default, bound to this instance,
 # changes every boot) or "kms" (stable across restarts and shared by every node of
-# the app, needs [kbs] and [chain]). See "App TLS certificates" above.
+# the app, needs [kbs] and the app registered on chain). See "App TLS certificates" above.
 tls_key_source = "local"
 
 # Optional CA for app TLS certificates. Unset, GetAppTlsCert self-signs — which is
@@ -409,7 +441,7 @@ socket_path = "/var/run/docker.sock"
 [logging]
 level = "info"
 format = "pretty"              # "json" or "pretty"
-file_path = "/var/log/tapp/"   # daily-rotated files; on RAM-rootfs CVM images use the persistent disk, e.g. /data/log/tapp/
+file_path = "/var/log/tapp/"   # daily-rotated files; CVM images use the runtime volume, /data/log/tapp/ (gone after a reboot)
 max_log_files = 7              # rotated daily files to keep; oldest deleted at startup and rotation (default: 7)
 
 # Optional: KMS cluster for hardware-independent app secrets
@@ -422,12 +454,11 @@ node_urls = [
     "https://kms-node-1:9443",
     "https://kms-node-2:9443",
 ]
-
-# Optional: on-chain TappRegistry integration
-[chain]
-rpc_url = "https://evmrpc-testnet.0g.ai"
-contract_address = "0x..."
 ```
+
+There is no `[chain]` section (an old one is ignored). A node is not tied to one
+registry: every on-chain command takes `--rpc-url`/`--contract`, so the same node can
+be registered on testnet and mainnet at once.
 
 ## Claiming Ownership (runtime owner claim)
 
@@ -439,11 +470,10 @@ claims it:
 ```bash
 tapp-cli -s http://<tapp>:50051 -k 0x<your-key> claim-config
 
-# Or claim and configure in one call — chain, KMS cluster and TLS key source are
-# all optional here if already present in config.toml:
+# Or claim and configure in one call. CVM images bake no KMS cluster (one image
+# serves both networks), so a node whose apps use the KMS needs --kbs-urls here
+# or via update-trust-anchors later:
 tapp-cli -s http://<tapp>:50051 -k 0x<your-key> claim-config \
-  --chain-rpc-url https://evmrpc-testnet.0g.ai \
-  --chain-contract 0x<TappRegistry> \
   --kbs-urls "https://kms-1:9443,https://kms-2:9443" \
   --tls-key-source kms \
   --scan-url https://scan.example \
@@ -454,7 +484,7 @@ The values to put in `--kbs-urls` — the deployed KMS cluster endpoints for
 mainnet and testnet, and the group public key that verifies you reached the
 right one (**both networks use the app_id `0g-kms`, but they are two different
 clusters with two different masters**) — are listed in
-[`docs/KMS.md`](KMS.md), which also explains why `--scan-url`/`--scan-pubkey`
+[`docs/KMS.md`](docs/KMS.md), which also explains why `--scan-url`/`--scan-pubkey`
 must accompany a `kms` setup.
 
 ### Trust anchors
@@ -515,9 +545,20 @@ cannot invent one.
   `claim_config` event (same mechanism as `start_app`), so verifiers see WHO owns
   the node in the attestation evidence and can reconcile it with the on-chain
   registration — the owner moved from the golden values into the runtime event log.
-- **Restart-safe**: the claimed owner is persisted under `/run` (tmpfs) — a
-  tapp-server process restart cannot reopen the claim; a VM reboot clears both
-  the state and the RTMRs, so a rebooted node is claimable (and re-measured) again.
+- **Restart-safe**: the claimed owner and the claimed config (KMS cluster, TLS key
+  source, trust anchors, including later `update-trust-anchors`) are persisted under
+  `/run` (tmpfs) — a tapp-server process restart cannot reopen the claim and resumes
+  the node as claimed. What it reads back is measured again as a `claim_resumed`
+  event, so a state file changed between two processes shows in the evidence:
+  verify-app reports a different owner as inconsistent, different trust anchors
+  as ✗, and a claimed config the restart found but could not read as ⚠️; a VM reboot
+  clears both the state and the RTMRs, so a rebooted node is claimable (and
+  re-measured) again. The apps started this boot are kept the same way
+  (`/run/tapp/apps.json`), so a restarted process still serves their evidence, stops
+  them and checks their owner. They are measured on resume as `apps_resumed`, and
+  verify-app fails a node whose resumed state for the app is not the last one this
+  boot measured for it, or the one before (which a process stopped between measuring
+  a change and recording it leaves).
 - **Hijack window**: practically closed — don't expose :50051 before claiming
   (cloud firewall), and claim right after boot. Even if raced, the intruder's
   address is indelibly measured, your own claim fails immediately (instant
@@ -526,20 +567,298 @@ cannot invent one.
 Legacy mode: setting `owner_address` in `config.toml` still works (the owner is
 claimed automatically at startup and also measured).
 
+### Handing an app over to a new owner
+
+Only the app's **registry** owner is transferable (TappRegistry >= 0.2.0). Machines
+are not transferred — the new owner replaces them with its own.
+
+1. **Transfer on chain**, in two steps so a mistyped address cannot strand the app
+   (with no admin override, an app owned by an address nobody controls could never
+   be updated, its nodes never removed, its stake never refunded):
+
+   ```bash
+   tapp-cli -k 0x<owner-key> transfer-app-ownership -a <app_id> -r <rpc> -c <registry> --new-owner 0x<new>
+   tapp-cli -k 0x<new-key>   accept-app-ownership   -a <app_id> -r <rpc> -c <registry>
+   ```
+
+   Nothing changes until the nominee accepts; nominating again replaces the nominee,
+   `--cancel` withdraws. Live nodes' stake travels with the app (`removeNode` refunds
+   whoever owns the app at that moment); stake already locked by earlier `removeNode`
+   calls stays with the address it was locked to. Acknowledgements are not
+   invalidated — no code changed, and every change the new owner can make bumps the
+   ack version.
+
+2. **Replace every node** with a machine the new owner has claimed — on each one:
+
+   ```bash
+   tapp-cli -s <new-node> -k 0x<new-key> start-app -f docker-compose.yml -a <app_id> \
+     --register-onchain --rpc-url <rpc> --contract <registry> --stake-wei <wei> \
+     --tee-url https://<new-node>:50052 \
+     [--old-signer 0x<node being replaced>]   # needed only when the app has several nodes
+   ```
+
+   Pass `--tee-url` here. Without it the replaced node's teeUrl is kept unless something
+   else answers there, and the old machine's port is normally closed to the new owner
+   (#141), so it would be kept — now pointing verifiers and the KMS at the old machine.
+
+   The new signer replaces the old one in place (`updateNode`): one transaction, the
+   stake carried over, no moment where the app has no node. It also orders things so
+   an `encrypted` app works: the new signer is on chain before the node asks the KMS
+   for its volume key.
+
+**Until a node is replaced, its machine's owner can still obtain the app's KMS keys**
+— the KMS authorizes by the on-chain node list — so replace promptly. The keys
+themselves do not change: they derive from the app id, so the new nodes get the same
+ones and an encrypted volume can be copied across. By the same token, anything
+encrypted before the hand-over was readable by the previous owner.
+
+### Request signing
+
+Every signed RPC carries `x-signature` (EIP-191 `personal_sign`, 65-byte r‖s‖v),
+`x-timestamp` and `x-signature-version: 2`, and signs
+
+```
+<Method>:0x<sha256 of the encoded protobuf request>:<unix timestamp>
+```
+
+— the hash is over the exact message bytes in the gRPC frame, which the server
+hashes as received, so a request altered in flight no longer recovers to the
+owner. Each signature is accepted **once** (replays are refused) within **±10
+minutes** of its timestamp.
+
+tapp-server >= 0.9.0 accepts **only** this form. The older `<Method>:<timestamp>`
+message authorised the method with *any* body, so an observed signature could
+carry a different request; it is refused (`AUTH_LEGACY_SIGNATURE_REFUSED`).
+
+tapp-cli >= 0.9.0 signs this form. To manage a tapp-server < 0.9.0 (which reports
+a body-bound signature as "Insufficient permission"), pass `--legacy-sign`. It is
+never chosen automatically, since falling back on failure would hand anyone able
+to make a request fail the weaker signature. The scripts under `examples/` sign
+the body-bound form too (`sign_message.py` takes the request JSON).
+
+### Signing with a key held elsewhere (`--external-signer`)
+
+The owner key does not have to be on the machine running tapp-cli. A hardware wallet or an
+MPC/multisig custodian (Fordefi, for one) looks like an ordinary address from outside and
+returns ordinary signatures, so the server and the registry need nothing different. Pass the
+signer's address instead of `-k`:
+
+```bash
+tapp-cli -s https://<node>:50052 --tls-pin 0x<pin> \
+  --external-signer 0x<owner address> start-app -f docker-compose.yml -a my-app
+```
+
+(or set `TAPP_EXTERNAL_SIGNER`). Every command that would sign then stops and asks, unless
+`--ledger` or `--fordefi` (below) has the device or the vault asked instead:
+
+- **a request signature**: the CLI prints the one line of text above (`<Method>:0x<hash>:<ts>`).
+  Sign it as a *message* (`personal_sign`), for example in Fordefi's message signing, and
+  paste the 65-byte signature back. The CLI checks that it recovers to the given address
+  before sending, and asks again if it does not. It has to come back within the server's
+  ±10-minute window; the prompt shows the deadline.
+- **an on-chain call**: the CLI prints the transaction — chain, from, contract, value, data,
+  and which registry function it is. Send it from the owner address, for example as a
+  contract call in Fordefi, and paste its hash back. The CLI waits for it to be mined and
+  checks that it is that transaction from that address and that it succeeded, then goes on.
+
+So multi-step commands such as `start-app --register-onchain` run to the end, with one
+prompt per signature and per transaction. The signer sees a hash, not the compose: what it
+approves is "this exact request", and the request is what this CLI run built. Each prompt
+names what the request is for: the method, the app and the node (`StartApp app my-app on
+203.0.113.7`), or for a transaction the registry function and the app.
+
+`start-app --register-onchain` asks for the StartApp before the last registry transaction, not
+after it, and sends it the moment that transaction is mined. A StartApp that arrived minutes
+later could find that the scan had already looked for the app on the node, found nothing, and
+kept that answer for about a minute, during which the KMS refuses the app its volume key. If
+the StartApp's signature runs out of time while the transaction waits, it is asked for again
+after the transaction. Should the start still fail with `GetEvidence: … App … not found`, run
+`start-app` again without `--register-onchain` after a minute.
+
+#### With a Ledger: `--ledger`
+
+Add `--ledger` and tapp-cli drives a Ledger on this machine's USB instead of prompting:
+
+```bash
+tapp-cli --external-signer 0x<the Ledger address> --ledger start-app -f docker-compose.yml -a my-app ...
+```
+
+- The account is found **by the address**: the first ten accounts of each path style (Ledger
+  Live, BIP44 standard as MetaMask offers it, and legacy MEW/MyCrypto) are searched, so there
+  is no derivation index to get wrong.
+- A message shows on the device as text; approve it if it matches what the CLI printed.
+- A transaction is **signed only**. tapp-cli checks the signed transaction (signer, chain,
+  contract, data, value) and broadcasts it itself, so a wrong one never reaches the chain.
+  A registry call is contract data, which the Ethereum app signs only with **Blind
+  signing** enabled in its settings.
+- Keep the device unlocked with the Ethereum app open, and **close Ledger Live** (only one
+  program can use the device at a time).
+
+Ledger support is built in on **macOS**, through the system's own USB (IOKit) with nothing
+else to install: install Rust and protobuf (`brew install protobuf`), then `cargo build
+--release -p tapp-cli`. The release binaries are built for Linux without it. On Linux, build
+with `--features ledger` (libusb; non-root access needs Ledger's udev rules).
+
+#### With Fordefi: `--fordefi`
+
+Add `--fordefi` (tapp-cli ≥ 0.11.0) and tapp-cli asks a Fordefi vault for each signature instead of prompting.
+It goes through the [0g-fordefi-signer](https://github.com/0gfoundation/0g-fordefi-signer)
+service:
+
+```bash
+export FORDEFI_SIGNER_URL=https://<the service>
+export FORDEFI_SIGNER_TOKEN=<this caller's token for it>
+tapp-cli --external-signer 0x<the vault address> --fordefi start-app -f docker-compose.yml -a my-app ...
+```
+
+The Fordefi API user's credentials (its access token and P-256 key) stay with the service.
+This machine holds only a token that names it to the service, which the service's operator can
+revoke on its own. `FORDEFI_SIGNER_URL` must be `https://`, with a certificate from a public CA
+(tapp-cli trusts no other). Plain `http://` is taken only to this machine, for example through an
+SSH tunnel, and never through a proxy, since the token travels on every call.
+
+What has to exist:
+
+- **The service**, with an entry for this caller in its policy file (see the service's README).
+  The service's operator makes the token with `python auth.py <name>`.
+
+  ```json
+  "tapp": {
+    "token_sha256": "<sha256 of this caller's token>",
+    "contracts": ["16661:0x54874F536301c993922Dd95097e3902e7FBfe612",
+                  "16602:0x2Ce80374318B1d7Fb3345724457a182E0ad165c9"],
+    "functions": ["registerApp(string,bytes,bytes,bytes[],address,string)",
+                  "updateApp(string,bytes,bytes,bytes[])",
+                  "addNode(string,address,string,bytes,bytes)",
+                  "updateNode(string,address,address,string,bytes,bytes)",
+                  "removeNode(string,address)", "withdraw()",
+                  "authorizeInvalidator(string,address)", "revokeInvalidator(string,address)",
+                  "acceptAppOwnership(string)"],
+    "max_value": "100000000000000000000",
+    "messages": "[A-Z][A-Za-z]+:0x[0-9a-f]{64}:[0-9]{10}"
+  }
+  ```
+
+  - `contracts`: the TappRegistry on each chain used. A call to any other contract is refused.
+  - `functions`: the registry functions tapp-cli calls, and none of the registry's admin ones.
+    `transferAppOwnership(string,address)` is left out: it hands an app, and the stake later
+    locked under it, to another address, so with it a token could move the vault's coin out a
+    call at a time. Add it only if this caller is to run `transfer-app-ownership`, and have
+    Fordefi's policy require an approver for it.
+  - `max_value`: the most stake one call may carry, in wei (here 100 OG). Without it, no stake
+    can be sent, so `registerApp` and `addNode` are refused.
+  - `max_fee` (not set here): the most gas × gas price one call may cost, default 0.1 OG.
+  - `messages`: tapp's request signatures. Without it, none can be signed. `--legacy-sign`
+    (tapp-server < 0.9.0) signs `Method:timestamp` and needs `(:0x[0-9a-f]{64})?` in place of
+    `:0x[0-9a-f]{64}`, which also admits that older, weaker form for any node.
+- **On Fordefi's side:**
+  - The service's API user.
+  - The organisation's **API Signer**, running and activated, with that API user's public key
+    registered.
+  - Fordefi's MPC is 2-of-2: one share is Fordefi's, the other is held by the API Signer.
+    Fordefi takes part once its **policy** has approved the request.
+- **The chain.** 0G mainnet is built into Fordefi. Any other chain, such as the Galileo testnet,
+  must first be added to the organisation as a custom chain (Settings > Chains > Add EVM chain).
+- **Funds.** The vault is the sender. It pays the gas of every call, and the stake of
+  `registerApp` and `addNode`, on each chain used. The stake must be at least the registry's
+  `minStakeAmount()`: 0.1 OG on mainnet and 1 OG on testnet as of October 2026.
+
+What tapp-cli does:
+
+- **A request signature** is a personal_sign request. Approvers see it noted
+  `0g-fordefi-signer: <caller>: tapp-cli: <Method> app <app> on <node>` (no app for a request
+  about the node).
+  - The CLI follows its state: `waiting for approval` is the policy; `approved` means the API
+    Signer has not signed yet.
+  - It goes on once the signature recovers to the given address.
+  - Approvers have until the server's ±10-minute window closes. After that the request is
+    aborted and a new one is made for the same request, every 10 minutes until one is signed
+    or the command is stopped.
+- **An on-chain call** is estimated here and signed without being broadcast, with the gas, the
+  gas price and the account's next nonce set here. Approvers see it noted with the registry
+  function and the app: `0g-fordefi-signer: <caller>: tapp-cli: addNode(string,address,string,bytes,bytes) app <app>`.
+  - tapp-cli checks the signed transaction: signer, chain, contract, data, value, gas, gas
+    price, and that its nonce is still the account's next.
+  - Fordefi may raise the gas limit: it added a quarter to one its simulation found within a
+    few percent of the gas used. Up to half as much again as the limit asked is taken, and the
+    output says so. It costs a little more: 0G charges at least 80% of a transaction's limit.
+  - It then broadcasts it, waits for it to be mined and checks it again: the same path as a
+    Ledger's.
+  - A call not signed within 30 minutes is aborted.
+- **Stopping the command** (Ctrl-C) leaves its Fordefi request open. Reject it in Fordefi, or it
+  can still be approved. The same holds when asking for a signature gets no answer or a server
+  error: Fordefi may have made the request anyway, and the error says which note to look for.
+
+Neither the service nor Fordefi is trusted for what comes back. A signature from another vault,
+or a transaction that differs from the one asked for in any of the fields above, stops the
+command before anything is sent. Such a transaction is still signed, though: whoever holds it
+can send it until the vault's next transaction uses its nonce. The error says when that nonce
+is already used and the transaction can no longer be sent.
+
+Fordefi keeps that transaction waiting to be pushed, and simulates the vault's later
+transactions as if it had been sent. Asking again for the same call can then fail in Fordefi's
+simulation: a second `removeNode` of an app's last node fails with `not app owner`, because the
+first one unregistered the app. When the transaction is the one wanted, send it instead:
+Fordefi's `POST /api/v1/transactions/<id>/push`, or broadcast its raw transaction.
+
+Whoever holds a token can have the vault sign whatever that caller's entry and Fordefi's policy
+let through. Within its entry, that is the owner's authority over the vault's apps: starting,
+stopping and registering them, and, if the entry lists `transferAppOwnership` (the one above does
+not), handing them to another address. So keep tokens off shared machines, and give the API user
+a policy that requires approval for anything it should not sign alone.
+
 ## On-chain Registration
 
-Register your app and TEE nodes on the TappRegistry contract using `tapp-cli`. These commands require `--private-key` (the deployer's Ethereum private key) and `--server` (the tapp gRPC endpoint, used both as the gRPC target and as the on-chain `teeUrl`).
+Register your app and TEE nodes on the TappRegistry contract using `tapp-cli`. These commands require `--private-key` (the deployer's Ethereum private key), or `--external-signer` for a key held elsewhere (see above), and `--server` (the tapp gRPC endpoint).
+
+The node's on-chain `teeUrl` — where the scan and `verify-app` fetch its evidence — is `--tee-url` when given. Otherwise a node already on chain **keeps its recorded `teeUrl`**: a DNS name, front or private address was someone's choice, and a run from wherever the operator happens to be must not move it. A **replacement** asks the replaced slot's `teeUrl` for the app's signer. If *this* node answers (the restart case), the URL is kept. If another signer answers, or something answers that is not a tapp-server naming this node, the replacement gets a URL derived from `--server` instead, and says so. If nothing answers — a VPC-private URL seen from outside, a dead machine, or the old machine on a hand-over — the URL is kept with a warning, so those replacements need `--tee-url`. The one automatic move is the legacy `http://<host>:50051` → `https://<host>:50052` when the node serves the TLS listener (tapp-server ≥ 0.8.0). A **new** record is derived from `--server`: `https://` as given, `http://` → `https://<host>:50052`; a `--server` reached locally (`127.0.0.1`, a socket) cannot be derived from, so a new record then needs `--tee-url`. Every change is printed. `:50051` is meant to stay closed to everyone but the node (#141). `--tee-url` takes a DNS name, a TLS front, or a **private address** — a node in the scan's VPC can register `https://10.x.x.x:50052`, which only the scan reaches; everyone else verifies it through the scan relay. To move a node's `teeUrl`, pass `--tee-url` to `start-app --register-onchain` or `update-node-onchain` (signer unchanged, nothing else touched).
 
 ### Register during start (recommended)
 
-`start-app --register-onchain` idempotently registers the app BEFORE its
-containers start: the server pulls the images and computes all hashes first
-(measure-only), the CLI submits the transaction, and only after it confirms are
-the containers started. Safe to re-run:
+`start-app --register-onchain` brings the chain in line with this deployment
+BEFORE its containers start — one command for a first deploy, a restart, a
+machine replacement and an upgrade. The server pulls the images and computes all
+hashes first (measure-only), the CLI submits what the chain needs, and only after
+it confirms are the containers started (so a node whose volume key comes from the
+KMS is on the node list when it asks). Safe to re-run; it writes nothing when the
+chain already matches.
 
-- app not registered on-chain → `registerApp` (this node becomes the first node)
-- registered, but this node's signer not in the node list → `addNode`
-- signer already a node → skip registration, just start
+With tapp-server ≥0.11.1, the measure-only preflight does not derive TLS keys or
+contact the KMS. Its task ID and measurements can therefore be returned before
+the app is registered, including on nodes using KMS-backed TLS. TLS derivation
+is attempted on the subsequent real start and when the app requests a certificate.
+
+**Each node's record says what that node runs.** A deployment rewrites only this
+node's compose and mount files — stored as the node's own override where they
+differ from the app's default — and never another node's. So every node can be
+checked against its own record at any moment, including half-way through a
+rolling upgrade, and nodes that legitimately differ (each KMS node has its own
+`kms.toml`) need nothing special.
+
+The app-level declaration is the default for new nodes. Its code (compose and
+images) follows the deployment only in a **single-node** app, where the two are the
+same thing; in a multi-node app it moves with an explicit `update-onchain` once every
+node runs the new code. Mount files never move the app default — a node whose files
+differ always records them as its own override.
+Images are the one exception to "per node": the registry keeps them per app only,
+so new images on one node of several are reported, not written — pin images by
+digest in the compose file and the compose hash covers them per node.
+
+The signer:
+  - app not registered → `registerApp` (this node becomes the first node)
+  - signer already a node → its record is corrected if needed, otherwise nothing
+  - signer absent, exactly one other node → `updateNode`, **replacing** it (a
+    restart re-derives the signer, so the address on chain is a dead instance)
+  - signer absent, several other nodes → `addNode`; pass `--old-signer` to replace
+    a specific one instead
+  - `--add-node` → `addNode` regardless: how a one-node app scales out to two
+  - **Apps whose external contracts key on the signer** (0g-sandbox's vouchers, for
+    one) should restart with `--add-node`, let the old signer's obligations settle,
+    then `remove-node-onchain` it. A one-step replacement skips that settling.
+
+Rewriting a node's record goes through `updateNode`, which also resets the node's
+on-chain `addedAt` to that block. Nothing in tapp reads it, but it means "when this
+record was last written", not "when this machine joined".
 
 ```bash
 tapp-cli -s http://<tapp>:50051 -k 0x<deployer-key> start-app \
@@ -562,7 +881,8 @@ tapp-cli -s http://<tapp>:50051 -k 0x<deployer-key> register-onchain \
   --contract 0x<TappRegistry> \
   --stake-wei 1000000000000000000
 
-# Update app hashes after redeployment
+# Set the app-level declaration (the default for new nodes) to what this node
+# runs — e.g. after every node of a multi-node app has been upgraded
 tapp-cli -s http://<tapp>:50051 -k 0x<deployer-key> update-onchain \
   --app-id my-app \
   --rpc-url https://evmrpc-testnet.0g.ai \
@@ -577,6 +897,8 @@ tapp-cli -s http://<new-node>:50051 -k 0x<deployer-key> add-node-onchain \
 
 # Remove a node (starts lock period). Pass --signer-address explicitly when the
 # node is unreachable; otherwise it is fetched from --server automatically.
+# Removing the LAST node unregisters the app: anyone may then register the same
+# app_id and take its KMS keys. To move an app, re-key or add a node instead.
 tapp-cli -s http://<node>:50051 -k 0x<deployer-key> remove-node-onchain \
   --app-id my-app \
   --rpc-url https://evmrpc-testnet.0g.ai \
@@ -599,21 +921,25 @@ tapp-cli -s http://<any-tapp>:50051 -k 0x<deployer-key> withdraw \
 
 ### Verifying an App
 
-`tapp-cli verify-app` checks that what a node actually runs matches its reference values.
-Two independent axes select which references are enforced:
+`tapp-cli verify-app` checks that what a node actually runs is what was published and
+registered — the same checks tappscan makes, made here on your machine, plus one tappscan
+does not make yet (the KMS keys below):
 
-- **`--contract` + `--rpc-url` → dynamic references** (on-chain): reconciles the runtime
-  events against the registry — signer, compose, volumes, image, and **owner** (the
-  `claim_config` event's owner vs the on-chain app owner) → `signer✓ compose✓ volumes✓ image✓ owner✓`.
-- **`--policy-ids` → static references** (AS-registered boot-chain values): the AS enforces
-  the policy and returns the AR4SI executables claim → `boot-chain ✓ (executables=3)`.
-
-Whichever axis has NO reference supplied, verify-app prints that side's **measured values
-verbatim** so you can compare manually:
-- no `--contract` → prints owner / compose / images as attested;
-- no `--policy-ids` → prints the boot-chain component digests in reference-value JSON
-  (`{"measurement.<shim|grub|kernel|initrd|kernel_cmdline|uki>.SHA-384": [...]}`), directly
-  diffable against `verifier/reference-values/<boot_format>/<version>/<env>.json`.
+- **Quote, TCB, event-log replay** — the AS (`--as-endpoint`) verifies the quote's signature
+  chain to Intel, reports TCB, and replays the event log against the signed RTMRs. This is
+  what the AS is trusted for, and all it is trusted for.
+- **Boot chain → published reference values**, compared locally against the AS's signed
+  token: `boot chain : ✓ gcp/uki/v0.8.0/dev` names the image. The values are the published
+  ones, `0gfoundation/0g-tapp@dev:verifier/reference-values` (pinned to the commit the ref
+  resolves to, cached per commit; `GITHUB_TOKEN` is honoured), or a directory given with
+  `--reference-values`. No match prints the measured digests in reference-value JSON
+  (`{"measurement.<shim|grub|kernel|initrd|kernel_cmdline|uki>.SHA-384": [...]}`), ready to
+  publish, and the closest published set. A newly published image needs nothing registered
+  anywhere. `--policy-ids` additionally shows an AS policy's own verdict.
+- **`--contract` + `--rpc-url` → the registry**: reconciles the runtime events against it —
+  signer, compose, volumes, image, and **owner** (the `claim_config` event's owner vs the
+  on-chain app owner) → `signer✓ compose✓ volumes✓ image✓ owner✓`. Without `--contract`
+  (direct mode) it prints owner / compose / images as attested.
 
 Both modes also print `tls key : <sha256>  (sha256 of the public key, attested)` when the app
 has a TLS key, followed by the `openssl s_client | … | openssl dgst -sha256` one-liner for
@@ -621,19 +947,83 @@ comparing it against a live endpoint — that comparison is what ties a TLS conn
 node just verified. The line is absent when the app has never asked for a key, which is not a
 failure.
 
+With tapp-cli ≥ 0.11.1, both modes also verify legacy `runtime_data.kms_keys` snapshots.
+For that schema they print a `kms key : <address>  material <hex>` line for each
+legacy key declaration on that node this boot (the first 20;
+`get-evidence` prints them all), but only when the node's evidence can be believed: the AS
+verified the quote; it was made for this request; in chain mode it names the node's signer;
+the event log replays; the platform passes (DEBUG off, TCB not revoked); and the image is a
+published production one, or reference values were unavailable. A dev image does not count:
+its operator has a shell in the TD. Otherwise one line says how many are not shown and why.
+See [A stable identity from the KMS](#a-stable-identity-from-the-kms).
+
+- A material for which more than one key is attested fails the run (`kms keys disagree ❌`,
+  exit 1): across the nodes in chain mode, and within the one node in both modes. The KMS
+  gives one key per app and material, so a node holding another got it from somewhere else.
+  Agreement shows the nodes use the same cluster, not that it is the right one.
+- The keys are what the KMS that answered gave the node. Each key's `get_secret_resource`
+  event records which KMS node answered (`kms_url`) and whether the connection to it was
+  checked against attestation (`kms_attested`), as the client that made the request knew it.
+  Keys whose events never say it was (no verifier, or a KMS node reached over plain http)
+  get `⚠️ N of these taken while this node did not check the KMS against attestation`, and
+  the run ends with `kms keys from an unchecked KMS ⚠️` (exit 2). Which cluster that was is
+  the owner's setting either way: compare `kms_url` and the node's `verifier` and `kms` lines
+  with [`docs/TAPPSCAN.md`](docs/TAPPSCAN.md) and [`docs/KMS.md`](docs/KMS.md). Those two
+  lines show the latest settings; if they were revised this boot, the events show which
+  were in force for each key.
+- Keys the event log names that runtime_data does not list are counted
+  (`+ N more taken this boot that only the event log names`) and compared too. A listed key
+  that no event of the app names fails the run (`✗ N of these named by no
+  get_secret_resource event of this app`): tapp-server lists a key only once its event is
+  written, and runtime_data names no app, so such a key is another app's.
+
 ```bash
-# full verification: dynamic (chain) + static (policy)
+# full verification: registry + published reference values
 tapp-cli verify-app \
   --app-id my-app \
   --rpc-url https://evmrpc-testnet.0g.ai \
-  --contract 0x<TappRegistry> \
-  --policy-ids 0g-tapp-<boot_format>-<version>-<env>
+  --contract 0x<TappRegistry>
+  # --reference-values <dir>         # pinned/offline values instead of the published ones
   # --as-endpoint https://host:port  # CoCo-AS gRPC; TLS now, so give the scheme
-  # --as-pubkey 0x<sha256>           # pin the AS's attested TLS key
+  # --as-pubkey 0x<sha256>           # pin the AS's TLS key (or TAPP_AS_PUBKEY); current value in docs/TAPPSCAN.md
 
 # direct mode (single node, not yet registered): prints attested values verbatim
 tapp-cli -s http://<tapp>:50051 verify-app --app-id my-app
 ```
+
+**Nodes whose port is closed to you** (open only to the scan and their operators) are
+reached through the scan relay of their registry, automatically — `evidence : the node did
+not answer here; relayed by …`. That is transport only: the evidence is checked exactly as
+if fetched directly, and the quote must echo the random challenge sent for it
+(`fresh : ✓`). An old quote is genuine too, so passing one off as new is the one thing a
+relay could do, and the echo is what rules it out; a quote echoing a different challenge
+fails whichever way it came. `docs/verify_app.py` does all of the above the same way, except
+the owner check (it does not read `claim_config`) and three KMS-key checks: it does not
+re-derive each address from its public key, read keys only the event log names, or judge
+each key by the KMS settings it was taken under.
+
+The AS is trusted for the quote, so **pin it** (`--as-pubkey`, or `TAPP_AS_PUBKEY` once;
+the current value is in [`docs/TAPPSCAN.md`](docs/TAPPSCAN.md)). Unpinned, anyone on the
+path could forge every verdict: verify-app warns and never reports better than ⚠️. A
+**dev** image's boot chain is reported ⚠️, not ✅ — dev builds can carry an SSH key into
+the TD — and on **mainnet** (chain 16661) it fails, as it does in the scan's verdict and so
+at the KMS. "✅" means the boot chain matches a published image's digests; firmware
+(MRTD/RTMR0) is not compared yet. verify-app **exits non-zero** when something fails or warns,
+so scripts and CI can use it:
+
+- **0**: everything checked and clean.
+- **1**: a failure (a reconcile FAIL; in direct mode, a quote made for another request; more
+  than one KMS key for a material; a listed KMS key no event of the app names; an unpublished
+  image; a dev image on mainnet; a platform ✗).
+- **2**: passed with a warning (unpinned AS, dev image off mainnet, a TCB trailing Intel's
+  latest, reference values unavailable, KMS keys taken while the node did not check the KMS
+  against attestation).
+
+The **platform** line reads the TD itself out of the AS token, as the AS policy used to:
+a TD launched with **DEBUG** fails whatever else passes (its host can read and write its
+memory — on bare metal the operator launches the TD), and so does a revoked TCB. A TCB
+that merely trails Intel's latest (`OutOfDate`, `SWHardeningNeeded`, …) warns: clouds
+roll firmware out behind Intel, and the outstanding advisories are listed.
 
 List the apps a server is currently running (read-only, no key needed):
 
@@ -667,7 +1057,7 @@ When `[kbs]` is configured, apps running inside the TEE can retrieve a hardware-
 
 ### Key material is served only on the Unix socket
 
-Three RPCs hand over private key material — `GetAppSecretKey`, `GetSecretResource` and `GetAppTlsCert` — and from v0.4.0 they are reachable **only over the Unix socket**. Over TCP they are refused with `PermissionDenied`, including from `localhost` and from a container using `host.docker.internal:host-gateway`.
+`GetAppSecretKey`, `GetSecretResource`, `GetAppTlsCert`, and the new `GetAppSigner` hand over private key material and are reachable **only over the Unix socket**. Over TCP they are refused with `PermissionDenied`, including from `localhost` and from a container using `host.docker.internal:host-gateway`.
 
 The check is the transport answering rather than a judgement about an address: tonic records connect-info per listener, and a TCP connection always carries a peer address while a Unix one never does. Before v0.4.0 this was an address check that accepted the Docker bridge ranges, which meant any host that could reach `:50051` could fetch any app's private key.
 
@@ -706,11 +1096,11 @@ The returned `secret` bytes are the HKDF-derived app key from the KMS cluster, d
 
 ### Remote / TCP access
 
-The server always listens on `bind_address` (default `0.0.0.0:50051`) for remote clients — management, the on-chain `teeUrl`, `verify-app`. The Unix socket above is additional, not a replacement. Everything except the three key-material RPCs works over either.
+The server always listens on `bind_address` (default `0.0.0.0:50051`) for remote clients — management, the on-chain `teeUrl`, `verify-app`. The Unix socket above is additional, not a replacement. The four key-material RPCs and the app-facing `ResolveAppIdentity` lookup are socket-only; other methods work over either.
 
 ### Derivation material (per-caller keys)
 
-`GetSecretResourceRequest` takes an optional `material` field — hex-encoded derivation material, opaque to tapp and forwarded verbatim to the KMS `/app-key` endpoint, which binds it into the derived key alongside `app_id`. This lets an app derive many independent keys from the KMS (e.g. AgenticID derives per-agent seal keys with `material = chainId ‖ contractAddress ‖ sealId`) instead of holding one app-wide secret and deriving locally. The KMS DPRF is one-way: per-material keys expose neither each other nor the app-wide key.
+`GetSecretResourceRequest` takes an optional `material` field — hex-encoded derivation material bound by KMS into the key alongside `app_id`. tapp normalizes it to lowercase hex without `0x` and refuses more than 256 decoded bytes. tapp-server ≥0.11.1 records a commitment without interpreting the secret as a signing key. This lets an app derive independent per-agent keys (e.g. `chainId ‖ contractAddress ‖ sealId`) instead of holding one app-wide secret and deriving locally.
 
 ```bash
 grpcurl -unix -plaintext \
@@ -719,3 +1109,40 @@ grpcurl -unix -plaintext \
 ```
 
 Absent/empty `material` derives purely from the `app_id` namespace — byte-identical to the pre-material request, so existing callers and older KMS nodes are unaffected.
+
+### A stable identity from the KMS
+
+The app's signer — the key `GetAppSecretKey` returns and the address registered on chain — is made inside the TEE and changes whenever tapp-server restarts or the VM reboots. That is right for the node's identity, but not for an app whose address is known outside: an address on a contract's allowlist, an oracle's signer, anything a counterparty has pinned. Such an app signs with a KMS key instead. `GetSecretResource` returns the same 32-byte secret for the same `app_id` and `material` on every node of the app, every time.
+
+With tapp-server ≥0.11.1, call the socket-only `GetAppSigner(app_id)` for the stable
+application identity. It uses the fixed `70726f7669646572` (hex `provider`) material
+and interprets that secret as a secp256k1 scalar, preserving existing KMS-provider
+addresses. Its response carries the secret, compressed public key, address,
+commitment, derivation and explicit measurement result. The typed `app_signer`
+declaration and commitment are authenticated in runtime data and the replayed
+event log. Generic `GetSecretResource` returns opaque bytes and a commitment;
+TLS uses a separate P-256 declaration under material `746c73`.
+
+Commitment parameters and future proof boundaries are described in
+[APP_IDENTITY.md](docs/APP_IDENTITY.md). The node signer and on-chain node
+registration remain unchanged. Cache secrets in memory rather than repeatedly
+fetching them: each generic fetch adds an event to the log carried by verification.
+
+**Legacy implementations that emitted `kms_keys`** interpreted generic secrets as secp256k1 keys:
+
+- Those legacy responses carried `eth_address` (20 bytes) and `compressed_public_key` (33 bytes), shown by grpcurl as base64-encoded `ethAddress` and `compressedPublicKey`. Legacy CLI snapshots printed them in hex. These fields are now reserved; current generic secrets carry a commitment rather than an inferred signing identity.
+- From then to the end of the boot, `GetEvidence` for the app lists the key in `runtime_data.kms_keys` (see [Trusted Execution Environment](#trusted-execution-environment)). A restarted tapp-server reads the list back from this boot's `get_secret_resource` events, which name the same address; a key is listed only once its event is written.
+- **Ask once per boot.** Every request adds an event (about 1 KB) to the event log, and every verification carries the whole log: an AS on default settings refuses a request past 4 MiB, at which point the node fails verification, and with attested admission on, the KMS. Keep the key in memory instead of asking again.
+- A verifier that checks the evidence learns that this TEE, registered on chain for the app, holds the key. `verify-app` lists each node's keys and fails the run when more than one key is attested for a material.
+- `material` must be hex (digits in either case, with an optional `0x`) of at most 256 bytes; anything else is refused with `INVALID_ARGUMENT` before the KMS is asked.
+- Whatever holds the socket and names the app adds to its list, including `get-secret-resource` run on the host.
+
+Nothing needs switching on, and the on-chain signer is unchanged: the KMS still authenticates the node by it.
+
+Know the limits before relying on it:
+
+- **Every node of the app holds the same key**, so one compromised node exposes it everywhere. That is the trade a stable key makes, as with `tls_key_source = "kms"`.
+- **The key is what the KMS that answered gave it, and the owner chooses the KMS** (`claim-config`, `update-trust-anchors`; measured in the event log). The node checks a KMS against attestation only with a verifier set and the KMS node reached over https. With no verifier it checks an https KMS only against public CAs, and an http one not at all. Each key's event records which KMS node answered and whether that check was made; `verify-app` warns about any key taken without it. An owner who points every node at a KMS of their own gets the same owner-known key listed on every node, and the nodes agree: compare the KMS node in each key's event, and the node's `verifier` and `kms` lines, with [`docs/TAPPSCAN.md`](docs/TAPPSCAN.md) and [`docs/KMS.md`](docs/KMS.md).
+- **The key is as durable as the KMS cluster.** Another cluster or network gives another key, and a cluster that loses its master key loses it. Keep a way to change the address wherever it is recorded.
+- **Whoever holds the app_id on chain holds its KMS keys.** Removing an app's last node unregisters the app, and anyone can then register the same app_id and take the same keys. Do not remove the last node of an app whose KMS key is its identity. Whoever can upgrade the registry can rewrite any app's owner and nodes, and so take its keys too: on testnet one address, immediately; on mainnet one address behind a 1-day timelock ([`contract/CONTRACTS.md`](contract/CONTRACTS.md)).
+- **Attested admission at the KMS** releases the key only to attested TEEs registered for the app: a verified quote naming the registered signer, an event log that replays, DEBUG off, a TCB not revoked, a published image (a dev image is refused on mainnet). Without it, the owner (or anyone with the owner's key) can register a plain address as a node and take the key outside any TEE. Admission does not check the compose: the owner decides that, and one that hands the key out is allowed. That is visible on chain and in the event log, not prevented. The testnet KMS has admission on ([`docs/KMS.md`](docs/KMS.md)); check the network you use.

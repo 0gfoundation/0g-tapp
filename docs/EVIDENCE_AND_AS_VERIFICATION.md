@@ -48,7 +48,7 @@ its own overrides if present, otherwise resolved to the app-level defaults. `ima
 
 > ⚠️ `getNode` on the **current** registry has 5 fields. The old deployment (`0x95a0…511c`, deprecated) has only 3;
 > using the wrong arity yields a decode error or silent truncation. Distinguish them with `cast call <proxy> "version()(string)"`:
-> the current one returns `"0.1.0"`, the old one simply reverts. See `contract/CONTRACTS.md`.
+> the current one returns `"0.2.0"`, the old one simply reverts. See `contract/CONTRACTS.md`.
 
 ```bash
 C=0x2Ce80374318B1d7Fb3345724457a182E0ad165c9 ; R=https://evmrpc-testnet.0g.ai
@@ -99,23 +99,69 @@ report_data = sha512(runtime_data)
 (base64). Definition in `tapp-common/src/report_data.rs`:
 
 ```json
-{"nonce":"0x…","signer":"0x…","tls_public_key":"0x…"}
+{"app_id":"my-app","identities":[],"key_commitments":[],
+ "nonce":"0x…","signer":"0x…","tls_public_key":"0x…"}
 ```
 
 | field | meaning |
 |---|---|
+| `app_id` | ≥0.11.1: exact application namespace; empty for the common node identity |
+| `identities` | ≥0.11.1: typed node/app/TLS public keys with algorithm, encoding, source, derivation and optional KMS commitment reference |
+| `key_commitments` | ≥0.11.1: canonical Poseidon commitments to opaque KMS secrets, scoped to app id and material |
+| `kms_keys` | Legacy secp256k1 address/public-key declarations; new generic KMS retrievals do not populate this list |
 | `nonce` | the caller-supplied challenge (`--nonce`, ≤64 bytes), echoed back verbatim |
 | `signer` | the app's TEE-derived signer EVM address (20 bytes), i.e. the identity registered on-chain |
 | `tls_public_key` | sha256 of the app's TLS public key (SubjectPublicKeyInfo); absent if the app has never requested a TLS key |
 
+**Current typed identities (≥0.11.1):** validate the app id, canonical
+`poseidon-bn254-4-v1` commitment and material, exact role/algorithm/derivation,
+compressed public key, and matching successful `get_secret_resource` events for
+KMS references. Derive the app signer's Ethereum address from its secp256k1 public
+key and the TLS SPKI hash from its P-256 public key; compare node/TLS legacy fields.
+The fixed commitment parameters and explicit proof extension boundary are in
+[APP_IDENTITY.md](APP_IDENTITY.md). The generic secret itself has no signing curve.
+Runtime data and the event log must both authenticate before using these fields.
+
+**Legacy `kms_keys` format:** the KMS derives one key per
+(app_id, material) and gives it only to signers registered on chain for the app, so the same
+material yields the same address on every node of the app and across restarts, while the
+`signer` above changes with every restart. A verifier that has checked the binding learns that
+this TEE holds the key behind `address`, as given by the KMS that answered when it was taken. What to
+check:
+
+- believe the list only from evidence that holds up in full: the AS verified the quote, it names
+  the registered signer, it echoes your challenge, the event log replays, the TD is out of debug
+  mode with a TCB that is not revoked, and it runs a published production image. A dev image
+  does not count: its operator has a shell in the TD, so its quote vouches for anything;
+- every entry is in exactly the form above, and `address` is the address of `public_key`
+  (tapp-cli drops any other entry and says so);
+- every node that lists a material lists the same address for it, and no node lists two. Two
+  addresses mean a node got a key from elsewhere, another KMS cluster or a substituted answer, and
+  `verify-app` fails the run on it. Agreement shows the nodes share a cluster, not that it is the
+  right one;
+- so judge each key by its own `get_secret_resource` events (below). There must be one for this
+  app: runtime_data names no app, and tapp-server lists a key only once its event is written, so a
+  listed key no event of the app names is another app's. Each event records the KMS node that
+  answered (`kms_url`) and whether the connection to it was checked against attestation
+  (`kms_attested`: a verifier set and the node reached over TLS), as the client that made the
+  request knew it. A key no event says was checked could have been substituted on the way.
+  Which KMS answered is the owner's choice, so also compare `kms_url` with `docs/KMS.md` (and
+  the node's current `verifier`/`kms` settings, printed by `verify-app`, with
+  `docs/TAPPSCAN.md`).
+
+The list covers the whole boot: a restarted tapp-server reads it back from this boot's
+`get_secret_resource` events, and a key is listed only once its event is written. An app need
+not, and should not, ask again: every request adds an event to the log.
+
 Two rules that must be remembered:
 
-1. **An empty field is "absent", not `""`.** This way, when a field is unused, the evidence bytes are byte-for-byte identical before and after the field was added.
-2. **The verifier hashes the bytes exactly as received and never re-serializes.** There is no "canonical form" both sides must agree on, and therefore no room for drift.
-   The `RuntimeData` struct is only for reading fields, not an encoder.
+1. **Hash exact received bytes.** ≥0.11.1 explicitly emits `app_id`, `identities` and `key_commitments`, including empty values. Optional legacy fields are omitted when unused. Do not reconstruct a legacy or current object to calculate its hash.
+2. **The verifier hashes the bytes exactly as received and never re-serializes.**
+   The `RuntimeData` struct is only for reading fields, not an encoder. The fields are written
+   in sorted order, so the bytes as received are also the canonical JSON CoCo-AS computes (below).
 
-Why sha512: TDX's `report_data` is exactly 64 bytes and sha512 fills it exactly; it is also the algorithm CoCo-AS expects when it is handed `runtime_data`
-and verifies the binding itself.
+Why sha512: TDX's `report_data` is exactly 64 bytes and sha512 fills it exactly. CoCo-AS checks the binding itself only when
+handed the object as `structured_runtime_data` with `sha512` named (below); its default is sha384.
 
 **Cost**: the quote alone can no longer state its own signer — this structure must accompany it. Evidence has always been the
 `{quote, cc_eventlog}` JSON, so this is just one more field on the same object; nowhere in the system is a bare quote passed around.
@@ -155,7 +201,12 @@ AS service: `attestation.AttestationService/AttestationEvaluate` (proto in trust
 
 - Leave the AS request's `runtime_data` **empty** → the AS does not check the binding; it only verifies the quote signature chain (PCK→Intel root) + TCB, and parses
   `report_data` into the claims. §④ recomputes `sha512` locally to verify the binding itself, so leaving it empty is sufficient.
-- Alternatively, pass the bytes of the evidence's own `runtime_data` to the AS and let the AS check `report_data == sha512(bytes)` for you.
+- Alternatively, let the AS check the binding: pass the evidence's own `runtime_data`, as its
+  base64-decoded JSON text, as `structured_runtime_data` with `runtime_data_hash_algorithm`
+  `sha512` (the default is sha384). The AS re-serialises it as canonical
+  JSON (sorted keys, no whitespace) and hashes that, and tapp-server writes the fields in that
+  order, so it matches. Not as `raw_runtime_data`: the AS compares raw data with `report_data`
+  directly, unhashed.
   Both paths reach the same conclusion — just don't skip it on both sides.
 
 ```python
@@ -205,6 +256,7 @@ rd = json.loads(rd_bytes)
 signer_ok  = rd["signer"].lower() == onchain_signer.lower()
 nonce_ok   = rd.get("nonce","").lower() == "0x" + my_nonce.hex()          # only check if a nonce was sent
 tls_pubkey = rd.get("tls_public_key")                                     # may be absent
+kms_keys   = rd.get("kms_keys") or []   # [{address, material, public_key}], may be absent; see §②
 ```
 
 Verify the binding first, then read the fields — doing it in the reverse order amounts to trusting a piece of JSON not covered by the quote.
@@ -267,6 +319,8 @@ while o + 12 <= len(log):
 | `runtime_data.signer` | = on-chain signerAddress | see above |
 | `runtime_data.nonce` | = the challenge sent with this request | only checked if `--nonce` was passed |
 | `runtime_data.tls_public_key` | = sha256 of the certificate public key obtained in the handshake | may be absent (app never requested a TLS key) |
+| `runtime_data.identities` / `key_commitments` | exact app/role/algorithm/source/derivation, public-key/address/SPKI correspondence, canonical commitments and matching successful replayed events | ≥0.11.1; see [APP_IDENTITY.md](APP_IDENTITY.md) |
+| Legacy `runtime_data.kms_keys` | each `address` = the address of its `public_key`; one address per material across the app's nodes; each key named by a `get_secret_resource` event of the app with `kms_attested: true` and a `kms_url` you trust | legacy schema compatibility; see §② |
 | compose / volumes / image hash | = corresponding on-chain field | see §① encoding rules |
 
 **kernel_cmdline has two reference values (new/old grub); matching either one passes:**
@@ -299,7 +353,7 @@ domain `cryptpilot.alibabacloud.com`, produced during the initrd stage, ordered 
 
 ### tapp operations
 
-domain `tapp.0g.com`, triggered by `start_app`/`stop_app`/`start_service`/`get_app_secret_key`/`docker_login`
+domain `tapp.0g.com`, triggered by `start_app`/`stop_app`/`start_service`/`get_app_secret_key`/`get_secret_resource`/`docker_login`
 (code: `extend_measurement()` → AA `extend_runtime_measurement`):
 
 ```
@@ -310,6 +364,16 @@ tapp.0g.com <operation> {"app_id","operation","result","error",
 - For reconciliation, take **the last `start_app` with `result:"success"` and `compose_hash` == the on-chain composeHash**.
 - Both success and failure are recorded (failure: `result:"failed"` + error text + empty `image_hash:{}`).
 - `docker_login` records `registry/username/signer/timestamp` (no password).
+- In tapp-server ≥0.11.1, successful `get_secret_resource` events carry canonical
+  `material` (lowercase hex without `0x`) and a `key_commitment`. App-signing and TLS
+  derivations also carry their typed `identity`. The event must be measured before
+  releasing the key or publishing its metadata; a process restart restores that metadata
+  from the successful events of the same boot. Each KMS derivation also records `kms_url`
+  (the answering node) and `kms_attested` (whether its connection was checked against
+  attestation).
+- Legacy snapshots may instead carry `address` and `public_key`, matching
+  `runtime_data.kms_keys`, and may preserve the caller's original material spelling.
+  Legacy TLS events have no `address`; current TLS identities reference a commitment.
 - Pattern: the first runtime event of each session lands on `pcrIndex=1`; subsequent ones land on `pcrIndex=4`.
 
 ### Reading key-access events with EMPTY hashes (the restart window)
@@ -351,12 +415,12 @@ event is honest ignorance of *which of the two*, not absence of accountability.
 
 ### claim_config (runtime claiming of owner+config; mandatory check for canonical images)
 
-Canonical images do not bake in owner/chain/kbs (one set of golden reference values network-wide, at path `<env>.json` with no owner layer),
+Canonical images do not bake in owner/kbs (one set of golden reference values network-wide, at path `<env>.json` with no owner layer),
 so **the entire runtime configuration moved from static measurements into the runtime event log**:
 
 ```
-tapp.0g.com claim_config {"owner":"0x<owner>","chain_rpc_url":"…",
-  "chain_contract_address":"0x…","kbs_node_urls":["…"],
+tapp.0g.com claim_config {"owner":"0x<owner>","kbs_node_urls":["…"],
+  "tls_key_source":"local|kms","scan_url":"…","scan_public_key":"0x…",
   "operation":"claim_config","timestamp":<ts>}
 ```
 
@@ -365,15 +429,16 @@ Reconciliation rules (add one step to §④):
 1. A **`claim_config` event must exist** in the event log (none → the node is ownerless or took an unmeasured path; reject);
 2. If there are multiple (e.g. config mode restarting across processes), **the `owner` of all `claim_config` events must be identical**;
 3. `owner` == the owner registered on-chain for this node (mismatch → the owner was squatted or the registration does not match; reject);
-4. `chain_contract_address` / `kbs_node_urls` are for audit: which contract and which KMS cluster the node claimed at the time.
+4. `kbs_node_urls` / `scan_url` are for audit: which KMS cluster and which verifier the node claimed at the time. (Whether a KMS key was taken over a checked connection is recorded in the key's own `get_secret_resource` event, not inferred from these.) Events from tapp-server before 0.9.0 also carry `chain_rpc_url` / `chain_contract_address`; they were a label only (nothing used them) and are no longer recorded — a node can be registered on more than one chain.
 
 The claim event is produced by the first claim after boot (dynamic mode via the ClaimConfig RPC, or automatic claiming at startup in config.toml preset mode).
 On every VM reboot the RTMRs are zeroed, the claim happens again, and it is measured again — the owner and the quote always share a lifecycle.
 
 **`tapp-cli verify-app` already performs the rules in this section automatically** (v0.3.0+): in chain mode the reconcile line prints
 `owner✓/✗/?` (✓ = claim_config owner == on-chain owner; ✗ = mismatch, Result ❌; ? = no claim_config event,
-images predating 0.3). Also, without `--policy-ids`, the boot-chain component measurements are printed verbatim in the reference-value JSON format,
-so they can be diffed directly against `verifier/reference-values/…/<env>.json`.
+images predating 0.3). Since v0.9.0 it also compares the boot chain itself, locally, against the published
+`verifier/reference-values/…/<env>.json` (read from the AS's signed token, as tappscan does) and names the image; on no match it
+prints the measured components in the reference-value JSON format, ready to publish.
 
 ---
 
@@ -513,5 +578,6 @@ Input `app_id = 0g-agentic-id-attestor`, fully automatic (script in the appendix
    - first verify `report_data == sha512(evidence.runtime_data as-is bytes)`, then read `runtime_data.signer` == on-chain signerAddress (never hand-roll quote offsets; for old evidence without this field, fall back to the first-20-bytes reading);
    - if a nonce was sent, check that `runtime_data.nonce` echoes it (distinguishes a fresh quote from a cached one);
    - `runtime_data.tls_public_key` (if present) == sha256 of the certificate public key obtained in the handshake;
+   - `runtime_data.kms_keys` (if present), only from evidence that verified in full, including a replaying event log, a passing platform and a published production image (not a dev one): each address is its public key's; every node that lists a material lists the same address for it, and no node lists two; each listed key is named by a `get_secret_resource` event of this app, one of which has `kms_attested: true` and a `kms_url` of the cluster you trust;
    - compose/volumes/image hash == on-chain (per the §① encoding); MRTD/boot chain == AS reference values (cmdline is OR).
 5. In RTMR3, recognize cryptpilot (old images) + take the last successful start_app for the compose/image/volumes reconciliation + reconcile the `claim_config` owner.

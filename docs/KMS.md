@@ -23,7 +23,7 @@ unchanged).
 ### Mainnet (chain 16661)
 
 Registered on TappRegistry `0x54874F536301c993922Dd95097e3902e7FBfe612`,
-app_id `0g-kms`, **2-of-5**, owner `0x73443d8C05c74F8C2F5D499Da2597a1EE49E431b`.
+app_id `0g-kms`, **2-of-5**, owner `0x9C58F839451EBf3e7f82442bC48E4088746380Bb`.
 
 ```
 group_pubkey = 8c30fd0e713be395d8f85ca5e0a879989fa8a4bbf019f0db00c4ee38c05f463a0079ab8c2ccda195f3171b98d0522050
@@ -40,19 +40,26 @@ group_pubkey = 8c30fd0e713be395d8f85ca5e0a879989fa8a4bbf019f0db00c4ee38c05f463a0
 ### Testnet (0G Galileo, chain 16602)
 
 Registered on TappRegistry `0x2Ce80374318B1d7Fb3345724457a182E0ad165c9`,
-app_id `0g-kms`, **2-of-5**.
+app_id `0g-kms`, **2-of-5**, owner `0x9C58F839451EBf3e7f82442bC48E4088746380Bb`.
+Attested admission is on: a node fetching keys must also be verified by the testnet
+scan, and must run tapp-server ≥ 0.9.0 (below, "With attested admission on").
 
 ```
-group_pubkey = 8fbb1b3f6309f35e93e069f5268bcea64617a20ab8dfc5f9b79251169e62356168e2d64d8936d52dadc1c8c0eb733541
+group_pubkey = 80be83e5fa1110a6c4ff55db2d991db2f5a296b001f9ec63b559007875e1eae4de879f9fbb1bd4c053a0925eaa753beb
 ```
 
 | node | zone | KBS endpoint (`--kbs-urls`) |
 |---|---|---|
-| 1 | us-central1-a | `https://104.197.68.77:9443` |
-| 2 | us-east1-c | `https://34.148.132.90:9443` |
-| 3 | us-east4-a | `https://34.11.104.41:9443` |
-| 4 | us-west1-a | `https://136.66.159.190:9443` |
-| 5 | us-east5-b | `https://136.83.14.240:9443` |
+| 1 | us-central1-a | `https://34.30.142.206:9443` |
+| 2 | us-east1-c | `https://35.185.85.8:9443` |
+| 3 | us-east4-a | `https://136.90.95.17:9443` |
+| 4 | us-west1-a | `https://136.86.212.43:9443` |
+| 5 | us-east5-b | `https://34.162.61.63:9443` |
+
+This cluster replaced, on 2026-10-11, the one with `group_pubkey 8fbb1b3f…3541` (a new
+master, not a reshare): every key derived from the old one is gone, and a testnet node
+still pointing at the old endpoints gets no key. Point it here with
+`update-trust-anchors --kbs-urls …`.
 
 Node signers and teeUrls live on-chain (`getNodeList("0g-kms")` /
 `getNode`) and rotate with reboots — the chain, not this table, is the
@@ -94,6 +101,25 @@ That makes the on-chain node list the entire authorization model:
 - A node that reboots re-derives its signer, no longer matches its
   registration, and is locked out until `update-node-onchain` syncs the chain —
   KMS refusals after a reboot are this, not a network problem.
+- The KMS sees the chain through a cache (~30s) and its own RPC, so a change
+  that just landed — a registration, a replaced or added node — is invisible to
+  it for a while — and with attested admission on, so is the verifier it asks.
+  tapp-server waits that out: a key request the KMS answers with "app not found
+  on-chain", "not in on-chain signer list", "not registered on-chain per
+  verifier", "verifier unreachable", the exact `GetEvidence: Invalid app_id: App
+  <requested-id> not found` negative cached before StartApp, or the verifier's
+  "DEBUG attribute is not known … needs re-attesting" is retried for up to `[kbs.retry] onchain_wait_ms` (240s) before
+  failing. So is the KMS's damped "(recently checked)" answer when it does not
+  say why (older KMS builds), since it turns into the real answer within 30s; a
+  damped answer that names a lasting reason fails at once. The KMS cannot tell
+  "not visible yet" from "never registered", so a request for an app that was
+  never registered also takes that long to fail.
+- With attested admission on (0g-kms#15), the KMS also has the verifier check the
+  node's evidence for the app before it answers. tapp-server serves that evidence
+  while the app is still being started (≥ 0.9.0), which an encrypted app needs: its
+  start waits for the volume key. Older servers refuse evidence for an app that is
+  not running yet, so the start deadlocks; every node fetching keys from a gated KMS
+  must run ≥ 0.9.0 before the gate is turned on (#145).
 - Nobody — including the cluster operators — can mint an app's key for an
   unregistered address without `t` colluding TEEs deviating from their measured
   code.
@@ -107,12 +133,23 @@ namespaces in use:
 |---|---|---|
 | `""` (empty) | apps, via `get-secret-resource` on the socket | the app's base secret, free-form use |
 | `746c73` (`"tls"`) | tapp-server, `tls-key-source = kms` | the app's stable TLS key (same cert across boots — what lets Let's Encrypt issuance survive; see [APP_TLS.md](APP_TLS.md)) |
+| `70726f7669646572` (`"provider"`) | tapp-server, `GetAppSigner` | stable secp256k1 application signer; compatible with existing sandbox KMS provider addresses |
 | `666465` (`"fde"`) | tapp-server, encrypted data volumes | the LUKS passphrase of the app's `data/` volume (see the README's data-modes section) |
 
 Not in this table: `scratch` volume keys and everything `local` — those derive
 from the node's own signer precisely because they must **not** survive a boot.
 The empty app_id (the node's common signer) is refused by `get-secret-resource`;
 node-scoped material is not servable to app containers.
+
+From tapp-server 0.11.1, fetched KMS secrets are opaque 32-byte values. tapp records
+the fixed `poseidon-bn254-4-v1` commitment in the SHA384 event log and in
+`runtime_data.key_commitments`; it never infers a signing curve from a generic
+secret. Dedicated app-signer and TLS paths additionally publish typed public keys
+in `runtime_data.identities`, referencing the same commitment format. The old
+`kms_keys` address declarations remain readable for compatibility.
+Take each generic key once per boot: every request adds an event carried by
+verification. See [APP_IDENTITY.md](APP_IDENTITY.md) and
+[A stable identity from the KMS](../README.md#a-stable-identity-from-the-kms).
 
 ## Configuring a node to consume the KMS
 
@@ -124,9 +161,15 @@ tapp-cli -s <node> -k <owner-key> claim-config \
   --scan-url https://<verifier> --scan-pubkey 0x<sha256 of its TLS key>
 ```
 
-- **`--kbs-urls`** (or a baked `[kbs] node_urls` in the image): the cluster
-  members. List several — any `t` of them serve a request. CVM images usually
-  bake the production list, in which case claiming without `--kbs-urls` keeps it.
+- **`--kbs-urls`**: the cluster members, from [Deployed clusters](#deployed-clusters).
+  List several — any `t` of them serve a request. **Always pass it**: CVM images
+  bake no list, because one image serves both networks and a baked list would be
+  wrong for one of them. A node claimed without it has no KMS. Calls that need one
+  fail with `KMS not configured`, but an app in the default `encrypted` data mode
+  does **not** fail: it starts on a RAM directory instead, lost at every reboot,
+  and the warning goes only to the tapp-server log. `update-trust-anchors
+  --kbs-urls` adds the list later without a restart; an app already running on
+  RAM stays there until it is restarted.
 - **`--scan-url` / `--scan-pubkey`** — the trust anchors. KMS nodes serve
   attested self-signed TLS; the consumer verifies their identity through a
   verifier (tappscan) whose own key is pinned here. **Omitting this is the
@@ -155,8 +198,8 @@ source cannot consume itself:
    no opt-out.)
 2. **`--tls-key-source local`** in its claim — its serving key cannot come from
    itself; consumers pin the attested key via the verifier instead.
-3. Its own `[kbs]` config is irrelevant to it and a baked one should be ignored
-   or removed — the KBS URLs point at the very cluster it forms.
+3. **No `--kbs-urls`** in its claim — the KBS URLs would point at the very
+   cluster it forms.
 
 Cluster formation, membership changes, share recovery and the reasons
 `update-node-onchain` (never remove+add) is the only safe way to rotate a KMS

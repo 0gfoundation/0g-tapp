@@ -1,0 +1,573 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.24;
+
+/// @title  TappRegistry
+/// @notice On-chain registry + stake manager for 0G Trusted Application Platform apps.
+/// @dev    Upgradeable via BeaconProxy + UpgradeableBeacon pattern (ERC-1967).
+///         Storage layout is fixed; use __gap for future fields.
+///
+///         App model
+///         ---------
+///         Every app is logically a cluster. A "single-node app" is a cluster with
+///         one node. The app-level composeHash/volumesHash/imageHashes are the SHARED
+///         defaults for every node. A node MAY override composeHash/volumesHash in its
+///         NodeInfo (for node-specific config); the effective value for a node is its
+///         own override if non-empty, else the app-level default. imageHashes are
+///         always shared. registerApp always adds the first node atomically.
+///         When the last node is removed the app is automatically unregistered.
+///
+///         Staking
+///         -------
+///         Stake is per node. Each addNode / registerApp call requires
+///         msg.value >= minStakeAmount. After removeNode, the stake is locked for
+///         lockPeriod seconds in the owner's locked balance. The owner may call
+///         withdraw() at any time to collect all matured entries.
+///
+///         Acknowledge
+///         -----------
+///         Each app has an ackVersion counter. Users acknowledge a specific version;
+///         their acknowledgement becomes stale whenever the counter increments.
+///         updateApp, updateNode, addNode, and replaceNode all increment the counter.
+///         removeNode does not (shrinking the cluster does not increase trust risk).
+///
+///         Off-chain workflow:
+///           1. Read app info + node list via getAppInfo / getNodeList.
+///           2. Pick a node; fetch attestation evidence from its teeUrl.
+///           3. Submit evidence to an RA service; confirm the returned signerAddress
+///              and codeHash match on-chain values.
+///           4. Call acknowledgeApp(appId) to record acknowledgement on-chain.
+contract TappRegistryV010 {
+
+    // ─── Structs ──────────────────────────────────────────────────────────────
+
+    struct AppInfo {
+        /// @dev SHA384 of the docker-compose yaml — the SHARED DEFAULT for all nodes.
+        ///      A node may override this in NodeInfo; effective = node override ?? this.
+        bytes   composeHash;
+        /// @dev SHA384 of mount/volume files — shared default (see composeHash).
+        bytes   volumesHash;
+        /// @dev Docker image digests, one per service in compose order (always shared)
+        bytes[] imageHashes;
+        address owner;
+        uint256 registeredAt;
+    }
+
+    struct NodeInfo {
+        /// @dev Node-specific URL to fetch TEE attestation evidence
+        string  teeUrl;
+        uint256 addedAt;
+        uint256 stakeAmount;
+        /// @dev OPTIONAL per-node override of the app-level composeHash. Empty in storage
+        ///      means "inherit the app-level default"; getNode() resolves it to the
+        ///      default on read (raw override is still observable via the NodeCode event).
+        ///      Appended after stakeAmount to keep the storage layout upgrade-compatible.
+        bytes   composeHash;
+        /// @dev OPTIONAL per-node override of the app-level volumesHash (see composeHash).
+        bytes   volumesHash;
+    }
+
+    struct LockedEntry {
+        uint256 amount;
+        /// @dev Timestamp after which the owner may withdraw this entry
+        uint256 unlockAt;
+    }
+
+    // ─── State (storage layout — must not reorder or remove between upgrades) ─
+    //
+    // slot 0 (packed): _locked | _initialized
+    bool private _locked;
+    bool private _initialized;
+
+    // slot 1
+    mapping(string => AppInfo) private _apps;
+    // slot 2 — appId => signerAddress => NodeInfo (addedAt==0 means node does not exist)
+    mapping(string => mapping(address => NodeInfo)) private _nodes;
+    // slot 3 — active node list; entries are removed when a node is removed
+    mapping(string => address[]) private _nodeList;
+    // slot 4 — owner => locked stake entries pending withdrawal
+    mapping(address => LockedEntry[]) private _lockedBalance;
+    // slot 5 — user => appId => ackVersion at time of acknowledgement (0 = never acked)
+    mapping(address => mapping(string => uint256)) private _acks;
+    // slot 6
+    mapping(string => uint256) private _ackCounts;
+    // slot 7 — incremented by registerApp / updateApp / addNode / updateNode / removeNode(last)
+    mapping(string => uint256) private _appAckVersions;
+
+    // slot 8
+    address public admin;
+    // slot 9 — minimum stake per node, in wei
+    uint256 public minStakeAmount;
+    // slot 10 — node stake lock period after removeNode, in seconds
+    uint256 public lockPeriod;
+
+    // slot 11 — appId => contract => is authorized to call invalidateAcks
+    mapping(string => mapping(address => bool)) private _authorizedInvalidators;
+
+    // slots 12–59: reserved for future upgrades
+    uint256[48] private __gap;
+
+    // ─── Events ───────────────────────────────────────────────────────────────
+
+    event AppRegistered(string indexed appId, address indexed owner, bytes composeHash, bytes volumesHash, bytes[] imageHashes);
+    event AppUpdated(string indexed appId, uint256 newAckVersion, bytes composeHash, bytes volumesHash, bytes[] imageHashes);
+    event AppUnregistered(string indexed appId, address indexed owner);
+    /// @dev Per-node compose/volumes override (empty = inherit app-level). Emitted on
+    ///      node add and update (not remove).
+    event NodeCode(string indexed appId, address indexed signerAddress, bytes composeHash, bytes volumesHash);
+    /// @dev oldSigner==0 means add, newSigner==0 means remove, both non-zero means replace.
+    ///      stakeAmount and unlockAt are only set on add/remove; zero for replace.
+    ///      newAckVersion is non-zero whenever the ack version was bumped by this call
+    ///      (add, replace, or remove of the last node); zero for non-last-node removes.
+    event NodeUpdated(string indexed appId, address indexed oldSigner, address indexed newSigner, uint256 stakeAmount, uint256 unlockAt, uint256 newAckVersion);
+    event StakeWithdrawn(address indexed owner, uint256 amount);
+    event AppAcknowledged(string indexed appId, address indexed user, uint256 ackVersion);
+    event AppAcknowledgementRevoked(string indexed appId, address indexed user);
+    event InvalidatorAuthorized(string indexed appId, address indexed invalidator);
+    event InvalidatorRevoked(string indexed appId, address indexed invalidator);
+    event AcksInvalidated(string indexed appId, address indexed invalidator, uint256 newAckVersion);
+    event MinStakeUpdated(uint256 oldAmount, uint256 newAmount);
+    event LockPeriodUpdated(uint256 oldPeriod, uint256 newPeriod);
+    event AdminTransferred(address indexed previousAdmin, address indexed newAdmin);
+
+    // ─── Modifiers ────────────────────────────────────────────────────────────
+
+    modifier onlyAdmin() {
+        require(msg.sender == admin, "not admin");
+        _;
+    }
+
+    modifier onlyAppOwner(string calldata appId) {
+        require(_apps[appId].owner == msg.sender, "not app owner");
+        _;
+    }
+
+    modifier nonReentrant() {
+        require(!_locked, "reentrant");
+        _locked = true;
+        _;
+        _locked = false;
+    }
+
+    modifier initializer() {
+        require(!_initialized, "already initialized");
+        _initialized = true;
+        _;
+    }
+
+    // ─── Constructor / Initializer ────────────────────────────────────────────
+
+    /// @dev Locks the implementation so initialize() cannot be called on it directly.
+    constructor() {
+        _initialized = true;
+    }
+
+    /// @notice Initialise the proxy. Called once via BeaconProxy through delegatecall.
+    /// @param _minStakeAmount Minimum stake per node in wei (e.g. 1 ether)
+    /// @param _lockPeriod     Lock period in seconds after removeNode (e.g. 7 days)
+    function initialize(uint256 _minStakeAmount, uint256 _lockPeriod) external initializer {
+        admin          = msg.sender;
+        minStakeAmount = _minStakeAmount;
+        lockPeriod     = _lockPeriod;
+    }
+
+    // ─── Version ──────────────────────────────────────────────────────────────
+
+    /// @notice Implementation version — see docs/VERSIONING.md.
+    /// @dev The proxy address is stable across upgrades, so callers read this to
+    ///      learn the live implementation's ABI version. Bump on every upgrade:
+    ///      MINOR on an ABI change, PATCH on a logic-only (storage-layout-safe)
+    ///      change.
+    function version() external pure returns (string memory) {
+        return "0.1.0";
+    }
+
+    // ─── Admin ────────────────────────────────────────────────────────────────
+
+    function setMinStakeAmount(uint256 amount) external onlyAdmin {
+        emit MinStakeUpdated(minStakeAmount, amount);
+        minStakeAmount = amount;
+    }
+
+    function setLockPeriod(uint256 period) external onlyAdmin {
+        emit LockPeriodUpdated(lockPeriod, period);
+        lockPeriod = period;
+    }
+
+    function transferAdmin(address newAdmin) external onlyAdmin {
+        require(newAdmin != address(0), "zero address");
+        emit AdminTransferred(admin, newAdmin);
+        admin = newAdmin;
+    }
+
+    // ─── App ──────────────────────────────────────────────────────────────────
+
+    /// @notice Register a new app and add its first node atomically.
+    ///         msg.value is the stake for the first node (>= minStakeAmount).
+    ///         composeHash/volumesHash are the app-level shared defaults; the first
+    ///         node inherits them (no override). Add divergent nodes via addNode with
+    ///         their own compose/volumes, or override later via updateNode.
+    /// @param appId               Unique application identifier
+    /// @param composeHash         SHA384 of the docker-compose yaml (shared default)
+    /// @param volumesHash         SHA384 of all mount/volume files (shared default)
+    /// @param imageHashes         Docker image digests, one per service in compose order
+    /// @param firstSignerAddress  TEE EVM address of the first node
+    /// @param firstTeeUrl         Evidence URL of the first node
+    function registerApp(
+        string   calldata appId,
+        bytes    calldata composeHash,
+        bytes    calldata volumesHash,
+        bytes[]  calldata imageHashes,
+        address           firstSignerAddress,
+        string   calldata firstTeeUrl
+    ) external payable {
+        require(_apps[appId].owner == address(0), "app already exists");
+        require(msg.value >= minStakeAmount, "insufficient stake");
+
+        _apps[appId] = AppInfo({
+            composeHash:  composeHash,
+            volumesHash:  volumesHash,
+            imageHashes:  imageHashes,
+            owner:        msg.sender,
+            registeredAt: block.timestamp
+        });
+
+        ++_appAckVersions[appId];
+        // first node inherits the app-level defaults (empty per-node override).
+        _addNode(appId, firstSignerAddress, firstTeeUrl, "", "", msg.value, 0);
+
+        emit AppRegistered(appId, msg.sender, composeHash, volumesHash, imageHashes);
+    }
+
+    /// @notice Update the app-level shared defaults (e.g. after re-deployment).
+    ///         Increments ackVersion, invalidating all prior acknowledgements.
+    ///         Per-node overrides are updated separately via updateNode.
+    function updateApp(
+        string  calldata appId,
+        bytes   calldata composeHash,
+        bytes   calldata volumesHash,
+        bytes[] calldata imageHashes
+    ) external onlyAppOwner(appId) {
+        AppInfo storage app = _apps[appId];
+        app.composeHash = composeHash;
+        app.volumesHash = volumesHash;
+        app.imageHashes = imageHashes;
+
+        uint256 newVersion = ++_appAckVersions[appId];
+        emit AppUpdated(appId, newVersion, composeHash, volumesHash, imageHashes);
+    }
+
+    // ─── Nodes ────────────────────────────────────────────────────────────────
+
+    /// @notice Add a node to an existing app. Only the app owner may add nodes.
+    ///         msg.value is the stake for this node (>= minStakeAmount).
+    ///         composeHash/volumesHash are this node's OPTIONAL override — pass empty
+    ///         to inherit the app-level defaults. Increments ackVersion.
+    function addNode(
+        string  calldata appId,
+        address          signerAddress,
+        string  calldata teeUrl,
+        bytes   calldata composeHash,
+        bytes   calldata volumesHash
+    ) external payable onlyAppOwner(appId) {
+        require(msg.value >= minStakeAmount, "insufficient stake");
+        require(_nodes[appId][signerAddress].addedAt == 0, "node already exists");
+
+        uint256 newVersion = ++_appAckVersions[appId];
+        _addNode(appId, signerAddress, teeUrl, composeHash, volumesHash, msg.value, newVersion);
+    }
+
+    /// @notice Update a node's signer address, teeUrl, and/or code identity
+    ///         (composeHash/volumesHash). Requires the old node to exist; applies new
+    ///         values unconditionally. Stake carries over. Always increments ackVersion.
+    ///         Pass newSigner == oldSigner to keep the signer and update the rest.
+    ///         Only the app owner may call this.
+    function updateNode(
+        string  calldata appId,
+        address          oldSigner,
+        address          newSigner,
+        string  calldata teeUrl,
+        bytes   calldata composeHash,
+        bytes   calldata volumesHash
+    ) external onlyAppOwner(appId) {
+        require(newSigner != address(0), "zero signer address");
+        require(_nodes[appId][oldSigner].addedAt != 0, "old node not found");
+        require(
+            newSigner == oldSigner || _nodes[appId][newSigner].addedAt == 0,
+            "new signer already exists"
+        );
+
+        uint256 stake = _nodes[appId][oldSigner].stakeAmount;
+
+        if (newSigner != oldSigner) {
+            address[] storage list = _nodeList[appId];
+            for (uint256 i = 0; i < list.length; i++) {
+                if (list[i] == oldSigner) { list[i] = newSigner; break; }
+            }
+            delete _nodes[appId][oldSigner];
+        }
+        _nodes[appId][newSigner] = NodeInfo({
+            teeUrl:      teeUrl,
+            addedAt:     block.timestamp,
+            stakeAmount: stake,
+            composeHash: composeHash,
+            volumesHash: volumesHash
+        });
+
+        uint256 newVersion = ++_appAckVersions[appId];
+        emit NodeUpdated(appId, oldSigner, newSigner, 0, 0, newVersion);
+        emit NodeCode(appId, newSigner, composeHash, volumesHash);
+    }
+
+    /// @notice Remove a node. Stake is locked for lockPeriod seconds in the owner's
+    ///         locked balance. If this was the last node, the app is unregistered.
+    ///         Only the app owner may remove nodes.
+    function removeNode(
+        string  calldata appId,
+        address          signerAddress
+    ) external onlyAppOwner(appId) {
+        NodeInfo storage node = _nodes[appId][signerAddress];
+        require(node.addedAt != 0, "node not found");
+
+        address owner    = _apps[appId].owner;
+        uint256 stake    = node.stakeAmount;
+        uint256 unlockAt = block.timestamp + lockPeriod;
+
+        // Lock stake in owner's balance
+        _lockedBalance[owner].push(LockedEntry({amount: stake, unlockAt: unlockAt}));
+
+        // Remove node from active set
+        delete _nodes[appId][signerAddress];
+        address[] storage list = _nodeList[appId];
+        for (uint256 i = 0; i < list.length; i++) {
+            if (list[i] == signerAddress) {
+                list[i] = list[list.length - 1];
+                list.pop();
+                break;
+            }
+        }
+
+        // If last node, unregister the app and bump ackVersion before emitting,
+        // so NodeUpdated reflects the real post-bump version.
+        uint256 newAckVersion = 0;
+        if (list.length == 0) {
+            delete _apps[appId];
+            newAckVersion = ++_appAckVersions[appId];
+        }
+
+        emit NodeUpdated(appId, signerAddress, address(0), stake, unlockAt, newAckVersion);
+
+        if (newAckVersion != 0) {
+            emit AppUnregistered(appId, owner);
+        }
+    }
+
+    /// @notice Withdraw all matured locked stake entries for the caller.
+    function withdraw() external nonReentrant {
+        LockedEntry[] storage entries = _lockedBalance[msg.sender];
+        uint256 total = 0;
+        uint256 i = 0;
+        while (i < entries.length) {
+            if (block.timestamp >= entries[i].unlockAt) {
+                total += entries[i].amount;
+                entries[i] = entries[entries.length - 1];
+                entries.pop();
+            } else {
+                i++;
+            }
+        }
+        require(total > 0, "nothing to withdraw");
+        (bool ok,) = msg.sender.call{value: total}("");
+        require(ok, "transfer failed");
+        emit StakeWithdrawn(msg.sender, total);
+    }
+
+    // ─── Acknowledge ──────────────────────────────────────────────────────────
+
+    /// @notice Record that the caller has manually verified this app's TEE evidence.
+    ///         Records the current ackVersion; becomes stale if updateApp or
+    ///         updateNode is called afterwards. Idempotent: re-acking the same
+    ///         version is a no-op (no revert, no event).
+    function acknowledgeApp(string calldata appId) external {
+        _acknowledgeApp(appId);
+    }
+
+    /// @notice Batch version of acknowledgeApp. All-or-nothing: if any appId
+    ///         does not exist, the entire batch reverts. Per-app idempotency is
+    ///         preserved (re-acking the same version emits no event). Duplicates
+    ///         within the array are allowed; the second occurrence is a no-op.
+    function acknowledgeApps(string[] calldata appIds) external {
+        uint256 n = appIds.length;
+        for (uint256 i = 0; i < n; i++) {
+            _acknowledgeApp(appIds[i]);
+        }
+    }
+
+    /// @notice Withdraw the caller's acknowledgement for an app. After this,
+    ///         isAcknowledged(caller, appId) returns false until they ack again.
+    ///         No-op if the caller has no current ack.
+    function revokeAcknowledgement(string calldata appId) external {
+        _revokeAcknowledgement(appId);
+    }
+
+    /// @notice Batch version of revokeAcknowledgement. No-op per appId for which
+    ///         the caller has no current ack. Does not check that the apps exist
+    ///         (revoking against a stale or missing app is harmless and clears
+    ///         stale entries).
+    function revokeAcknowledgements(string[] calldata appIds) external {
+        uint256 n = appIds.length;
+        for (uint256 i = 0; i < n; i++) {
+            _revokeAcknowledgement(appIds[i]);
+        }
+    }
+
+    function _acknowledgeApp(string calldata appId) internal {
+        require(_apps[appId].owner != address(0), "app not found");
+
+        uint256 ackVersion = _appAckVersions[appId];
+        uint256 prior      = _acks[msg.sender][appId];
+        if (prior == ackVersion + 1) return;
+
+        // Store ackVersion+1 so that ackVersion==0 (initial) is distinguishable from "never acked"
+        if (prior == 0) {
+            _ackCounts[appId]++;
+        }
+        _acks[msg.sender][appId] = ackVersion + 1;
+
+        emit AppAcknowledged(appId, msg.sender, ackVersion);
+    }
+
+    function _revokeAcknowledgement(string calldata appId) internal {
+        uint256 prior = _acks[msg.sender][appId];
+        if (prior == 0) return;
+
+        delete _acks[msg.sender][appId];
+        if (_ackCounts[appId] > 0) {
+            _ackCounts[appId]--;
+        }
+
+        emit AppAcknowledgementRevoked(appId, msg.sender);
+    }
+
+    // ─── Invalidators ─────────────────────────────────────────────────────────
+    //
+    // Sibling contracts whose on-chain state is part of the dapp's user-facing
+    // surface (e.g. SandboxServing's prices) can be authorized by the app owner
+    // to bump _appAckVersions[appId]. This lets price/policy changes invalidate
+    // existing user acks without abusing updateApp (which is for code identity).
+
+    /// @notice Authorize a sibling contract to call invalidateAcks for this app.
+    ///         Only the app owner may authorize.
+    function authorizeInvalidator(string calldata appId, address invalidator)
+        external
+        onlyAppOwner(appId)
+    {
+        require(invalidator != address(0), "zero invalidator");
+        if (_authorizedInvalidators[appId][invalidator]) return;
+        _authorizedInvalidators[appId][invalidator] = true;
+        emit InvalidatorAuthorized(appId, invalidator);
+    }
+
+    /// @notice Revoke a previously-authorized invalidator.
+    ///         Only the app owner may revoke.
+    function revokeInvalidator(string calldata appId, address invalidator)
+        external
+        onlyAppOwner(appId)
+    {
+        if (!_authorizedInvalidators[appId][invalidator]) return;
+        delete _authorizedInvalidators[appId][invalidator];
+        emit InvalidatorRevoked(appId, invalidator);
+    }
+
+    /// @notice Bump the app's ackVersion, invalidating every existing user ack
+    ///         for this app. Callable only by an authorized invalidator.
+    function invalidateAcks(string calldata appId) external {
+        require(_apps[appId].owner != address(0), "app not found");
+        require(_authorizedInvalidators[appId][msg.sender], "not authorized");
+        uint256 newVersion = ++_appAckVersions[appId];
+        emit AcksInvalidated(appId, msg.sender, newVersion);
+    }
+
+    /// @notice Returns true if `invalidator` is currently authorized to call
+    ///         invalidateAcks for `appId`.
+    function isAuthorizedInvalidator(string calldata appId, address invalidator)
+        external
+        view
+        returns (bool)
+    {
+        return _authorizedInvalidators[appId][invalidator];
+    }
+
+    // ─── Views ────────────────────────────────────────────────────────────────
+
+    function getAppInfo(string calldata appId) external view returns (AppInfo memory) {
+        return _apps[appId];
+    }
+
+    function getAckVersion(string calldata appId) external view returns (uint256) {
+        return _appAckVersions[appId];
+    }
+
+    /// @notice Returns a node's info with its EFFECTIVE compose/volumes resolved: if the
+    ///         node's per-node override is empty (inherit), the app-level default is
+    ///         substituted in the returned struct. (Storage still holds empty = inherit;
+    ///         the raw override is observable via the NodeCode event.) A non-existent
+    ///         node (addedAt == 0) is returned as-is without substitution.
+    function getNode(
+        string  calldata appId,
+        address          signerAddress
+    ) external view returns (NodeInfo memory) {
+        NodeInfo memory node = _nodes[appId][signerAddress];
+        if (node.addedAt != 0) {
+            AppInfo storage app = _apps[appId];
+            if (node.composeHash.length == 0) node.composeHash = app.composeHash;
+            if (node.volumesHash.length == 0) node.volumesHash = app.volumesHash;
+        }
+        return node;
+    }
+
+    /// @notice Active node list. Entries are removed immediately when a node is removed.
+    function getNodeList(string calldata appId) external view returns (address[] memory) {
+        return _nodeList[appId];
+    }
+
+    /// @notice All locked stake entries for an owner.
+    function getLockedBalance(address owner) external view returns (LockedEntry[] memory) {
+        return _lockedBalance[owner];
+    }
+
+    /// @notice Returns true if the user has acknowledged the current app version.
+    function isAcknowledged(address user, string calldata appId) external view returns (bool) {
+        uint256 ackVersion = _appAckVersions[appId];
+        return _acks[user][appId] == ackVersion + 1;
+    }
+
+    /// @notice Total number of unique users who have ever acknowledged this app.
+    function getAckCount(string calldata appId) external view returns (uint256) {
+        return _ackCounts[appId];
+    }
+
+    // ─── Internal ─────────────────────────────────────────────────────────────
+
+    function _addNode(
+        string  memory appId,
+        address        signerAddress,
+        string  memory teeUrl,
+        bytes   memory composeHash,
+        bytes   memory volumesHash,
+        uint256        stakeAmount,
+        uint256        newAckVersion
+    ) internal {
+        require(signerAddress != address(0), "zero signer address");
+        _nodes[appId][signerAddress] = NodeInfo({
+            teeUrl:      teeUrl,
+            addedAt:     block.timestamp,
+            stakeAmount: stakeAmount,
+            composeHash: composeHash,
+            volumesHash: volumesHash
+        });
+        _nodeList[appId].push(signerAddress);
+
+        emit NodeUpdated(appId, address(0), signerAddress, stakeAmount, 0, newAckVersion);
+        emit NodeCode(appId, signerAddress, composeHash, volumesHash);
+    }
+}

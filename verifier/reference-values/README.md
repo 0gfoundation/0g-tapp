@@ -28,7 +28,7 @@ custom:    verifier/reference-values/<boot_format>/<version>/<env>/<owner>.json
 
 - **dev and prod images differ** (HARDEN=0 / HARDEN=1) → separate `dev/` / `prod/` per version.
 - **owner is a dimension only in custom builds**. Canonical images (the default,
-  `BUILD_MODE=canonical`) are owner-agnostic: owner/chain/kbs are claimed at runtime via the
+  `BUILD_MODE=canonical`) are owner-agnostic: owner/kbs are claimed at runtime via the
   ClaimConfig RPC and land in the **runtime measurement event log** (a `claim_config` event,
   like `start_app`), NOT in the boot-chain digests — one image ⇒ one reference set at
   `<env>.json`, no owner path segment at all. Verifiers get the owner from the claim_config

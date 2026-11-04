@@ -6,9 +6,15 @@ pub mod error;
 pub mod onchain;
 pub mod app_key;
 pub mod report_data;
+pub mod identity;
+pub mod identity_verify;
+pub mod kms;
 pub mod pinned_tls;
+pub mod scan;
+pub mod refvalues;
 pub mod verify;
 pub mod compat;
+pub mod external_signer;
 
 pub mod proto {
     tonic::include_proto!("tapp_service");

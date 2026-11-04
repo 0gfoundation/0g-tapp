@@ -303,23 +303,6 @@ echo "Compose File: $COMPOSE_FILE"
 echo "========================================"
 echo ""
 
-# Generate signature using shared sign_message.py
-echo "Generating signature..."
-SIGN_OUTPUT=$(python3 "$sign_script" "StartApp" "$PRIVATE_KEY" 2>&1)
-if [ $? -ne 0 ]; then
-  echo "Error generating signature: $SIGN_OUTPUT"
-  exit 1
-fi
-
-SIGNATURE=$(echo "$SIGN_OUTPUT" | cut -d',' -f1)
-TIMESTAMP=$(echo "$SIGN_OUTPUT" | cut -d',' -f2)
-SIGNER_ADDRESS=$(echo "$SIGN_OUTPUT" | cut -d',' -f3)
-
-echo "Signer: $SIGNER_ADDRESS"
-echo "Signature: ${SIGNATURE:0:20}...${SIGNATURE: -20}"
-echo "Timestamp: $TIMESTAMP"
-echo "========================================"
-echo ""
 
 echo "Reading configuration files..."
 
@@ -406,12 +389,31 @@ request_json=$(jq -n \
 echo "Sending StartApp request with signature authentication..."
 echo ""
 
+# Generate signature using shared sign_message.py
+echo "Generating signature..."
+SIGN_OUTPUT=$(printf "%s" "$request_json" | python3 "$sign_script" "StartApp" "$PRIVATE_KEY" - 2>&1)
+if [ $? -ne 0 ]; then
+  echo "Error generating signature: $SIGN_OUTPUT"
+  exit 1
+fi
+
+SIGNATURE=$(echo "$SIGN_OUTPUT" | cut -d',' -f1)
+TIMESTAMP=$(echo "$SIGN_OUTPUT" | cut -d',' -f2)
+SIGNER_ADDRESS=$(echo "$SIGN_OUTPUT" | cut -d',' -f3)
+
+echo "Signer: $SIGNER_ADDRESS"
+echo "Signature: ${SIGNATURE:0:20}...${SIGNATURE: -20}"
+echo "Timestamp: $TIMESTAMP"
+echo "========================================"
+echo ""
+
 # Send request with signature headers and capture both stdout and stderr
 set +e  # Don't exit on error
 response=$(printf "%s" "$request_json" | tr -d '\n' | \
   grpcurl -plaintext \
     -H "x-signature: $SIGNATURE" \
     -H "x-timestamp: $TIMESTAMP" \
+    -H "x-signature-version: 2" \
     -import-path "$SCRIPT_DIR/../proto" \
     -proto tapp_service.proto \
     -d @ \

@@ -31,7 +31,7 @@ command -v docker >/dev/null || { echo "docker is required" >&2; exit 2; }
 # `docker info | grep sysbox-runc` check runs on the deployed enclave (sandbox CI);
 # here we statically verify, offline, that the image was provisioned correctly:
 # sysbox-runc binary present, registered in daemon.json, sysbox.service enabled,
-# and docker data-root pinned off the RAM rootfs overlay (onto /data).
+# and docker data-root pinned off the RAM rootfs overlay (onto the runtime volume at /data).
 if [ "${CHECK_SYSBOX:-0}" = 1 ]; then
     echo "==> [sysbox] static image check"
     export LIBGUESTFS_BACKEND=direct

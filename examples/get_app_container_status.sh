@@ -278,9 +278,22 @@ echo "App ID: $APP_ID"
 echo "========================================"
 echo ""
 
+
+echo "Generating JSON request..."
+
+# Build request JSON
+request_json=$(jq -n \
+  --arg app_id "$APP_ID" \
+  '{
+    app_id: $app_id
+  }')
+
+echo "Sending GetAppContainerStatus request with signature authentication..."
+echo ""
+
 # Generate signature using shared sign_message.py
 echo "Generating signature..."
-SIGN_OUTPUT=$(python3 "$sign_script" "GetAppContainerStatus" "$PRIVATE_KEY" 2>&1)
+SIGN_OUTPUT=$(printf "%s" "$request_json" | python3 "$sign_script" "GetAppContainerStatus" "$PRIVATE_KEY" - 2>&1)
 if [ $? -ne 0 ]; then
   echo "Error generating signature: $SIGN_OUTPUT"
   exit 1
@@ -296,24 +309,13 @@ echo "Timestamp: $TIMESTAMP"
 echo "========================================"
 echo ""
 
-echo "Generating JSON request..."
-
-# Build request JSON
-request_json=$(jq -n \
-  --arg app_id "$APP_ID" \
-  '{
-    app_id: $app_id
-  }')
-
-echo "Sending GetAppContainerStatus request with signature authentication..."
-echo ""
-
 # Send request with signature headers and capture both stdout and stderr
 set +e  # Don't exit on error
 response=$(printf "%s" "$request_json" | tr -d '\n' | \
   grpcurl -plaintext \
     -H "x-signature: $SIGNATURE" \
     -H "x-timestamp: $TIMESTAMP" \
+    -H "x-signature-version: 2" \
     -import-path "$SCRIPT_DIR/../proto" \
     -proto tapp_service.proto \
     -d @ \

@@ -71,3 +71,30 @@ pub fn format_bytes(bytes: u64) -> String {
 
     format!("{:.2} {}", size, UNITS[unit_index])
 }
+
+/// Write a state file whole and rename it into place, so a crash mid-write leaves the
+/// previous version rather than half of a new one. The temporary name is unique per write:
+/// two overlapping writes sharing one could rename each other's half-written file. Mode
+/// 0600: these hold apps' compose and mount files, for root only.
+pub fn write_state_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".{}.{}.tmp", std::process::id(), seq));
+    let tmp = path.with_file_name(name);
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        f.write_all(bytes)?;
+    }
+    std::fs::rename(&tmp, path)
+}

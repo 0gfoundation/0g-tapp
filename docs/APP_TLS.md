@@ -92,8 +92,9 @@ Nothing in the recipe depends on where the image comes from.
 ```
 
 `/run` is tmpfs, so the key stays in memory the TEE protects. A Docker named volume would put
-it in `/data`, which is plain unencrypted ext4 — readable by anyone who can snapshot the disk,
-and the end of the platform's guarantee that an application's private key cannot be extracted.
+it on disk, in the app's persistent volume, where it outlives the boot it belongs to — and under
+`data: plain` is readable by anyone who can snapshot the disk, the end of the platform's guarantee
+that an application's private key cannot be extracted.
 A tmpfs-backed named volume (`driver_opts: {type: tmpfs}`) is not a substitute: each container
 gets its own, so the application finds an empty directory.
 
@@ -152,6 +153,10 @@ A `kms` key additionally requires the app registered on chain and the cluster re
 shortly after a fresh registration the cluster may answer `401` until its own view of the chain
 catches up ([0g-kms#11](https://github.com/0gfoundation/0g-kms/issues/11)).
 
+The measure-only preflight used by `start-app --register-onchain` does not derive
+TLS keys (tapp-server ≥0.11.1). It returns measurements so the CLI can register the
+app before the real start attempts KMS-backed TLS derivation.
+
 > **`local` is not merely the default for some services — it is the only option.** Deriving a
 > `kms` key means reaching the KMS cluster over the network. Any service that the cluster
 > itself depends on, and the cluster's own nodes, therefore cannot use `kms`: they would need
@@ -181,9 +186,17 @@ tapp-cli -s http://<node>:50051 get-app-csr \
   --app-id my-app --domain api.example.com --out my.csr
 ```
 
-**The app does not have to exist yet.** The key is derived from the app id, so a signing request
-can be obtained — and a certificate issued — before anything is deployed. That ordering is what
-makes this workable: the certificate is ready before the container that needs it starts.
+Claim the node and choose its intended `--tls-key-source` before requesting a CSR. Do not
+derive a CSR under the unclaimed default and then change the source: TLS identities are cached,
+and claiming does not rotate an identity already derived in this process.
+
+**With `local`, the app does not have to exist yet.** The key is derived from the app id, so a
+signing request can be obtained — and a certificate issued — before anything is deployed.
+With `kms`, the application container can still start later, but its node must first be
+registered for the app and able to supply evidence accepted by the KMS (and the configured
+Scan when attested admission is enabled); the KMS cluster must also be reachable. Prepare that
+registration and evidence before requesting the CSR. The certificate can then be ready before
+the container that needs it starts.
 
 Take `my.csr` to any ACME client in CSR mode. With [lego](https://github.com/go-acme/lego):
 

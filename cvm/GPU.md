@@ -78,7 +78,7 @@ image excludes cloud scratch by its NVMe model string (`nvme_card<N>` for local 
 `nvme_card-pd` for a persistent disk), which means **attaching one data disk is enough and it
 provisions itself**, exactly as on a CPU instance.
 
-The local SSDs are left unused. They are wiped on stop/start, so they cannot hold `/data`.
+The local SSDs are left unused. They are wiped on stop/start, so they cannot be the data disk.
 
 If a host has more than one genuine spare disk, the node refuses to guess rather than risk
 formatting the wrong one, and says so on the console — naming the disks it found and the command

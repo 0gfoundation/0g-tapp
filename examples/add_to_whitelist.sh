@@ -242,9 +242,20 @@ echo "Address:       $ADDRESS_TO_ADD"
 echo "========================================"
 echo ""
 
+
+# Generate JSON request
+request_json=$(jq -n \
+  --arg address "$ADDRESS_TO_ADD" \
+  '{
+    evm_address: $address
+  }')
+
+echo "Sending AddToWhitelist request..."
+echo ""
+
 # Generate signature
 echo "Generating signature..."
-SIGN_OUTPUT=$(python3 "$sign_script" "AddToWhitelist" "$PRIVATE_KEY" 2>&1)
+SIGN_OUTPUT=$(printf "%s" "$request_json" | python3 "$sign_script" "AddToWhitelist" "$PRIVATE_KEY" - 2>&1)
 
 if [ $? -ne 0 ]; then
   echo "Error generating signature: $SIGN_OUTPUT"
@@ -261,22 +272,13 @@ echo "Timestamp:     $TIMESTAMP"
 echo "========================================"
 echo ""
 
-# Generate JSON request
-request_json=$(jq -n \
-  --arg address "$ADDRESS_TO_ADD" \
-  '{
-    evm_address: $address
-  }')
-
-echo "Sending AddToWhitelist request..."
-echo ""
-
 # Send request with signature headers and capture both stdout and stderr
 set +e  # Don't exit on error
 response=$(printf "%s" "$request_json" | tr -d '\n' | \
   grpcurl -plaintext \
     -H "x-signature: $SIGNATURE" \
     -H "x-timestamp: $TIMESTAMP" \
+    -H "x-signature-version: 2" \
     -import-path "$SCRIPT_DIR/../proto" \
     -proto tapp_service.proto \
     -d @ \
