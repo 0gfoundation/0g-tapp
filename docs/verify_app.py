@@ -47,12 +47,13 @@ CLI   = os.environ.get("TAPP_CLI", "tapp-cli")
 C     = os.environ.get("REGISTRY", "0x2Ce80374318B1d7Fb3345724457a182E0ad165c9")  # TappRegistry (0G testnet)
 R     = os.environ.get("RPC_URL", "https://evmrpc-testnet.0g.ai")
 # CoCo-AS gRPC, verifies evidence. Same rule as tapp-cli: https:// = TLS, a bare
-# host:port = plaintext. The AS serves a self-signed certificate, so the TLS here is
-# encryption without authentication (tapp-cli verify-app --as-pubkey pins it).
-AS    = os.environ.get("AS_ENDPOINT", "https://35.253.66.70:50004")
+# host:port = plaintext. The TLS here is encryption without authentication unless
+# AS_PUBKEY pins the AS's attested key (as tapp-cli verify-app --as-pubkey does).
+# Any network's AS verifies any node: the default is the mainnet scan's (TAPPSCAN.md).
+AS    = os.environ.get("AS_ENDPOINT", "https://tappscan.0g.ai:50004")
 AS_PUBKEY = os.environ.get("AS_PUBKEY", "").lower().removeprefix("0x")
-RELAYS = {"0x2ce80374318b1d7fb3345724457a182e0ad165c9": "https://tappscan.0g.ai",          # testnet
-          "0x54874f536301c993922dd95097e3902e7fbfe612": "https://tappscan.0g.ai/mainnet"}  # mainnet
+RELAYS = {"0x2ce80374318b1d7fb3345724457a182e0ad165c9": "https://tappscan-testnet.34-122-75-6.sslip.io",  # testnet
+          "0x54874f536301c993922dd95097e3902e7fbfe612": "https://tappscan.0g.ai"}                         # mainnet
 RELAY = os.environ.get("RELAY", RELAYS.get(C.lower(), "")).rstrip("/")
 REFS  = os.environ.get("REFERENCE_VALUES", "")
 PROTO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "attestation.proto")
@@ -297,7 +298,10 @@ for signer in nodes:
     nonce = secrets.token_bytes(16)
     raw = relayed = None
     try:
-        ev = subprocess.run([CLI, "-s", teeUrl, "get-evidence", "--app-id", APP,
+        # An https teeUrl is the node's :50052 listener, self-signed per boot: encryption
+        # only (--insecure) is enough, since the evidence is checked below on its own.
+        tls = ["--insecure"] if teeUrl.startswith("https://") else []
+        ev = subprocess.run([CLI, "-s", teeUrl, *tls, "get-evidence", "--app-id", APP,
                              "--nonce", nonce.hex()],
                             capture_output=True, text=True, timeout=30)
         m = re.search(r'Evidence \(hex\): ([0-9a-f]+)', ev.stdout)

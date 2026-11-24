@@ -23,19 +23,27 @@ unchanged).
 ### Mainnet (chain 16661)
 
 Registered on TappRegistry `0x54874F536301c993922Dd95097e3902e7FBfe612`,
-app_id `0g-kms`, **2-of-5**, owner `0x9C58F839451EBf3e7f82442bC48E4088746380Bb`.
+app_id `0g-kms`, **2-of-5**, owner `0xc0603224dE8c3B910a4487368E476e19dC6127cF` (a Fordefi
+multisig vault). Attested admission is on: a node fetching keys must also be verified by
+the mainnet scan (`https://tappscan.0g.ai`), and must run tapp-server ≥ 0.9.0 (below,
+"With attested admission on").
 
 ```
-group_pubkey = 8c30fd0e713be395d8f85ca5e0a879989fa8a4bbf019f0db00c4ee38c05f463a0079ab8c2ccda195f3171b98d0522050
+group_pubkey = 80a8275b3ae9de57003773a8725539a33f82887661de3e8d81e2f07623f786fac055d67b862192a7f3ba3435854508ff
 ```
 
 | node | zone | KBS endpoint (`--kbs-urls`) |
 |---|---|---|
-| 1 | us-central1-a | `https://34.66.205.90:9443` |
-| 2 | us-east1-c | `https://35.229.43.139:9443` |
-| 3 | us-east4-a | `https://35.245.117.228:9443` |
-| 4 | us-west1-a | `https://136.66.58.34:9443` |
-| 5 | us-east5-b | `https://34.162.149.158:9443` |
+| 1 | us-central1-a | `https://136.119.59.130:9443` |
+| 2 | us-east1-c | `https://34.74.119.238:9443` |
+| 3 | us-east4-a | `https://34.181.206.228:9443` |
+| 4 | us-west1-a | `https://136.109.175.247:9443` |
+| 5 | us-east5-b | `https://136.79.131.94:9443` |
+
+This cluster replaced, on 2026-10-14, the one with `group_pubkey 8c30fd0e…2050` (a new
+master, not a reshare): every key derived from the old one is gone, and a mainnet node
+still pointing at the old endpoints gets no key. Point it here with
+`update-trust-anchors --kbs-urls …`.
 
 ### Testnet (0G Galileo, chain 16602)
 
@@ -163,8 +171,9 @@ tapp-cli -s <node> -k <owner-key> claim-config \
 
 - **`--kbs-urls`**: the cluster members, from [Deployed clusters](#deployed-clusters).
   List several — any `t` of them serve a request. **Always pass it**: CVM images
-  bake no list, because one image serves both networks and a baked list would be
-  wrong for one of them. A node claimed without it has no KMS. Calls that need one
+  bake no list from v0.11.1 on, because one image serves both networks and a baked list would be
+  wrong for one of them (images up to v0.10.0 bake the endpoints of a testnet cluster
+  since retired). A node claimed without it has no working KMS. Calls that need one
   fail with `KMS not configured`, but an app in the default `encrypted` data mode
   does **not** fail: it starts on a RAM directory instead, lost at every reboot,
   and the warning goes only to the tapp-server log. `update-trust-anchors
@@ -178,7 +187,7 @@ tapp-cli -s <node> -k <owner-key> claim-config \
   certificate". `update-trust-anchors` fixes it on a running node, no restart.
   The deployed verifier's URL and pin to put here are in
   [TAPPSCAN.md](TAPPSCAN.md).
-  Check with `get-tapp-info` — the `kms :` and `Verifier` lines show exactly
+  Check with `get-tapp-info` — its `KBS:` and `Verifier` sections show exactly
   what the node believes.
 
 Bootstrap ordering matters and is the same for every KMS-derived thing: **chain

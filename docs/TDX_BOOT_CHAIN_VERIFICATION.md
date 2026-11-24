@@ -113,16 +113,17 @@ values and sets the AR4SI `executables` claim (3 = matched).
 - **Two verification methods, same policy** — they differ only in how the reference values
   reach the AS:
   - **Self-hosted AS** (`coco-as-grpc` + `rvps`, RVPS writable): register the release's
-    `verifier/reference-values/<version>/<env>.json` to RVPS → policy reads via `query_reference_value()`.
+    `verifier/reference-values/<boot_format>/<version>/<env>.json` to RVPS → policy reads via `query_reference_value()`.
     The full stack is vendored as a git submodule at `verifier/0g-tapp-verifier/`
     (`tdx-boot-chain/`; upstream
     [`0g-tapp-verifier`](https://github.com/0gfoundation/0g-tapp-verifier)). Pull it with
     `git submodule update --init verifier/0g-tapp-verifier`.
   - **Shared remote AS** (RVPS not writable): inject the values into a copy of the policy at
-    registration time, registered under id `0g-tapp-<version>-<env>` —
-    `verifier/register-shared-as.sh <version> <env> [as-endpoint]`.
-- Client: `tapp-cli verify-app --as-endpoint <as>:50004 --policy-ids 0g-tapp-<version>-<env>`
-  (e.g. `0g-tapp-v0.1.0-dev`) adds the AS policy's verdict. Since tapp-cli 0.9.0 the client
+    registration time, registered under id `0g-tapp-<boot_format>-<version>-<env>` —
+    `verifier/register-shared-as.sh <boot_format> <version> <env> [owner] [as-endpoint]`.
+- Client: `tapp-cli verify-app --as-endpoint https://<as>:50004 --as-pubkey <its pin>
+  --policy-ids 0g-tapp-<boot_format>-<version>-<env>` (e.g. `0g-tapp-uki-v0.11.1-prod`; the
+  hosted AS and its pin are in [TAPPSCAN.md](TAPPSCAN.md)) adds the AS policy's verdict. Since tapp-cli 0.9.0 the client
   needs no policy for the boot chain: it compares the AS's signed token against the
   published reference values itself, like tappscan.
 

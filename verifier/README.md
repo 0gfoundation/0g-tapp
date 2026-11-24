@@ -34,15 +34,15 @@ by RTMR0-2):
 The policy reads reference values from RVPS via the `query_reference_value()` builtin
 under `measurement.<component>.SHA-384` keys — **no values are baked into `policy.rego`**.
 
-The values themselves live in [`reference-values/<version>/<env>.json`](./reference-values/),
-one set per tapp-server release × `{dev,prod}` (see that directory's README for layout and
+The values themselves live in [`reference-values/<boot_format>/<version>/<env>.json`](./reference-values/),
+one set per boot format × tapp-server release × `{dev,prod}` (see that directory's README for layout and
 how to (re)generate them with `cryptpilot-fde` on an Alinux host).
 
 ## Two verification methods (same policy)
 
 ### 1. Self-hosted AS (RVPS writable)
 
-Register the release's `reference-values/<version>/<env>.json` into your own RVPS, then use
+Register the release's `reference-values/<boot_format>/<version>/<env>.json` into your own RVPS, then use
 `policy.rego` unchanged; it reads the values via `query_reference_value()`. The full
 self-hosted stack (coco-as-grpc + rvps + compose + run script) is vendored in as a git
 submodule at [`0g-tapp-verifier/`](./0g-tapp-verifier) (upstream:
@@ -59,11 +59,11 @@ The shared AS's RVPS cannot be written externally, so values are **injected into
 the policy** at registration time and registered under a per-release/env id:
 
 ```bash
-./verifier/register-shared-as.sh v0.1.0 dev            # → policy id 0g-tapp-v0.1.0-dev
-./verifier/register-shared-as.sh v0.1.0 dev 35.253.66.70:50004
+./verifier/register-shared-as.sh uki v0.11.1 prod      # → policy id 0g-tapp-uki-v0.11.1-prod
+./verifier/register-shared-as.sh uki v0.11.1 prod https://<as>:50004   # another AS (default: docs/TAPPSCAN.md's)
 # gated AS (issue #82): the write needs a key; reads (AttestationEvaluate /
 # GetAttestationChallenge) stay open. Unset = unchanged, and an ungated AS ignores the header.
-AS_WRITE_KEY=<key> ./verifier/register-shared-as.sh v0.1.0 dev
+AS_WRITE_KEY=<key> ./verifier/register-shared-as.sh uki v0.11.1 prod
 ```
 
 Keys are issued against the registry's on-chain `admin` signature, expire (30d / 90d / never) and can be revoked. In CI the key comes from the `AS_WRITE_KEY` repository secret. Note what a key does **not** buy: an EAR token records the policy *id* it evaluated, never a hash of the policy, so a write made with a stolen key is as undetectable to verifiers as one made against an open port — the key makes writes attributable and revocable, not verifiable.
@@ -72,15 +72,16 @@ Then evaluate (the AS appends the `_cpu` device-class suffix internally):
 
 ```bash
 tapp-cli verify-app --app-id <id> \
-  --as-endpoint 35.253.66.70:50004 \
-  --policy-ids 0g-tapp-v0.1.0-dev
+  --as-endpoint https://tappscan.0g.ai:50004 --as-pubkey <its pin, docs/TAPPSCAN.md> \
+  --policy-ids 0g-tapp-uki-v0.11.1-prod
 # executables==3 in the EAR token's cpu submod means the boot chain matched
 ```
 
 ## Notes (measured findings)
 
-- **`SetAttestationPolicy` has no auth**: anyone who can reach `:50004` can register or
-  overwrite any `policy_id`. A policy on a shared AS is therefore not a sole root of trust;
+- **`SetAttestationPolicy` has no auth of its own**: on an AS without a gate in front, anyone
+  who can reach `:50004` can register or overwrite any `policy_id` (the hosted one requires a
+  key, above). Either way a policy on a shared AS is not a sole root of trust;
   for the strongest guarantee run a self-hosted AS (method 1) you control.
 - **Overall `ear.status`**: `executables==3` only means the boot chain matched;
   `ear.status==affirming` also needs `hardware` (affected by platform `tcb_status`) etc.

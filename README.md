@@ -28,6 +28,7 @@
 ### Creating a Confidential Computing Instance
 
 To run 0G Tapp, you need to create an Alibaba Cloud ECS instance with confidential computing support.
+The same image also boots on GCP and on bare metal: see [`cvm/README.md`](cvm/README.md) and [`cvm/BARE_METAL.md`](cvm/BARE_METAL.md).
 
 > **GCP (Intel TDX) variant**: To build a hardened, measured, attestable confidential image for Google Cloud from a stock Ubuntu 24.04 cloud image, see [`cvm/`](cvm/) — one-command build (`build-tapp.sh`), full SOP and root-cause notes in [`cvm/cryptpilot-gcp-boot-fix.md`](cvm/cryptpilot-gcp-boot-fix.md), and a security-hardening audit (removes SSH / cloud-init / google-guest-agent / metadata startup-scripts and other backdoor vectors).
 >
@@ -89,17 +90,19 @@ Once the instance is created and running, 0G Tapp service will start automatical
 
 #### Starting an Application
 
-Use the provided example script to deploy an application:
+Use the provided example script to deploy an application. It speaks plaintext gRPC, so run it
+on the node itself; from another machine use `tapp-cli -s https://<node>:50052 --tls-pin 0x<node pin> start-app …`
+(see [Register during start](#register-during-start-recommended)).
 
 ```bash
-./start_app.sh --host HOST --port PORT --app-id APP_ID [OPTIONS]
+examples/start_app.sh --host HOST --port PORT --app-id APP_ID --compose-file FILE [OPTIONS]
 
 # Example with owner credentials
 export TAPP_OWNER_PRIVATE_KEY="0x..."
-./start_app.sh --host your-cvm-instance-host --port 50051 --app-id my-nginx-app --use-owner
+examples/start_app.sh --host localhost --port 50051 --app-id my-nginx-app --compose-file docker-compose.yml --use-owner
 
 # Example with custom private key
-./start_app.sh --host localhost --port 50051 --app-id my-app --private-key 0xabcd1234...
+examples/start_app.sh --host localhost --port 50051 --app-id my-app --compose-file docker-compose.yml --private-key 0xabcd1234...
 ```
 
 **Options:**
@@ -107,7 +110,7 @@ export TAPP_OWNER_PRIVATE_KEY="0x..."
 - `--port PORT`: gRPC server port (default: 50051)
 - `--app-id APP_ID`: Application ID (default: test-broker-app)
 - `--private-key KEY`: Private key for signing (required unless using presets)
-- `--compose-file FILE`: Docker compose file (default: examples/docker-compose.yml)
+- `--compose-file FILE`: Docker compose file (required in practice: its default, examples/docker-compose.yml, is not shipped)
 - `--use-owner`: Use pre-configured owner credentials (requires TAPP_OWNER_PRIVATE_KEY env var)
 - `--use-whitelist`: Use pre-configured whitelist user credentials (requires TAPP_WHITELIST_PRIVATE_KEY env var)
 
@@ -198,17 +201,17 @@ mode is refused at `start-app`, never silently mapped.
 
 #### Stopping an Application
 
-Stop and remove a deployed application:
+Stop and remove a deployed application (on the node, like `start_app.sh`; remotely, `tapp-cli … stop-app`):
 
 ```bash
-./stop_app.sh --host HOST --port PORT --app-id APP_ID [OPTIONS]
+examples/stop_app.sh --host HOST --port PORT --app-id APP_ID [OPTIONS]
 
 # Example with owner credentials
 export TAPP_OWNER_PRIVATE_KEY="0x..."
-./stop_app.sh --host your-cvm-instance-host --port 50051 --app-id my-nginx-app --use-owner
+examples/stop_app.sh --host localhost --port 50051 --app-id my-nginx-app --use-owner
 
 # Example with custom private key
-./stop_app.sh --host localhost --port 50051 --app-id my-app --private-key 0xabcd1234...
+examples/stop_app.sh --host localhost --port 50051 --app-id my-app --private-key 0xabcd1234...
 ```
 
 **Options:**
@@ -370,14 +373,14 @@ For more details, see the [Tapp documentation](https://0g-labs.notion.site/0G-Ta
 
 ```bash
 # Clone repository
-git clone https://github.com/0glabs/0g-tapp.git
+git clone https://github.com/0gfoundation/0g-tapp.git
 cd 0g-tapp
 
 # Build
 cargo build --release
 
 # Run
-./target/release/tapp-service --config config.toml
+./target/release/tapp-server --config config.toml
 ```
 
 ## Configuration
@@ -436,7 +439,7 @@ enabled = true
 # measured runtime event). The old initial_whitelist config was removed.
 
 [boot]
-socket_path = "/var/run/docker.sock"
+aa_config_path = "config/attestation-agent.toml"   # attestation agent config (default; created if missing)
 
 [logging]
 level = "info"
@@ -454,6 +457,10 @@ node_urls = [
     "https://kms-node-1:9443",
     "https://kms-node-2:9443",
 ]
+# How long a start keeps retrying while the KMS cannot yet see a fresh registration
+# (default 240000 ms; keep it under the KMS's 300 s timestamp tolerance):
+# [kbs.retry]
+# onchain_wait_ms = 240000
 ```
 
 There is no `[chain]` section (an old one is ignored). A node is not tied to one
@@ -468,12 +475,16 @@ freshly booted tapp is UNCLAIMED — every owner-level RPC is rejected until som
 claims it:
 
 ```bash
-tapp-cli -s http://<tapp>:50051 -k 0x<your-key> claim-config
+# First contact: the node's own evidence authenticates itself. Verify its quote
+# (verify-app, direct mode) and take runtime_data.tls_public_key as the node pin.
+tapp-cli -s https://<tapp>:50052 --insecure get-evidence
+
+tapp-cli -s https://<tapp>:50052 --tls-pin 0x<node pin> -k 0x<your-key> claim-config
 
 # Or claim and configure in one call. CVM images bake no KMS cluster (one image
 # serves both networks), so a node whose apps use the KMS needs --kbs-urls here
 # or via update-trust-anchors later:
-tapp-cli -s http://<tapp>:50051 -k 0x<your-key> claim-config \
+tapp-cli -s https://<tapp>:50052 --tls-pin 0x<node pin> -k 0x<your-key> claim-config \
   --kbs-urls "https://kms-1:9443,https://kms-2:9443" \
   --tls-key-source kms \
   --scan-url https://scan.example \
@@ -494,7 +505,7 @@ cluster's identity, can be changed after the claim — owner-only, and every cha
 into the runtime measurement carrying the resulting anchors in full:
 
 ```bash
-tapp-cli -s http://<tapp>:50051 -k 0x<owner-key> update-trust-anchors \
+tapp-cli -s https://<tapp>:50052 --tls-pin 0x<node pin> -k 0x<owner-key> update-trust-anchors \
   --kbs-urls "https://kms-1:9443,https://kms-2:9443" \
   --scan-url https://scan.example --scan-pubkey 0x<sha256>
 ```
@@ -559,8 +570,8 @@ cannot invent one.
   verify-app fails a node whose resumed state for the app is not the last one this
   boot measured for it, or the one before (which a process stopped between measuring
   a change and recording it leaves).
-- **Hijack window**: practically closed — don't expose :50051 before claiming
-  (cloud firewall), and claim right after boot. Even if raced, the intruder's
+- **Hijack window**: practically closed — don't expose :50051 or :50052 to anyone
+  but yourself before claiming (cloud firewall), and claim right after boot. Even if raced, the intruder's
   address is indelibly measured, your own claim fails immediately (instant
   detection), and the box holds no secrets yet — delete and recreate.
 
@@ -761,7 +772,7 @@ What has to exist:
   must first be added to the organisation as a custom chain (Settings > Chains > Add EVM chain).
 - **Funds.** The vault is the sender. It pays the gas of every call, and the stake of
   `registerApp` and `addNode`, on each chain used. The stake must be at least the registry's
-  `minStakeAmount()`: 0.1 OG on mainnet and 1 OG on testnet as of October 2026.
+  `minStakeAmount()`: 10 OG on mainnet since 2026-10-28 (0.1 OG before) and 1 OG on testnet.
 
 What tapp-cli does:
 
@@ -861,7 +872,7 @@ on-chain `addedAt` to that block. Nothing in tapp reads it, but it means "when t
 record was last written", not "when this machine joined".
 
 ```bash
-tapp-cli -s http://<tapp>:50051 -k 0x<deployer-key> start-app \
+tapp-cli -s https://<tapp>:50052 --tls-pin 0x<node pin> -k 0x<deployer-key> start-app \
   -f docker-compose.yml --app-id my-app \
   --register-onchain \
   --rpc-url https://evmrpc-testnet.0g.ai \
@@ -875,7 +886,7 @@ is already running:
 
 ```bash
 # Register a new app (fetches hashes and signerAddress from --server automatically)
-tapp-cli -s http://<tapp>:50051 -k 0x<deployer-key> register-onchain \
+tapp-cli -s https://<tapp>:50052 --tls-pin 0x<node pin> -k 0x<deployer-key> register-onchain \
   --app-id my-app \
   --rpc-url https://evmrpc-testnet.0g.ai \
   --contract 0x<TappRegistry> \
@@ -883,13 +894,13 @@ tapp-cli -s http://<tapp>:50051 -k 0x<deployer-key> register-onchain \
 
 # Set the app-level declaration (the default for new nodes) to what this node
 # runs — e.g. after every node of a multi-node app has been upgraded
-tapp-cli -s http://<tapp>:50051 -k 0x<deployer-key> update-onchain \
+tapp-cli -s https://<tapp>:50052 --tls-pin 0x<node pin> -k 0x<deployer-key> update-onchain \
   --app-id my-app \
   --rpc-url https://evmrpc-testnet.0g.ai \
   --contract 0x<TappRegistry>
 
 # Add a new TEE node to an existing app
-tapp-cli -s http://<new-node>:50051 -k 0x<deployer-key> add-node-onchain \
+tapp-cli -s https://<new-node>:50052 --tls-pin 0x<node pin> -k 0x<deployer-key> add-node-onchain \
   --app-id my-app \
   --rpc-url https://evmrpc-testnet.0g.ai \
   --contract 0x<TappRegistry> \
@@ -899,7 +910,7 @@ tapp-cli -s http://<new-node>:50051 -k 0x<deployer-key> add-node-onchain \
 # node is unreachable; otherwise it is fetched from --server automatically.
 # Removing the LAST node unregisters the app: anyone may then register the same
 # app_id and take its KMS keys. To move an app, re-key or add a node instead.
-tapp-cli -s http://<node>:50051 -k 0x<deployer-key> remove-node-onchain \
+tapp-cli -s https://<node>:50052 --tls-pin 0x<node pin> -k 0x<deployer-key> remove-node-onchain \
   --app-id my-app \
   --rpc-url https://evmrpc-testnet.0g.ai \
   --contract 0x<TappRegistry>
@@ -907,14 +918,14 @@ tapp-cli -s http://<node>:50051 -k 0x<deployer-key> remove-node-onchain \
 # Re-key a node: replace its old signer with a new one atomically (stake transfers
 # directly, no withdrawal needed). New signer is fetched from --server unless
 # --new-signer is provided.
-tapp-cli -s http://<node>:50051 -k 0x<deployer-key> update-node-onchain \
+tapp-cli -s https://<node>:50052 --tls-pin 0x<node pin> -k 0x<deployer-key> update-node-onchain \
   --app-id my-app \
   --rpc-url https://evmrpc-testnet.0g.ai \
   --contract 0x<TappRegistry>
 
 # Withdraw all matured stake entries belonging to the caller (across all apps).
-# Run this after the lock period elapses on any node you removed.
-tapp-cli -s http://<any-tapp>:50051 -k 0x<deployer-key> withdraw \
+# Run this after the lock period elapses on any node you removed. No --server needed.
+tapp-cli -k 0x<deployer-key> withdraw \
   --rpc-url https://evmrpc-testnet.0g.ai \
   --contract 0x<TappRegistry>
 ```
@@ -978,17 +989,21 @@ See [A stable identity from the KMS](#a-stable-identity-from-the-kms).
   written, and runtime_data names no app, so such a key is another app's.
 
 ```bash
-# full verification: registry + published reference values
+# full verification: registry + published reference values.
+# tapp-cli <= 0.11.1 defaults to an AS that is no longer current: give the AS and its pin
+# (docs/TAPPSCAN.md). The AS is network-agnostic, so the mainnet scan's serves testnet too.
 tapp-cli verify-app \
   --app-id my-app \
   --rpc-url https://evmrpc-testnet.0g.ai \
-  --contract 0x<TappRegistry>
+  --contract 0x<TappRegistry> \
+  --as-endpoint https://tappscan.0g.ai:50004 \
+  --as-pubkey 0x<AS pin>             # or TAPP_AS_ENDPOINT / TAPP_AS_PUBKEY
+  # --relay <scan URL>               # nodes whose port is closed to you, see below
   # --reference-values <dir>         # pinned/offline values instead of the published ones
-  # --as-endpoint https://host:port  # CoCo-AS gRPC; TLS now, so give the scheme
-  # --as-pubkey 0x<sha256>           # pin the AS's TLS key (or TAPP_AS_PUBKEY); current value in docs/TAPPSCAN.md
 
 # direct mode (single node, not yet registered): prints attested values verbatim
-tapp-cli -s http://<tapp>:50051 verify-app --app-id my-app
+tapp-cli -s https://<tapp>:50052 --insecure verify-app --app-id my-app \
+  --as-endpoint https://tappscan.0g.ai:50004 --as-pubkey 0x<AS pin>
 ```
 
 **Nodes whose port is closed to you** (open only to the scan and their operators) are
@@ -997,10 +1012,16 @@ not answer here; relayed by …`. That is transport only: the evidence is checke
 if fetched directly, and the quote must echo the random challenge sent for it
 (`fresh : ✓`). An old quote is genuine too, so passing one off as new is the one thing a
 relay could do, and the echo is what rules it out; a quote echoing a different challenge
-fails whichever way it came. `docs/verify_app.py` does all of the above the same way, except
-the owner check (it does not read `claim_config`) and three KMS-key checks: it does not
-re-derive each address from its public key, read keys only the event log names, or judge
-each key by the KMS settings it was taken under.
+fails whichever way it came. tapp-cli ≤ 0.11.1 relays through scan URLs that are no longer
+current, so pass `--relay <this network's scan URL>` (chain mode): mainnet
+`https://tappscan.0g.ai`, testnet `https://tappscan-testnet.34-122-75-6.sslip.io`.
+
+`docs/verify_app.py` does all of the above the same way (give it the AS, pin and relay as
+`AS_ENDPOINT`, `AS_PUBKEY`, `RELAY`), except the owner check (it does not read
+`claim_config`), the ≥0.11.1 `identities`/`key_commitments` (it does not validate them) and
+four KMS-key checks: it does not re-derive each address from its public key, read keys only
+the event log names, fail keys no event of the app names, or judge each key by the KMS
+settings it was taken under.
 
 The AS is trusted for the quote, so **pin it** (`--as-pubkey`, or `TAPP_AS_PUBKEY` once;
 the current value is in [`docs/TAPPSCAN.md`](docs/TAPPSCAN.md)). Unpinned, anyone on the
@@ -1028,7 +1049,7 @@ roll firmware out behind Intel, and the outstanding advisories are listed.
 List the apps a server is currently running (read-only, no key needed):
 
 ```bash
-tapp-cli -s http://<tapp>:50051 list-apps
+tapp-cli -s https://<tapp>:50052 --tls-pin 0x<node pin> list-apps
 ```
 
 ### Managing Ack Invalidators
@@ -1077,9 +1098,10 @@ services:
 ```
 
 ```bash
-# From inside the container or on the host — no signature needed, the socket is the authorization:
-grpcurl -unix -plaintext -d '{"app_id": "my-app"}' /run/tapp/tapp.sock tapp_service.TappService/GetSecretResource
-grpcurl -unix -plaintext -d '{"app_id": "my-app"}' /run/tapp/tapp.sock tapp_service.TappService/GetAppTlsCert
+# From inside the container or on the host — no signature needed, the socket is the authorization.
+# The server offers no reflection, so give grpcurl the proto (proto/tapp_service.proto):
+grpcurl -unix -plaintext -import-path proto -proto tapp_service.proto -d '{"app_id": "my-app"}' /run/tapp/tapp.sock tapp_service.TappService/GetSecretResource
+grpcurl -unix -plaintext -import-path proto -proto tapp_service.proto -d '{"app_id": "my-app"}' /run/tapp/tapp.sock tapp_service.TappService/GetAppTlsCert
 ```
 
 > **⚠️ Security note:** The Unix socket grants access to all app keys and secret
@@ -1096,14 +1118,14 @@ The returned `secret` bytes are the HKDF-derived app key from the KMS cluster, d
 
 ### Remote / TCP access
 
-The server always listens on `bind_address` (default `0.0.0.0:50051`) for remote clients — management, the on-chain `teeUrl`, `verify-app`. The Unix socket above is additional, not a replacement. The four key-material RPCs and the app-facing `ResolveAppIdentity` lookup are socket-only; other methods work over either.
+The server always listens on `bind_address` (plaintext; default `127.0.0.1:50051`, CVM images set `0.0.0.0:50051`) and on `tls_bind_address` (default `0.0.0.0:50052`). Remote clients — management, the on-chain `teeUrl`, `verify-app` — use the TLS listener; `:50051` is meant to stay closed to all but the node (#141). The Unix socket above is additional, not a replacement. The four key-material RPCs and the app-facing `ResolveAppIdentity` lookup are socket-only; other methods work over either.
 
 ### Derivation material (per-caller keys)
 
 `GetSecretResourceRequest` takes an optional `material` field — hex-encoded derivation material bound by KMS into the key alongside `app_id`. tapp normalizes it to lowercase hex without `0x` and refuses more than 256 decoded bytes. tapp-server ≥0.11.1 records a commitment without interpreting the secret as a signing key. This lets an app derive independent per-agent keys (e.g. `chainId ‖ contractAddress ‖ sealId`) instead of holding one app-wide secret and deriving locally.
 
 ```bash
-grpcurl -unix -plaintext \
+grpcurl -unix -plaintext -import-path proto -proto tapp_service.proto \
   -d '{"app_id": "my-app", "material": "deadbeef01"}' \
   /run/tapp/tapp.sock tapp_service.TappService/GetSecretResource
 ```
