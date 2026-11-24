@@ -228,7 +228,13 @@ ssl_certificate_key /certs/tls.key;             # the TEE's
 ```
 
 The certificate is public, so shipping it in the compose directory is fine — `start-app`
-uploads it like any other mounted file. Renewal needs `nginx -s reload`, not a restart.
+uploads it like any other mounted file.
+
+Renewal is a restart. With `kms` the key does not change, so the same CSR is signed again; the
+new `fullchain.pem` reaches the node only through `stop-app` and `start-app`, because no RPC
+replaces a mounted file in place; and since the file's hash is measured, the app needs an
+`updateApp` on chain as well. Behind a load balancer, do one node at a time. A restart for any
+other reason needs no new certificate.
 
 That nginx starts at all is itself a check: a certificate and key that did not match would be
 refused outright.
