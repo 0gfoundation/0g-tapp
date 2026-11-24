@@ -1,8 +1,10 @@
 # Verifying a tapp node by App ID (on-chain → fetch evidence → verify signature → reconcile)
 
-> **This is now built into the CLI**: just run `tapp-cli verify-app --app-id <X> --rpc-url <RPC> --contract <Registry>`;
-> for apps not yet registered on-chain, use direct mode `tapp-cli -s <server> verify-app --app-id <X>`. This document describes what it does internally, plus
-> the equivalent hand-rolled `cast`/`grpcurl` flow (`docs/verify_app.py` is a script reference with the same logic; the CLI implementation is in `src/verify.rs`).
+> **This is now built into the CLI**: just run `tapp-cli verify-app --app-id <X> --rpc-url <RPC> --contract <Registry> --as-endpoint <AS> --as-pubkey <pin>`
+> (the AS and its pin are in [TAPPSCAN.md](TAPPSCAN.md); give both explicitly — tapp-cli ≤ 0.11.1 defaults to a retired AS);
+> for apps not yet registered on-chain, use direct mode `tapp-cli -s <server> verify-app --app-id <X>`. A node whose port is closed to you is reached through
+> the scan of its registry; tapp-cli ≤ 0.11.1 has outdated scan URLs for that, so add `--relay <that network's scan URL>` (TAPPSCAN.md). This document describes what it does internally, plus
+> the equivalent hand-rolled `cast`/`grpcurl` flow (`docs/verify_app.py` is a script reference with the same logic; the CLI implementation is in `tapp-common/src/verify.rs`).
 
 **The verifier's only input is `app_id`.** Everything else is automatic: read the app's registration info and node list from the chain →
 fetch evidence from the `teeUrl` recorded on-chain for each node → verify the quote signature/TCB → reconcile the measurements and identity in the evidence against the chain, item by item.
@@ -16,7 +18,7 @@ Input: app_id
   │
   └─ For each node signer:
       ├─② get-evidence(teeUrl, app_id)        fetch evidence
-      ├─③ verify quote signature + TCB  (CoCo-AS gRPC 35.253.66.70:50004, see §③)
+      ├─③ verify quote signature + TCB  (CoCo-AS gRPC `:50004`, see §③)
       └─④ reconcile evidence ↔ chain:
             report_data == sha512(runtime_data as-is bytes), and runtime_data.signer == signerAddress
             start_app event compose_hash == on-chain composeHash
@@ -57,7 +59,7 @@ cast call "$C" "getNodeList(string)(address[])" "$APP_ID" --rpc-url "$R"
 cast call "$C" "getNode(string,address)((string,uint256,uint256,bytes,bytes))" "$APP_ID" "$SIGNER" --rpc-url "$R"
 ```
 
-### Encoding of on-chain hashes (must be reconstructed exactly like this when reconciling) — `src/onchain.rs:103`
+### Encoding of on-chain hashes (must be reconstructed exactly like this when reconciling) — `tapp-common/src/onchain.rs` (`combine_map_hashes`)
 
 | field | encoding |
 |---|---|
@@ -73,10 +75,12 @@ cast call "$C" "getNode(string,address)((string,uint256,uint256,bytes,bytes))" "
 ## ② Fetching evidence (using the on-chain teeUrl)
 
 ```bash
-tapp-cli -s <teeUrl> get-evidence --app-id <APP_ID> --nonce $(openssl rand -hex 16) 2>&1 \
+tapp-cli -s <teeUrl> --insecure get-evidence --app-id <APP_ID> --nonce $(openssl rand -hex 16) 2>&1 \
   | grep -o 'Evidence (hex): [0-9a-f]*' | sed 's/Evidence (hex): //' > ev.hex
 ```
 
+- `--insecure` because a teeUrl is normally the node's `https://<host>:50052` listener, whose certificate is self-signed per boot:
+  the channel only needs encryption here, since the evidence authenticates itself (§③④).
 - The signer is not persisted: when the tapp server restarts, it re-derives and the address changes; use `update-node-onchain` to sync the chain.
 - **Node-level evidence (≥0.8.0)**: omitting `--app-id` (empty) returns evidence for **the node itself** — the signer is the node's
   common signer (generated at every boot; all app signers are derived from it), and `runtime_data.tls_public_key`
@@ -176,7 +180,7 @@ Nothing in the quote says when it was generated, so a cached quote and a fresh q
 indistinguishable. If the caller supplies a random value on each request, they become distinguishable:
 
 ```
-$ tapp-cli -s <teeUrl> get-evidence --app-id <APP_ID> --nonce 0a1b2c3d…
+$ tapp-cli -s <teeUrl> --insecure get-evidence --app-id <APP_ID> --nonce 0a1b2c3d…
   runtime_data: {"nonce":"0x0a1b2c3d…","signer":"0x…","tls_public_key":"0x…"}
   report_data : <sha512, 128 hex>
   challenge   : echoed — this quote was produced for this request
@@ -215,10 +219,12 @@ raw = binascii.unhexlify(open('ev.hex').read().strip())
 req = {"verification_requests": [
         {"tee": "tdx", "evidence": base64.urlsafe_b64encode(raw).rstrip(b'=').decode()}]}
 open('/tmp/as_req.json','w').write(json.dumps(req))
-# requires trustee's protos/attestation.proto locally
+# requires trustee's protos/attestation.proto locally. The AS (TAPPSCAN.md) speaks TLS with a
+# self-signed certificate: -insecure only encrypts — check its key against the pin in TAPPSCAN.md
+# (docs/verify_app.py does, and then trusts exactly that certificate with -cacert)
 subprocess.run(
-  "grpcurl -plaintext -import-path . -proto attestation.proto -d @ "
-  "35.253.66.70:50004 attestation.AttestationService/AttestationEvaluate < /tmp/as_req.json",
+  "grpcurl -insecure -import-path . -proto attestation.proto -d @ "
+  "tappscan.0g.ai:50004 attestation.AttestationService/AttestationEvaluate < /tmp/as_req.json",
   shell=True)
 ```
 
@@ -266,7 +272,7 @@ Old evidence (no `runtime_data`) uses the legacy reading: the first 20 bytes of 
 ### Quote measurements / report_data — taken directly from the AS parse result in §③
 
 **Do not hand-roll quote byte offsets to extract measurements.** The field offsets inside the TD body are fixed, but **the body's starting offset within the quote varies with the quote version**:
-v4 header = 48 bytes, **v5 header = 54 bytes**. Hardcoding `q[48:]` on a v5 quote shifts everything by 6 bytes, mistaking the tail of RTMR3 for the prefix of report_data — this is a pit that has actually been fallen into (see `VERIFIER_AGENT_GUIDANCE.md`).
+v4 header = 48 bytes, **v5 header = 54 bytes**. Hardcoding `q[48:]` on a v5 quote shifts everything by 6 bytes, mistaking the tail of RTMR3 for the prefix of report_data — this is a pit that has actually been fallen into.
 
 The AS (§③) has already aligned and parsed correctly per version; just read the token's `submods.cpu0.ear.veraison.annotated-evidence.tdx.quote.body`:
 
@@ -353,8 +359,9 @@ domain `cryptpilot.alibabacloud.com`, produced during the initrd stage, ordered 
 
 ### tapp operations
 
-domain `tapp.0g.com`, triggered by `start_app`/`stop_app`/`start_service`/`get_app_secret_key`/`get_secret_resource`/`docker_login`
-(code: `extend_measurement()` → AA `extend_runtime_measurement`):
+domain `tapp.0g.com`, triggered by `start_app`/`stop_app`/`start_service`/`stop_service`/`get_app_secret_key`/`get_secret_resource`/`docker_login`/`docker_logout`/
+`add_to_whitelist`/`remove_from_whitelist`/`withdraw_balance`, and `claim_config`/`update_trust_anchors`/`claim_resumed`/`apps_resumed` (below)
+(code: `extend_measurement()` → AA `extend_runtime_measurement`; the names are in `src/measurement_service.rs`):
 
 ```
 tapp.0g.com <operation> {"app_id","operation","result","error",
@@ -429,10 +436,11 @@ Reconciliation rules (add one step to §④):
 1. A **`claim_config` event must exist** in the event log (none → the node is ownerless or took an unmeasured path; reject);
 2. If there are multiple (e.g. config mode restarting across processes), **the `owner` of all `claim_config` events must be identical**;
 3. `owner` == the owner registered on-chain for this node (mismatch → the owner was squatted or the registration does not match; reject);
-4. `kbs_node_urls` / `scan_url` are for audit: which KMS cluster and which verifier the node claimed at the time. (Whether a KMS key was taken over a checked connection is recorded in the key's own `get_secret_resource` event, not inferred from these.) Events from tapp-server before 0.9.0 also carry `chain_rpc_url` / `chain_contract_address`; they were a label only (nothing used them) and are no longer recorded — a node can be registered on more than one chain.
+4. `kbs_node_urls` / `scan_url` are for audit: which KMS cluster and which verifier the node claimed at the time. A later `update_trust_anchors` event (`update-trust-anchors`) carries the anchors in full after each change, so the newest of `claim_config` / `update_trust_anchors` is what the node uses now. (Whether a KMS key was taken over a checked connection is recorded in the key's own `get_secret_resource` event, not inferred from these.) Events from tapp-server before 0.9.0 also carry `chain_rpc_url` / `chain_contract_address`; they were a label only (nothing used them) and are no longer recorded — a node can be registered on more than one chain.
 
 The claim event is produced by the first claim after boot (dynamic mode via the ClaimConfig RPC, or automatic claiming at startup in config.toml preset mode).
 On every VM reboot the RTMRs are zeroed, the claim happens again, and it is measured again — the owner and the quote always share a lifecycle.
+A tapp-server restarted within the same boot measures what it read back instead: `claim_resumed` (the owner and anchors, which must repeat the claim / update before it) and `apps_resumed` (each app's owner and hashes, which must be the state after its last `start_app`/`start_service`/`stop_app` or the one before); anything else was written by something other than tapp-server (`verify-app` checks both).
 
 **`tapp-cli verify-app` already performs the rules in this section automatically** (v0.3.0+): in chain mode the reconcile line prints
 `owner✓/✗/?` (✓ = claim_config owner == on-chain owner; ✗ = mismatch, Result ❌; ? = no claim_config event,
@@ -572,8 +580,8 @@ Input `app_id = 0g-agentic-id-attestor`, fully automatic (script in the appendix
 ## Quick checklist (input = app_id)
 
 1. Read registration info + each node's teeUrl from the chain: `getAppInfo` / `getNodeList` / `getNode`.
-2. For each node: `get-evidence --app-id <id> --nonce <random hex>` at its teeUrl.
-3. Verify quote signature + TCB: submit `AttestationEvaluate` to **CoCo-AS gRPC `35.253.66.70:50004`** (leave the AS request's `runtime_data` empty); check `ear.status==affirming` and `tcb_status==UpToDate` (**do not use the KBS on 8080 — that is RCAR key distribution and will 401**).
+2. For each node: `get-evidence --app-id <id> --nonce <random hex>` at its teeUrl (`--insecure` for an `https://` teeUrl, §②).
+3. Verify quote signature + TCB: submit `AttestationEvaluate` to **the CoCo-AS in [TAPPSCAN.md](TAPPSCAN.md)** over TLS, its key checked against the pin there (leave the AS request's `runtime_data` empty); check `ear.status==affirming` and `tcb_status==UpToDate` (**do not use the KBS on 8080 — that is RCAR key distribution and will 401**).
 4. Reconcile:
    - first verify `report_data == sha512(evidence.runtime_data as-is bytes)`, then read `runtime_data.signer` == on-chain signerAddress (never hand-roll quote offsets; for old evidence without this field, fall back to the first-20-bytes reading);
    - if a nonce was sent, check that `runtime_data.nonce` echoes it (distinguishes a fresh quote from a cached one);

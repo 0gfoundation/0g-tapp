@@ -65,7 +65,8 @@ Automated on the al8 self-hosted runner (`.github/workflows/build-cvm.yml`); man
 ```bash
 cvm/ci/setup-toolchain.sh                                  # provision the 0.8.0 + #128/#130 toolchain once
 cvm/ci/gen-reference-values.sh \
-  <release-image> <boot_format> <version> <env> <owner>   # writes <boot_format>/<version>/<env>/<owner>.json
+  <release-image> <boot_format> <version> <env> [owner]   # writes <boot_format>/<version>/<env>.json
+                                                          # (custom builds, owner given: <env>/<owner>.json)
 ```
 
 ## Using
@@ -73,5 +74,5 @@ cvm/ci/gen-reference-values.sh \
 - **Self-hosted AS** (RVPS writable): register the json to RVPS; the policy reads it via
   `query_reference_value()`. See the `../0g-tapp-verifier/` submodule (`tdx-boot-chain/`).
 - **Shared AS** (RVPS not writable): inject the json into the policy at registration —
-  `verifier/register-shared-as.sh <boot_format> <version> <env> <owner> [as-endpoint]` registers it as
-  `0g-tapp-<boot_format>-<version>-<env>-<owner>`.
+  `verifier/register-shared-as.sh <boot_format> <version> <env> [owner] [as-endpoint]` registers it as
+  `0g-tapp-<boot_format>-<version>-<env>` (custom builds: `…-<owner>`).
