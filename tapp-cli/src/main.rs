@@ -321,11 +321,12 @@ enum Commands {
         #[arg(long)]
         contract: Option<String>,
         /// CoCo Attestation Service gRPC endpoint (https://host:port; a bare host:port is
-        /// plaintext)
+        /// plaintext). Default: the mainnet scan's AS, which verifies quotes from either
+        /// network
         #[arg(
             long,
             env = "TAPP_AS_ENDPOINT",
-            default_value = "https://35.253.66.70:50004"
+            default_value = "https://tappscan.0g.ai:50004"
         )]
         as_endpoint: String,
 

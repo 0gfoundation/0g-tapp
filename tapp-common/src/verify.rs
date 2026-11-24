@@ -1095,11 +1095,14 @@ async fn fetch_evidence(tee_url: &str, app_id: &str, nonce: &[u8]) -> Result<Vec
 
 /// The scan that relays evidence for nodes of a known registry. A node whose port is
 /// closed to the caller is reached through it — transport only: what comes back is
-/// checked here exactly as if fetched directly, challenge included.
+/// checked here exactly as if fetched directly, challenge included. One scan per network,
+/// each serving only its own registry (docs/TAPPSCAN.md).
 pub fn known_relay(contract: &str) -> Option<&'static str> {
     match contract.to_ascii_lowercase().as_str() {
-        "0x2ce80374318b1d7fb3345724457a182e0ad165c9" => Some("https://tappscan.0g.ai"),
-        "0x54874f536301c993922dd95097e3902e7fbfe612" => Some("https://tappscan.0g.ai/mainnet"),
+        "0x2ce80374318b1d7fb3345724457a182e0ad165c9" => {
+            Some("https://tappscan-testnet.34-122-75-6.sslip.io")
+        }
+        "0x54874f536301c993922dd95097e3902e7fbfe612" => Some("https://tappscan.0g.ai"),
         _ => None,
     }
 }
@@ -2156,11 +2159,11 @@ mod relay_tests {
     fn each_known_registry_has_its_own_relay() {
         assert_eq!(
             known_relay("0x2Ce80374318B1d7Fb3345724457a182E0ad165c9"),
-            Some("https://tappscan.0g.ai")
+            Some("https://tappscan-testnet.34-122-75-6.sslip.io")
         );
         assert_eq!(
             known_relay("0x54874F536301c993922Dd95097e3902e7FBfe612"),
-            Some("https://tappscan.0g.ai/mainnet")
+            Some("https://tappscan.0g.ai")
         );
         // The relay only serves nodes of the registry it scans; a different one gets none.
         assert_eq!(known_relay("0x5f0d9c243048F5a55468472c6F090184E2E333c7"), None);
