@@ -52,7 +52,8 @@ same TEE app, so it presents the same key — pin it, or every verdict
 `verify-app` prints could come from whoever is on the path (it warns, and never
 reports better than ⚠️, without one). An AS judges a quote, not a network, so
 either instance's AS verifies the nodes of both; these docs use the mainnet one.
-Pass it explicitly: tapp-cli ≤ 0.11.1 defaults `--as-endpoint` to a retired AS.
+tapp-cli ≥ 0.11.2 uses it by default; ≤ 0.11.1 defaults `--as-endpoint` to a
+retired AS, so pass it there. The pin is never a default: always pass it.
 
 ```
 --as-endpoint https://tappscan.0g.ai:50004
@@ -81,8 +82,9 @@ fails as an h2 protocol error, so always give the scheme.
 - `verify-app --as-endpoint` → `https://tappscan.0g.ai:50004` with its pin, for
   nodes of either network.
 - `verify-app` on a node whose port is closed to you fetches its evidence through
-  the scan of its registry; tapp-cli ≤ 0.11.1 has outdated scan URLs for that, so
-  pass `--relay <the node's network's scan URL>`.
+  the scan of its registry — the URLs above by default from tapp-cli 0.11.2;
+  ≤ 0.11.1 has outdated scan URLs for that, so pass `--relay <the node's network's
+  scan URL>`.
 
 Like [KMS.md](KMS.md)'s cluster tables, this file tracks deployments, not
 truth: what a given instance actually vouches for is recomputed from the chain

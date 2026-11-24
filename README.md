@@ -990,8 +990,8 @@ See [A stable identity from the KMS](#a-stable-identity-from-the-kms).
 
 ```bash
 # full verification: registry + published reference values.
-# tapp-cli <= 0.11.1 defaults to an AS that is no longer current: give the AS and its pin
-# (docs/TAPPSCAN.md). The AS is network-agnostic, so the mainnet scan's serves testnet too.
+# tapp-cli >= 0.11.2 defaults to this AS; <= 0.11.1 to one no longer current, so give it
+# there. Always give the pin (docs/TAPPSCAN.md). The AS is network-agnostic, so the mainnet scan's serves testnet too.
 tapp-cli verify-app \
   --app-id my-app \
   --rpc-url https://evmrpc-testnet.0g.ai \
@@ -1012,8 +1012,8 @@ not answer here; relayed by …`. That is transport only: the evidence is checke
 if fetched directly, and the quote must echo the random challenge sent for it
 (`fresh : ✓`). An old quote is genuine too, so passing one off as new is the one thing a
 relay could do, and the echo is what rules it out; a quote echoing a different challenge
-fails whichever way it came. tapp-cli ≤ 0.11.1 relays through scan URLs that are no longer
-current, so pass `--relay <this network's scan URL>` (chain mode): mainnet
+fails whichever way it came. tapp-cli ≥ 0.11.2 relays through the scans below by default;
+≤ 0.11.1 relays through scan URLs that are no longer current, so there pass `--relay <this network's scan URL>` (chain mode): mainnet
 `https://tappscan.0g.ai`, testnet `https://tappscan-testnet.34-122-75-6.sslip.io`.
 
 `docs/verify_app.py` does all of the above the same way (give it the AS, pin and relay as
