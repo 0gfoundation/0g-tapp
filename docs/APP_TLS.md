@@ -43,7 +43,7 @@ services:
       - /run/my-app-certs:/certs                  # /run is tmpfs — see Rules
 
   web:
-    image: nginx:1.27-alpine            # unmodified
+    image: nginx:1.30.8-alpine@sha256:6437a63b5c529f0e06162b3f593c0154cff6fa2ea0f94fd7c27928cb399e022d   # unmodified
     depends_on:
       tls-init:
         condition: service_completed_successfully
@@ -126,7 +126,8 @@ openssl s_client -connect HOST:PORT </dev/null 2>/dev/null \
 and compare it against the attested value, which `verify-app` prints for you:
 
 ```bash
-tapp-cli -s http://HOST:50051 verify-app --app-id my-app
+tapp-cli -s https://HOST:50052 verify-app --app-id my-app \
+  --as-endpoint https://tappscan.0g.ai:50004 --as-pubkey <its pin, TAPPSCAN.md>
 #   tls key : 0xf714c426…  (sha256 of the public key, attested)
 ```
 
@@ -182,9 +183,12 @@ private half, all of which the resulting certificate publishes anyway. It works 
 no socket, and needs no key:
 
 ```bash
-tapp-cli -s http://<node>:50051 get-app-csr \
+tapp-cli -s https://<node>:50052 --tls-pin 0x<node pin> get-app-csr \
   --app-id my-app --domain api.example.com --out my.csr
 ```
+
+(`0x<node pin>` is the `:50052` key named in the node's own evidence — `get-evidence` with no
+`--app-id`, see [EVIDENCE_AND_AS_VERIFICATION.md](EVIDENCE_AND_AS_VERIFICATION.md) §②.)
 
 Claim the node and choose its intended `--tls-key-source` before requesting a CSR. Do not
 derive a CSR under the unclaimed default and then change the source: TLS identities are cached,
@@ -224,7 +228,13 @@ ssl_certificate_key /certs/tls.key;             # the TEE's
 ```
 
 The certificate is public, so shipping it in the compose directory is fine — `start-app`
-uploads it like any other mounted file. Renewal needs `nginx -s reload`, not a restart.
+uploads it like any other mounted file.
+
+Renewal is a restart. With `kms` the key does not change, so the same CSR is signed again; the
+new `fullchain.pem` reaches the node only through `stop-app` and `start-app`, because no RPC
+replaces a mounted file in place; and since the file's hash is measured, the app needs an
+`updateApp` on chain as well. Behind a load balancer, do one node at a time. A restart for any
+other reason needs no new certificate.
 
 That nginx starts at all is itself a check: a certificate and key that did not match would be
 refused outright.

@@ -168,7 +168,8 @@ few minutes, through a laptop expect an hour.
 
 ```bash
 qemu-img create -f qcow2 tapp-data.qcow2 200G     # the data disk — exactly one, see below
-sudo ./run-tapp-td.sh                             # see the invocation below
+sudo IMG=$PWD/tapp.qcow2 DATA=$PWD/tapp-data.qcow2 ./run-tapp-td.sh   # see the invocation below
+                                                  # (IMG/DATA default to /home/ubuntu/…)
 ```
 
 The TDX-specific flags are `canonical/tdx`'s own (`/opt/tdx/guest-tools/run_td`,
@@ -213,8 +214,12 @@ Four things to get right:
 ```bash
 tapp-cli -s http://127.0.0.1:50051 -k 0x<owner-key> claim-config
 tapp-cli -s http://127.0.0.1:50051 -k 0x<owner-key> start-app --app-id <id> --compose-file app.yml
-tapp-cli -s http://127.0.0.1:50051 verify-app --app-id <id> --as-pubkey 0x<as-tls-key-sha256>
+tapp-cli -s http://127.0.0.1:50051 verify-app --app-id <id> \
+  --as-endpoint https://tappscan.0g.ai:50004 --as-pubkey 0x<AS pin, docs/TAPPSCAN.md>
 ```
+
+Name the AS explicitly: the current pin is in [`docs/TAPPSCAN.md`](../docs/TAPPSCAN.md), and
+tapp-cli 0.11.1's built-in `--as-endpoint` default points at a retired host.
 
 `claim-config` doubles as the RTMR-extend test: it is a measured operation, so if it succeeds the
 guest kernel's TDX measurement interface works. Then `update-node-onchain` if the node is
@@ -272,4 +277,4 @@ What running the host does hand you:
   Ours boots from disk rather than `-kernel`, so that specific bug may not apply — but the class
   does, and on bare metal the QEMU version is yours to change. Worth testing before a host upgrade:
   same qcow2, newer QEMU, does `verify-app` still pass?
-- GPU confidential computing — `ebmg8i` has none. See the GPU notes in the main README.
+- GPU confidential computing — `ebmg8i` has none. See [`GPU.md`](GPU.md).

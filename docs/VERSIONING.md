@@ -91,7 +91,7 @@ separately — see below.
 
 ### Consolidated v0.11.1 release batch
 
-The upcoming `v0.11.1` release consolidates the app-identity and measurement-preflight
+The `v0.11.1` release (2026-11-04, #177) consolidated the app-identity and measurement-preflight
 changes into **tapp-server 0.11.1 and tapp-cli 0.11.1**. Both manifests and their lockfile
 entries use those versions. This release-batch choice supersedes the provisional
 0.12.x/0.13.x feature thresholds in the development documentation; it does not alter
@@ -187,7 +187,7 @@ The image is a **separate artifact from the binary it carries**, and it is measu
 
 Any change to the image changes its measurements. Reusing the identity makes `register-shared-as.sh` overwrite the reference values behind the **same policy id**, so every node still running the previous image fails verification from that moment on — no deploy, no warning. Bumping the revision leaves the old values registered and gives the new image its own policy.
 
-Consequence to plan for: **verifiers must be told the new policy id** (`verify-app --policy-ids`, plus anywhere ops has one written down). That is the cost of separate identities, and it is much cheaper than a silent fleet-wide verification failure.
+Consequence to plan for: **the new identity's reference values must be published** (`verifier/reference-values/`, the refvalues PR the workflow opens). `verify-app` and the scan match the boot chain against the published sets, so nothing else needs telling; only `verify-app --policy-ids`, which adds an AS policy's own verdict, and anywhere ops has a policy id written down need the new id. That is the cost of separate identities, and it is much cheaper than a silent fleet-wide verification failure.
 
 Do **not** bump tapp-server just to give a changed image a new number — the binary did not change, and a release whose artifact is byte-identical to the previous one is a lie to everyone reading the version.
 
@@ -273,11 +273,12 @@ consumer starts depending on a newer interface feature.)*
 The contract is deployed behind a **BeaconProxy + UpgradeableBeacon (ERC-1967)**
 pattern (`contract/src/proxy/`), so it is **upgradeable in place**:
 
-- The **proxy address is stable** — this is the `contract_address` that
-  `tapp-server` / `tapp-cli` are configured with. It does **not** change across
-  versions.
+- The **proxy address is stable** — this is the address tapp-cli's on-chain
+  commands take as `--contract` (tapp-server holds no chain configuration). It
+  does **not** change across versions.
 - An upgrade deploys a **new implementation** and points the beacon at it
-  (`contract/script/Upgrade.s.sol`: `beacon.upgradeTo(newImpl)`).
+  (`beacon.upgradeTo(newImpl)`): directly by the beacon owner on testnet, through
+  the 1-day TimelockController on mainnet — see `contract/CONTRACTS.md`.
 
 Consequences for versioning:
 

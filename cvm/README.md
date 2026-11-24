@@ -65,7 +65,10 @@ Convert-side handling follows `BOOT_FORMAT`, not the cloud: grub syncs the ESP `
 ## Directory contents
 | File | Description |
 |---|---|
-| `cryptpilot-gcp-boot-fix.md` | **Main doc**: root-cause analysis + fixes + full SOP (§9) + security-hardening audit (§11) + convert issues for Alibaba Cloud (§7) |
+| `cryptpilot-gcp-boot-fix.md` | **History**: root-cause analysis of the GCP boot / RTMR / DNS problems and their fixes, the security-hardening audit (§11), convert issues raised upstream (§7). Not the current procedure — that is this README (`build-tapp.sh` / `prepare-tapp.sh` / `ci/setup-toolchain.sh`) |
+| `ci/setup-toolchain.sh` | Install the conversion toolchain on the al8 host: cryptpilot 0.8.0 + our unmerged #128 / #130 fixes; prints the path of the target-image `.deb` (see Prerequisites) |
+| `ci/gen-reference-values.sh` | Extract an image's boot-chain reference values into `verifier/reference-values/` (see [Extracting reference values](#extracting-reference-values-for-remote-attestation)) |
+| `GPU.md` | Building and running a confidential-GPU image (`ENABLE_GPU=1`) |
 | `build-tapp.sh` | **One-shot full chain** (cloud-generic, `CLOUD=`): base image → final tapp image (Stage A app/docker/SGX/DNS + hardening + data disk / runtime volume + Sysbox / Stage B kernel + convert / opt-in Stage C publish via `PUBLISH_AS=`) |
 | `prepare-tapp.sh` | Stage B only (when a base already exists): HWE generic kernel + fix A + DNS (guestfish) + nbd reset + `cryptpilot-convert` (grub or `--uki`) |
 | `run-tapp-td.sh` | **Launch the image as a TD on a bare-metal TDX host** (own QEMU, no cloud). TDX flags taken from `canonical/tdx`'s own launchers; see [`BARE_METAL.md`](BARE_METAL.md) |
@@ -74,10 +77,10 @@ Convert-side handling follows `BOOT_FORMAT`, not the cloud: grub syncs the ESP `
 | `fix-esp-grub.sh` | Sync the ESP grub only (gcp/grub fix B, standalone against an already-converted image) |
 | `test/boot-smoke-test.sh` | **Local boot smoke test**: boots a converted image under QEMU/OVMF (no real CVM needed) and checks the boot chain (grub *or* UKI) reaches multi-user / tapp-server |
 | `config_dir/` | cryptpilot convert config (`fde.toml`, `rw_overlay="ram"`) |
-| `cryptpilot-fde_0.7.0_amd64.deb` | FDE **runtime installed into the target image**. **Binary, gitignored**, must be placed locally in this directory (see Prerequisites) |
+| `cryptpilot-fde-guest_0.8.0_amd64.deb` | FDE **runtime installed into the target image**. **Binary, gitignored**: place it in this directory, or point `FDE_PACKAGE` at it (see Prerequisites) |
 
 > The output qcow2 (~4–4.5G, converted / verity-sealed / hardened) is the **output** of `build-tapp.sh` and is not committed (gitignored).
-> The same applies to `cryptpilot-fde_*.deb` and the tapp-server binary: the deb must be placed locally in this directory; tapp-server is pulled by default from a GitHub release (see below).
+> The same applies to `cryptpilot-fde-guest_*.deb` and the tapp-server binary: the deb is placed locally (or named by `FDE_PACKAGE`); tapp-server is pulled by default from a GitHub release (see below).
 
 > **Running on bare metal?** The image is the same; what changes is that you launch the TD
 > yourself and own the quote-generation setup. [`BARE_METAL.md`](BARE_METAL.md) is the runbook —
@@ -95,19 +98,21 @@ Convert-side handling follows `BOOT_FORMAT`, not the cloud: grub syncs the ESP `
 - **Conversion host = Anolis / Alibaba Cloud Linux 3 (al8).** `cryptpilot-convert` is only packaged for al8; a plain Ubuntu/macOS host cannot run it.
 - Install the host tool and dependencies (run the build as **root**):
   ```bash
-  # cryptpilot-convert (host tool), from openanolis/cryptpilot v0.7.0 release:
-  #   https://github.com/openanolis/cryptpilot/releases/tag/v0.7.0
-  sudo rpm -i cryptpilot-fde-0.7.0-1.al8.x86_64.rpm     # provides /usr/bin/cryptpilot-convert
+  # cryptpilot 0.8.0 (cryptpilot-convert, cryptpilot-fde-host) with our unmerged fixes overlaid
+  # (#128 show-reference-value on a never-booted image, #130 ESP grub.cfg sync), plus the
+  # target-image .deb. Needs dnf, git, cargo/rust, cryptsetup-devel and an authenticated gh.
+  # The last line it prints is the .deb's path:
+  export FDE_PACKAGE="$(ci/setup-toolchain.sh | tail -1)"
   sudo dnf install -y libguestfs-tools qemu-img          # guestfish, virt-customize, qemu-img, qemu-nbd
   sudo modprobe nbd max_part=16
   export LIBGUESTFS_BACKEND=direct
   # docker is only needed for test/boot-smoke-test.sh
   ```
 - Place into this directory (gitignored binaries):
-  - `cryptpilot-fde_0.7.0_amd64.deb` — the FDE runtime for the **target image**, from the same [v0.7.0 release](https://github.com/openanolis/cryptpilot/releases/tag/v0.7.0) (the `.deb`, distinct from the host `.al8.rpm`).
-  - `tapp-server` is optional locally — pulled from the 0g-tapp v0.1.0 release by default, or set `TAPP_SERVER_BIN=<path>`.
+  - `cryptpilot-fde-guest_0.8.0_amd64.deb` — the FDE runtime for the **target image** (the `.deb`, distinct from the host RPMs). Not needed here when `FDE_PACKAGE` points at the copy `ci/setup-toolchain.sh` downloaded.
+  - `tapp-server` is optional locally — pulled from the 0g-tapp v0.10.0 release by default (`TAPP_SERVER_URL`), or set `TAPP_SERVER_BIN=<path>`. The image's disk layout needs tapp-server **≥ 0.10.0**; the build refuses an older one. The current release is v0.11.1.
 
-See `cryptpilot-gcp-boot-fix.md` §0.1 for details.
+Why the toolchain is a fork build rather than a released RPM is in the header of `ci/setup-toolchain.sh`.
 
 ## One-shot build
 ```bash
@@ -124,9 +129,10 @@ export LIBGUESTFS_BACKEND=direct
   wrong for one of them; the claimer passes `--kbs-urls` (#169). `KBS_URLS` (KBS node URLs for
   `[kbs] node_urls`, comma-separated and quoted, e.g. `'"http://host1:9091", "http://host2:9091"'`)
   is required in custom mode only.
-- tapp-server is downloaded by default from GitHub v0.1.0 (includes the guest-components `8d71a3b4` fix, RTMR OK); if you have it locally, set `TAPP_SERVER_BIN=<path>`.
+- tapp-server is downloaded by default from GitHub v0.10.0 (`TAPP_SERVER_URL`; ≥ 0.10.0 required); if you have it locally, set `TAPP_SERVER_BIN=<path>`.
+- **GPU**: `ENABLE_GPU=1` (driver branch `NVIDIA_DRIVER_BRANCH`, default `580`) builds a confidential-GPU image, a separate identity from the CPU one — see [`GPU.md`](GPU.md).
 - Storage / Sysbox knobs: `DATA_ROOT` (docker data-root, default `/data/docker`, on the runtime volume), `CONTAINERD_ROOT` (default `/data/containerd`), `DOCKER_VERSION` (default `5:27.5.1-…noble`; empty = repo default), `ENABLE_SYSBOX` / `SYSBOX_VERSION` (default `0.7.0`).
-- Publish (Stage C, opt-in): `PUBLISH_AS=<gcp-image-name>` publishes the built image to GCP after the build (see [Publish to GCP](#publish-to-gcp-stage-c)); `GCS_BUCKET` / `GCP_PROJECT` / `GUEST_OS_FEATURES` pass through.
+- Publish (Stage C, opt-in): `PUBLISH_AS=<image-name>` publishes the built image after the build to the cloud `CLOUD` names — GCP by default, Alibaba Cloud with `CLOUD=ali` (see [Publish to GCP](#publish-to-gcp-stage-c)); `GCS_BUCKET` / `GCP_PROJECT` / `GUEST_OS_FEATURES` pass through.
 - Other environment variables: `DNS_FALLBACK` `PURGE_KERNEL` `CONFIG_DIR` `FDE_PACKAGE` `ROOTFS_MODE` `IN_PLACE` `INSTALL_KERNEL` `NBD_RESET` (see the top of the script).
 
 ## Root filesystem size (`/`) — read-only base + writable overlay
@@ -173,7 +179,7 @@ ENABLE_SYSBOX=1 ./build-tapp.sh base.qcow2 gcp-tapp.qcow2
 - **Docker is pinned to 27.5.1** (`DOCKER_VERSION`). Docker 28+/29+ emit the Linux *time namespace* in the OCI spec, which `sysbox-runc` rejects (`namespace ... does not exist`); Nestybox supports Docker 20.10–27.x only.
 - The image ships **`fuse3`** (`fusermount3`), which `sysbox-fs` 0.7.0 needs to mount its per-container FUSE fs (without it container launch fails with `FuseServer InitWait`).
 - **`br_netfilter`** is auto-loaded (`/etc/modules-load.d/`, baked for **all** images). Docker 28's `icc=false` bridges — created by the 0g-sandbox runner — hard-require `/proc/sys/net/bridge/bridge-nf-call-iptables`, which only exists once `br_netfilter` is loaded; a fresh CVM without it crash-loops the runner.
-- **Kernel**: the gcp kernel (≥5.12, idmapped mounts) is supported (**6.17 verified on hardware**); the alinux 5.10 image is not (would need shiftfs).
+- **Kernel**: the image's HWE generic kernel (≥5.12 needed, for idmapped mounts) is supported (**6.17 verified on hardware**); the alinux 5.10 image is not (would need shiftfs).
 - **Validate on hardware**: `docker run --rm --runtime=sysbox-runc alpine cat /proc/self/uid_map` should show a remapped range (e.g. `0 100000 65536`). Static build-side check: `CHECK_SYSBOX=1 ./test/boot-smoke-test.sh <img>`.
 - **Measurement**: enabling Sysbox changes the rootfs/initrd measurements → regenerate reference values (see #19).
 
@@ -182,7 +188,7 @@ Before uploading an image to GCP, sanity-check that it actually boots, locally, 
 ```bash
 ./test/boot-smoke-test.sh gcp-tapp.qcow2
 ```
-It boots the image under QEMU/OVMF (UEFI) in the `qemux/qemu` container — using `/dev/kvm` if present, otherwise TCG software emulation — and scans the serial console for the full chain: grub → gcp kernel → `cryptpilot-fde` (dm-verity + zram + dm-snapshot) → `/sysroot` mount → switch-root → multi-user / `tapp-server.service`. Exit code `0` means the boot was confirmed.
+It boots the image under QEMU/OVMF (UEFI) in the `qemux/qemu` container — using `/dev/kvm` if present, otherwise TCG software emulation — and scans the serial console for the full chain: grub (or the UKI) → kernel → `cryptpilot-fde` (dm-verity + zram + dm-snapshot) → `/sysroot` mount → switch-root → multi-user / `tapp-server.service`. Exit code `0` means the boot was confirmed.
 
 This validates everything except the TDX-specific bits (RTMR extend, remote attestation), which require real hardware — so it is a fast pre-flight check, not a replacement for on-hardware testing. Tunables: `MAX` (timeout seconds), `RAM_SIZE`, `CPU_CORES`.
 
@@ -194,7 +200,7 @@ gcloud auth login            # gcloud + gsutil must be authenticated with write 
 ./publish-gcp-image.sh /path/og-tdx-dev.qcow2 og-tdx-dev
 ./publish-gcp-image.sh /path/og-tdx.qcow2     og-tdx
 ```
-Defaults `GCS_BUCKET=gs://tapp-image`, `GCP_PROJECT=g-devops`, `GUEST_OS_FEATURES=UEFI_COMPATIBLE,GVNIC,SEV_CAPABLE,TDX_CAPABLE` (all overridable). It refuses to clobber an existing image name (delete it, or publish under a new name). Or fold it into the build as an opt-in final stage:
+Defaults `GCS_BUCKET=gs://tapp-image`, `GCP_PROJECT=g-devops`, `GUEST_OS_FEATURES=UEFI_COMPATIBLE,GVNIC,SEV_CAPABLE,TDX_CAPABLE` (all overridable). It refuses to clobber an existing image name (delete it, publish under a new name, or set `OVERWRITE=1` to delete and recreate it). Or fold it into the build as an opt-in final stage:
 ```bash
 PUBLISH_AS=og-tdx-dev ENABLE_SYSBOX=1 ./build-tapp.sh base.qcow2 og-tdx-dev.qcow2
 ```
@@ -206,7 +212,7 @@ A qcow2 can't be registered directly — it goes through OSS. `publish-ali-image
 # ossutil + aliyun both authenticated (AK/SK env, or an instance RAM role on an Ali ECS build host)
 ALIYUN_REGION=cn-beijing ./publish-ali-image.sh /path/og-tdx-ali-dev.qcow2 og-tdx-ali-dev
 ```
-Defaults `OSS_BUCKET=0g-confidential-disk` (`ALIYUN_REGION` required, no default). It refuses to clobber an existing image name. In CI the al8 build runner is itself an Ali ECS instance, so it authenticates via its **instance RAM role** (no AK/SK secret). Create a confidential (TDX) instance from the image; assign a public IPv4 (for Trustee attestation) and use **key-pair** auth (passwords are unsupported on confidential instances).
+Defaults `OSS_BUCKET=0g-confidential-disk` (`ALIYUN_REGION` required, no default). It refuses to clobber an existing image name unless `OVERWRITE=1`. In CI the al8 build runner is itself an Ali ECS instance, so it authenticates via its **instance RAM role** (no AK/SK secret). Create a confidential (TDX) instance from the image; assign a public IPv4 (for Trustee attestation) and use **key-pair** auth (passwords are unsupported on confidential instances).
 
 **In CI, reach both clouds from one build: `cloud=both`.** The image is identical on every platform,
 so building twice to publish twice was waste — and the second dispatch also redid the identity work,
@@ -217,8 +223,8 @@ remain if you want a single target. For a GPU build, which spends most of its 90
 this is the difference between one build and two.
 
 ## Three core fixes (all required)
-- **Fix A**: before convert, point the `/boot/vmlinuz` symlink at the gcp kernel → the cryptpilot stack goes into the correct initrd (fixes read-only / RTMR / verity).
-- **Fix B**: after convert, sync the boot-partition grub.cfg + modules to the ESP (fixes the boot crash bli.mod / vmlinuz not found).
+- **Fix A**: before convert, point the `/boot/vmlinuz` symlink at the HWE generic kernel the image boots → the cryptpilot stack goes into the correct initrd (fixes read-only / RTMR / verity). `prepare-tapp.sh` does it.
+- **Fix B**: after convert, sync the boot-partition grub.cfg + modules to the ESP (fixes the boot crash bli.mod / vmlinuz not found). `cryptpilot-convert` now does this itself (#130, in the toolchain from `ci/setup-toolchain.sh`); `fix-esp-grub.sh` is only for an image converted without it.
 - **Application side (§8)**: tapp-server uses guest-components `8d71a3b4` (already in v0.1.0) → RTMR extend no longer misdetected.
 - Also: DNS must be written to a static `/etc/resolv.conf` with **guestfish** (virt-customize wipes what it writes itself); reset nbd before convert with `modprobe nbd max_part=16`.
 
@@ -237,11 +243,12 @@ Scope: this covers **apt**. `HARDEN=1` additionally purges the other self-changi
 
 <a name="dev-ssh-access-cloud-independent"></a>
 ### Dev SSH access without a cloud — `DEV_SSH_PUBKEY` (dev only)
-The `HARDEN=0` dev variants get you in by letting the **cloud inject your key at boot**: on GCP
-`google-guest-agent` reads it from `metadata.google.internal`, on Alibaba Cloud cloud-init reads it
-from `100.100.100.200`. That is why the dev image has to pick a cloud — and why **neither dev
-variant can be used on bare metal**, where no metadata service exists at all and a self-launched TD
-is handed nothing.
+The `HARDEN=0` dev variants used to get you in by letting the **cloud inject your key at boot**: on GCP
+`google-guest-agent` read it from `metadata.google.internal`, on Alibaba Cloud cloud-init read it
+from `100.100.100.200`. That is why the dev image had to pick a cloud — and why **neither dev
+variant could be used on bare metal**, where no metadata service exists at all and a self-launched TD
+is handed nothing. The build no longer installs any cloud agent; what a keyless dev image still
+lets in is below.
 
 `DEV_SSH_PUBKEY` removes the dependency by baking the key at **build** time, so nothing has to be
 asked for at boot:
@@ -338,11 +345,13 @@ every node of that identity verifies against. `build-cvm` now refuses that (see
 - Authoritative check of the internal listening surface: `ss -tlnp` inside the instance (with no login entry after lockdown, use a boot-time audit service that outputs to the serial console, see the same-named suggestion in the doc).
 
 ## Extracting reference values (for remote attestation)
-After building, use a `cryptpilot-fde` with the fix (openanolis/cryptpilot#128) to extract RA reference values offline from the image:
+After building, extract the RA reference values offline from the image with the #128-fixed `cryptpilot-fde-host` that `ci/setup-toolchain.sh` installs (al8 host):
 ```bash
-cryptpilot-fde show-reference-value --disk gcp-tapp.qcow2 --hash-algo sha384
+ci/gen-reference-values.sh tapp.qcow2 <boot_format> <version> <env>   # writes verifier/reference-values/<boot_format>/<version>/<env>.json
+# or just print them:
+cryptpilot-fde-host show-reference-value --disk tapp.qcow2 --hash-algo sha384
 ```
-The original version reports `saved_entry not found` because a new image's grubenv is empty; see the main doc **§12** (includes the steps to build a fixed cryptpilot-fde from the fork branch).
+A released cryptpilot without openanolis/cryptpilot#128 reports `saved_entry not found` because a new image's grubenv is empty (history: `cryptpilot-gcp-boot-fix.md` §7.6).
 
 ## TODO (optional, "zero-residue" finishing, non-blocking)
 - Remove leftover `authorized_keys` (root + 4 human accounts) + lock/delete human accounts;

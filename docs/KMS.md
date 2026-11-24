@@ -171,8 +171,9 @@ tapp-cli -s <node> -k <owner-key> claim-config \
 
 - **`--kbs-urls`**: the cluster members, from [Deployed clusters](#deployed-clusters).
   List several — any `t` of them serve a request. **Always pass it**: CVM images
-  bake no list, because one image serves both networks and a baked list would be
-  wrong for one of them. A node claimed without it has no KMS. Calls that need one
+  bake no list from v0.11.1 on, because one image serves both networks and a baked list would be
+  wrong for one of them (images up to v0.10.0 bake the endpoints of a testnet cluster
+  since retired). A node claimed without it has no working KMS. Calls that need one
   fail with `KMS not configured`, but an app in the default `encrypted` data mode
   does **not** fail: it starts on a RAM directory instead, lost at every reboot,
   and the warning goes only to the tapp-server log. `update-trust-anchors
@@ -186,7 +187,7 @@ tapp-cli -s <node> -k <owner-key> claim-config \
   certificate". `update-trust-anchors` fixes it on a running node, no restart.
   The deployed verifier's URL and pin to put here are in
   [TAPPSCAN.md](TAPPSCAN.md).
-  Check with `get-tapp-info` — the `kms :` and `Verifier` lines show exactly
+  Check with `get-tapp-info` — its `KBS:` and `Verifier` sections show exactly
   what the node believes.
 
 Bootstrap ordering matters and is the same for every KMS-derived thing: **chain

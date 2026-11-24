@@ -45,8 +45,7 @@ inherit), add-node-onchain (per-node override), update-node-onchain — all veri
 on-chain via getNode/getAppInfo.
 
 > A superseded earlier deployment lives at proxy `0x95a0BF4148b30F6F8D86870534c51df46Da5511c`
-> (no `version()`, 3-field `getNode`); some long-lived apps (testnet sandbox
-> provider / attestor) are still registered there. Details in git history.
+> (no `version()`, 3-field `getNode`). Details in git history.
 
 ---
 
@@ -59,7 +58,7 @@ TAPP_REGISTRY_CONTRACT=0x54874F536301c993922Dd95097e3902e7FBfe612
 ```
 
 **Deployed:** 2026-09-04 **Deployer:** `0x60BF67E31784af4E58371cBEfd7a5B6c00C3EBe4` (throwaway,
-retains no authority) **Min stake:** 10 OG (initial, will be raised to 100)
+retains no authority) **Min stake:** 10 0G (`10000000000000000000` wei) since 2026-10-28; 0.1 0G before
 **Lock period:** 604800 s (7 days) **Implementation:** v0.2.0 since 2026-10-12 (deployed as v0.1.0)
 All five contracts (both implementations, beacon, proxy, timelock) source-verified on https://chainscan.0g.ai.
 
@@ -82,36 +81,40 @@ All five contracts (both implementations, beacon, proxy, timelock) source-verifi
 - Beacon owner = TimelockController, minDelay **86400 s (1 day)**: every upgrade is
   scheduled on-chain and executable only a day later.
 - Timelock proposer / executor / canceller / admin =
-  `0x87605ec8e10eb373c1d070e15e5d78fac4d7621d` (the timelock also administers
-  itself).
+  `0xc0603224dE8c3B910a4487368E476e19dC6127cF`, a Fordefi multisig vault (the timelock
+  also administers itself).
 - Registry `admin` (setMinStakeAmount / setLockPeriod / transferAdmin) =
-  `0x87605ec8e10eb373c1d070e15e5d78fac4d7621d`.
+  `0xc0603224dE8c3B910a4487368E476e19dC6127cF`.
 
-Both moved from `0x73443d8C05c74F8C2F5D499Da2597a1EE49E431b` on 2026-10-04, all
+Both moved from `0x73443d8C05c74F8C2F5D499Da2597a1EE49E431b` to
+`0x87605ec8e10eb373c1d070e15e5d78fac4d7621d` on 2026-10-04, all
 signed by the old address: the registry admin first (`AdminTransferred`, block
 46146695, 13:28:45 UTC), then the four timelock roles — granted to the new address
-and revoked from the old one (blocks 46146918–46146998, 13:32:00–13:33:10 UTC). App
-ownership is separate: the five apps here, `0g-kms` among them, moved from `0x73443d…`
-to `0x9C58F839451EBf3e7f82442bC48E4088746380Bb` on 2026-10-12 (`transferAppOwnership`,
-once 0.2.0 was live; see [`docs/KMS.md`](../docs/KMS.md)).
+and revoked from the old one (blocks 46146918–46146998, 13:32:00–13:33:10 UTC). On
+2026-10-16 they moved on to the vault: `0x87605ec8…` granted it every timelock role and
+transferred the registry admin, then renounced its own roles, each only after the vault
+held it. App ownership is separate: the five apps here, `0g-kms` among them, moved from
+`0x73443d…` to `0x9C58F839451EBf3e7f82442bC48E4088746380Bb` on 2026-10-12
+(`transferAppOwnership`, once 0.2.0 was live); `0g-kms` moved on to the vault on
+2026-10-16 (see [`docs/KMS.md`](../docs/KMS.md)), as did `0g-tappscan`, registered
+2026-10-14 ([`docs/TAPPSCAN.md`](../docs/TAPPSCAN.md)).
 
-One address holds every timelock role, so the delay is the only check: whoever holds
-that key can schedule, execute and cancel. Moving the roles to a multisig would
-restore a second one.
+One address holds every timelock role, but it is a multisig: a schedule, execute or
+cancel needs its approvers as well as the delay.
 
 To re-check what is in force:
 
 ```bash
 TL=0xD070792b1dB64F858ACE3E5443f2d21c0edE0BAc
-cast call $TL "hasRole(bytes32,address)(bool)" $(cast keccak PROPOSER_ROLE) 0x87605ec8e10eb373c1d070e15e5d78fac4d7621d --rpc-url https://evmrpc.0g.ai
+cast call $TL "hasRole(bytes32,address)(bool)" $(cast keccak PROPOSER_ROLE) 0xc0603224dE8c3B910a4487368E476e19dC6127cF --rpc-url https://evmrpc.0g.ai
 cast call 0x54874F536301c993922Dd95097e3902e7FBfe612 "admin()(address)" --rpc-url https://evmrpc.0g.ai
 ```
 
-**Upgrading:** deploy the new implementation, then use `0g-agentic-id`'s
-`ScheduleUpgrade.s.sol` / `ExecuteUpgrade.s.sol` (its OZ scripts match this beacon's
-`upgradeTo(address)`) with `TIMELOCK=0xD070…0BAc BEACON=0x32fF…975f`, run as the
-proposer key (`0x87605ec8…`). Direct `beacon.upgradeTo` no longer works — only the
-timelock can call it.
+**Upgrading:** deploy the new implementation, then schedule and execute
+`upgradeTo(address)` through the timelock (`TIMELOCK=0xD070…0BAc BEACON=0x32fF…975f`) as
+its proposer, the vault (`0xc060…27cF`): `go run ./cmd/upgrade/` prints both
+transactions for it to sign (Go Tools below). Direct `beacon.upgradeTo` no longer
+works — only the timelock can call it.
 
 ---
 
@@ -127,7 +130,9 @@ timelock can call it.
 | `pendingAppOwner(appId)` → address | anyone | current nominee, or `address(0)` |
 
 Events `AppOwnershipTransferStarted(appId, owner, pendingOwner)` and
-`AppOwnershipTransferred(appId, previousOwner, newOwner)`.
+`AppOwnershipTransferred(appId, previousOwner, newOwner)`. From tapp-cli:
+`transfer-app-ownership --new-owner <addr>` (or `--cancel`), signed by the owner, then
+`accept-app-ownership`, signed by the nominee.
 
 - **Stake**: live nodes' stake travels with the app (`removeNode` refunds whoever
   owns the app then); stake already locked to the old owner stays theirs.
@@ -142,7 +147,7 @@ Events `AppOwnershipTransferStarted(appId, owner, pendingOwner)` and
 Rollout with `go run ./cmd/upgrade/` (Go Tools below), which keeps the beacon
 owner's key off the machine doing the work. Testnet: the owner (`0x9C58…`) signs
 the printed `upgradeTo`. Mainnet: the owner is the timelock — its proposer
-(`0x87605ec8…`) schedules, and after the 1-day delay an executor executes. Then
+(the vault, `0xc060…27cF`) schedules, and after the 1-day delay an executor executes. Then
 `go run ./cmd/verify/ --network <net>`. Record each in its network's upgrades table
 and flip this section to "deployed". Both paths have been rehearsed end to end on
 local forks of the live networks: state unchanged, the new functions live.
@@ -159,7 +164,7 @@ upgrade test runs against.
 tapp-cli / user  ──►  BeaconProxy  (stable address, all state lives here)
                            │ reads impl from beacon
                            ▼
-                   UpgradeableBeacon  (stores current impl, owned by deployer)
+                   UpgradeableBeacon  (stores current impl; owner = who may upgrade, see above)
                            │ delegatecall
                            ▼
                    TappRegistry impl  (pure logic, stateless, replaceable)
@@ -244,7 +249,7 @@ Rehearse on a fork first — it costs nothing and runs the real state:
 ```bash
 anvil --fork-url https://evmrpc.0g.ai --port 8545 &
 PRIVATE_KEY=<an anvil account> go run ./cmd/upgrade/ --network mainnet --rpc http://127.0.0.1:8545 \
-  --proposer 0x87605ec8e10eb373c1d070e15e5d78fac4d7621d --apps 0g-kms,0g-agentic-id
+  --proposer 0xc0603224dE8c3B910a4487368E476e19dC6127cF --apps 0g-kms,0g-agentic-id
 # impersonate the proposer (anvil_impersonateAccount), send the schedule tx,
 # evm_increaseTime 86401, send the execute tx, then --check
 ```
@@ -270,11 +275,18 @@ need them.
 
 ## tapp-cli Usage
 
+`--server` is the node's TLS listener, pinned: `--tls-pin` is the `:50052` key named in the
+node's own evidence (`tapp-cli -s https://<node>:50052 --insecure get-evidence`, verified as in
+[`docs/EVIDENCE_AND_AS_VERIFICATION.md`](../docs/EVIDENCE_AND_AS_VERIFICATION.md)). An owner key
+held elsewhere signs with `--external-signer <address>` plus `--ledger` or `--fordefi` instead
+of `--private-key`. `--stake-wei` must be at least `minStakeAmount`: 1 0G on testnet, 10 0G on
+mainnet.
+
 ### Register app on-chain
 
 ```bash
 tapp-cli \
-  --server http://<TAPP_SERVER>:50051 \
+  --server https://<TAPP_SERVER>:50052 --tls-pin 0x<NODE_PIN> \
   --private-key 0x<PRIVATE_KEY> \
   register-onchain \
   --app-id <APP_ID> \
@@ -287,7 +299,7 @@ tapp-cli \
 
 ```bash
 tapp-cli \
-  --server http://<NEW_NODE>:50051 \
+  --server https://<NEW_NODE>:50052 --tls-pin 0x<NODE_PIN> \
   --private-key 0x<PRIVATE_KEY> \
   add-node-onchain \
   --app-id <APP_ID> \
@@ -310,13 +322,21 @@ current compose/volumes from `--server`).
 
 ```bash
 tapp-cli \
-  --server http://<TAPP_SERVER>:50051 \
+  --server https://<TAPP_SERVER>:50052 --tls-pin 0x<NODE_PIN> \
   --private-key 0x<PRIVATE_KEY> \
   update-onchain \
   --app-id <APP_ID> \
   --rpc-url <RPC_URL> \
   --contract <TAPP_REGISTRY_CONTRACT>
 ```
+
+### Other on-chain commands
+
+- `update-node-onchain` — replace a node's signer in place (stake carried), e.g. after a reboot.
+- `remove-node-onchain` — remove a node; its stake is locked for the lock period, then `withdraw`.
+- `authorize-invalidator-onchain` / `revoke-invalidator-onchain` — let a sibling contract call
+  `invalidateAcks(appId)`, which bumps `getAckVersion(appId)` as `updateApp` / `updateNode` do,
+  so every user's `acknowledgeApp` for that app goes stale.
 
 ---
 

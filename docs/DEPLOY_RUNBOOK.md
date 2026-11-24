@@ -14,8 +14,8 @@ The standard procedure — and the pitfall checklist — for deploying an app (u
 
 | # | Step | Command / key points | provider | broker |
 |---|------|------------|:---:|:---:|
-| 1 | Set the owner in the tapp-server config, start the tapp server | this owner key is used for all subsequent start/stop/register | ✅ | ✅ |
-| 2 | `start-app` to bring up the services | `PROVIDER_ADDRESS` must == the app's on-chain owner; `docker-login` to the private registry first; `.env` must have both `TAPP_REGISTRY`/`SETTLEMENT_CONTRACT` | ✅ | ✅ |
+| 1 | Boot the node and `claim-config` it (images are ownerless; the first signer becomes the owner) | this owner key is used for all subsequent start/stop/register; pass `--kbs-urls` and `--scan-url`/`--scan-pubkey` so the KMS (encrypted volumes) works | ✅ | ✅ |
+| 2 | `start-app` to bring up the services | `docker-login` to the private registry first; `.env` must have both `TAPP_REGISTRY`/`SETTLEMENT_CONTRACT` | ✅ | ✅ |
 | 3 | `register-onchain` to register on-chain | 1 0G stake each | ✅ | ✅ |
 
 > Steps 2+3 can be combined into one command: `start-app --register-onchain --rpc-url … --contract … --stake-wei …`
@@ -25,29 +25,36 @@ The standard procedure — and the pitfall checklist — for deploying an app (u
 | 5 | `cmd/provider register` to bind the service to SandboxServing | sets `services[provider].appId` + pricing | ✅ | — |
 
 ```bash
+# 1. First contact (the evidence authenticates itself: verify the quote, and its
+#    runtime_data.tls_public_key is the node pin), then claim
+tapp-cli -s https://<server>:50052 --insecure get-evidence
+tapp-cli -s https://<server>:50052 --tls-pin 0x<node pin> -k 0x<owner-key> claim-config \
+  --kbs-urls "<testnet KMS endpoints, docs/KMS.md>" \
+  --scan-url https://tappscan-testnet.34-122-75-6.sslip.io --scan-pubkey 0x<testnet scan pin, docs/TAPPSCAN.md>
+
 # 2. Start services (docker-login first)
-tapp-cli -s http://<server>:50051 -k 0x<owner-key> docker-login -r <registry> -u <user> -p <pass>
-tapp-cli -s http://<server>:50051 -k 0x<owner-key> start-app -f <compose> --app-id <appId>
+tapp-cli -s https://<server>:50052 --tls-pin 0x<node pin> -k 0x<owner-key> docker-login -r <registry> -u <user> -p <pass>
+tapp-cli -s https://<server>:50052 --tls-pin 0x<node pin> -k 0x<owner-key> start-app -f <compose> --app-id <appId>
 
 # 3. Register on-chain (the key must be both the server owner and a funded app owner)
-tapp-cli -s http://<server>:50051 -k 0x<owner-key> register-onchain \
+tapp-cli -s https://<server>:50052 --tls-pin 0x<node pin> -k 0x<owner-key> register-onchain \
   --app-id <appId> --rpc-url https://evmrpc-testnet.0g.ai \
   --contract 0x2Ce80374318B1d7Fb3345724457a182E0ad165c9 --stake-wei 1000000000000000000
 
 # 2+3 combined: register first, then start (idempotent, safe to re-run)
-tapp-cli -s http://<server>:50051 -k 0x<owner-key> start-app -f <compose> --app-id <appId> \
+tapp-cli -s https://<server>:50052 --tls-pin 0x<node pin> -k 0x<owner-key> start-app -f <compose> --app-id <appId> \
   --register-onchain --rpc-url https://evmrpc-testnet.0g.ai \
   --contract 0x2Ce80374318B1d7Fb3345724457a182E0ad165c9 --stake-wei 1000000000000000000
 
 # 4. Authorize the invalidator (note: authorize the SandboxServing contract address, not the owner wallet)
-#    No tapp-cli subcommand yet — use cast send directly (watch the gas)
-cast send 0x2Ce80374318B1d7Fb3345724457a182E0ad165c9 \
-  "authorizeInvalidator(string,address)" "<appId>" 0x<SANDBOX_SERVING_CONTRACT> \
-  --rpc-url https://evmrpc-testnet.0g.ai --private-key 0x<owner-key> \
-  --legacy --gas-price 3000000000
+tapp-cli -k 0x<owner-key> authorize-invalidator-onchain --app-id <appId> \
+  --rpc-url https://evmrpc-testnet.0g.ai \
+  --contract 0x2Ce80374318B1d7Fb3345724457a182E0ad165c9 --invalidator 0x<SANDBOX_SERVING_CONTRACT>
 
-# 5. provider registers the service (in the 0g-sandbox repo)
-PROVIDER_KEY=0x<owner-key> go run ./cmd/provider register --app-id <appId> --url ... --price-per-cpu ...
+# 5. provider registers the service (in the 0g-sandbox repo). --kms when the node runs
+#    PROVIDER_KEY_SOURCE=kms, otherwise --signer 0x<node TEE address>
+OWNER_KEY=0x<owner-key> go run ./cmd/provider register --kms --contract 0x<SANDBOX_SERVING_CONTRACT> \
+  --app-id <appId> --url https://<sandbox host> --price-per-cpu ... --price-per-mem ... --fee ...
 ```
 
 > The broker only goes through step 3; steps 4 and 5 are provider-only.
@@ -58,7 +65,7 @@ PROVIDER_KEY=0x<owner-key> go run ./cmd/provider register --app-id <appId> --url
 
 - **Three keys in one**: the `--private-key` for `register-onchain` must **simultaneously** satisfy: "can connect to the server (server owner or allowlisted)" + "will be the app's owner" + "funded on-chain (1 0G stake + gas)". All three must be the same address — this is the most common blocker.
 - **Authorize the invalidator to a contract, not a wallet**: `invalidateAcks` checks `msg.sender == the SandboxServing contract`. Authorizing the owner EOA makes `isAuthorizedInvalidator` return true, but the contract call still reverts with `sandbox not authorized as invalidator`.
-- **`PROVIDER_ADDRESS` must == the app's on-chain owner**, otherwise the sandbox's signer_mismatch monitor reports a mismatch and every voucher gets `INVALID_SIGNATURE`.
+- **The provider address is not configured**: it is the node's TEE signer, or with `PROVIDER_KEY_SOURCE=kms` the app's KMS key (the billing server's `/api/info` `provider_address`). `cmd/provider register --kms` reads it from there; with `--signer`, give that address. The appId's on-chain owner signs the registration (`OWNER_KEY`).
 - **Restart → TEE signer changes**: the TEE-derived signer is not persisted; after any `stop/start` the on-chain node is stale → start with `start-app --register-onchain`, which replaces it; for an app already running, `update-node-onchain` (pass the old one via `--old-signer`; the new signer is fetched from the server automatically).
 - **Owner transfer** (TappRegistry ≥ 0.2.0): `transfer-app-ownership` then `accept-app-ownership` by the new owner, who then replaces every node with its own machine (`start-app --register-onchain`). See the README's "Handing an app over". On a 0.1.0 registry there is none: the old owner removes the nodes and the new owner registers afresh.
 - **app-id is globally unique**: registering with a taken name fails with `app already exists`. For an existing one you can only `add-node` / `update-node` (`update-node` replaces the original node — be careful not to accidentally remove a production node elsewhere).

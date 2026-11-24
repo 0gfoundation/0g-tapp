@@ -13,9 +13,12 @@ values and its own AS policy id. It is not a drop-in replacement for the CPU ima
 ```bash
 cd cvm
 ENABLE_GPU=1 \
-TAPP_SERVER_URL=https://github.com/0gfoundation/0g-tapp/releases/download/v0.8.0/tapp-server \
+TAPP_SERVER_URL=https://github.com/0gfoundation/0g-tapp/releases/download/v0.11.1/tapp-server \
 ./build-tapp.sh <pristine-ubuntu-24.04.qcow2> out-gpu.qcow2
 ```
+
+The image needs tapp-server ≥ 0.10.0 (`build-tapp.sh` refuses an older one); the host toolchain is
+the one in [`README.md`](README.md#prerequisites).
 
 Add `HARDEN=0 DEV_SSH_PUBKEY="ssh-ed25519 AAAA… you@host"` for an image you need a shell on.
 On GCP, do not expect to get in without it: `HARDEN=0` leaves cloud-init installed, but the image

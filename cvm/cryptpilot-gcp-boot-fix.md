@@ -1,12 +1,20 @@
 # cryptpilot-convert boot crash after switching the kernel on a GCP Ubuntu image — root-cause analysis and fix
 
+> **History, not the current procedure.** This is the root-cause record of getting cryptpilot
+> images to boot and measure on GCP. The build has moved on since: one HWE generic kernel on every
+> platform instead of `linux-image-gcp`, cryptpilot 0.8.0 with the ESP sync (#130) and the
+> `show-reference-value` fix (#128) built into the toolchain, and tapp-server ≥ 0.10.0. The current
+> SOP is `build-tapp.sh` / `prepare-tapp.sh` / `ci/setup-toolchain.sh` as described in
+> [`README.md`](README.md), which also gives the current versions. Read the steps below as what was
+> done then.
+
 > Goal: switch the kernel (generic → gcp) to enable **RTMR extend** on a GCP Ubuntu image. Along the way we hit four classes of problems, all now resolved, and RTMR extend has been confirmed working on real TDX:
 > 1. **Image boot crash** (grub cannot find the kernel/modules) — root cause is GCP's dual grub.cfg, see §4 / §5 fix B;
 > 2. **read-only rootfs / RTMR not extended / verity bypassed** — root cause is convert installing the cryptpilot stack into the wrong kernel's initrd, see §7.3 / §5 fix A;
 > 3. **runtime RTMR extend failure** ("Cannot extend runtime measurement") — root cause is a misdetection in the application-side guest-components, see §8;
 > 4. **instance DNS broken** (requires a manual `echo nameserver … > /etc/resolv.conf`) — root cause is virt-customize cleaning up resolv.conf during teardown and the resolved fallback being ineffective; a static resolv.conf must be written with guestfish, see §9.
 >
-> §1–§7 cover the image-build side (including convert issues to confirm with the cryptpilot maintainers), §8 covers the application-side (guest-components) fix, **§9 is the complete reproducible build flow (SOP)**, §10 is the script appendix.
+> §1–§7 cover the image-build side (including convert issues to confirm with the cryptpilot maintainers), §8 covers the application-side (guest-components) fix, **§9 is the build flow as it stood then** (superseded, see the note above), §10 is the script appendix.
 
 ---
 
@@ -15,6 +23,8 @@
 ### 0.1 Build / conversion host
 
 `cryptpilot-convert` is packaged only for **Anolis / Alibaba Cloud Linux 3 (al8)**, so the conversion must run on such a host (e.g. an Alibaba Cloud ECS running Alibaba Cloud Linux 3, or an Anolis 8 VM). A plain Ubuntu/macOS host cannot run `cryptpilot-convert`.
+
+> Superseded: today the host is set up with `ci/setup-toolchain.sh` (cryptpilot 0.8.0 + fixes), the target-image runtime is `cryptpilot-fde-guest_0.8.0_amd64.deb`, and the image needs tapp-server ≥ 0.10.0 — see [README → Prerequisites](README.md#prerequisites). The 0.7.0 / v0.1.0 below are what this analysis used.
 
 On that host:
 
@@ -69,9 +79,9 @@ sudo modprobe gve
 sudo lsmod | grep -i gve
 ```
 
-> Note on SSH access — the stock Ubuntu cloud image relies on `google-guest-agent` to inject the instance's SSH public key (from the metadata server, via the `169.254.169.254` IP — independent of DNS) into `~ubuntu/.ssh/authorized_keys`. Because the build pins `/etc/resolv.conf` to public DNS (fix C, §9), `metadata.google.internal` no longer resolves, so a `169.254.169.254 metadata.google.internal` line in `/etc/hosts` is also needed for the agent to reach the metadata server by name. The build handles this **only for the dev variant** (`HARDEN=0`): it (re)installs `google-guest-agent` and adds the `/etc/hosts` line. The hardened variant intentionally omits both — `google-guest-agent` is exactly the kind of component that can push changes into the instance from outside, so the hardened image is not SSH-reachable by design.
+> Note on SSH access — the stock Ubuntu cloud image relies on `google-guest-agent` to inject the instance's SSH public key (from the metadata server, via the `169.254.169.254` IP — independent of DNS) into `~ubuntu/.ssh/authorized_keys`. Because the build pins `/etc/resolv.conf` to public DNS (fix C, §9), `metadata.google.internal` no longer resolves, so a `169.254.169.254 metadata.google.internal` line in `/etc/hosts` is also needed for the agent to reach the metadata server by name. The build used to handle this **only for the dev variant** (`HARDEN=0`), reinstalling `google-guest-agent` and adding the `/etc/hosts` line; it no longer installs any cloud agent, and dev access is `DEV_SSH_PUBKEY` (see [README → Dev SSH access](README.md#dev-ssh-access-cloud-independent)). The hardened variant intentionally omits both — `google-guest-agent` is exactly the kind of component that can push changes into the instance from outside, so the hardened image is not SSH-reachable by design.
 
-The full build (`cvm/build-tapp.sh`, §9) then takes this base image and adds the application, Docker, the gcp kernel, runs `cryptpilot-convert`, syncs the ESP, and (for the hardened variant) removes back-door software.
+The full build (`cvm/build-tapp.sh`) then takes this base image and adds the application, Docker, the HWE generic kernel, runs `cryptpilot-convert` (which syncs the ESP itself), and (for the hardened variant) removes back-door software.
 
 ## 1. Environment
 
@@ -324,14 +334,14 @@ This integrates all the fixes above into one reproducible pipeline, in two stage
 
 The repository provides three scripts:
 - **`build-tapp.sh <bare-ubuntu.qcow2> <out.qcow2>`** — chains the full stage A + stage B flow;
-- **`prepare-tapp.sh <base.qcow2> <out.qcow2>`** — stage B only (use when a base already exists); includes fix A, DNS (guestfish), nbd reset, convert, fix B;
+- **`prepare-tapp.sh <base.qcow2> <out.qcow2>`** — stage B only (use when a base already exists); includes fix A, DNS (guestfish), nbd reset, convert (fix B is now done inside convert, #130);
 - **`fix-esp-grub.sh <img.qcow2>`** — sync the ESP only (fix B).
 
 ```bash
 # bare Ubuntu 24.04 → final gcp-tapp.qcow2 (one command)
 ./build-tapp.sh ubuntu-24.04.qcow2 gcp-tapp.qcow2
 ```
-Key environment variables: `TAPP_SERVER_BIN` (local tapp-server; if empty, downloads v0.1.0), `DNS_FALLBACK`, `PURGE_KERNEL`, `CONFIG_DIR`, `FDE_PACKAGE`, `ROOTFS_MODE`, `IN_PLACE` (1 = modify the input directly without copying), `INSTALL_KERNEL`, `NBD_RESET`.
+Key environment variables: `TAPP_SERVER_BIN` (local tapp-server; if empty, downloads `TAPP_SERVER_URL`, today v0.10.0; ≥ 0.10.0 required), `DNS_FALLBACK`, `PURGE_KERNEL`, `CONFIG_DIR`, `FDE_PACKAGE`, `ROOTFS_MODE`, `IN_PLACE` (1 = modify the input directly without copying), `INSTALL_KERNEL`, `NBD_RESET`.
 
 ### Artifact verification checklist (all passed)
 
@@ -413,6 +423,8 @@ The hardening above is integrated at the end of stage A in `build-tapp.sh` (`apt
 
 ## 12. Extracting reference values: `show-reference-value` (requires the saved_entry fix)
 
+> Today: `ci/setup-toolchain.sh` installs the #128-fixed `cryptpilot-fde-host`, and `ci/gen-reference-values.sh` runs it — see [README → Extracting reference values](README.md#extracting-reference-values-for-remote-attestation). The manual build below is how it was done before that.
+
 After building `gcp-tapp.qcow2`, use `cryptpilot-fde` to extract the reference values needed for remote attestation (RA) **offline** from the image, and write them into the KBS/attestation policy.
 
 ### Prerequisite: cryptpilot-fde must include the §7.6 fix
@@ -484,7 +496,7 @@ Notes:
 - **`--format=oldgnu -S`**: GCP's importer requires the GNU-old tar format; `-S` keeps the (mostly-empty) 20 GiB raw sparse so the tarball stays small (~few GB).
 - **`-C <dir> disk.raw`**: the archive member must be the bare name `disk.raw`, not a path.
 - **Guest-OS features**: `UEFI_COMPATIBLE` (cryptpilot boots via UEFI/ESP), `GVNIC` (network driver), `SEV_CAPABLE`+`TDX_CAPABLE` (usable as an AMD-SEV or Intel-TDX confidential VM).
-- The script refuses to overwrite an existing image name (delete it first, or publish a versioned name, e.g. `og-tdx-YYYYMMDD`).
+- The script refuses to overwrite an existing image name (delete it first, publish a versioned name, e.g. `og-tdx-YYYYMMDD`, or set `OVERWRITE=1` to delete and recreate it).
 - Boot a confidential instance from it: `gcloud compute instances create … --image=og-tdx --image-project=g-devops --confidential-compute-type=TDX --maintenance-policy=TERMINATE`.
 
 ### Stages at a glance
